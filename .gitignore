@@ -1,0 +1,42 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Node
+node_modules/
+dist/
+
+# Tauri
+gui/src-tauri/target/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Build artifacts
+*.exe
+*.dll
+*.so
+*.dylib
+*.msi
+*.deb
+*.rpm
+*.AppImage
+
+# ClamAV databases
+*.cvd
+*.cld
+*.cbc
+
+# ClamAV upstream build artifacts (if built in-tree)
+third_party/clamav/build/
+third_party/clamav/target/
+third_party/clamav/clamav-main.zip

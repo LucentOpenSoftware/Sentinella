@@ -1,0 +1,8 @@
+[package]
+name = "sentinella-common"
+description = "Shared constants, paths, and version info for the Sentinella AV suite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

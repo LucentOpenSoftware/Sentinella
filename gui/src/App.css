@@ -1,0 +1,37 @@
+@import "tailwindcss";
+
+/* ── Sentinella design tokens ─────────────────────────────── */
+
+:root {
+  --accent: 59 130 246;          /* blue-500 */
+  --bg-base: 15 17 23;           /* near-black */
+  --bg-surface: 22 26 39;        /* card bg */
+  --bg-elevated: 30 35 50;       /* hover / sidebar active */
+  --border: 42 45 58;
+  --text-primary: 228 228 231;
+  --text-muted: 156 163 175;
+  --success: 34 197 94;
+  --warning: 234 179 8;
+  --danger: 239 68 68;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: rgb(var(--bg-base));
+  color: rgb(var(--text-primary));
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: rgba(var(--text-muted), 0.3);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(var(--text-muted), 0.5);
+}

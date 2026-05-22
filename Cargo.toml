@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sentinella-ipc-proto",
+    "crates/sentinella-common",
+    "crates/sentinelld",
+    "crates/sentinella-cli",
+]
+exclude = ["gui/src-tauri", "third_party"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-only"
+repository = "https://github.com/nicfb/sentinella"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Shared deps pinned at workspace level
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+
+# IPC proto is shared between daemon, CLI, and GUI backend
+sentinella-ipc-proto = { path = "crates/sentinella-ipc-proto" }
+sentinella-common = { path = "crates/sentinella-common" }

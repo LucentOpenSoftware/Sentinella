@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(where.exe uv *)",
+      "Bash(where.exe uvx *)",
+      "Bash(where.exe npx *)"
+    ]
+  }
+}

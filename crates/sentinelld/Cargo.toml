@@ -1,0 +1,24 @@
+[package]
+name = "sentinelld"
+description = "Sentinella daemon — scanning engine host, IPC server, real-time watcher"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sentinelld"
+path = "src/main.rs"
+
+[dependencies]
+sentinella-ipc-proto = { workspace = true }
+sentinella-common = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }

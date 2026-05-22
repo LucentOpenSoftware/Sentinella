@@ -1,0 +1,18 @@
+[package]
+name = "sentinella-cli"
+description = "Sentinella command-line client — talks to the daemon via IPC"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sentinella"
+path = "src/main.rs"
+
+[dependencies]
+sentinella-ipc-proto = { workspace = true }
+sentinella-common = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
