@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sentinella</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+    background: #0d1019;
+    color: #e6e9f2;
+    overflow: hidden;
+    height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    -webkit-font-smoothing: antialiased;
+    user-select: none;
+  }
+  .splash {
+    width: 100%;
+    height: 100%;
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 24px;
+  }
+  .bg {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    opacity: 0.5;
+    filter: brightness(0.45) saturate(0.7);
+    border-radius: 12px;
+  }
+  .content {
+    position: relative;
+    z-index: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 20px;
+  }
+  .status {
+    font-size: 13px;
+    color: rgba(255,255,255,0.6);
+    letter-spacing: 0.02em;
+    min-height: 18px;
+    transition: opacity 0.3s;
+  }
+  .steps {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    background: rgba(0,0,0,0.45);
+    backdrop-filter: blur(16px);
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 12px;
+    padding: 14px 20px;
+    min-width: 260px;
+  }
+  .step {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 11px;
+    color: rgba(255,255,255,0.25);
+    transition: color 0.4s;
+  }
+  .step.done { color: rgba(46,204,100,0.8); }
+  .step.active { color: rgba(255,255,255,0.7); }
+  .dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: rgba(255,255,255,0.1);
+    flex-shrink: 0;
+    transition: background 0.4s;
+  }
+  .step.done .dot { background: #2ecc64; }
+  .step.active .dot {
+    background: #3c82f5;
+    animation: pulse 1.2s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 0.5; transform: scale(0.9); }
+    50% { opacity: 1; transform: scale(1.1); }
+  }
+  .footer {
+    position: absolute;
+    bottom: 12px;
+    font-size: 9px;
+    color: rgba(255,255,255,0.15);
+    z-index: 1;
+  }
+</style>
+</head>
+<body>
+  <div class="splash" data-tauri-drag-region>
+    <img class="bg" src="assets/load_ui.png" alt="" onerror="this.style.display='none'">
+    <div class="content">
+      <div class="status" id="status">Initializing...</div>
+      <div class="steps">
+        <div class="step active" id="s0"><div class="dot"></div>Connecting to daemon</div>
+        <div class="step" id="s1"><div class="dot"></div>Loading ClamAV engine</div>
+        <div class="step" id="s2"><div class="dot"></div>Loading signatures</div>
+        <div class="step" id="s3"><div class="dot"></div>Initializing ARGUS heuristics</div>
+        <div class="step" id="s4"><div class="dot"></div>Preparing real-time monitoring</div>
+      </div>
+    </div>
+    <div class="footer">Lucent Open Software &middot; GPLv2 &middot; v0.1.0</div>
+  </div>
+  <script>
+    // Splash is controlled by Rust backend — no Tauri IPC needed.
+    // Steps advance on a timer for visual feedback while Rust polls daemon.
+    // Rust closes this window when daemon is ready.
+    const steps = ['s0','s1','s2','s3','s4'];
+    const labels = [
+      'Connecting to daemon...',
+      'Loading ClamAV engine...',
+      'Loading signatures...',
+      'Initializing ARGUS heuristics...',
+      'Preparing real-time monitoring...',
+    ];
+    let current = 0;
+
+    function advance() {
+      if (current >= steps.length) return;
+      document.getElementById(steps[current]).className = 'step done';
+      current++;
+      if (current < steps.length) {
+        document.getElementById(steps[current]).className = 'step active';
+        document.getElementById('status').textContent = labels[current];
+      } else {
+        document.getElementById('status').textContent = 'Ready';
+      }
+    }
+
+    // Visual pacing — Rust handles real daemon readiness check.
+    setTimeout(() => advance(), 1500);
+    setTimeout(() => advance(), 3500);
+    setTimeout(() => advance(), 5500);
+    setTimeout(() => advance(), 7500);
+    setTimeout(() => advance(), 9500);
+    setTimeout(() => {
+      document.getElementById('status').textContent = 'Almost ready...';
+    }, 11000);
+  </script>
+</body>
+</html>

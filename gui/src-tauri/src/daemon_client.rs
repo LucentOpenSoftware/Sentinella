@@ -6,8 +6,11 @@
 use serde::Serialize;
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::{timeout, Duration};
 
 const PIPE_NAME: &str = r"\\.\pipe\sentinelld";
+const IPC_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
 /// Errors from talking to the daemon.
 #[derive(Debug)]
@@ -16,6 +19,8 @@ pub enum DaemonError {
     Io(std::io::Error),
     Json(serde_json::Error),
     Rpc { code: i32, message: String },
+    Timeout(&'static str),
+    InvalidFrame(String),
 }
 
 impl std::fmt::Display for DaemonError {
@@ -25,6 +30,8 @@ impl std::fmt::Display for DaemonError {
             Self::Io(e) => write!(f, "IO error: {e}"),
             Self::Json(e) => write!(f, "JSON error: {e}"),
             Self::Rpc { code, message } => write!(f, "RPC error {code}: {message}"),
+            Self::Timeout(op) => write!(f, "Daemon IPC timeout during {op}"),
+            Self::InvalidFrame(msg) => write!(f, "Invalid daemon response frame: {msg}"),
         }
     }
 }
@@ -40,19 +47,39 @@ impl From<DaemonError> for String {
 }
 
 /// Send a JSON-RPC request to the daemon and return the `result` value.
+/// Retries on PIPE_BUSY (error 231) up to 3 times with backoff.
 pub async fn call(method: &str, params: Value) -> Result<Value, DaemonError> {
-    // Connect to named pipe.
-    let mut pipe = match tokio::net::windows::named_pipe::ClientOptions::new()
-        .open(PIPE_NAME)
-    {
-        Ok(p) => p,
-        Err(e) => {
-            let code = e.raw_os_error().unwrap_or(0);
-            // 2 = FILE_NOT_FOUND, 231 = PIPE_BUSY
-            if code == 2 || code == 231 || e.kind() == std::io::ErrorKind::NotFound {
-                return Err(DaemonError::NotRunning);
+    // Connect to named pipe with retry on busy.
+    let mut pipe = {
+        let mut last_err = None;
+        let mut connected = None;
+        for attempt in 0..4 {
+            match tokio::net::windows::named_pipe::ClientOptions::new()
+                .open(PIPE_NAME)
+            {
+                Ok(p) => { connected = Some(p); break; }
+                Err(e) => {
+                    let code = e.raw_os_error().unwrap_or(0);
+                    if code == 2 || e.kind() == std::io::ErrorKind::NotFound {
+                        // Pipe doesn't exist → daemon not running.
+                        return Err(DaemonError::NotRunning);
+                    }
+                    if code == 231 && attempt < 3 {
+                        // PIPE_BUSY → daemon running but all instances occupied.
+                        // Retry after short backoff.
+                        std::thread::sleep(std::time::Duration::from_millis(50 * (attempt as u64 + 1)));
+                        last_err = Some(e);
+                        continue;
+                    }
+                    return Err(DaemonError::Io(e));
+                }
             }
-            return Err(DaemonError::Io(e));
+        }
+        match connected {
+            Some(p) => p,
+            None => return Err(DaemonError::Io(last_err.unwrap_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "pipe busy after retries")
+            }))),
         }
     };
 
@@ -64,17 +91,42 @@ pub async fn call(method: &str, params: Value) -> Result<Value, DaemonError> {
         "params": params,
     });
     let payload = serde_json::to_vec(&req)?;
+    if payload.is_empty() {
+        return Err(DaemonError::InvalidFrame("zero-length request".into()));
+    }
+    if payload.len() > MAX_FRAME_SIZE {
+        return Err(DaemonError::InvalidFrame(format!(
+            "request is {} bytes; limit is {MAX_FRAME_SIZE}",
+            payload.len()
+        )));
+    }
 
     // Write length-prefixed frame.
-    pipe.write_all(&(payload.len() as u32).to_be_bytes()).await?;
-    pipe.write_all(&payload).await?;
+    timeout(IPC_TIMEOUT, pipe.write_all(&(payload.len() as u32).to_be_bytes()))
+        .await
+        .map_err(|_| DaemonError::Timeout("write length"))??;
+    timeout(IPC_TIMEOUT, pipe.write_all(&payload))
+        .await
+        .map_err(|_| DaemonError::Timeout("write payload"))??;
 
     // Read length-prefixed response.
     let mut len_buf = [0u8; 4];
-    pipe.read_exact(&mut len_buf).await?;
+    timeout(IPC_TIMEOUT, pipe.read_exact(&mut len_buf))
+        .await
+        .map_err(|_| DaemonError::Timeout("read length"))??;
     let resp_len = u32::from_be_bytes(len_buf) as usize;
+    if resp_len == 0 {
+        return Err(DaemonError::InvalidFrame("zero-length response".into()));
+    }
+    if resp_len > MAX_FRAME_SIZE {
+        return Err(DaemonError::InvalidFrame(format!(
+            "{resp_len} bytes exceeds {MAX_FRAME_SIZE} byte limit"
+        )));
+    }
     let mut resp_buf = vec![0u8; resp_len];
-    pipe.read_exact(&mut resp_buf).await?;
+    timeout(IPC_TIMEOUT, pipe.read_exact(&mut resp_buf))
+        .await
+        .map_err(|_| DaemonError::Timeout("read payload"))??;
 
     let resp: Value = serde_json::from_slice(&resp_buf)?;
 
@@ -92,6 +144,22 @@ pub async fn call(method: &str, params: Value) -> Result<Value, DaemonError> {
 /// Call with no params.
 pub async fn call_simple(method: &str) -> Result<Value, DaemonError> {
     call(method, Value::Null).await
+}
+
+/// Send an authenticated request for dangerous local-only operations.
+pub async fn call_auth(method: &str, mut params: Value) -> Result<Value, DaemonError> {
+    match &mut params {
+        Value::Object(map) => {
+            map.insert(
+                "auth".into(),
+                Value::String(crate::ipc_auth::secret().to_string()),
+            );
+        }
+        _ => {
+            params = serde_json::json!({"auth": crate::ipc_auth::secret()});
+        }
+    }
+    call(method, params).await
 }
 
 /// Call with a serializable params struct.

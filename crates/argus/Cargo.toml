@@ -1,0 +1,40 @@
+[package]
+name = "argus"
+description = "ARGUS Heuristics Engine — Sentinella's layered suspicion and correlation engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+
+# PE/ELF binary parsing
+goblin = "0.10"
+
+# File type detection by magic bytes
+infer = "0.19"
+
+# Shannon entropy calculation
+entropy = "0.4"
+
+# Memory-mapped file I/O for efficient scanning
+memmap2 = "0.9"
+
+# Hashing for IOC matching
+sha2 = "0.10"
+md-5 = "0.10"
+hex = "0.4"
+
+# YARA-X rule engine (pure Rust, BSD-3-Clause)
+yara-x = "1.16"
+
+# Windows API for Authenticode verification
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Security_WinTrust",
+    "Win32_Security_Cryptography",
+    "Win32_Foundation",
+] }

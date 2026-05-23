@@ -1,285 +1,784 @@
-import { useState, useEffect } from "react";
-import {
-  Search,
-  Zap,
-  HardDrive,
-  FolderOpen,
-  Upload,
-  CheckCircle,
-  AlertTriangle,
-  Loader2,
-} from "lucide-react";
-import { PageHeader } from "../components/PageHeader";
+import { useState, useEffect, useRef } from "react";
+import { FileSearch, Zap, CheckCircle, AlertTriangle, Loader2, ShieldCheck, ShieldAlert, XCircle, WifiOff, Square, Eye, ChevronDown, ChevronUp, Search } from "lucide-react";
+import { ShieldIcon } from "../components/ShieldIcon";
+import { open } from "@tauri-apps/plugin-dialog";
 import { Card } from "../components/Card";
-import { startQuickScan, startFullScan, getScanHistory } from "../api/sentinella";
-import type { ScanRecord } from "../types/sentinella";
+import { scanFile, scanFolder, startQuickScan, startFullScan, startStartupScan, getScanStatus, cancelScan, getScanHistory, notifyThreat, quarantineFile, notifyQuarantine } from "../api/sentinella";
+import { FolderOpen, HardDrive, RotateCcw } from "lucide-react";
+import type { FileScanResponse, ScanRecord, ScanStatusResponse, EngineStatus, ArgusVerdict, ArgusFinding } from "../types/sentinella";
 
-type ScanMode = "idle" | "scanning" | "complete";
+type St = {k:"idle"}|{k:"picked";path:string}|{k:"scanning";path:string}|{k:"result";r:FileScanResponse;argus?:ArgusVerdict}|{k:"quick"}|{k:"error";msg:string};
 
-export function ScanPage() {
-  const [mode, setMode] = useState<ScanMode>("idle");
-  const [progress, setProgress] = useState(0);
-  const [dragOver, setDragOver] = useState(false);
-  const [recentScans, setRecentScans] = useState<ScanRecord[]>([]);
+export function ScanPage({ droppedFile, onConsumeDroppedFile, connected, engineStatus }: {
+  droppedFile?: string | null;
+  onConsumeDroppedFile?: () => string | null;
+  connected?: boolean;
+  engineStatus?: EngineStatus | null;
+}) {
+  const [st, setSt] = useState<St>({k:"idle"});
+  const [ss, setSs] = useState<ScanStatusResponse|null>(null);
+  const [hist, setHist] = useState<ScanRecord[]>([]);
+  const poll = useRef<ReturnType<typeof setInterval>|null>(null);
+
+  // Use shared connection state from parent (consistent with TopBar).
+  // Falls back to own check if not provided (backward compat).
+  const up = connected ?? true;
+  const eng = engineStatus ?? null;
 
   useEffect(() => {
-    getScanHistory().then(setRecentScans).catch(() => {});
-  }, [mode]); // refetch after a scan completes
+    getScanHistory().then(setHist).catch(() => {});
+  }, [st.k]);
 
-  async function handleStartScan(type: "quick" | "full") {
-    setMode("scanning");
-    setProgress(0);
-
-    // Call the real daemon endpoint.
-    try {
-      if (type === "quick") await startQuickScan();
-      else await startFullScan();
-    } catch {
-      // Daemon call may fail; still show mock progress for now.
+  // Handle dropped file from drag-and-drop.
+  useEffect(() => {
+    if (droppedFile && st.k === "idle" && onConsumeDroppedFile) {
+      const file = onConsumeDroppedFile();
+      if (file) {
+        setSt({ k: "picked", path: file });
+      }
     }
+  }, [droppedFile, st.k, onConsumeDroppedFile]);
 
-    // Mock progress animation until real scan streaming exists.
-    const interval = setInterval(() => {
-      setProgress((p) => {
-        if (p >= 100) {
-          clearInterval(interval);
-          setMode("complete");
-          return 100;
+  useEffect(() => {
+    if (st.k === "quick") {
+      const fn = () => getScanStatus().then(s => {
+        setSs(s);
+        if (!s.running && s.state !== "idle" && s.state !== "pending") {
+          if (poll.current) clearInterval(poll.current);
+          getScanHistory().then(setHist).catch(() => {});
         }
-        return p + 2;
-      });
-    }, 80);
-  }
+      }).catch(() => {});
+      fn();
+      poll.current = setInterval(fn, 2000); // was 500ms — reduced IPC load during scans
+      return () => { if (poll.current) clearInterval(poll.current); };
+    }
+  }, [st.k]);
+
+  const ready = up && eng?.state === "ready" && (eng?.signature_count ?? 0) > 0;
+  const qQueued = st.k === "quick" && ss && (ss.state === "queued" || ss.state === "pending");
+  const qCancelling = st.k === "quick" && ss?.state === "cancelling";
+  const qr = st.k === "quick" && ss?.running && !qQueued && !qCancelling;
+  const qd = st.k === "quick" && ss && !ss.running && ss.state !== "idle" && ss.state !== "queued" && ss.state !== "pending";
 
   return (
-    <div>
-      <PageHeader
-        icon={<Search size={22} />}
-        title="Scan"
-        subtitle="Run a virus scan on your system"
-      />
-
-      {/* ── Scan types ─────────────────────────────────────── */}
-      <div className="grid grid-cols-3 gap-4 mb-6">
-        <ScanTypeCard
-          icon={<Zap size={22} />}
-          title="Quick Scan"
-          description="Scans Downloads, Desktop, Documents, and Temp folders."
-          duration="~2 min"
-          accent
-          onClick={() => handleStartScan("quick")}
-          disabled={mode === "scanning"}
-        />
-        <ScanTypeCard
-          icon={<HardDrive size={22} />}
-          title="Full Scan"
-          description="Comprehensive scan of all files on every drive."
-          duration="~45 min"
-          onClick={() => handleStartScan("full")}
-          disabled={mode === "scanning"}
-        />
-        <ScanTypeCard
-          icon={<FolderOpen size={22} />}
-          title="Custom Scan"
-          description="Choose specific files or folders to scan."
-          duration="Varies"
-          onClick={() => handleStartScan("quick")}
-          disabled={mode === "scanning"}
-        />
-      </div>
-
-      {/* ── Drag & drop zone ───────────────────────────────── */}
-      <Card
-        className={`mb-6 transition-colors ${
-          dragOver
-            ? "border-[rgb(var(--accent))] bg-[rgb(var(--accent))]/5"
-            : ""
-        }`}
-      >
-        <div
-          className="flex flex-col items-center py-8 text-center"
-          onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
-          onDragLeave={() => setDragOver(false)}
-          onDrop={(e) => { e.preventDefault(); setDragOver(false); handleStartScan("quick"); }}
-        >
-          <div className="w-14 h-14 rounded-2xl bg-[rgb(var(--bg-elevated))] flex items-center justify-center mb-3">
-            <Upload size={24} className={dragOver ? "text-[rgb(var(--accent))]" : "text-[rgb(var(--text-muted))]"} />
-          </div>
-          <p className="text-sm font-medium mb-1">
-            Drag files or folders here to scan
-          </p>
-          <p className="text-xs text-[rgb(var(--text-muted))]">
-            Or use one of the scan types above
-          </p>
+    <div className="page-stack">
+      {!up && (
+        <div className="flex items-center gap-3 px-5 py-3 rounded-xl bg-[rgb(var(--amber))]/6 border border-[rgb(var(--amber))]/10 text-[12px] text-[rgb(var(--amber))]">
+          <WifiOff size={14} /> Daemon not connected — scanning unavailable
         </div>
-      </Card>
-
-      {/* ── Scan progress / result ─────────────────────────── */}
-      {mode === "scanning" && (
-        <Card className="mb-6">
-          <div className="flex items-center gap-4 mb-4">
-            <Loader2 size={22} className="text-[rgb(var(--accent))] animate-spin" />
-            <div className="flex-1">
-              <p className="text-sm font-semibold">Scanning...</p>
-              <p className="text-xs text-[rgb(var(--text-muted))]">
-                {Math.floor(progress * 142)} files checked
-              </p>
-            </div>
-            <span className="text-sm font-bold text-[rgb(var(--accent))]">{progress}%</span>
-          </div>
-          {/* Progress bar */}
-          <div className="w-full h-2 bg-[rgb(var(--bg-elevated))] rounded-full overflow-hidden">
-            <div
-              className="h-full bg-[rgb(var(--accent))] rounded-full transition-all duration-200"
-              style={{ width: `${progress}%` }}
-            />
-          </div>
-          <p className="text-xs text-[rgb(var(--text-muted))] mt-2 truncate">
-            C:\Users\Nicolas\Documents\project\src\main.rs
-          </p>
-        </Card>
       )}
 
-      {mode === "complete" && (
-        <Card className="mb-6 border-[rgb(var(--success))]/30">
+      {/* ── SCAN TYPES ── */}
+      {(st.k === "idle" || st.k === "picked") && (
+        <>
+          <div className="grid gap-6 md:grid-cols-2 xl:grid-cols-3">
+            <ScanTypeCard icon={<FileSearch size={22}/>} title="Scan File" desc="Signature + ARGUS heuristic analysis on a single file." accent disabled={!ready}
+              onClick={async () => { const p = await open({multiple:false,directory:false,title:"Select file"}); if (p) setSt({k:"picked",path:p as string}); }} />
+            <ScanTypeCard icon={<Zap size={22}/>} title="Quick Scan" desc="Downloads, Desktop, Temp — fast check." disabled={!ready}
+              onClick={async () => { try { await startQuickScan(); setSt({k:"quick"}); } catch(e) { setSt({k:"error",msg:String(e)}); }}} />
+            <ScanTypeCard icon={<FolderOpen size={22}/>} title="Scan Folder" desc="Multi-engine scan across all files in a folder." disabled={!ready}
+              onClick={async () => {
+                const p = await open({multiple:false, directory:true, title:"Select folder to scan"});
+                if (p) { try { await scanFolder(p as string); setSt({k:"quick"}); } catch(e) { setSt({k:"error",msg:String(e)}); } }
+              }} />
+          </div>
+          <div className="grid gap-6 md:grid-cols-2 xl:grid-cols-3">
+            <ScanTypeCard icon={<HardDrive size={22}/>} title="Full Scan" desc="Scan all fixed drives — thorough but slow." disabled={!ready}
+              onClick={async () => { try { await startFullScan(); setSt({k:"quick"}); } catch(e) { setSt({k:"error",msg:String(e)}); }}} />
+            <ScanTypeCard icon={<RotateCcw size={22}/>} title="Startup Scan" desc="Autorun entries, Run keys, recent executables." disabled={!ready}
+              onClick={async () => { try { await startStartupScan(); setSt({k:"quick"}); } catch(e) { setSt({k:"error",msg:String(e)}); }}} />
+          </div>
+        </>
+      )}
+
+      {/* ── FILE PICKED ── */}
+      {st.k === "picked" && (
+        <Card>
           <div className="flex items-center gap-4">
-            <div className="w-12 h-12 rounded-xl bg-[rgb(var(--success))]/15 flex items-center justify-center">
-              <CheckCircle size={24} className="text-[rgb(var(--success))]" />
+            <div className="w-11 h-11 rounded-xl bg-[rgb(var(--accent))]/8 flex items-center justify-center flex-shrink-0">
+              <FileSearch size={18} className="text-[rgb(var(--accent))]" />
             </div>
-            <div className="flex-1">
-              <p className="text-sm font-semibold">Scan complete — No threats found</p>
-              <p className="text-xs text-[rgb(var(--text-muted))]">
-                14,203 files scanned in 2m 14s
-              </p>
+            <div className="flex-1 min-w-0">
+              <p className="text-[14px] font-semibold">Selected file</p>
+              <p className="text-[12px] text-[rgb(var(--t3))] truncate mt-0.5">{st.path}</p>
             </div>
-            <button
-              onClick={() => setMode("idle")}
-              className="text-xs text-[rgb(var(--text-muted))] hover:text-[rgb(var(--text-primary))] px-3 py-1.5 rounded-lg bg-[rgb(var(--bg-elevated))] transition-colors"
-            >
-              Dismiss
+            <button disabled={!ready} onClick={async () => {
+              setSt({k:"scanning",path:st.path});
+              try {
+                const r = await scanFile(st.path);
+                // Orchestrator owns queued scans; use shared scan.status polling.
+                if (r.status === "queued") {
+                  setSt({k:"quick"});
+                  return;
+                } else {
+                  setSt({k:"result",r});
+                  getScanHistory().then(setHist).catch(()=>{});
+                  if (r.result?.infected) notifyThreat(r.result.virus_name || "Unknown", r.result.path);
+                }
+              }
+              catch(e) { setSt({k:"error",msg:String(e)}); }
+            }} className="px-5 py-2.5 bg-[rgb(var(--accent))] text-white rounded-xl text-[13px] font-semibold hover:opacity-90 cursor-pointer disabled:opacity-40 shadow-sm shadow-[rgb(var(--accent))]/10">
+              Scan Now
             </button>
           </div>
         </Card>
       )}
 
-      {/* ── Recent scans (from daemon) ──────────────────────── */}
-      <h3 className="text-xs font-medium text-[rgb(var(--text-muted))] mb-3 uppercase tracking-wider">
-        Recent Scans
-      </h3>
-      {recentScans.length === 0 ? (
-        <Card className="text-center py-10">
-          <p className="text-sm text-[rgb(var(--text-muted))]">No scans recorded yet. Run a scan to see results here.</p>
+      {/* ── SCANNING ── */}
+      {st.k === "scanning" && (
+        <Card><div className="flex items-center gap-4 py-2">
+          <Loader2 size={20} className="text-[rgb(var(--accent))] animate-spin" />
+          <div className="flex-1 min-w-0"><p className="text-[14px] font-semibold">Scanning...</p><p className="text-[12px] text-[rgb(var(--t3))] truncate">{st.path}</p></div>
+        </div></Card>
+      )}
+
+      {/* ── FILE RESULT ── */}
+      {st.k === "result" && st.r.result && <FileResult r={st.r.result} argus={st.argus} onDismiss={() => setSt({k:"idle"})} onQuarantine={async () => {
+        const r = st.r.result!;
+        await quarantineFile(r.path, r.virus_name || "Unknown", st.r.job_id);
+        notifyQuarantine(r.virus_name || "Unknown", r.path);
+        setSt({k:"idle"});
+        getScanHistory().then(setHist).catch(()=>{});
+      }} />}
+
+      {/* ── QUEUED (waiting for worker) ── */}
+      {qQueued && ss && (
+        <Card>
+          <div className="flex items-center gap-4 py-2">
+            <Loader2 size={20} className="text-[rgb(var(--accent))] animate-spin" />
+            <div className="flex-1 min-w-0">
+              <p className="text-[14px] font-semibold">Scan Queued</p>
+              <p className="text-[12px] text-[rgb(var(--t3))]">Waiting for available worker...</p>
+            </div>
+            <button onClick={() => cancelScan().catch(()=>{})} className="flex items-center gap-2 px-4 py-2 rounded-xl bg-[rgb(var(--raised))]/40 text-[12px] text-[rgb(var(--t2))] hover:text-[rgb(var(--red))] cursor-pointer"><Square size={11}/>Cancel</button>
+          </div>
         </Card>
-      ) : (
-      <Card className="p-0 overflow-hidden">
-        <table className="w-full text-sm">
-          <thead>
-            <tr className="border-b border-[rgb(var(--border))] text-left text-[rgb(var(--text-muted))]">
-              <th className="px-5 py-3 font-medium">Type</th>
-              <th className="px-5 py-3 font-medium">Date</th>
-              <th className="px-5 py-3 font-medium">Files</th>
-              <th className="px-5 py-3 font-medium">Result</th>
-              <th className="px-5 py-3 font-medium">Duration</th>
-            </tr>
-          </thead>
-          <tbody>
-            {recentScans.slice(0, 5).map((scan) => (
-              <tr
-                key={scan.job_id}
-                className="border-b border-[rgb(var(--border))]/40 last:border-0 hover:bg-[rgb(var(--bg-elevated))]/40 transition-colors"
-              >
-                <td className="px-5 py-3 capitalize font-medium">{scan.scan_type}</td>
-                <td className="px-5 py-3 text-[rgb(var(--text-muted))]">{new Date(scan.started_at * 1000).toLocaleString()}</td>
-                <td className="px-5 py-3">{scan.files_scanned.toLocaleString()}</td>
-                <td className="px-5 py-3">
-                  {scan.threats_found > 0 ? (
-                    <span className="inline-flex items-center gap-1 text-[rgb(var(--danger))]">
-                      <AlertTriangle size={13} />
-                      <span className="font-medium">{scan.threats_found} threat{scan.threats_found > 1 ? "s" : ""}</span>
-                    </span>
-                  ) : (
-                    <span className="inline-flex items-center gap-1 text-[rgb(var(--success))]">
-                      <CheckCircle size={13} />
-                      <span className="font-medium">Clean</span>
-                    </span>
-                  )}
-                </td>
-                <td className="px-5 py-3 text-[rgb(var(--text-muted))]">
-                  {formatDur(scan.finished_at - scan.started_at)}
-                </td>
-              </tr>
+      )}
+
+      {/* ── CANCELLING ── */}
+      {qCancelling && ss && (
+        <Card>
+          <div className="flex items-center gap-4 py-2">
+            <Loader2 size={20} className="text-[rgb(var(--amber))] animate-spin" />
+            <div className="flex-1 min-w-0">
+              <p className="text-[14px] font-semibold text-[rgb(var(--amber))]">Cancelling...</p>
+              <p className="text-[12px] text-[rgb(var(--t3))]">{ss.files_scanned.toLocaleString()} files scanned before cancel</p>
+            </div>
+          </div>
+        </Card>
+      )}
+
+      {/* ── QUICK SCAN RUNNING ── */}
+      {qr && ss && (
+        <>
+          <Card className="border-[rgb(var(--accent))]/12">
+            <div className="flex items-center justify-between mb-6">
+              <div className="flex items-center gap-4">
+                <div className="relative flex-shrink-0">
+                  <ShieldIcon icon="scan" size={28} className="opacity-80" />
+                  <Loader2 size={12} className="text-[rgb(var(--accent))] animate-spin absolute -bottom-0.5 -right-0.5" />
+                </div>
+                <div>
+                  <p className="text-[15px] font-semibold">{ss.scan_type === "folder" ? "Folder" : "Quick"} Scan Running</p>
+                  <p className="text-[12px] text-[rgb(var(--t3))] truncate max-w-[400px]">{ss.current_path || "Starting..."}</p>
+                </div>
+              </div>
+              <button onClick={() => cancelScan().catch(()=>{})} className="flex items-center gap-2 px-4 py-2 rounded-xl bg-[rgb(var(--raised))]/40 text-[12px] text-[rgb(var(--t2))] hover:text-[rgb(var(--red))] cursor-pointer"><Square size={11}/>Cancel</button>
+            </div>
+            {/* Progress bar */}
+            {ss.files_total > 0 && (
+              <div className="mb-5">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-[11px] text-[rgb(var(--t3))]">{ss.files_scanned.toLocaleString()} / {ss.files_total.toLocaleString()} files</span>
+                  <span className="text-[13px] font-bold text-[rgb(var(--accent))]">{ss.progress_percent < 1 && ss.progress_percent > 0 ? ss.progress_percent.toFixed(1) : Math.round(ss.progress_percent)}%</span>
+                </div>
+                <div className="w-full h-2 bg-[rgb(var(--raised))]/40 rounded-full overflow-hidden">
+                  <div className="h-full bg-[rgb(var(--accent))] rounded-full transition-all duration-300" style={{ width: `${ss.progress_percent}%` }} />
+                </div>
+              </div>
+            )}
+            <div className="grid gap-5 text-center md:grid-cols-3">
+              <div><p className="text-[24px] font-bold">{ss.files_scanned.toLocaleString()}</p><p className="text-[11px] text-[rgb(var(--t3))] mt-1">Files Scanned</p></div>
+              <div><p className={`text-[24px] font-bold ${ss.threats_found > 0 ? "text-[rgb(var(--red))]" : ""}`}>{ss.threats_found}</p><p className="text-[11px] text-[rgb(var(--t3))] mt-1">Threats Found</p></div>
+              <div><p className="text-[24px] font-bold">{ss.started_at ? `${Math.max(0, Math.floor(Date.now()/1000 - ss.started_at))}s` : "—"}</p><p className="text-[11px] text-[rgb(var(--t3))] mt-1">Elapsed</p></div>
+            </div>
+          </Card>
+
+          {/* Live threat feed — shows detections as they're found */}
+          {ss.detections.length > 0 && (
+            <Card className="border-[rgb(var(--red))]/10">
+              <div className="flex items-center gap-3 mb-4">
+                <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-[rgb(var(--red))]/8">
+                  <AlertTriangle size={15} className="text-[rgb(var(--red))]" />
+                </div>
+                <div>
+                  <h4 className="text-[14px] font-semibold">
+                    {ss.detections.length} Threat{ss.detections.length > 1 ? "s" : ""} Detected
+                  </h4>
+                  <p className="text-[11px] text-[rgb(var(--t3))] mt-0.5">Live feed — threats appear as ARGUS identifies them</p>
+                </div>
+              </div>
+              <div className="space-y-2">
+                {ss.detections.map((d, i) => {
+                  const isArgus = d.virus_name.startsWith("ARGUS/");
+                  const fileName = d.path.split(/[/\\]/).pop() || d.path;
+                  const dirPath = d.path.split(/[/\\]/).slice(0, -1).join("\\");
+                  return (
+                    <div key={i} className="flex items-start gap-3 rounded-xl bg-[rgb(var(--raised))]/12 px-4 py-3 animate-in fade-in">
+                      <div className={`mt-0.5 flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg ${
+                        isArgus ? "bg-[rgb(var(--amber))]/8" : "bg-[rgb(var(--red))]/8"
+                      }`}>
+                        {isArgus
+                          ? <Eye size={14} className="text-[rgb(var(--amber))]" />
+                          : <ShieldAlert size={14} className="text-[rgb(var(--red))]" />}
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2">
+                          <p className={`text-[13px] font-semibold ${isArgus ? "text-[rgb(var(--amber))]" : "text-[rgb(var(--red))]"}`}>
+                            {d.virus_name}
+                          </p>
+                          <span className={`text-[9px] font-semibold uppercase px-1.5 py-0.5 rounded ${
+                            isArgus
+                              ? "bg-[rgb(var(--amber))]/8 text-[rgb(var(--amber))]"
+                              : "bg-[rgb(var(--red))]/8 text-[rgb(var(--red))]"
+                          }`}>
+                            {isArgus ? "Heuristic" : "Signature"}
+                          </span>
+                        </div>
+                        <p className="text-[12px] font-medium text-[rgb(var(--t1))] mt-1 truncate" title={d.path}>{fileName}</p>
+                        <p className="text-[10px] text-[rgb(var(--t3))]/40 truncate" title={d.path}>{dirPath}</p>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </Card>
+          )}
+        </>
+      )}
+
+      {/* ── SCAN COMPLETE — Full Report ── */}
+      {qd && ss && <ScanReport ss={ss} onNewScan={() => { setSt({k:"idle"}); setSs(null); }} />}
+
+      {/* ── ERROR ── */}
+      {st.k === "error" && (
+        <Card className="border-[rgb(var(--red))]/12"><div className="flex items-center gap-4"><XCircle size={18} className="text-[rgb(var(--red))]"/><div className="flex-1"><p className="text-[14px] font-semibold text-[rgb(var(--red))]">Scan Failed</p><p className="text-[12px] text-[rgb(var(--t3))]">{st.msg}</p></div><button onClick={() => setSt({k:"idle"})} className="px-4 py-2 rounded-xl bg-[rgb(var(--raised))]/40 text-[12px] cursor-pointer">Dismiss</button></div></Card>
+      )}
+
+      {/* ── RECENT SCANS ── */}
+      <Card>
+        <h4 className="text-[15px] font-semibold mb-5">Recent Scans</h4>
+        {hist.length === 0 ? (
+          <p className="text-[13px] text-[rgb(var(--t3))]/40 py-6 text-center">No scans recorded yet</p>
+        ) : (
+          <div className="space-y-2">
+            {hist.slice(0,5).map(s => (
+              <div key={s.scan_id} className="flex items-center gap-4 px-4 py-3 rounded-xl bg-[rgb(var(--raised))]/15 hover:bg-[rgb(var(--raised))]/25 transition-colors">
+                <div className={`w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0 ${s.threats_found > 0 ? "bg-[rgb(var(--red))]/8 text-[rgb(var(--red))]" : s.status === "cancelled" ? "bg-[rgb(var(--amber))]/8 text-[rgb(var(--amber))]" : "bg-[rgb(var(--green))]/6 text-[rgb(var(--green))]"}`}>
+                  {s.threats_found > 0 ? <AlertTriangle size={14}/> : s.status === "cancelled" ? <XCircle size={14}/> : <CheckCircle size={14}/>}
+                </div>
+                <div className="flex-1 min-w-0">
+                  <p className="text-[13px] font-medium capitalize">{s.scan_type} Scan</p>
+                  <p className="text-[11px] text-[rgb(var(--t3))]/40">{new Date(s.started_at * 1000).toLocaleString()}</p>
+                </div>
+                <p className="text-[13px] font-medium">{s.files_scanned} files</p>
+                <p className={`text-[13px] font-semibold min-w-[60px] text-right ${s.threats_found > 0 ? "text-[rgb(var(--red))]" : s.status === "cancelled" ? "text-[rgb(var(--amber))]" : "text-[rgb(var(--green))]"}`}>
+                  {s.threats_found > 0 ? `${s.threats_found} threat${s.threats_found > 1 ? "s" : ""}` : s.status === "cancelled" ? "Cancelled" : "Clean"}
+                </p>
+              </div>
             ))}
-          </tbody>
-        </table>
+          </div>
+        )}
       </Card>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Scan Report — shown after scan completes or is cancelled.
+   Presents a full summary with stats, detections, and actions.
+   ═══════════════════════════════════════════════════════════════ */
+
+function ScanReport({ ss, onNewScan }: { ss: ScanStatusResponse; onNewScan: () => void }) {
+  const cancelled = ss.state === "cancelled";
+  const hasThreats = ss.threats_found > 0;
+  const statusColor = cancelled ? "amber" : hasThreats ? "red" : "green";
+  const cv = `var(--${statusColor})`;
+  const elapsed = ss.started_at && ss.finished_at ? ss.finished_at - ss.started_at : 0;
+  const scanType = ss.scan_type || "quick";
+
+  return (
+    <div className="page-stack">
+      {/* Hero result card */}
+      <Card className={`border-[rgb(${cv})]/12`}>
+        <div className="flex items-start gap-5">
+          <div className="flex h-16 w-16 flex-shrink-0 items-center justify-center rounded"
+            style={{ background: `rgba(${cv}, 0.08)`, color: `rgb(${cv})` }}>
+            {cancelled ? <XCircle size={28} /> : hasThreats ? <ShieldAlert size={28} /> : <ShieldCheck size={28} />}
+          </div>
+          <div className="flex-1 min-w-0">
+            <h3 className="text-[22px] font-bold leading-tight">
+              {cancelled
+                ? "Scan Cancelled"
+                : hasThreats
+                  ? `${ss.threats_found} Threat${ss.threats_found > 1 ? "s" : ""} Found`
+                  : "Scan Complete — No Threats Found"}
+            </h3>
+            <p className="text-[13px] text-[rgb(var(--t2))] mt-2 leading-relaxed">
+              {cancelled
+                ? `The ${scanType} scan was stopped after scanning ${ss.files_scanned.toLocaleString()} files.${hasThreats ? ` ${ss.threats_found} threat${ss.threats_found > 1 ? "s were" : " was"} detected before cancellation.` : ""}`
+                : hasThreats
+                  ? `ARGUS and ClamAV analyzed ${ss.files_scanned.toLocaleString()} files and identified ${ss.threats_found} threat${ss.threats_found > 1 ? "s" : ""}. Review the detections below and take appropriate action.`
+                  : `${ss.files_scanned.toLocaleString()} files were analyzed by ClamAV signatures and ARGUS heuristics. No malicious content was detected.`}
+            </p>
+          </div>
+        </div>
+
+        {/* Stats grid */}
+        <div className="grid grid-cols-2 xl:grid-cols-4 gap-3 mt-6">
+          <StatBox label="Files Scanned" value={ss.files_scanned.toLocaleString()} />
+          <StatBox label="Threats" value={String(ss.threats_found)} color={hasThreats ? "red" : undefined} />
+          <StatBox label="Duration" value={elapsed > 0 ? formatDuration(elapsed) : "—"} />
+          <StatBox label="Errors" value={String(ss.errors_count)} color={ss.errors_count > 0 ? "amber" : undefined} />
+        </div>
+
+        {/* Actions */}
+        <div className="flex items-center gap-3 mt-6 pt-5 border-t border-[rgb(var(--border))]/8">
+          <button onClick={onNewScan}
+            className="flex items-center gap-2 px-5 py-2.5 rounded-xl bg-[rgb(var(--accent))] text-white text-[13px] font-semibold hover:opacity-90 cursor-pointer shadow-sm shadow-[rgb(var(--accent))]/10">
+            <Search size={14} />
+            New Scan
+          </button>
+          {hasThreats && !cancelled && (
+            <p className="text-[11px] text-[rgb(var(--t3))] ml-2">
+              Detected threats should be quarantined or reviewed in the History page.
+            </p>
+          )}
+        </div>
+      </Card>
+
+      {/* Detection list */}
+      {ss.detections.length > 0 && (
+        <Card>
+          <div className="flex items-center justify-between mb-5">
+            <div className="flex items-center gap-3">
+              <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-[rgb(var(--red))]/8">
+                <AlertTriangle size={16} className="text-[rgb(var(--red))]" />
+              </div>
+              <div>
+                <h4 className="text-[15px] font-semibold">Detected Threats</h4>
+                <p className="text-[11px] text-[rgb(var(--t3))] mt-0.5">
+                  {ss.detections.length} item{ss.detections.length > 1 ? "s" : ""} identified during scan
+                </p>
+              </div>
+            </div>
+          </div>
+
+          <div className="space-y-2">
+            {ss.detections.map((d, i) => {
+              const isArgus = d.virus_name.startsWith("ARGUS/");
+              const fileName = d.path.split(/[/\\]/).pop() || d.path;
+              const dirPath = d.path.split(/[/\\]/).slice(0, -1).join("\\");
+              // Extract ARGUS score if present in the name (e.g., "ARGUS/Stealer.Discord [85/100]")
+              const scoreMatch = d.virus_name.match(/\[(\d+)\/100\]/);
+              const score = scoreMatch ? parseInt(scoreMatch[1]) : null;
+
+              return (
+                <div key={i} className="flex items-start gap-3 rounded-xl border border-[rgb(var(--border))]/8 px-4 py-3.5">
+                  <div className={`mt-0.5 flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-xl ${
+                    isArgus ? "bg-[rgb(var(--amber))]/8" : "bg-[rgb(var(--red))]/8"
+                  }`}>
+                    {isArgus
+                      ? <Eye size={18} className="text-[rgb(var(--amber))]" />
+                      : <ShieldAlert size={18} className="text-[rgb(var(--red))]" />}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <p className={`text-[13px] font-semibold ${isArgus ? "text-[rgb(var(--amber))]" : "text-[rgb(var(--red))]"}`}>
+                        {d.virus_name.replace(/\s*\[\d+\/100\]/, "")}
+                      </p>
+                      <span className={`text-[9px] font-semibold uppercase px-1.5 py-0.5 rounded ${
+                        isArgus ? "bg-[rgb(var(--amber))]/8 text-[rgb(var(--amber))]" : "bg-[rgb(var(--red))]/8 text-[rgb(var(--red))]"
+                      }`}>
+                        {isArgus ? "Heuristic" : "Signature"}
+                      </span>
+                      {score !== null && (
+                        <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded bg-[rgb(var(--raised))]/30 text-[rgb(var(--t3))]">
+                          Score: {score}/100
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-[12px] font-medium text-[rgb(var(--t1))] mt-1.5">{fileName}</p>
+                    <p className="text-[10px] text-[rgb(var(--t3))]/40 mt-0.5 truncate" title={d.path}>{dirPath}</p>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </Card>
+      )}
+
+      {/* Clean result — positive reinforcement */}
+      {ss.detections.length === 0 && !cancelled && (
+        <Card>
+          <div className="flex flex-col items-center py-6 text-center">
+            <div className="flex h-16 w-16 items-center justify-center rounded bg-[rgb(var(--green))]/8 mb-4">
+              <CheckCircle size={28} className="text-[rgb(var(--green))]" />
+            </div>
+            <p className="text-[15px] font-semibold text-[rgb(var(--t1))]">All Clear</p>
+            <p className="text-[12px] text-[rgb(var(--t3))] mt-2 max-w-md leading-relaxed">
+              No threats were detected in the {ss.files_scanned.toLocaleString()} files analyzed.
+              ClamAV signatures and ARGUS heuristics found no malicious indicators.
+            </p>
+          </div>
+        </Card>
       )}
     </div>
   );
 }
 
-function ScanTypeCard({
-  icon,
-  title,
-  description,
-  duration,
-  accent,
-  onClick,
-  disabled,
-}: {
-  icon: React.ReactNode;
-  title: string;
-  description: string;
-  duration: string;
-  accent?: boolean;
-  onClick?: () => void;
-  disabled?: boolean;
-}) {
+function StatBox({ label, value, color }: { label: string; value: string; color?: "red" | "amber" }) {
   return (
-    <Card
-      className={`
-        ${accent ? "border-[rgb(var(--accent))]/30" : ""}
-        ${disabled ? "opacity-60" : "hover:border-[rgb(var(--accent))]/40 cursor-pointer"}
-        transition-all
-      `}
-    >
-      <div className="flex items-start gap-4">
-        <div
-          className={`w-11 h-11 rounded-xl flex items-center justify-center flex-shrink-0 ${
-            accent
-              ? "bg-[rgb(var(--accent))]/15 text-[rgb(var(--accent))]"
-              : "bg-[rgb(var(--bg-elevated))] text-[rgb(var(--text-muted))]"
-          }`}
-        >
-          {icon}
+    <div className="rounded-xl bg-[rgb(var(--raised))]/15 px-4 py-3 text-center">
+      <p className="text-[10px] text-[rgb(var(--t3))] uppercase tracking-wider">{label}</p>
+      <p className={`text-[18px] font-bold mt-1 ${color ? `text-[rgb(var(--${color}))]` : ""}`}>{value}</p>
+    </div>
+  );
+}
+
+function formatDuration(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  if (m < 60) return `${m}m ${s}s`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${m % 60}m`;
+}
+
+function ScanTypeCard({ icon, title, desc, accent, disabled, onClick }: { icon: React.ReactNode; title: string; desc: string; accent?: boolean; disabled?: boolean; onClick?: () => void }) {
+  return (
+    <Card className={`${disabled ? "opacity-35" : "cursor-pointer"} ${accent && !disabled ? "border-[rgb(var(--accent))]/12" : ""}`}>
+      <button onClick={onClick} disabled={disabled} className="flex w-full flex-col gap-4 text-left cursor-pointer disabled:cursor-not-allowed">
+        <div className={`flex h-12 w-12 items-center justify-center rounded-xl ${accent && !disabled ? "bg-[rgb(var(--accent))]/8 text-[rgb(var(--accent))]" : "bg-[rgb(var(--raised))]/40 text-[rgb(var(--t3))]"}`}>{icon}</div>
+        <div className="min-w-0">
+          <h4 className="text-[14px] font-semibold">{title}</h4>
+          <p className="mt-2 text-[12px] leading-relaxed text-[rgb(var(--t3))]">{desc}</p>
         </div>
-        <div className="flex-1 min-w-0">
-          <h4 className="text-sm font-semibold mb-1">{title}</h4>
-          <p className="text-xs text-[rgb(var(--text-muted))] leading-relaxed mb-3">
-            {description}
-          </p>
-          <div className="flex items-center justify-between">
-            <span className="text-[11px] text-[rgb(var(--text-muted))]">{duration}</span>
-            <button
-              onClick={onClick}
-              disabled={disabled}
-              className={`text-xs font-medium px-3 py-1.5 rounded-lg transition-colors ${
-                accent
-                  ? "bg-[rgb(var(--accent))] text-white hover:opacity-90"
-                  : "bg-[rgb(var(--bg-elevated))] text-[rgb(var(--text-muted))] hover:text-[rgb(var(--text-primary))]"
-              } ${disabled ? "cursor-not-allowed" : "cursor-pointer"}`}
-            >
-              Start
-            </button>
-          </div>
-        </div>
-      </div>
+      </button>
     </Card>
   );
 }
 
-function formatDur(secs: number): string {
-  if (secs <= 0) return "<1s";
-  const m = Math.floor(secs / 60);
-  const s = secs % 60;
-  return m > 0 ? `${m}m ${s}s` : `${s}s`;
+/* ─── ARGUS-enriched file scan result ─── */
+
+const VERDICT_STYLE: Record<string, { color: string; label: string }> = {
+  clean: { color: "var(--green)", label: "Clean" },
+  low_suspicion: { color: "var(--accent)", label: "Low Suspicion" },
+  suspicious: { color: "var(--amber)", label: "Suspicious" },
+  high_suspicion: { color: "var(--amber)", label: "High Suspicion" },
+  malicious: { color: "var(--red)", label: "Malicious" },
+};
+
+const SEV_COLORS: Record<string, string> = {
+  critical: "var(--red)",
+  high: "var(--red)",
+  medium: "var(--amber)",
+  low: "var(--accent)",
+  info: "var(--t3)",
+};
+
+/** Behavioral Analysis panel — shows sandbox detonation results when present. */
+function BehavioralPanel({ findings }: { findings: ArgusFinding[] }) {
+  const behavioral = findings.filter(f => f.layer === "behavioral_runtime");
+  if (behavioral.length === 0) return null;
+
+  // Group by description content.
+  const groups: Record<string, ArgusFinding[]> = {};
+  for (const f of behavioral) {
+    const desc = f.description.toLowerCase();
+    const group = desc.includes("spawn") || desc.includes("process") ? "Process"
+      : desc.includes("registry") || desc.includes("run key") ? "Registry"
+      : desc.includes("network") || desc.includes("tcp") || desc.includes("connect") ? "Network"
+      : desc.includes("dll") || desc.includes("image") || desc.includes("loaded") ? "Image Load"
+      : desc.includes("containment") || desc.includes("job object") || desc.includes("token") ? "Containment"
+      : "Other";
+    (groups[group] ??= []).push(f);
+  }
+
+  const hasDegraded = behavioral.some(f => f.description.toLowerCase().includes("degraded") || f.description.toLowerCase().includes("containment failed"));
+  const totalDelta = behavioral.reduce((sum, f) => sum + f.weight, 0);
+
+  return (
+    <div className="rounded border border-[rgb(var(--accent))]/12 bg-[rgb(var(--accent))]/3 px-5 py-4 space-y-3">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <div className="flex h-7 w-7 items-center justify-center rounded-md bg-[rgb(var(--accent))]/10 text-[rgb(var(--accent))]">
+            <Eye size={14} />
+          </div>
+          <div>
+            <p className="text-[13px] font-semibold">Behavioral Analysis</p>
+            <p className="text-[10px] text-[rgb(var(--t3))]">Sandbox detonation — experimental</p>
+          </div>
+        </div>
+        {totalDelta > 0 && (
+          <span className="text-[12px] font-bold text-[rgb(var(--amber))]">+{totalDelta} score impact</span>
+        )}
+      </div>
+
+      {hasDegraded && (
+        <div className="flex items-center gap-2 px-3 py-2 rounded bg-[rgb(var(--amber))]/8 text-[11px] text-[rgb(var(--amber))]">
+          <AlertTriangle size={13} />
+          Containment degraded — some sandbox protections were unavailable
+        </div>
+      )}
+
+      {Object.entries(groups).filter(([k]) => k !== "Containment").map(([group, items]) => (
+        <div key={group}>
+          <p className="text-[10px] font-semibold uppercase tracking-wider text-[rgb(var(--t3))]/50 mb-1">{group}</p>
+          {items.map((f, i) => {
+            const sevColor = f.severity === "critical" ? "var(--red)"
+              : f.severity === "high" ? "var(--red)"
+              : f.severity === "medium" ? "var(--amber)"
+              : "var(--t3)";
+            return (
+              <div key={i} className="flex items-center gap-2 py-1">
+                <span className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ background: `rgb(${sevColor})` }} />
+                <span className="text-[12px] text-[rgb(var(--t1))] flex-1">{f.description}</span>
+                <span className="text-[10px] font-semibold uppercase" style={{ color: `rgb(${sevColor})` }}>{f.severity}</span>
+              </div>
+            );
+          })}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+const LAYER_NAMES: Record<string, string> = {
+  signatures: "Signature Analysis",
+  yara_rules: "Behavioral Rules",
+  mime_validation: "File Integrity",
+  structural_analysis: "Structural Analysis",
+  packer_detection: "Packer Detection",
+  script_analysis: "Script Analysis",
+  ioc_correlation: "Threat Intelligence",
+  pattern_detection: "Pattern Detection",
+  file_deception: "Deception Detection",
+  reputation: "Software Reputation",
+  context: "Origin Context",
+  behavioral_runtime: "Behavioral Analysis",
+};
+
+function FileResult({ r, argus, onDismiss, onQuarantine }: {
+  r: NonNullable<FileScanResponse["result"]>;
+  argus?: ArgusVerdict;
+  onDismiss: () => void;
+  onQuarantine: () => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const inf = r.infected;
+  const vs = argus ? VERDICT_STYLE[argus.verdict] ?? VERDICT_STYLE.clean : null;
+  const borderCls = inf ? "border-[rgb(var(--red))]/15" : vs && argus && argus.score > 25 ? "border-[rgb(var(--amber))]/15" : "border-[rgb(var(--green))]/15";
+
+  return (
+    <div className="page-stack">
+      {/* Main result card */}
+      <Card className={borderCls}>
+        <div className="flex items-center gap-4">
+          <div className={`w-12 h-12 rounded-xl flex items-center justify-center flex-shrink-0 ${inf ? "bg-[rgb(var(--red))]/8 text-[rgb(var(--red))]" : "bg-[rgb(var(--green))]/8 text-[rgb(var(--green))]"}`}>
+            {inf ? <ShieldAlert size={22} /> : <ShieldCheck size={22} />}
+          </div>
+          <div className="flex-1 min-w-0">
+            <p className="text-[15px] font-semibold">{inf ? `Threat: ${r.virus_name}` : "File is clean"}</p>
+            <p className="text-[12px] text-[rgb(var(--t3))] truncate mt-0.5">{r.path}</p>
+          </div>
+          <div className="flex gap-2 flex-shrink-0">
+            {inf && (
+              <button onClick={onQuarantine}
+                className="px-4 py-2 rounded-xl bg-[rgb(var(--red))]/8 text-[12px] font-semibold text-[rgb(var(--red))] hover:bg-[rgb(var(--red))]/15 cursor-pointer">
+                Quarantine
+              </button>
+            )}
+            <button onClick={onDismiss}
+              className="px-4 py-2 rounded-xl bg-[rgb(var(--raised))]/40 text-[12px] text-[rgb(var(--t2))] hover:text-[rgb(var(--t1))] cursor-pointer">
+              {inf ? "Ignore" : "Scan Another"}
+            </button>
+          </div>
+        </div>
+      </Card>
+
+      {/* ARGUS Analysis card */}
+      {argus && (
+        <Card>
+          <div className="flex items-center justify-between mb-5">
+            <div className="flex items-center gap-3">
+              <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-[rgb(var(--accent))]/8">
+                <Eye size={16} className="text-[rgb(var(--accent))]" />
+              </div>
+              <div>
+                <h4 className="text-[14px] font-semibold">ARGUS Analysis</h4>
+                <p className="text-[11px] text-[rgb(var(--t3))] mt-0.5">
+                  Heuristic engine v{argus.engine_version} · {(argus.analysis_time_us / 1000).toFixed(1)}ms
+                </p>
+              </div>
+            </div>
+
+            {/* Score badge */}
+            <div className="flex items-center gap-3">
+              <div className="text-right">
+                <p className="text-[11px] text-[rgb(var(--t3))]">Suspicion Score</p>
+                <p className="text-[20px] font-bold leading-none mt-1" style={{ color: vs ? `rgb(${vs.color})` : undefined }}>
+                  {argus.score}<span className="text-[12px] font-normal text-[rgb(var(--t3))]">/100</span>
+                </p>
+              </div>
+              <div
+                className="px-3 py-1.5 rounded-lg text-[11px] font-semibold"
+                style={{
+                  background: vs ? `color-mix(in srgb, rgb(${vs.color}) 8%, transparent)` : undefined,
+                  color: vs ? `rgb(${vs.color})` : undefined,
+                }}
+              >
+                {vs?.label ?? "Clean"}
+              </div>
+            </div>
+          </div>
+
+          {/* File metadata */}
+          <div className="grid grid-cols-2 xl:grid-cols-4 gap-3 mb-5">
+            <MetaItem label="File Size" value={formatBytes(argus.file_size)} />
+            <MetaItem label="MIME Type" value={argus.mime_type ?? "Unknown"} />
+            <MetaItem label="SHA-256" value={argus.sha256.slice(0, 16) + "..."} title={argus.sha256} />
+            <MetaItem label="Findings" value={String(argus.findings.length)} />
+          </div>
+
+          {/* Why this verdict? — explainable scoring */}
+          {argus.explanation && (argus.explanation.suspicion_reasons.length > 0 || argus.explanation.trust_reasons.length > 0) && (
+            <div className="mb-5 rounded-xl border border-[rgb(var(--border))]/8 p-4">
+              <p className="text-[12px] font-semibold text-[rgb(var(--t2))] mb-3">Why this verdict?</p>
+              <div className="grid gap-4 md:grid-cols-2">
+                {argus.explanation.suspicion_reasons.length > 0 && (
+                  <div>
+                    <p className="text-[10px] font-semibold uppercase tracking-wider text-[rgb(var(--amber))] mb-2">
+                      Suspicion increased (+{argus.explanation.raw_score})
+                    </p>
+                    <ul className="space-y-1.5">
+                      {argus.explanation.suspicion_reasons.map((r, i) => (
+                        <li key={i} className="text-[11px] text-[rgb(var(--t2))] leading-relaxed flex gap-2">
+                          <span className="text-[rgb(var(--amber))] flex-shrink-0 mt-0.5">▲</span>
+                          {r}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                {argus.explanation.trust_reasons.length > 0 && (
+                  <div>
+                    <p className="text-[10px] font-semibold uppercase tracking-wider text-[rgb(var(--green))] mb-2">
+                      Trust applied (−{argus.explanation.reputation_discount + argus.explanation.authenticode_discount})
+                    </p>
+                    <ul className="space-y-1.5">
+                      {argus.explanation.trust_reasons.map((r, i) => (
+                        <li key={i} className="text-[11px] text-[rgb(var(--t2))] leading-relaxed flex gap-2">
+                          <span className="text-[rgb(var(--green))] flex-shrink-0 mt-0.5">▼</span>
+                          {r}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </div>
+              {(argus.explanation.signer || argus.explanation.recognized_software) && (
+                <div className="flex flex-wrap gap-2 mt-3 pt-3 border-t border-[rgb(var(--border))]/8">
+                  {argus.explanation.signer && (
+                    <span className="text-[10px] px-2 py-0.5 rounded bg-[rgb(var(--green))]/8 text-[rgb(var(--green))]">
+                      Signed: {argus.explanation.signer}
+                    </span>
+                  )}
+                  {argus.explanation.recognized_software && (
+                    <span className="text-[10px] px-2 py-0.5 rounded bg-[rgb(var(--accent))]/8 text-[rgb(var(--accent))]">
+                      Known: {argus.explanation.recognized_software}
+                    </span>
+                  )}
+                  {argus.explanation.installer_discount_applied && (
+                    <span className="text-[10px] px-2 py-0.5 rounded bg-[rgb(var(--raised))]/30 text-[rgb(var(--t3))]">
+                      Installer framework
+                    </span>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Behavioral Analysis summary — only shows when sandbox findings exist */}
+          <BehavioralPanel findings={argus.findings} />
+
+          {/* Findings list */}
+          {argus.findings.length > 0 ? (
+            <>
+              <div className="space-y-2">
+                {argus.findings.slice(0, expanded ? undefined : 4).map((f, i) => {
+                  const sevColor = SEV_COLORS[f.severity] ?? "var(--t3)";
+                  return (
+                    <div key={i} className="flex items-start gap-3 rounded-xl px-4 py-3 bg-[rgb(var(--raised))]/15">
+                      <div
+                        className="mt-0.5 flex h-6 w-6 flex-shrink-0 items-center justify-center rounded-lg text-[10px] font-bold"
+                        style={{ background: `color-mix(in srgb, rgb(${sevColor}) 10%, transparent)`, color: `rgb(${sevColor})` }}
+                      >
+                        +{f.weight}
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <p className="text-[12px] leading-relaxed">{f.description}</p>
+                        <div className="flex items-center gap-2 mt-1.5">
+                          <span className="text-[10px] px-2 py-0.5 rounded bg-[rgb(var(--raised))]/30 text-[rgb(var(--t3))]">
+                            {LAYER_NAMES[f.layer] ?? f.layer}
+                          </span>
+                          <span className="text-[10px] font-semibold uppercase" style={{ color: `rgb(${sevColor})` }}>
+                            {f.severity}
+                          </span>
+                        </div>
+                        {expanded && f.technical_detail && (
+                          <p className="text-[10px] text-[rgb(var(--t3))]/50 mt-1.5 font-mono break-all">
+                            {f.technical_detail}
+                          </p>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              {argus.findings.length > 4 && (
+                <button onClick={() => setExpanded(!expanded)}
+                  className="flex items-center gap-1.5 mt-3 text-[11px] font-semibold text-[rgb(var(--accent))] cursor-pointer hover:underline">
+                  {expanded ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
+                  {expanded ? "Show Less" : `Show All ${argus.findings.length} Findings`}
+                </button>
+              )}
+            </>
+          ) : (
+            <div className="flex items-center gap-3 py-4 text-[12px] text-[rgb(var(--green))]">
+              <CheckCircle size={15} />
+              No suspicious indicators detected by ARGUS heuristics.
+            </div>
+          )}
+        </Card>
+      )}
+    </div>
+  );
+}
+
+function MetaItem({ label, value, title }: { label: string; value: string; title?: string }) {
+  return (
+    <div className="rounded-xl bg-[rgb(var(--raised))]/15 px-3.5 py-2.5">
+      <p className="text-[10px] text-[rgb(var(--t3))] uppercase tracking-wider">{label}</p>
+      <p className="text-[12px] font-medium mt-1 truncate" title={title}>{value}</p>
+    </div>
+  );
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return "0 B";
+  const k = 1024;
+  const sizes = ["B", "KB", "MB", "GB"];
+  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(k)), sizes.length - 1);
+  return `${(bytes / Math.pow(k, i)).toFixed(i > 0 ? 1 : 0)} ${sizes[i]}`;
 }

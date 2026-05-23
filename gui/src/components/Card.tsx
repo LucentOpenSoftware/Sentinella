@@ -1,13 +1,6 @@
-interface CardProps {
-  children: React.ReactNode;
-  className?: string;
-}
-
-export function Card({ children, className = "" }: CardProps) {
+export function Card({ children, className = "" }: { children: React.ReactNode; className?: string }) {
   return (
-    <div
-      className={`rounded-2xl border border-[rgb(var(--border))] bg-[rgb(var(--bg-surface))] p-5 ${className}`}
-    >
+    <div className={`min-w-0 overflow-hidden glass-card p-8 ${className}`}>
       {children}
     </div>
   );

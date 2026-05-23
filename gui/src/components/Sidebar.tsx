@@ -1,114 +1,71 @@
-import {
-  Shield,
-  Search,
-  Archive,
-  Clock,
-  Settings,
-  Info,
-} from "lucide-react";
+import { Shield, Search, Archive, Clock, Settings, Info, RefreshCw, Bell } from "lucide-react";
+import { ShieldIcon } from "./ShieldIcon";
+import { t } from "../i18n";
 
-export type Page =
-  | "dashboard"
-  | "scan"
-  | "quarantine"
-  | "history"
-  | "settings"
-  | "about";
+export type Page = "dashboard" | "scan" | "quarantine" | "history" | "notifications" | "update" | "settings" | "about";
 
-interface SidebarProps {
-  current: Page;
-  onNavigate: (page: Page) => void;
-}
-
-const mainNav: { page: Page; label: string; icon: React.ReactNode }[] = [
-  { page: "dashboard", label: "Dashboard", icon: <Shield size={20} /> },
-  { page: "scan", label: "Scan", icon: <Search size={20} /> },
-  { page: "quarantine", label: "Quarantine", icon: <Archive size={20} /> },
-  { page: "history", label: "History", icon: <Clock size={20} /> },
+const groups = [
+  { labelKey: "nav.protection", items: [
+    { page: "dashboard" as Page, labelKey: "nav.dashboard", Icon: Shield },
+    { page: "scan" as Page, labelKey: "nav.scan", Icon: Search },
+    { page: "quarantine" as Page, labelKey: "nav.quarantine", Icon: Archive },
+    { page: "history" as Page, labelKey: "nav.history", Icon: Clock },
+    { page: "notifications" as Page, labelKey: "nav.notifications", Icon: Bell },
+  ]},
+  { labelKey: "nav.system", items: [
+    { page: "update" as Page, labelKey: "nav.update", Icon: RefreshCw },
+    { page: "settings" as Page, labelKey: "nav.settings", Icon: Settings },
+    { page: "about" as Page, labelKey: "nav.about", Icon: Info },
+  ]},
 ];
 
-const bottomNav: { page: Page; label: string; icon: React.ReactNode }[] = [
-  { page: "settings", label: "Settings", icon: <Settings size={20} /> },
-  { page: "about", label: "About", icon: <Info size={20} /> },
-];
-
-export function Sidebar({ current, onNavigate }: SidebarProps) {
+export function Sidebar({ current, onNavigate }: { current: Page; onNavigate: (p: Page) => void }) {
   return (
-    <aside className="w-60 h-screen flex flex-col border-r border-[rgb(var(--border))] bg-[rgb(var(--bg-surface))]">
-      {/* Logo area */}
-      <div className="flex items-center gap-3 px-5 py-5 border-b border-[rgb(var(--border))]">
-        <div className="w-9 h-9 rounded-xl bg-[rgb(var(--accent))] flex items-center justify-center">
-          <Shield size={20} className="text-white" />
+    <aside className="flex h-screen w-[248px] flex-shrink-0 flex-col glass-sidebar">
+      {/* Brand area — generous, calm */}
+      <div className="flex items-center gap-3.5 px-6 py-6">
+        <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-[rgb(var(--accent))] to-[rgb(var(--accent))]/60 flex items-center justify-center shadow-lg shadow-[rgb(var(--accent))]/10 overflow-hidden">
+          <ShieldIcon icon="sentinel" size={30} className="brightness-0 invert" />
         </div>
         <div>
-          <h1 className="text-base font-semibold tracking-tight">Sentinella</h1>
-          <p className="text-xs text-[rgb(var(--text-muted))]">Antivirus Suite</p>
+          <p className="text-[15px] font-bold leading-none tracking-tight">{t("app.name")}</p>
+          <p className="text-[11px] text-[rgb(var(--t3))] mt-1">{t("app.subtitle")}</p>
         </div>
       </div>
 
-      {/* Main navigation */}
-      <nav className="flex-1 px-3 py-4">
-        <p className="px-3 mb-2 text-[11px] font-medium uppercase tracking-wider text-[rgb(var(--text-muted))]">
-          Protection
-        </p>
-        {mainNav.map((item) => (
-          <NavItem
-            key={item.page}
-            active={current === item.page}
-            icon={item.icon}
-            label={item.label}
-            onClick={() => onNavigate(item.page)}
-          />
-        ))}
-
-        <p className="px-3 mt-6 mb-2 text-[11px] font-medium uppercase tracking-wider text-[rgb(var(--text-muted))]">
-          System
-        </p>
-        {bottomNav.map((item) => (
-          <NavItem
-            key={item.page}
-            active={current === item.page}
-            icon={item.icon}
-            label={item.label}
-            onClick={() => onNavigate(item.page)}
-          />
+      {/* Navigation — spacious, desktop-native */}
+      <nav className="flex-1 overflow-y-auto px-5 pb-4">
+        {groups.map(g => (
+          <div key={g.labelKey} className="mb-7">
+            <p className="mb-3 px-4 text-[10px] font-semibold tracking-[0.15em] text-[rgb(var(--t3))]/35 uppercase">
+              {t(g.labelKey)}
+            </p>
+            <div className="space-y-1">
+              {g.items.map(item => {
+                const active = current === item.page;
+                return (
+                  <button key={item.page} onClick={() => onNavigate(item.page)}
+                    aria-current={active ? "page" : undefined}
+                    className={`w-full flex items-center gap-3 rounded-xl px-4 py-3 text-[13px] font-medium cursor-pointer transition-colors
+                      ${active
+                        ? "bg-[rgb(var(--accent))]/10 text-[rgb(var(--accent))]"
+                        : "text-[rgb(var(--t2))] hover:bg-[rgb(var(--raised))]/40 hover:text-[rgb(var(--t1))]"
+                      }`}
+                  >
+                    <item.Icon size={18} strokeWidth={active ? 2 : 1.5} />
+                    {t(item.labelKey)}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
         ))}
       </nav>
 
-      {/* Version footer */}
-      <div className="px-5 py-3 border-t border-[rgb(var(--border))] text-xs text-[rgb(var(--text-muted))]">
-        v0.1.0 &middot; GPLv2
+      {/* Footer */}
+      <div className="px-6 py-6 text-[10px] text-[rgb(var(--t3))]/20">
+        v0.1.0 · GPLv2
       </div>
     </aside>
-  );
-}
-
-function NavItem({
-  active,
-  icon,
-  label,
-  onClick,
-}: {
-  active: boolean;
-  icon: React.ReactNode;
-  label: string;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      onClick={onClick}
-      className={`
-        w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium
-        transition-colors duration-150 cursor-pointer mb-0.5
-        ${
-          active
-            ? "bg-[rgb(var(--accent))]/15 text-[rgb(var(--accent))]"
-            : "text-[rgb(var(--text-muted))] hover:bg-[rgb(var(--bg-elevated))] hover:text-[rgb(var(--text-primary))]"
-        }
-      `}
-    >
-      {icon}
-      {label}
-    </button>
   );
 }

@@ -1,0 +1,72 @@
+realtime_enabled = true
+realtime_roots = [
+    'C:\Users\Nicolas\Downloads',
+    'C:\Users\Nicolas\Desktop',
+    'C:\Users\Nicolas\AppData\Local\Temp',
+]
+max_file_size_mb = 512
+scan_archives = true
+heuristic_alerts = true
+auto_update = true
+update_interval_hours = 4
+update_mirror = "database.clamav.net"
+quarantine_retention_days = 90
+auto_quarantine = true
+excluded_paths = []
+excluded_extensions = []
+excluded_detections = []
+trusted_hashes = []
+log_level = "info"
+scheduled_scan_enabled = true
+scheduled_scan_hour = 3
+scheduled_scan_type = "quick"
+idle_scan_enabled = true
+idle_scan_on_battery = false
+idle_scan_cpu_pause_threshold = 50
+idle_scan_max_file_size_mb = 256
+idle_scan_fullscreen_pause = true
+idle_scan_disk_latency_pause_ms = 50
+idle_scan_max_files_per_session = 10000
+idle_scan_slow_delay_min_ms = 1500
+idle_scan_slow_delay_max_ms = 2500
+idle_scan_normal_delay_min_ms = 400
+idle_scan_normal_delay_max_ms = 1000
+idle_scan_fast_delay_min_ms = 100
+idle_scan_fast_delay_max_ms = 300
+argus_worker_enabled = false
+argus_worker_path = "argusd.exe"
+argus_worker_timeout_sec = 15
+clamav_isolation = "in_process"
+clamav_worker_timeout_sec = 30
+
+[scan]
+argus_worker_enabled = false
+argus_worker_path = "argusd.exe"
+argus_worker_timeout_sec = 15
+orchestrator_file_scan_enabled = false
+orchestrator_folder_scan_enabled = false
+orchestrator_quick_scan_enabled = false
+
+[performance]
+memory_profile = "normal"
+memory_warning_mb = 1500
+memory_critical_mb = 2500
+external_argus_under_pressure = true
+max_resident_workers_on_pressure = 1
+
+[fish]
+enabled = true
+observe_only = true
+window_seconds = 30
+rename_threshold = 25
+rewrite_threshold = 40
+entropy_delta_threshold = 0.2
+alert_cooldown_seconds = 60
+active_response = "observe"
+
+[sandbox]
+enabled = false
+mode = "experimental"
+timeout_sec = 10
+min_score = 26
+max_score = 75

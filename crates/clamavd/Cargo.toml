@@ -1,0 +1,19 @@
+[package]
+name = "clamavd"
+description = "Sentinella ClamAV isolated scanner worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "clamavd"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+libloading = "0.8"
+sha2 = "0.10"

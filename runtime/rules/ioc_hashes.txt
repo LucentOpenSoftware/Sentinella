@@ -1,0 +1,29 @@
+# Sentinella IOC Hash Database
+# Format: one SHA-256 hash per line (lowercase hex, 64 characters)
+# Lines starting with # are comments.
+#
+# Sources: Add known-malicious file hashes here.
+# This file is loaded by the ARGUS engine at startup.
+#
+# EICAR test file hash (standard AV test file):
+275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f
+#
+# ── Sims 4 "Linua Updater" Stealer (GitHub-distributed) ──
+# PyInstaller-packed Python infostealer targeting Discord tokens,
+# browser credentials, and crypto wallets. Distributed via
+# github.com/Sims-4-Linua-Updater (now deleted).
+# Source: Hybrid Analysis, ANY.RUN, Joe Sandbox
+674ff5a6c6fc56dcbef9def8a1f97e928f9d9b537a059762838b8b6800c02325
+6219afaee569e4b3b685dc8663f5980d746ca572dbcca00cfdb3b59bc25810f5
+fa05d2b1d4db39b6e052a861067a1abebb758ed880798fecba9a6ef24dbbbf00
+d261d8e19a2165642060a815b8b482b1b56190109cae0c693ef5be82e4df733e
+035eaab128c1b826ce88420b158b60ea13a12af3da56879d51349984567d24c6
+# v4.0 variant — recovered from local sample
+4330448d0dc3f32a40b46c5b99985071a47130b284c6bf485568deff41285f7f
+# ZIP container hashes (for archive-level matching)
+6efcd8ccae49e020e5d34d14b8d31b6b059037ab65cb648676c36a8466d26a6b
+2be8fdbbe2a69da8142fd378683ccbc7701b90ff37cfda63d6391bfd43c9cca1
+#
+# Additional hashes can be added manually or via automated feeds.
+# The file is checked at daemon startup and can be reloaded via
+# the update.start IPC command.

@@ -1,0 +1,110 @@
+name: Bug Report
+description: Report a bug in Sentinella
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting a bug. Please fill in as much detail as possible.
+        **Do NOT paste credentials, tokens, API keys, or personal file contents.**
+
+  - type: input
+    id: os-version
+    attributes:
+      label: Windows Version
+      description: "Run `winver` to find this"
+      placeholder: "Windows 11 23H2 (Build 22631)"
+    validations:
+      required: true
+
+  - type: input
+    id: sentinella-version
+    attributes:
+      label: Sentinella Version
+      description: "From About page or daemon startup log"
+      placeholder: "0.1.0-alpha"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install-mode
+    attributes:
+      label: Install Mode
+      options:
+        - Dev mode (cargo build + dev-run.bat)
+        - MSI installer
+        - NSIS installer
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: defender-status
+    attributes:
+      label: Windows Defender Status
+      options:
+        - Active (default)
+        - Active with Sentinella exclusion
+        - Disabled
+        - Unknown
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro-steps
+    attributes:
+      label: Steps to Reproduce
+      description: "Numbered steps to trigger the bug"
+      placeholder: |
+        1. Start daemon
+        2. Open GUI
+        3. Click "Quick Scan"
+        4. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: "What should happen?"
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior
+      description: "What actually happened?"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: quarantine-involved
+    attributes:
+      label: Was a file quarantined?
+      options:
+        - "No"
+        - "Yes — correctly"
+        - "Yes — incorrectly (false positive)"
+        - "Quarantine failed"
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant Logs
+      description: "Last 30-50 lines from runtime/logs/sentinelld.log (remove any paths with personal info)"
+      render: shell
+
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots
+      description: "Drag and drop screenshots here if helpful"
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional Context
+      description: "Any other relevant information"

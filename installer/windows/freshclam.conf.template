@@ -1,0 +1,18 @@
+# Sentinella — freshclam configuration (installed mode)
+# Downloads ClamAV signature databases.
+
+# Signature storage directory.
+# Installer replaces this with the actual ProgramData path.
+DatabaseDirectory C:\ProgramData\Sentinella\signatures
+
+# Log file.
+UpdateLogFile C:\ProgramData\Sentinella\logs\freshclam.log
+LogTime yes
+
+# Official ClamAV signature mirror.
+DatabaseMirror database.clamav.net
+
+# Update behavior.
+MaxAttempts 3
+ConnectTimeout 30
+ReceiveTimeout 60

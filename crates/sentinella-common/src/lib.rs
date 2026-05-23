@@ -21,8 +21,7 @@ pub mod paths {
     use std::path::PathBuf;
 
     pub fn data_dir() -> PathBuf {
-        let base = std::env::var("ProgramData")
-            .unwrap_or_else(|_| r"C:\ProgramData".to_string());
+        let base = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".to_string());
         PathBuf::from(base).join("Sentinella")
     }
 

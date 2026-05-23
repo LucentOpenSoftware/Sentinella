@@ -1,37 +1,348 @@
 @import "tailwindcss";
 
-/* ── Sentinella design tokens ─────────────────────────────── */
+/*
+ * SENTINELLA — Desktop Security Application Design System
+ * ========================================================
+ *
+ * Visual targets: Windows 11 Mica/Acrylic + ESET calm + Malwarebytes clarity
+ * Aesthetic: frosted glass, layered depth, quiet confidence
+ *
+ * SPACING (8px base grid):
+ *   xs: 8px   sm: 12px   md: 16px   lg: 24px   xl: 32px   2xl: 40px
+ *
+ * LAYOUT:
+ *   Sidebar:     248px, frosted translucent panel
+ *   TopBar:      ~60px, frosted header
+ *   Content:     24px padding, subtle gradient depth
+ *   Card radius: 16px, frosted glass
+ */
 
-:root {
-  --accent: 59 130 246;          /* blue-500 */
-  --bg-base: 15 17 23;           /* near-black */
-  --bg-surface: 22 26 39;        /* card bg */
-  --bg-elevated: 30 35 50;       /* hover / sidebar active */
-  --border: 42 45 58;
-  --text-primary: 228 228 231;
-  --text-muted: 156 163 175;
-  --success: 34 197 94;
-  --warning: 234 179 8;
-  --danger: 239 68 68;
+:root, [data-theme="dark"] {
+  --accent: 60 130 245;
+  --base: 13 16 25;
+  --surface: 19 23 36;
+  --raised: 27 32 48;
+  --border: 38 44 62;
+  --t1: 230 233 242;
+  --t2: 168 176 198;
+  --t3: 100 110 138;
+  --green: 46 204 100;
+  --amber: 240 185 45;
+  --red: 235 70 70;
+  --page-padding: 56px;
+  --section-gap: 28px;
+  --card-gap: 24px;
+  --card-padding: 32px;
+  --icon-gap: 12px;
+  --topbar-gap: 16px;
+  --sidebar-padding: 24px;
+  --content-max: 1160px;
+
+  /* Design tokens */
+  --radius-card: 16px;
+  --radius-button: 12px;
+  --radius-badge: 9999px;
+  --transition-fast: 0.15s ease;
+  --transition-normal: 0.2s ease;
+  --font-hero: 24px;
+  --font-title: 16px;
+  --font-section: 15px;
+  --font-body: 13px;
+  --font-secondary: 12px;
+  --font-meta: 11px;
+  --font-tiny: 10px;
+
+  /* Frosted glass system */
+  --glass-bg: rgba(19, 23, 36, 0.65);
+  --glass-border: rgba(255, 255, 255, 0.06);
+  --glass-highlight: rgba(255, 255, 255, 0.03);
+  --glass-shadow: rgba(0, 0, 0, 0.25);
+  --glass-blur: 16px;
+  --sidebar-bg: rgba(15, 18, 28, 0.75);
+  --topbar-bg: rgba(19, 23, 36, 0.55);
+  --content-gradient-start: rgba(13, 16, 25, 0.88);
+  --content-gradient-end: rgba(18, 22, 35, 0.72);
+  --app-bg-image: url("./assets/bg-dark.png");
 }
 
-* { box-sizing: border-box; margin: 0; padding: 0; }
+[data-theme="light"] {
+  --accent: 50 110 220;
+  --base: 244 245 249;
+  --surface: 255 255 255;
+  --raised: 235 237 242;
+  --border: 210 215 225;
+  --t1: 25 30 45;
+  --t2: 80 88 110;
+  --t3: 130 140 160;
+  --green: 34 180 80;
+  --amber: 215 160 30;
+  --red: 210 55 55;
+
+  /* Frosted glass — light mode */
+  --glass-bg: rgba(255, 255, 255, 0.55);
+  --glass-border: rgba(255, 255, 255, 0.7);
+  --glass-highlight: rgba(255, 255, 255, 0.5);
+  --glass-shadow: rgba(0, 0, 0, 0.06);
+  --glass-blur: 20px;
+  --sidebar-bg: rgba(248, 249, 252, 0.8);
+  --topbar-bg: rgba(255, 255, 255, 0.6);
+  --content-gradient-start: rgba(238, 240, 246, 0.88);
+  --content-gradient-end: rgba(244, 245, 249, 0.72);
+  --app-bg-image: url("./assets/bg-light.png");
+}
+
+* { box-sizing: border-box; }
+
+html, body, #root {
+  height: 100%;
+}
 
 body {
-  background: rgb(var(--bg-base));
-  color: rgb(var(--text-primary));
-  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+  background: rgb(var(--base));
+  color: rgb(var(--t1));
+  font-family: "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
   -webkit-font-smoothing: antialiased;
+  font-size: 14px;
+  line-height: 1.6;
   overflow: hidden;
 }
 
-/* Scrollbar styling */
 ::-webkit-scrollbar { width: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb {
-  background: rgba(var(--text-muted), 0.3);
+::-webkit-scrollbar-thumb { background: rgba(var(--t3), 0.18); border-radius: 6px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(var(--t3), 0.3); }
+
+button { transition: all 0.15s ease; }
+
+/* ── Accessibility ──────────────────────────────────────── */
+
+*:focus-visible {
+  outline: 2px solid rgba(var(--accent), 0.6);
+  outline-offset: 2px;
   border-radius: 3px;
 }
-::-webkit-scrollbar-thumb:hover {
-  background: rgba(var(--text-muted), 0.5);
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ── Glass card ─────────────────────────────────────────── */
+
+.glass-card {
+  background: var(--glass-bg);
+  backdrop-filter: blur(var(--glass-blur));
+  -webkit-backdrop-filter: blur(var(--glass-blur));
+  border: 1px solid var(--glass-border);
+  border-radius: 4px;
+  box-shadow:
+    0 1px 0 0 var(--glass-highlight) inset,
+    0 2px 8px -2px var(--glass-shadow);
+  transition: box-shadow 0.2s ease, transform 0.2s ease;
+}
+
+.glass-card:hover {
+  box-shadow:
+    0 1px 0 0 var(--glass-highlight) inset,
+    0 4px 12px -3px var(--glass-shadow);
+}
+
+/* ── TopBar notice (compact inline pill) ────────────────── */
+
+.topbar-notice {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  max-width: 520px;
+  padding: 0 10px;
+  border-radius: 3px;
+  border: 1px solid;
+  font-size: 11px;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  animation: notification-in 0.2s ease-out;
+}
+
+.topbar-notice__message {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+
+.topbar-notice__actions {
+  flex-shrink: 0;
+  display: flex;
+  gap: 6px;
+}
+
+@media (max-width: 960px) {
+  .topbar-notice { max-width: 320px; }
+}
+
+@media (max-width: 720px) {
+  .topbar-notice__message { display: none; }
+  .topbar-notice__actions { display: none; }
+  .topbar-notice { max-width: 40px; padding: 0 8px; }
+}
+
+/* ── Inline notification (overlay banner) ───────────────── */
+
+.inline-notification {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 44px;
+  padding: 10px 18px;
+  border-radius: 4px;
+  border: 1px solid;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  box-shadow: 0 2px 8px -2px rgba(0, 0, 0, 0.12);
+  animation: notification-in 0.2s ease-out;
+}
+
+.notification-overlay {
+  position: absolute;
+  top: 12px;
+  left: 0;
+  right: 0;
+  z-index: 20;
+  pointer-events: none;
+}
+
+.notification-overlay > * {
+  pointer-events: auto;
+}
+
+@keyframes notification-in {
+  from { opacity: 0; transform: translateY(-6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* Fallback for browsers without backdrop-filter */
+@supports not (backdrop-filter: blur(1px)) {
+  .glass-card {
+    background: rgb(var(--surface));
+  }
+}
+
+/* ── Glass sidebar ──────────────────────────────────────── */
+
+.glass-sidebar {
+  background: var(--sidebar-bg);
+  backdrop-filter: blur(24px) saturate(1.2);
+  -webkit-backdrop-filter: blur(24px) saturate(1.2);
+  border-right: 1px solid var(--glass-border);
+}
+
+@supports not (backdrop-filter: blur(1px)) {
+  .glass-sidebar {
+    background: rgb(var(--surface));
+  }
+}
+
+/* ── Glass topbar ───────────────────────────────────────── */
+
+.glass-topbar {
+  background: var(--topbar-bg);
+  backdrop-filter: blur(var(--glass-blur)) saturate(1.1);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.1);
+  border-bottom: 1px solid var(--glass-border);
+}
+
+@supports not (backdrop-filter: blur(1px)) {
+  .glass-topbar {
+    background: rgb(var(--surface));
+    border-bottom: 1px solid rgba(var(--border), 0.12);
+  }
+}
+
+/* ── Content area gradient ──────────────────────────────── */
+
+.content-depth {
+  background:
+    linear-gradient(
+      168deg,
+      var(--content-gradient-start) 0%,
+      var(--content-gradient-end) 100%
+    ),
+    var(--app-bg-image) right bottom / cover no-repeat;
+}
+
+/* ── Layout ─────────────────────────────────────────────── */
+
+.app-shell-width {
+  width: min(100%, var(--content-max));
+  margin: 0 auto;
+}
+
+.page-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--section-gap);
+  width: 100%;
+}
+
+.section-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--card-gap);
+}
+
+.card-grid-4 {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: var(--card-gap);
+}
+
+.card-grid-2 {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--card-gap);
+}
+
+@media (max-width: 1200px) {
+  .card-grid-4 {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 860px) {
+  .card-grid-4,
+  .card-grid-2,
+  .dash-secondary-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.dash-secondary-row {
+  display: grid;
+  grid-template-columns: minmax(180px, 280px) 1fr;
+  gap: var(--card-gap);
+  align-items: stretch;
+}
+
+/* ── Status badge glass ─────────────────────────────────── */
+
+.badge-glass {
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+/* ── Subtle animations ──────────────────────────────────── */
+
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.animate-in {
+  animation: fade-in 0.2s ease-out;
 }

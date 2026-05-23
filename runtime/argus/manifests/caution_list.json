@@ -1,0 +1,127 @@
+{
+  "description": "ARGUS Caution List — software that should NOT receive reputation discounts",
+  "version": "2025.1",
+  "note": "These entries get NO reputation discount. Some may trigger additional YARA scrutiny.",
+  "entries": [
+    {
+      "name": "AnyDesk",
+      "risk": "impersonation_target",
+      "reason": "Heavily impersonated by malware. 1,300+ fake AnyDesk sites documented. Legitimate tool but frequently abused for unauthorized remote access."
+    },
+    {
+      "name": "TeamViewer",
+      "risk": "impersonation_target",
+      "reason": "Major impersonation target. Legitimate remote access tool frequently bundled with scam campaigns and tech support fraud."
+    },
+    {
+      "name": "CCleaner",
+      "risk": "supply_chain",
+      "reason": "Suffered a major supply chain attack in 2017 (Piriform/Avast compromise). Current ownership by Gen Digital raises ongoing concerns."
+    },
+    {
+      "name": "uTorrent / BitTorrent",
+      "risk": "bundleware",
+      "reason": "Both products aggressively bundle adware, toolbars, and PUPs in their installers. uTorrent once bundled a cryptocurrency miner."
+    },
+    {
+      "name": "WinZip",
+      "risk": "bundleware",
+      "reason": "Bundles PUPs and adware in free/trial versions. Corel ownership has added aggressive upselling."
+    },
+    {
+      "name": "IObit products (Advanced SystemCare, Driver Booster, Smart Defrag)",
+      "risk": "bundleware",
+      "reason": "Aggressive bundling, misleading 'scan results' designed to pressure purchases, and history of dubious system optimization claims."
+    },
+    {
+      "name": "Avast / AVG",
+      "risk": "privacy_concern",
+      "reason": "Jumpshot data-selling scandal (2020) — sold detailed browsing data of millions of users. Acquired by Gen Digital (formerly NortonLifeLock)."
+    },
+    {
+      "name": "Opera / Opera GX",
+      "risk": "privacy_concern",
+      "reason": "Acquired by a Chinese consortium in 2016. Opera GX has aggressive data collection. Their predatory loan apps were exposed in 2020."
+    },
+    {
+      "name": "GOM Player / GOM Lab products",
+      "risk": "bundleware",
+      "reason": "History of bundling adware. Korean origin with opaque data practices. Used as a malware distribution vector in targeted attacks."
+    },
+    {
+      "name": "KMPlayer",
+      "risk": "bundleware",
+      "reason": "Bundled with adware and PUPs. Pandora TV ownership with aggressive monetization."
+    },
+    {
+      "name": "Foxit PDF Editor",
+      "risk": "bundleware",
+      "reason": "Free version bundles unwanted software. Foxit Reader has had security vulnerabilities exploited in the wild."
+    },
+    {
+      "name": "DAEMON Tools",
+      "risk": "supply_chain",
+      "reason": "Active supply chain attack documented May 2026. Installer compromised to deliver malware. Critical risk."
+    },
+    {
+      "name": "CPU-Z / HWMonitor (CPUID)",
+      "risk": "impersonation_target",
+      "reason": "Heavily impersonated via fake download sites and Google Ads poisoning (April 2026). Legitimate but a prime impersonation target."
+    },
+    {
+      "name": "Free Download Manager",
+      "risk": "supply_chain",
+      "reason": "Suffered a supply chain compromise — malicious Linux package distributed through official site for years before discovery."
+    },
+    {
+      "name": "Cobalt Strike",
+      "risk": "abuse_vector",
+      "reason": "Legitimate penetration testing tool, but cracked copies are the #1 post-exploitation framework used by ransomware gangs and APT groups."
+    },
+    {
+      "name": "Mimikatz",
+      "risk": "abuse_vector",
+      "reason": "Credential extraction tool. While it has legitimate security research uses, it is found in virtually every major breach."
+    },
+    {
+      "name": "Generic 'AI Tool' installers",
+      "risk": "unverified",
+      "reason": "Post-ChatGPT boom produced thousands of fake AI tool installers distributing stealers and RATs. Any AI-branded installer should receive full scrutiny."
+    },
+    {
+      "name": "Generic 'Driver Updater' tools",
+      "risk": "bundleware",
+      "reason": "Almost universally bundled with PUPs, fake scan results, and aggressive upselling. Legitimate driver updates come from hardware vendors."
+    },
+    {
+      "name": "Generic 'VPN' installers",
+      "risk": "unverified",
+      "reason": "Many free VPN services are data harvesting operations. Kape Technologies (CyberGhost, PIA, ZenMate) has a history as a former adware company."
+    },
+    {
+      "name": "Unsigned Chromium builds",
+      "risk": "abuse_vector",
+      "reason": "Custom Chromium builds are frequently used as malware delivery vehicles (credential stealers, crypto miners). Only official browser distributions should be trusted."
+    },
+    {
+      "name": "Comodo products",
+      "risk": "privacy_concern",
+      "reason": "History of issuing fraudulent SSL certificates (2015 incident). Comodo Internet Security has been used as a vector for PUP installation."
+    },
+    {
+      "name": "Qihoo 360 / Tencent security products",
+      "risk": "privacy_concern",
+      "reason": "Chinese government-linked companies with mandatory data sharing requirements under Chinese law. Opaque data practices for international users."
+    },
+    {
+      "name": "Game cheats / trainers / mod tools",
+      "risk": "abuse_vector",
+      "reason": "The #1 malware distribution vector targeting gamers. Fake game cheats for Roblox, Minecraft, GTA V, etc. are overwhelmingly malware."
+    },
+    {
+      "name": "Crypto mining software (NiceHash, PhoenixMiner, etc.)",
+      "risk": "abuse_vector",
+      "reason": "Legitimate when user-installed, but frequently deployed without consent. Presence should always be flagged for user verification."
+    }
+  ]
+}

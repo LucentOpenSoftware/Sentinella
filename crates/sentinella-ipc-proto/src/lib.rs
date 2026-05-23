@@ -15,11 +15,11 @@
 //! `protocol_version` field. Breaking changes bump the major version.
 
 pub mod engine;
-pub mod scan;
 pub mod quarantine;
-pub mod watcher;
-pub mod update;
+pub mod scan;
 pub mod settings;
+pub mod update;
+pub mod watcher;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

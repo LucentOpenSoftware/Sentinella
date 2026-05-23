@@ -1,158 +1,369 @@
 import { useState, useEffect } from "react";
 import {
-  Clock,
-  CheckCircle,
-  AlertTriangle,
-  Search,
-  Zap,
-  HardDrive,
-  FolderOpen,
-  Loader2,
-  WifiOff,
+  AlertTriangle, ArrowLeft, CheckCircle, ChevronDown, ChevronUp,
+  Clock, Download, Eye, Loader2, Search, Shield, WifiOff, XCircle,
 } from "lucide-react";
-import { PageHeader } from "../components/PageHeader";
 import { Card } from "../components/Card";
-import { getScanHistory } from "../api/sentinella";
-import type { ScanRecord } from "../types/sentinella";
+import { getScanHistory, getDetections, getArgusVerdicts, exportScanReport, type DetectionEntry } from "../api/sentinella";
+import type { ScanRecord, ArgusVerdictRecord, ArgusFinding } from "../types/sentinella";
 
-const typeIcons: Record<string, React.ReactNode> = {
-  quick: <Zap size={16} />,
-  full: <HardDrive size={16} />,
-  custom: <FolderOpen size={16} />,
-};
+type View = { k: "list" } | { k: "detail"; scan: ScanRecord };
 
 export function HistoryPage() {
   const [records, setRecords] = useState<ScanRecord[]>([]);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
   const [filter, setFilter] = useState<"all" | "threats">("all");
-  const [searchText, setSearchText] = useState("");
+  const [search, setSearch] = useState("");
+  const [view, setView] = useState<View>({ k: "list" });
+  const [pageSize, setPageSize] = useState(50);
 
   useEffect(() => {
     getScanHistory()
-      .then((r) => { setRecords(r); setError(null); })
-      .catch((e) => setError(String(e)))
+      .then((r) => { setRecords(r); setErr(null); })
+      .catch((e) => setErr(String(e)))
       .finally(() => setLoading(false));
   }, []);
 
-  if (loading) {
-    return (
-      <div className="flex flex-col items-center py-24">
-        <Loader2 size={24} className="text-[rgb(var(--accent))] animate-spin mb-3" />
-        <p className="text-sm text-[rgb(var(--text-muted))]">Loading scan history...</p>
-      </div>
-    );
-  }
+  if (loading) return <div className="flex items-center justify-center py-20"><Loader2 size={20} className="text-[rgb(var(--accent))] animate-spin" /></div>;
+  if (err) return <Card className="text-center py-10"><WifiOff size={20} className="mx-auto text-[rgb(var(--amber))] mb-3" /><p className="text-[13px] text-[rgb(var(--t3))]">Could not reach daemon</p></Card>;
 
-  if (error) {
-    return (
-      <div>
-        <PageHeader icon={<Clock size={22} />} title="History" subtitle="Review past scan results" />
-        <Card className="text-center py-12">
-          <WifiOff size={28} className="mx-auto text-[rgb(var(--warning))] mb-3" />
-          <p className="text-sm text-[rgb(var(--text-muted))]">Could not reach daemon</p>
-          <p className="text-xs text-[rgb(var(--danger))] mt-1">{error}</p>
-        </Card>
-      </div>
-    );
+  if (view.k === "detail") {
+    return <ScanDetail scan={view.scan} onBack={() => setView({ k: "list" })} />;
   }
 
   const filtered = records.filter((r) => {
     if (filter === "threats" && r.threats_found === 0) return false;
-    if (searchText && !r.scan_type.toLowerCase().includes(searchText.toLowerCase()) &&
-        !r.job_id.toLowerCase().includes(searchText.toLowerCase())) return false;
+    if (search && !r.scan_type.includes(search.toLowerCase()) && !r.scan_id.includes(search)) return false;
     return true;
   });
 
   return (
-    <div>
-      <PageHeader icon={<Clock size={22} />} title="History" subtitle="Review past scan results">
-        <span className="text-xs text-[rgb(var(--text-muted))] bg-[rgb(var(--bg-elevated))] px-3 py-1.5 rounded-lg">
-          {records.length} scan{records.length !== 1 ? "s" : ""} recorded
-        </span>
-      </PageHeader>
-
+    <div className="page-stack">
       {/* Filters */}
-      <div className="flex items-center gap-3 mb-4">
-        <div className="flex items-center gap-2 px-3 py-2 rounded-xl bg-[rgb(var(--bg-surface))] border border-[rgb(var(--border))] flex-1 max-w-xs">
-          <Search size={14} className="text-[rgb(var(--text-muted))]" />
-          <input type="text" placeholder="Search scans..." value={searchText}
-            onChange={(e) => setSearchText(e.target.value)}
-            className="bg-transparent text-sm outline-none w-full text-[rgb(var(--text-primary))] placeholder:text-[rgb(var(--text-muted))]" />
+      <div className="flex flex-wrap items-center gap-3">
+        <div className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-[rgb(var(--surface))] border border-[rgb(var(--border))]/12 flex-1 max-w-[280px]">
+          <Search size={14} className="text-[rgb(var(--t3))]/30" />
+          <input type="text" placeholder="Search scans..." value={search} onChange={(e) => setSearch(e.target.value)}
+            className="bg-transparent text-[13px] outline-none w-full text-[rgb(var(--t1))] placeholder:text-[rgb(var(--t3))]/25" />
         </div>
-        <Pill active={filter === "all"} onClick={() => setFilter("all")} label="All" />
-        <Pill active={filter === "threats"} onClick={() => setFilter("threats")} label="With threats" />
+        {(["all", "threats"] as const).map((f) => (
+          <button key={f} onClick={() => setFilter(f)}
+            className={`text-[12px] font-medium px-4 py-2.5 rounded-xl border cursor-pointer capitalize ${filter === f
+              ? "border-[rgb(var(--accent))]/15 text-[rgb(var(--accent))] bg-[rgb(var(--accent))]/5"
+              : "border-[rgb(var(--border))]/12 text-[rgb(var(--t3))] bg-[rgb(var(--surface))]"
+            }`}>{f === "threats" ? "With threats" : f}</button>
+        ))}
+        <span className="text-[11px] text-[rgb(var(--t3))]/25 md:ml-auto">{records.length} total</span>
+        <button onClick={async () => {
+          try {
+            const report = await exportScanReport();
+            // Create downloadable blob.
+            const json = JSON.stringify(report, null, 2);
+            const blob = new Blob([json], { type: "application/json" });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = `sentinella-report-${new Date().toISOString().slice(0, 10)}.json`;
+            a.click();
+            URL.revokeObjectURL(url);
+          } catch {}
+        }} className="flex items-center gap-1.5 text-[11px] text-[rgb(var(--accent))] hover:underline cursor-pointer">
+          <Download size={12} /> Export
+        </button>
       </div>
 
+      {/* Results */}
       {filtered.length === 0 ? (
-        <Card className="text-center py-16">
-          <Clock size={28} className="mx-auto text-[rgb(var(--text-muted))] mb-3" />
-          <p className="text-sm font-medium mb-1">
-            {records.length === 0 ? "No scans recorded yet" : "No matching scans"}
-          </p>
-          <p className="text-xs text-[rgb(var(--text-muted))]">
-            {records.length === 0
-              ? "Run a scan from the Dashboard or Scan page."
-              : "Try a different search term or filter."}
-          </p>
+        <Card className="text-center py-12">
+          <Clock size={28} className="mx-auto text-[rgb(var(--t3))]/15 mb-3" />
+          <p className="text-[14px] font-medium text-[rgb(var(--t2))]">{records.length === 0 ? "No scans recorded yet" : "No matching scans"}</p>
         </Card>
       ) : (
-        <div className="space-y-3">
-          {filtered.map((r) => (
-            <Card key={r.job_id} className="hover:border-[rgb(var(--accent))]/30 transition-colors">
-              <div className="flex items-center gap-4">
-                <div className="w-10 h-10 rounded-xl bg-[rgb(var(--bg-elevated))] flex items-center justify-center text-[rgb(var(--text-muted))] flex-shrink-0">
-                  {typeIcons[r.scan_type] || <FolderOpen size={16} />}
+        <Card>
+          <div className="space-y-2">
+            {filtered.slice(0, pageSize).map((r) => (
+              <button key={r.scan_id} onClick={() => setView({ k: "detail", scan: r })}
+                className="flex items-center gap-4 px-4 py-3.5 rounded-xl bg-[rgb(var(--raised))]/12 hover:bg-[rgb(var(--raised))]/22 transition-colors w-full text-left cursor-pointer"
+              >
+                <div className={`w-9 h-9 rounded-lg flex items-center justify-center flex-shrink-0 ${r.threats_found > 0 ? "bg-[rgb(var(--red))]/8 text-[rgb(var(--red))]" : r.status === "cancelled" ? "bg-[rgb(var(--amber))]/8 text-[rgb(var(--amber))]" : "bg-[rgb(var(--green))]/6 text-[rgb(var(--green))]"}`}>
+                  {r.threats_found > 0 ? <AlertTriangle size={15} /> : r.status === "cancelled" ? <XCircle size={15} /> : <CheckCircle size={15} />}
                 </div>
                 <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2">
-                    <p className="text-sm font-semibold capitalize">{r.scan_type} Scan</p>
-                    {r.threats_found > 0 ? (
-                      <span className="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-md bg-[rgb(var(--danger))]/10 text-[rgb(var(--danger))]">
-                        <AlertTriangle size={11} /> {r.threats_found} threat{r.threats_found > 1 ? "s" : ""}
-                      </span>
-                    ) : (
-                      <span className="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-md bg-[rgb(var(--success))]/10 text-[rgb(var(--success))]">
-                        <CheckCircle size={11} /> {r.status}
-                      </span>
-                    )}
-                  </div>
-                  <p className="text-xs text-[rgb(var(--text-muted))] mt-0.5">
-                    {new Date(r.started_at * 1000).toLocaleString()} · Job {r.job_id.slice(0, 8)}
-                  </p>
+                  <p className="text-[13px] font-semibold capitalize">{r.scan_type} Scan</p>
+                  <p className="text-[11px] text-[rgb(var(--t3))]/40 mt-0.5">{new Date(r.started_at * 1000).toLocaleString()}</p>
                 </div>
-                <div className="flex items-center gap-6 text-sm flex-shrink-0">
-                  <div className="text-right">
-                    <p className="text-[11px] text-[rgb(var(--text-muted))]">Files</p>
-                    <p className="font-medium">{r.files_scanned.toLocaleString()}</p>
+                <p className="text-[13px] font-medium text-[rgb(var(--t2))]">{r.files_scanned} files</p>
+                <p className="text-[13px] font-medium w-[55px] text-right">{Math.floor(r.duration_ms / 1000)}s</p>
+                <p className={`text-[13px] font-semibold w-[80px] text-right ${r.threats_found > 0 ? "text-[rgb(var(--red))]" : r.status === "cancelled" ? "text-[rgb(var(--amber))]" : "text-[rgb(var(--green))]"}`}>
+                  {r.threats_found > 0 ? `${r.threats_found} threat${r.threats_found > 1 ? "s" : ""}` : r.status === "cancelled" ? "Cancelled" : "Clean"}
+                </p>
+              </button>
+            ))}
+          </div>
+          {filtered.length > pageSize && (
+            <button
+              onClick={() => setPageSize((s) => s + 50)}
+              className="mt-4 w-full py-3 text-[12px] text-[rgb(var(--accent))] hover:bg-[rgb(var(--accent))]/5 rounded cursor-pointer transition-colors"
+            >
+              Load more ({filtered.length - pageSize} remaining)
+            </button>
+          )}
+        </Card>
+      )}
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Scan Detail — drill-down view
+   ═══════════════════════════════════════════════════════════════ */
+
+const SEV_COLORS: Record<string, string> = {
+  critical: "var(--red)", high: "var(--red)", medium: "var(--amber)",
+  low: "var(--accent)", info: "var(--t3)",
+};
+
+const LAYER_NAMES: Record<string, string> = {
+  signatures: "Signature Analysis", yara_rules: "Behavioral Rules",
+  mime_validation: "File Integrity", structural_analysis: "Structural Analysis",
+  packer_detection: "Packer Detection", script_analysis: "Script Analysis",
+  ioc_correlation: "Threat Intelligence", pattern_detection: "Pattern Detection",
+  file_deception: "Deception Detection",
+  reputation: "Software Reputation",
+  context: "Origin Context",
+};
+
+function ScanDetail({ scan, onBack }: { scan: ScanRecord; onBack: () => void }) {
+  const [detections, setDetections] = useState<DetectionEntry[]>([]);
+  const [verdicts, setVerdicts] = useState<ArgusVerdictRecord[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    Promise.all([
+      getDetections(scan.scan_id).catch(() => []),
+      getArgusVerdicts(scan.scan_id).catch(() => []),
+    ]).then(([dets, vds]) => {
+      setDetections(dets);
+      setVerdicts(vds);
+    }).finally(() => setLoading(false));
+  }, [scan.scan_id]);
+
+  const statusColor = scan.threats_found > 0 ? "red" : scan.status === "cancelled" ? "amber" : "green";
+  const cv = `var(--${statusColor})`;
+  const started = new Date(scan.started_at * 1000);
+  const finished = scan.finished_at ? new Date(scan.finished_at * 1000) : null;
+
+  return (
+    <div className="page-stack">
+      {/* Back button */}
+      <button onClick={onBack}
+        className="flex items-center gap-2 text-[12px] text-[rgb(var(--t3))] hover:text-[rgb(var(--t1))] cursor-pointer transition-colors self-start">
+        <ArrowLeft size={14} /> Back to History
+      </button>
+
+      {/* Summary card */}
+      <Card className={`border-[rgb(${cv})]/12`}>
+        <div className="flex items-start gap-5">
+          <div className="flex h-14 w-14 flex-shrink-0 items-center justify-center rounded"
+            style={{ background: `rgba(${cv}, 0.08)`, color: `rgb(${cv})` }}>
+            {scan.threats_found > 0 ? <AlertTriangle size={24} /> : scan.status === "cancelled" ? <XCircle size={24} /> : <Shield size={24} />}
+          </div>
+          <div className="flex-1 min-w-0">
+            <h3 className="text-[20px] font-bold capitalize">{scan.scan_type} Scan</h3>
+            <p className="text-[13px] text-[rgb(var(--t3))] mt-1">
+              {started.toLocaleString()}
+              {finished && ` — ${Math.floor(scan.duration_ms / 1000)}s duration`}
+            </p>
+          </div>
+          <div className="text-right">
+            <p className="text-[24px] font-bold" style={{ color: `rgb(${cv})` }}>
+              {scan.threats_found > 0 ? scan.threats_found : scan.status === "cancelled" ? "—" : "0"}
+            </p>
+            <p className="text-[11px] text-[rgb(var(--t3))] mt-1">
+              {scan.threats_found > 0 ? "threats found" : scan.status === "cancelled" ? "cancelled" : "threats found"}
+            </p>
+          </div>
+        </div>
+
+        {/* Metadata grid */}
+        <div className="grid grid-cols-2 xl:grid-cols-4 gap-3 mt-6">
+          <MetaBox label="Files Scanned" value={scan.files_scanned.toLocaleString()} />
+          <MetaBox label="Duration" value={`${(scan.duration_ms / 1000).toFixed(1)}s`} />
+          <MetaBox label="Errors" value={String(scan.errors_count)} />
+          <MetaBox label="Scan ID" value={scan.scan_id.slice(0, 8)} title={scan.scan_id} />
+        </div>
+      </Card>
+
+      {loading && (
+        <div className="flex items-center justify-center py-8">
+          <Loader2 size={18} className="text-[rgb(var(--accent))] animate-spin" />
+        </div>
+      )}
+
+      {/* Detections */}
+      {!loading && detections.length > 0 && (
+        <Card>
+          <h4 className="text-[15px] font-semibold mb-4">Detections</h4>
+          <div className="space-y-2">
+            {detections.map((d) => (
+              <div key={d.detection_id} className="flex items-center gap-3 rounded-xl bg-[rgb(var(--red))]/5 px-4 py-3">
+                <AlertTriangle size={15} className="text-[rgb(var(--red))] flex-shrink-0" />
+                <div className="flex-1 min-w-0">
+                  <p className="text-[13px] font-semibold text-[rgb(var(--red))]">{d.virus_name}</p>
+                  <p className="text-[11px] text-[rgb(var(--t3))] truncate mt-0.5" title={d.path}>{shortenPath(d.path)}</p>
+                </div>
+                <span className="text-[10px] text-[rgb(var(--t3))]">{new Date(d.detected_at * 1000).toLocaleTimeString()}</span>
+              </div>
+            ))}
+          </div>
+        </Card>
+      )}
+
+      {/* ARGUS Verdicts */}
+      {!loading && verdicts.length > 0 && (
+        <Card>
+          <div className="flex items-center gap-3 mb-5">
+            <Eye size={16} className="text-[rgb(var(--accent))]" />
+            <div>
+              <h4 className="text-[15px] font-semibold">ARGUS Analysis Results</h4>
+              <p className="text-[11px] text-[rgb(var(--t3))] mt-0.5">{verdicts.length} file{verdicts.length > 1 ? "s" : ""} analyzed with heuristic intelligence</p>
+            </div>
+          </div>
+          <div className="space-y-3">
+            {verdicts
+              .sort((a, b) => b.score - a.score)
+              .map((v, i) => <VerdictRow key={i} v={v} />)
+            }
+          </div>
+        </Card>
+      )}
+
+      {/* Empty state */}
+      {!loading && detections.length === 0 && verdicts.length === 0 && (
+        <Card className="text-center py-10">
+          <CheckCircle size={24} className="mx-auto text-[rgb(var(--green))]/40 mb-3" />
+          <p className="text-[13px] text-[rgb(var(--t3))]">No detailed analysis records available for this scan.</p>
+        </Card>
+      )}
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   ARGUS Verdict Row — expandable forensic detail
+   ═══════════════════════════════════════════════════════════════ */
+
+function VerdictRow({ v }: { v: ArgusVerdictRecord }) {
+  const [expanded, setExpanded] = useState(false);
+  const findings: ArgusFinding[] = (() => {
+    try { return JSON.parse(v.findings_json); } catch { return []; }
+  })();
+
+  const vColor = v.score >= 76 ? "var(--red)" : v.score >= 51 ? "var(--amber)" : v.score >= 26 ? "var(--amber)" : v.score > 0 ? "var(--accent)" : "var(--green)";
+
+  return (
+    <div className="rounded-xl border border-[rgb(var(--border))]/8 overflow-hidden">
+      <button onClick={() => setExpanded(!expanded)}
+        className="flex items-center gap-3 w-full px-4 py-3 text-left hover:bg-[rgb(var(--raised))]/15 transition-colors cursor-pointer"
+      >
+        {/* Score badge */}
+        <div className="flex h-8 w-8 items-center justify-center rounded-lg text-[11px] font-bold flex-shrink-0"
+          style={{ background: `rgba(${vColor}, 0.1)`, color: `rgb(${vColor})` }}>
+          {v.score}
+        </div>
+        {/* File info */}
+        <div className="flex-1 min-w-0">
+          <p className="text-[12px] font-medium truncate" title={v.path}>{shortenPath(v.path)}</p>
+          <div className="flex items-center gap-2 mt-1">
+            <span className="text-[10px] text-[rgb(var(--t3))]">{v.verdict}</span>
+            {v.mime_type && <span className="text-[10px] text-[rgb(var(--t3))]/40">{v.mime_type}</span>}
+            <span className="text-[10px] text-[rgb(var(--t3))]/40">{formatBytes(v.file_size)}</span>
+          </div>
+        </div>
+        {/* Finding count */}
+        {findings.length > 0 && (
+          <span className="text-[10px] text-[rgb(var(--t3))] px-2 py-0.5 rounded bg-[rgb(var(--raised))]/20">
+            {findings.length} finding{findings.length > 1 ? "s" : ""}
+          </span>
+        )}
+        {findings.length > 0 && (expanded ? <ChevronUp size={14} className="text-[rgb(var(--t3))]" /> : <ChevronDown size={14} className="text-[rgb(var(--t3))]" />)}
+      </button>
+
+      {expanded && findings.length > 0 && (
+        <div className="border-t border-[rgb(var(--border))]/8 px-4 py-3 space-y-2 bg-[rgb(var(--raised))]/5">
+          {/* File metadata */}
+          <div className="grid grid-cols-2 xl:grid-cols-4 gap-2 mb-3">
+            <MiniMeta label="SHA-256" value={v.sha256.slice(0, 16) + "..."} title={v.sha256} />
+            <MiniMeta label="Analysis Time" value={`${(v.analysis_time_us / 1000).toFixed(1)}ms`} />
+            <MiniMeta label="Engine" value={`ARGUS ${v.engine_version}`} />
+            <MiniMeta label="Analyzed" value={new Date(v.timestamp * 1000).toLocaleTimeString()} />
+          </div>
+
+          {/* Findings */}
+          {findings.map((f, i) => {
+            const sevColor = SEV_COLORS[f.severity] ?? "var(--t3)";
+            return (
+              <div key={i} className="flex items-start gap-3 rounded-lg px-3 py-2.5 bg-[rgb(var(--raised))]/15">
+                <div className="mt-0.5 flex h-5 w-5 flex-shrink-0 items-center justify-center rounded text-[9px] font-bold"
+                  style={{ background: `rgba(${sevColor}, 0.1)`, color: `rgb(${sevColor})` }}>
+                  +{f.weight}
+                </div>
+                <div className="min-w-0 flex-1">
+                  <p className="text-[11px] leading-relaxed">{f.description}</p>
+                  <div className="flex items-center gap-2 mt-1">
+                    <span className="text-[9px] px-1.5 py-0.5 rounded bg-[rgb(var(--raised))]/30 text-[rgb(var(--t3))]">
+                      {LAYER_NAMES[f.layer] ?? f.layer}
+                    </span>
+                    <span className="text-[9px] font-semibold uppercase" style={{ color: `rgb(${sevColor})` }}>
+                      {f.severity}
+                    </span>
                   </div>
-                  <div className="text-right">
-                    <p className="text-[11px] text-[rgb(var(--text-muted))]">Duration</p>
-                    <p className="font-medium">{formatDuration(r.finished_at - r.started_at)}</p>
-                  </div>
+                  {f.technical_detail && (
+                    <p className="text-[9px] text-[rgb(var(--t3))]/40 mt-1 font-mono break-all">{f.technical_detail}</p>
+                  )}
                 </div>
               </div>
-            </Card>
-          ))}
+            );
+          })}
         </div>
       )}
     </div>
   );
 }
 
-function Pill({ active, onClick, label }: { active: boolean; onClick: () => void; label: string }) {
+/* ═══════════════════════════════════════════════════════════════
+   Utilities
+   ═══════════════════════════════════════════════════════════════ */
+
+function MetaBox({ label, value, title }: { label: string; value: string; title?: string }) {
   return (
-    <button onClick={onClick} className={`text-xs font-medium px-3 py-2 rounded-xl border transition-colors cursor-pointer ${
-      active ? "border-[rgb(var(--accent))]/40 text-[rgb(var(--accent))] bg-[rgb(var(--accent))]/10"
-        : "border-[rgb(var(--border))] text-[rgb(var(--text-muted))] bg-[rgb(var(--bg-surface))] hover:border-[rgb(var(--text-muted))]"
-    }`}>{label}</button>
+    <div className="rounded-xl bg-[rgb(var(--raised))]/15 px-3.5 py-2.5">
+      <p className="text-[10px] text-[rgb(var(--t3))] uppercase tracking-wider">{label}</p>
+      <p className="text-[13px] font-semibold mt-1 truncate" title={title}>{value}</p>
+    </div>
   );
 }
 
-function formatDuration(secs: number): string {
-  if (secs <= 0) return "<1s";
-  const m = Math.floor(secs / 60);
-  const s = secs % 60;
-  if (m > 0) return `${m}m ${s}s`;
-  return `${s}s`;
+function MiniMeta({ label, value, title }: { label: string; value: string; title?: string }) {
+  return (
+    <div className="rounded-lg bg-[rgb(var(--raised))]/10 px-2.5 py-1.5">
+      <p className="text-[9px] text-[rgb(var(--t3))]/50 uppercase tracking-wider">{label}</p>
+      <p className="text-[10px] font-medium mt-0.5 truncate" title={title}>{value}</p>
+    </div>
+  );
+}
+
+function shortenPath(path: string): string {
+  const parts = path.split(/[/\\]/);
+  if (parts.length <= 3) return path;
+  return "..." + parts.slice(-3).join("\\");
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return "0 B";
+  const k = 1024;
+  const sizes = ["B", "KB", "MB", "GB"];
+  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(k)), sizes.length - 1);
+  return `${(bytes / Math.pow(k, i)).toFixed(i > 0 ? 1 : 0)} ${sizes[i]}`;
 }

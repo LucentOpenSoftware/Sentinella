@@ -1,22 +1,32 @@
 # Sentinella
 
-A modern, open-source antivirus suite built on the [ClamAV](https://www.clamav.net) scanning engine.
+A modern, open-source antivirus suite built on the [ClamAV](https://www.clamav.net) scanning engine and the ARGUS heuristic engine.
 
-**Status: early development scaffold.** The project compiles and the GUI renders, but no actual scanning is functional yet.
+**Status: alpha (0.1.0-alpha).** Core scanning, real-time protection, and quarantine are functional on Windows.
 
 ## What is this?
 
-Sentinella wraps the battle-tested ClamAV engine in a modern, beginner-friendly interface. The ClamAV engine itself is kept **unmodified** so upstream security fixes merge cleanly.
+Sentinella wraps the battle-tested ClamAV engine in a modern, beginner-friendly interface and supplements it with ARGUS, an 8-layer heuristic engine. The ClamAV engine itself is kept **unmodified** so upstream security fixes merge cleanly.
 
-### Goals
+## Current capabilities
 
-- Cross-platform (Windows first, then Linux, macOS)
-- Modern GUI (Tauri + React) that non-technical users can understand
-- Real-time file monitoring (user-mode in v1, kernel minifilter planned for v2)
-- On-demand and scheduled scanning
-- Quarantine vault with encrypted storage
-- Automatic signature updates via freshclam
-- No cloud dependencies, no telemetry, no AI buzzwords
+- **ClamAV signature scanning** — 3.6M+ signatures via subprocess isolation (`clamavd`)
+- **ARGUS heuristic engine** — 8-layer analysis pipeline with 119 YARA rules
+- **Real-time filesystem watcher** — monitors 8 user directories for new/modified files
+- **Idle background scanner** — resource-aware scanning during system idle
+- **AES-256-GCM quarantine vault** — encrypted storage for detected threats
+- **Memory scanner** — scans process memory for in-memory threats
+- **FISH ransomware shield** — observe mode + active response
+- **Behavioral sandbox** — experimental, Job Object containment on Windows
+- **ClamAV subprocess isolation** — `clamavd` process boundary
+- **Persistent scan cache** — SQLite-backed, avoids re-scanning unchanged files
+- **Scan types** — full, quick, folder, startup, and single-file scans
+- **Daemon supervisor** — auto-recovery on crash
+- **Memory pressure management** — adapts to available system resources
+- **Detection exclusions + hash whitelisting**
+- **i18n** — English and Spanish
+- **Tauri 2 GUI** — frosted glass design with system tray integration
+- **Windows service install scripts**
 
 ### Architecture
 
@@ -60,6 +70,7 @@ sentinella/
   crates/
     sentinella-ipc-proto/   # Shared JSON-RPC types
     sentinella-common/      # Paths, constants, version info
+    argus/                  # ARGUS heuristic engine
     sentinelld/             # The daemon binary
     sentinella-cli/         # Command-line client
   gui/                      # Tauri + React frontend

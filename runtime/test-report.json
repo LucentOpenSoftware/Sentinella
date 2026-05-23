@@ -1,0 +1,123 @@
+{
+  "engine": {
+    "db_timestamp": null,
+    "db_version": null,
+    "engine_version": "0.1.0",
+    "last_update": null,
+    "protocol_version": 1,
+    "signature_count": 3627855,
+    "state": "ready"
+  },
+  "generated_at": "2026-05-13T22:16:29.413160500+00:00",
+  "quarantine": [
+    {
+      "original_path": "C:\\Users\\Nicolas\\Downloads\\eicar-watcher-test.txt",
+      "original_size": 68,
+      "quarantine_id": "d9e67a0c-cbab-49c7-a066-cd27059e81a3",
+      "quarantined_at": 1778642173,
+      "scan_id": "realtime",
+      "sha256": "42ce21541d47e972eb6b6e0c8d0a13e1fa1b180feaec8993079130738a0a7298",
+      "status": "quarantined",
+      "vault_path": "runtime/quarantine\\d9\\d9e67a0c-cbab-49c7-a066-cd27059e81a3.qbin",
+      "virus_name": "Eicar-Test-Signature"
+    }
+  ],
+  "report_type": "sentinella_scan_report",
+  "runtime": {
+    "activity_count": 3,
+    "db_stale": true,
+    "db_stale_hours": 0,
+    "engine_loaded": true,
+    "ipc_requests_served": 2,
+    "last_update_timestamp": null,
+    "quarantine_count": 1,
+    "scans_completed": 7,
+    "signature_count": 3627855,
+    "started_at": 1778710583,
+    "threats_found_total": 3,
+    "total_detections": 3,
+    "total_files_scanned": 0,
+    "uptime_human": "6s",
+    "uptime_secs": 6,
+    "watcher_active": true
+  },
+  "scan_history": [
+    {
+      "duration_ms": 0,
+      "errors_count": 0,
+      "files_scanned": 1,
+      "finished_at": 1778694311,
+      "scan_id": "50ba8e9f-e7b2-4c4f-8fd5-1db69901f5be",
+      "scan_type": "file",
+      "started_at": 1778694311,
+      "status": "infected",
+      "threats_found": 1
+    },
+    {
+      "duration_ms": 0,
+      "errors_count": 0,
+      "files_scanned": 1,
+      "finished_at": 1778692795,
+      "scan_id": "6c300e20-4bfb-49a1-b4c9-bfc9c1143cfa",
+      "scan_type": "file",
+      "started_at": 1778692795,
+      "status": "clean",
+      "threats_found": 0
+    },
+    {
+      "duration_ms": 0,
+      "errors_count": 0,
+      "files_scanned": 4,
+      "finished_at": 1778692795,
+      "scan_id": "8f1be5f6-a567-40b6-b872-11ee1315e066",
+      "scan_type": "folder",
+      "started_at": 1778692795,
+      "status": "clean",
+      "threats_found": 0
+    },
+    {
+      "duration_ms": 0,
+      "errors_count": 0,
+      "files_scanned": 1,
+      "finished_at": 1778641387,
+      "scan_id": "bf0ea11e-f0c5-40d3-bcf0-db90430dce43",
+      "scan_type": "file",
+      "started_at": 1778641387,
+      "status": "infected",
+      "threats_found": 1
+    },
+    {
+      "duration_ms": 0,
+      "errors_count": 0,
+      "files_scanned": 1,
+      "finished_at": 1778622947,
+      "scan_id": "5030e7b3-50c1-4269-b8ea-ac37e75b28ed",
+      "scan_type": "file",
+      "started_at": 1778622947,
+      "status": "clean",
+      "threats_found": 0
+    },
+    {
+      "duration_ms": 0,
+      "errors_count": 0,
+      "files_scanned": 1,
+      "finished_at": 1778622836,
+      "scan_id": "5e03fe6c-9607-4b10-821d-cc412cc35535",
+      "scan_type": "file",
+      "started_at": 1778622836,
+      "status": "infected",
+      "threats_found": 1
+    },
+    {
+      "duration_ms": 51000,
+      "errors_count": 0,
+      "files_scanned": 2,
+      "finished_at": 1778622887,
+      "scan_id": "ad954571-0f09-4395-a09e-ba1a1bc3ff9a",
+      "scan_type": "quick",
+      "started_at": 1778622836,
+      "status": "cancelled",
+      "threats_found": 0
+    }
+  ]
+}

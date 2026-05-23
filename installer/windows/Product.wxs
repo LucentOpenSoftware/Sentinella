@@ -1,0 +1,182 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Sentinella Antivirus — Windows Installer (WiX 4)
+
+  Build requires:
+  - WiX Toolset v4 (dotnet tool install --global wix)
+  - Release binaries: cargo build --workspace --release
+  - ClamAV DLLs in target/release/ or build/clamav/
+  - YARA rules in runtime/argus/rules/yara/
+
+  Build command:
+    wix build -d BuildDir=..\..\target\release ^
+              -d ConfigDir=..\..\installer\windows ^
+              -d RulesDir=..\..\runtime\argus\rules\yara ^
+              -o sentinella-0.1.0.msi ^
+              installer\windows\Product.wxs
+
+  For YARA rules and certs, use WiX heat to harvest directories:
+    wix heat dir runtime\argus\rules\yara -cg YaraRules -dr YARASUBDIR
+    wix heat dir third_party\clamav\certs -cg CertFiles -dr CERTSDIR
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="Sentinella Antivirus Suite"
+    Version="0.1.0"
+    Manufacturer="Lucent Open Software"
+    UpgradeCode="A1B2C3D4-E5F6-7890-ABCD-EF1234567890"
+    Scope="perMachine">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Sentinella is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <!-- ═══════════════════════════════════════════════════════════
+         DIRECTORY STRUCTURE
+         ═══════════════════════════════════════════════════════════ -->
+
+    <!-- Program Files\Sentinella\ -->
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Sentinella">
+        <Directory Id="CERTSDIR" Name="certs" />
+        <Directory Id="RULESDIR" Name="rules">
+          <Directory Id="YARASUBDIR" Name="yara" />
+        </Directory>
+        <Directory Id="MANIFESTDIR" Name="manifests" />
+        <Directory Id="SCRIPTSDIR" Name="scripts" />
+      </Directory>
+    </StandardDirectory>
+
+    <!-- ProgramData\Sentinella\ (runtime data — created, not populated) -->
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="DATADIRPARENT" Name="Sentinella">
+        <Directory Id="SIGDIR" Name="signatures" />
+        <Directory Id="STATEDIR" Name="state" />
+        <Directory Id="LOGDIR" Name="logs" />
+        <Directory Id="QUARANTINEDIR" Name="quarantine" />
+        <Directory Id="CONFIGDIR" Name="config" />
+      </Directory>
+    </StandardDirectory>
+
+    <!-- ═══════════════════════════════════════════════════════════
+         FEATURES
+         ═══════════════════════════════════════════════════════════ -->
+
+    <Feature Id="MainFeature" Title="Sentinella Antivirus" Level="1">
+      <ComponentGroupRef Id="DaemonComponents" />
+      <ComponentGroupRef Id="ClamAVComponents" />
+      <ComponentGroupRef Id="CLIComponents" />
+      <ComponentGroupRef Id="ConfigComponents" />
+      <ComponentGroupRef Id="IntelligenceComponents" />
+      <ComponentGroupRef Id="ScriptComponents" />
+      <ComponentGroupRef Id="LegalComponents" />
+    </Feature>
+
+    <!-- ═══════════════════════════════════════════════════════════
+         DAEMON + SERVICE
+         ═══════════════════════════════════════════════════════════ -->
+
+    <ComponentGroup Id="DaemonComponents" Directory="INSTALLFOLDER">
+      <Component Id="DaemonExe">
+        <File Source="$(var.BuildDir)\sentinelld.exe" KeyPath="yes" />
+        <ServiceInstall
+          Id="SentinelldService"
+          Name="SentinellaDaemon"
+          DisplayName="Sentinella Protection Service"
+          Description="Sentinella antivirus daemon — ClamAV signatures + ARGUS heuristic intelligence engine."
+          Type="ownProcess"
+          Start="delayed"
+          Account="LocalSystem"
+          ErrorControl="normal"
+          Arguments="--foreground --log-level info --dll-dir &quot;[INSTALLFOLDER]&quot; --db-dir &quot;[SIGDIR]&quot; --state-db &quot;[STATEDIR]\sentinella.db&quot;" />
+        <ServiceControl
+          Id="SentinelldControl"
+          Name="SentinellaDaemon"
+          Start="install"
+          Stop="both"
+          Remove="uninstall"
+          Wait="yes" />
+      </Component>
+      <Component Id="ArgusWorkerExe">
+        <File Source="$(var.BuildDir)\argusd.exe" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- ═══════════════════════════════════════════════════════════
+         CLAMAV ENGINE
+         ═══════════════════════════════════════════════════════════ -->
+
+    <ComponentGroup Id="ClamAVComponents" Directory="INSTALLFOLDER">
+      <Component Id="LibClamAV">
+        <File Source="$(var.BuildDir)\libclamav.dll" />
+      </Component>
+      <Component Id="LibClamMSPack">
+        <File Source="$(var.BuildDir)\libclammspack.dll" />
+      </Component>
+      <Component Id="FreshclamExe">
+        <File Source="$(var.BuildDir)\freshclam.exe" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- ═══════════════════════════════════════════════════════════
+         CLI
+         ═══════════════════════════════════════════════════════════ -->
+
+    <ComponentGroup Id="CLIComponents" Directory="INSTALLFOLDER">
+      <Component Id="CLIExe">
+        <File Source="$(var.BuildDir)\sentinella.exe" Name="sentinella-cli.exe" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- ═══════════════════════════════════════════════════════════
+         CONFIGURATION TEMPLATES
+         ═══════════════════════════════════════════════════════════ -->
+
+    <ComponentGroup Id="ConfigComponents" Directory="CONFIGDIR">
+      <Component Id="FreshclamConf">
+        <File Source="$(var.ConfigDir)\freshclam.conf.template" Name="freshclam.conf" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- ═══════════════════════════════════════════════════════════
+         ARGUS INTELLIGENCE
+         ═══════════════════════════════════════════════════════════ -->
+
+    <ComponentGroup Id="IntelligenceComponents" Directory="INSTALLFOLDER">
+      <!-- Pack manifest -->
+      <Component Id="PackManifest" Directory="MANIFESTDIR">
+        <File Source="..\..\runtime\argus\manifests\pack_manifest.json" />
+      </Component>
+      <!-- IOC hashes -->
+      <Component Id="IOCHashes" Directory="RULESDIR">
+        <File Source="..\..\runtime\rules\ioc_hashes.txt" />
+      </Component>
+      <!--
+        YARA rule files — use WiX heat to harvest the directory:
+        wix heat dir runtime\argus\rules\yara -cg YaraRules -dr YARASUBDIR -srd
+        Then add: <ComponentGroupRef Id="YaraRules" />
+        For now, rules are bundled via staging script.
+      -->
+    </ComponentGroup>
+
+    <!-- ═══════════════════════════════════════════════════════════
+         SCRIPTS
+         ═══════════════════════════════════════════════════════════ -->
+
+    <ComponentGroup Id="ScriptComponents" Directory="SCRIPTSDIR">
+      <Component Id="ShellMenuScript">
+        <File Source="..\..\scripts\install-shell-menu.bat" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- ═══════════════════════════════════════════════════════════
+         LEGAL
+         ═══════════════════════════════════════════════════════════ -->
+
+    <ComponentGroup Id="LegalComponents" Directory="INSTALLFOLDER">
+      <Component Id="LicenseFile">
+        <File Source="..\..\LICENSE" Name="LICENSE.txt" />
+      </Component>
+    </ComponentGroup>
+
+  </Package>
+</Wix>

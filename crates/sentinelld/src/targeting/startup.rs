@@ -1,0 +1,167 @@
+//! Startup scan target provider.
+//! Collects executables from Windows autorun locations + recent downloads.
+
+use super::{TargetConfig, TargetProvider};
+use std::path::PathBuf;
+
+pub struct StartupTargets;
+
+impl TargetProvider for StartupTargets {
+    fn name(&self) -> &str {
+        "startup"
+    }
+
+    fn collect(&self, config: &TargetConfig) -> Vec<PathBuf> {
+        if !config.startup_scan_enabled {
+            return vec![];
+        }
+
+        let mut targets = Vec::new();
+        let home = std::env::var("USERPROFILE").unwrap_or_default();
+        let appdata = std::env::var("APPDATA").unwrap_or_default();
+
+        // 1. User Startup folder.
+        let startup = PathBuf::from(format!(
+            "{appdata}\\Microsoft\\Windows\\Start Menu\\Programs\\Startup"
+        ));
+        if startup.exists() {
+            collect_executables(&startup, &mut targets, 1);
+        }
+
+        // 2. Recent executables in Downloads (last N days).
+        let downloads = PathBuf::from(format!("{home}\\Downloads"));
+        if downloads.exists() {
+            collect_recent_executables(&downloads, &mut targets, config.startup_recent_days);
+        }
+
+        // 3. Recent executables on Desktop.
+        let desktop = PathBuf::from(format!("{home}\\Desktop"));
+        if desktop.exists() {
+            collect_recent_executables(&desktop, &mut targets, config.startup_recent_days);
+        }
+
+        // 4. Registry Run keys (read values, resolve paths).
+        #[cfg(target_os = "windows")]
+        {
+            collect_run_key_targets(&mut targets);
+        }
+
+        targets
+    }
+}
+
+/// Collect executable files from a directory (shallow).
+fn collect_executables(dir: &PathBuf, targets: &mut Vec<PathBuf>, depth: u32) {
+    if depth == 0 {
+        return;
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            if let Some(ext) = path.extension() {
+                let el = ext.to_string_lossy().to_lowercase();
+                if matches!(
+                    el.as_str(),
+                    "exe" | "dll" | "scr" | "bat" | "cmd" | "ps1" | "vbs" | "lnk"
+                ) {
+                    targets.push(path);
+                }
+            }
+        }
+    }
+}
+
+/// Collect executables modified within the last N days.
+fn collect_recent_executables(dir: &PathBuf, targets: &mut Vec<PathBuf>, recent_days: u32) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let cutoff =
+        std::time::SystemTime::now() - std::time::Duration::from_secs(recent_days as u64 * 86400);
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if let Some(ext) = path.extension() {
+            let el = ext.to_string_lossy().to_lowercase();
+            if !matches!(el.as_str(), "exe" | "msi" | "scr" | "bat" | "cmd" | "ps1") {
+                continue;
+            }
+        } else {
+            continue;
+        }
+        // Check modification time.
+        if let Ok(meta) = path.metadata() {
+            if let Ok(mtime) = meta.modified() {
+                if mtime >= cutoff {
+                    targets.push(path);
+                }
+            }
+        }
+    }
+}
+
+/// Read Windows Registry Run keys to find autostart programs.
+#[cfg(target_os = "windows")]
+fn collect_run_key_targets(targets: &mut Vec<PathBuf>) {
+    use std::process::Command;
+
+    // Query HKCU Run key.
+    let output = Command::new("reg")
+        .args([
+            "query",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+        ])
+        .output();
+
+    if let Ok(out) = output {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            // Lines look like: "    AppName    REG_SZ    C:\path\to\app.exe --args"
+            if line.contains("REG_SZ") || line.contains("REG_EXPAND_SZ") {
+                if let Some(value) = line.split("    ").last() {
+                    let path_str = value
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .trim_matches('"');
+                    if !path_str.is_empty() {
+                        let p = PathBuf::from(path_str);
+                        if p.exists() {
+                            targets.push(p);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_disabled_returns_empty() {
+        let cfg = TargetConfig::default(); // startup_scan_enabled = false
+        let targets = StartupTargets.collect(&cfg);
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn startup_enabled_finds_something() {
+        let mut cfg = TargetConfig::default();
+        cfg.startup_scan_enabled = true;
+        cfg.startup_recent_days = 30;
+        let targets = StartupTargets.collect(&cfg);
+        // May or may not find files depending on system — just verify no crash.
+        let _ = targets.len();
+    }
+}

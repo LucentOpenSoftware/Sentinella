@@ -9,6 +9,11 @@ pub struct UpdateStatus {
     pub percent: Option<f64>,
     pub bytes_downloaded: u64,
     pub bytes_total: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// Name of the file currently being downloaded (e.g. "daily.cvd").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,244 +1,458 @@
 import {
-  Zap,
-  HardDrive,
-  RefreshCw,
-  Archive,
-  Database,
-  ShieldCheck,
-  ShieldOff,
-  Eye,
-  EyeOff,
-  Clock,
   Activity,
-  Loader2,
-  WifiOff,
   AlertCircle,
-  CheckCircle,
   AlertTriangle,
-  ServerCrash,
+  Archive,
+  CheckCircle,
+  Clock,
+  Database,
+  Eye,
+  Loader2,
+  RefreshCw,
+  Search,
+  ShieldOff,
+  WifiOff,
+  Zap,
 } from "lucide-react";
-import { QuickActionCard } from "../components/QuickActionCard";
-import { StatCard } from "../components/StatCard";
 import { Card } from "../components/Card";
-import { useDaemon } from "../hooks/useDaemon";
-import { startQuickScan, startFullScan, startSignatureUpdate } from "../api/sentinella";
+import { ShieldIcon } from "../components/ShieldIcon";
+import { useDaemonContext } from "../hooks/DaemonContext";
+import { startQuickScan } from "../api/sentinella";
+import type { Page } from "../components/Sidebar";
 
-export function Dashboard() {
-  const { data, connected, loading, error, lastRefresh, refresh } = useDaemon();
+export function Dashboard({ onNavigate }: { onNavigate: (p: Page) => void }) {
+  const { data, connected, loading, error, lastRefresh, refresh } = useDaemonContext();
 
-  // ── Loading ─────────────────────────────────────────────
   if (loading && !data) {
     return (
-      <div className="flex flex-col items-center justify-center py-32">
-        <Loader2 size={28} className="text-[rgb(var(--accent))] animate-spin mb-4" />
-        <p className="text-sm text-[rgb(var(--text-muted))]">Connecting to daemon...</p>
+      <div className="flex flex-col items-center py-32">
+        <Loader2 size={24} className="mb-4 animate-spin text-[rgb(var(--accent))]" />
+        <p className="text-[13px] text-[rgb(var(--t3))]">Connecting to daemon...</p>
       </div>
     );
   }
 
-  // ── Disconnected (never connected) ──────────────────────
   if (!connected && !data) {
     return (
-      <Card className="text-center py-20 max-w-lg mx-auto">
-        <WifiOff size={32} className="mx-auto text-[rgb(var(--warning))] mb-4" />
-        <h3 className="text-lg font-semibold mb-2">Daemon not connected</h3>
-        <p className="text-sm text-[rgb(var(--text-muted))] mb-1">
-          Cannot reach sentinelld on the named pipe.
-        </p>
-        <p className="text-xs text-[rgb(var(--text-muted))] font-mono mb-6">
-          \\.\pipe\sentinelld
-        </p>
-        {error && (
-          <p className="text-xs text-[rgb(var(--danger))] mb-4 flex items-center justify-center gap-1">
-            <AlertCircle size={12} /> {error}
-          </p>
-        )}
-        <button
-          onClick={refresh}
-          className="px-5 py-2.5 bg-[rgb(var(--accent))] text-white rounded-xl text-sm font-medium hover:opacity-90 transition-opacity cursor-pointer"
-        >
-          Retry Connection
-        </button>
-      </Card>
+      <div className="page-stack">
+        <Card className="border-[rgb(var(--amber))]/12">
+          <div className="grid gap-6 xl:grid-cols-[minmax(0,1.6fr)_320px] xl:items-start">
+            <div className="flex items-start gap-5">
+              <div className="flex h-16 w-16 flex-shrink-0 items-center justify-center rounded bg-[rgb(var(--amber))]/8 text-[rgb(var(--amber))]">
+                <WifiOff size={28} />
+              </div>
+              <div className="flex min-w-0 flex-col gap-3">
+                <h3 className="text-[24px] font-bold leading-tight">Daemon Not Connected</h3>
+                <p className="max-w-xl text-[14px] leading-relaxed text-[rgb(var(--t2))]">
+                  Cannot reach the Sentinella daemon. Make sure sentinelld is running.
+                </p>
+                {error && (
+                  <div className="flex items-center gap-2 text-[12px] text-[rgb(var(--red))]">
+                    <AlertCircle size={14} />
+                    <span>{error}</span>
+                  </div>
+                )}
+              </div>
+            </div>
+            <div className="flex flex-col gap-4">
+              <div className="rounded border border-[rgb(var(--border))]/15 bg-[rgb(var(--raised))]/25 p-4">
+                <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-[rgb(var(--t3))]">Endpoint</p>
+                <p className="mt-2 break-all font-mono text-[12px] text-[rgb(var(--t2))]">\\.\pipe\sentinelld</p>
+              </div>
+              <button
+                onClick={refresh}
+                className="rounded-xl bg-[rgb(var(--accent))] px-5 py-3 text-[13px] font-semibold text-white shadow-sm shadow-[rgb(var(--accent))]/15 hover:opacity-90 cursor-pointer"
+              >
+                Retry Connection
+              </button>
+            </div>
+          </div>
+        </Card>
+
+        <div className="card-grid-4">
+          <StatusTile
+            label="Real-time"
+            value="Unavailable"
+            sub="Watcher offline"
+            color="amber"
+            icon={<Eye size={18} />}
+          />
+          <StatusTile
+            label="Engine"
+            value="Disconnected"
+            sub="Daemon unreachable"
+            color="red"
+            icon={<ShieldOff size={18} />}
+          />
+          <StatusTile
+            label="Signatures"
+            value="Unknown"
+            sub="Database state unavailable"
+            color="amber"
+            icon={<Database size={18} />}
+          />
+          <StatusTile
+            label="Last Update"
+            value="Never"
+            sub="No sync detected"
+            color="amber"
+            icon={<Clock size={18} />}
+          />
+        </div>
+
+        <section className="section-stack">
+          <div className="flex flex-col gap-2">
+            <h4 className="text-[15px] font-semibold">Quick Actions</h4>
+            <p className="text-[12px] text-[rgb(var(--t3))]">Common tasks remain available once the daemon reconnects.</p>
+          </div>
+          <div className="card-grid-4">
+            <ActionTile
+              icon={<Search size={20} />}
+              label="Scan File"
+              description="Open single-file scan"
+              onClick={() => onNavigate("scan")}
+            />
+            <ActionTile icon={<Zap size={20} />} label="Quick Scan" description="Requires daemon connection" />
+            <ActionTile icon={<RefreshCw size={20} />} label="Update" description="Retry signatures after reconnect" />
+            <ActionTile
+              icon={<Archive size={20} />}
+              label="Quarantine"
+              description="Review isolated items"
+              onClick={() => onNavigate("quarantine")}
+            />
+          </div>
+        </section>
+      </div>
     );
   }
 
-  // ── Destructure daemon data ─────────────────────────────
   const engine = data!.engine;
-  const scan = data!.scan;
   const watcher = data!.watcher;
   const stats = data!.stats;
-  const quarantineCount = data!.quarantine.length;
   const activity = data!.activity;
-  const scanHistory = data!.scanHistory;
-
+  const idle = data!.idleScanner;
   const isReady = engine.state === "ready";
-  const isError = engine.state === "error";
+  const lastDbUpdate = engine.last_update ? new Date(engine.last_update * 1000).toLocaleString() : "Never";
+  const lastSeen = lastRefresh ? lastRefresh.toLocaleTimeString() : "Waiting";
+  const dbVersion = engine.db_version ? `v${engine.db_version}` : "Unavailable";
 
   return (
-    <div className="space-y-5">
-      {/* ── Stale-data banner ──────────────────────────── */}
-      {!connected && (
-        <div className="flex items-center gap-3 px-4 py-2.5 rounded-xl bg-[rgb(var(--warning))]/8 border border-[rgb(var(--warning))]/20 text-sm">
-          <WifiOff size={15} className="text-[rgb(var(--warning))] flex-shrink-0" />
-          <span className="text-[rgb(var(--warning))]">Daemon disconnected — showing last known state</span>
-          <button onClick={refresh} className="ml-auto text-xs text-[rgb(var(--accent))] hover:underline cursor-pointer">Retry</button>
-        </div>
-      )}
+    <div className="page-stack">
+      {/* Notifications now live in TopBar — dashboard content starts clean */}
 
-      {/* ── Protection hero ────────────────────────────── */}
-      <div className={`rounded-2xl p-5 border flex items-center gap-5 ${
-        isError ? "bg-[rgb(var(--danger))]/5 border-[rgb(var(--danger))]/20"
-        : isReady ? "bg-[rgb(var(--success))]/5 border-[rgb(var(--success))]/20"
-        : "bg-[rgb(var(--accent))]/5 border-[rgb(var(--accent))]/20"
-      }`}>
-        <div className={`w-13 h-13 rounded-2xl flex items-center justify-center flex-shrink-0 ${
-          isError ? "bg-[rgb(var(--danger))]/15" : isReady ? "bg-[rgb(var(--success))]/15" : "bg-[rgb(var(--accent))]/15"
-        }`}>
-          {isError ? <ShieldOff size={26} className="text-[rgb(var(--danger))]" />
-            : isReady ? <ShieldCheck size={26} className="text-[rgb(var(--success))]" />
-            : <Loader2 size={26} className="text-[rgb(var(--accent))] animate-spin" />}
+      <Card className={isReady ? "border-[rgb(var(--green))]/12" : "border-[rgb(var(--red))]/12"}>
+        <div className="grid gap-6 xl:grid-cols-[minmax(0,1.7fr)_300px] xl:items-start">
+          <div className="flex items-start gap-5">
+            <div
+              className={`flex h-16 w-16 flex-shrink-0 items-center justify-center rounded ${
+                isReady ? "bg-[rgb(var(--green))]/8 text-[rgb(var(--green))]" : "bg-[rgb(var(--red))]/8 text-[rgb(var(--red))]"
+              }`}
+            >
+              <ShieldIcon icon={isReady ? "protected" : "threat"} size={38} className={isReady ? "" : "opacity-70"} />
+            </div>
+            <div className="flex min-w-0 flex-col gap-3">
+              <h3 className="text-[24px] font-bold leading-tight">
+                {isReady ? "Your System is Protected" : "Protection Attention Needed"}
+              </h3>
+              <p className="max-w-2xl text-[14px] leading-relaxed text-[rgb(var(--t2))]">
+                {engine.signature_count > 0
+                  ? `${engine.signature_count.toLocaleString()} signatures loaded. ARGUS heuristics active. Database ${dbVersion}.`
+                  : "No signature database loaded yet. ARGUS heuristics active."}
+              </p>
+              <div className="flex flex-wrap items-center gap-3 text-[12px] text-[rgb(var(--t3))]">
+                <span className="rounded-full bg-[rgb(var(--raised))]/25 px-3 py-1.5">
+                  Engine {engine.engine_version}
+                </span>
+                <span className="rounded-full bg-[rgb(var(--raised))]/25 px-3 py-1.5">
+                  Watcher {watcher.mode.replace("_", " ")}
+                </span>
+              </div>
+            </div>
+          </div>
+          <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-1">
+            <HeroDetail label="Last Refresh" value={lastSeen} sub="UI heartbeat" />
+            <HeroDetail label="Database Updated" value={lastDbUpdate} sub="Last signatures sync" />
+          </div>
         </div>
-        <div className="flex-1 min-w-0">
-          <h3 className="text-lg font-semibold">
-            {isError ? "Protection Issue" : isReady ? "Your System is Protected" : "Engine Loading..."}
-          </h3>
-          <p className="text-sm text-[rgb(var(--text-muted))] mt-0.5">
-            {engine.signature_count > 0
-              ? `${engine.signature_count.toLocaleString()} signatures loaded`
-              : "No signature database loaded"}
-            {engine.db_version ? ` · DB v${engine.db_version}` : ""}
-          </p>
-        </div>
-        <div className="text-right flex-shrink-0 space-y-0.5">
-          <p className="text-xs text-[rgb(var(--text-muted))]">Engine {engine.engine_version}</p>
-          {lastRefresh && (
-            <p className="text-[11px] text-[rgb(var(--text-muted))]">
-              Refreshed {lastRefresh.toLocaleTimeString()}
-            </p>
-          )}
-        </div>
+      </Card>
+
+      <div className="card-grid-4">
+        <StatusTile
+          label="Real-time"
+          value={watcher.enabled ? "Active" : "Disabled"}
+          sub={watcher.enabled ? `${watcher.events_per_sec} events/sec` : "Watcher inactive"}
+          color={watcher.enabled ? "green" : "amber"}
+          icon={<Eye size={18} />}
+        />
+        <StatusTile
+          label="Background"
+          value={idle.state === "disabled" ? "Off"
+            : idle.state.startsWith("scanning") ? "Scanning"
+            : idle.state.startsWith("paused") ? "Paused"
+            : idle.state === "completed" ? "Done"
+            : "Waiting"}
+          sub={idle.state === "disabled" ? "Idle scanner disabled"
+            : idle.state.startsWith("scanning") ? `${idle.files_scanned_session} files · ${idle.current_target || "..."}`
+            : idle.state.startsWith("paused") ? idle.last_pause_reason.replace("_", " ")
+            : idle.state === "completed" ? `${idle.files_scanned_session} files checked`
+            : "Waiting for capacity"}
+          color={idle.state === "disabled" ? "amber"
+            : idle.state.startsWith("scanning") ? "green"
+            : idle.state === "completed" ? "green"
+            : "accent"}
+          icon={<Search size={18} />}
+        />
+        <StatusTile
+          label="ARGUS"
+          value={stats.argus_active_layers > 0 ? `${stats.argus_active_layers} Layers` : "Active"}
+          sub={stats.argus_yara_rules > 0
+            ? `${stats.argus_yara_rules} rules · ${stats.argus_files_analyzed} analyzed`
+            : stats.argus_files_analyzed > 0
+              ? `${stats.argus_files_analyzed} files analyzed`
+              : "Heuristic engine ready"}
+          color="accent"
+          icon={<Zap size={18} />}
+        />
+        <StatusTile
+          label="Signatures"
+          value={engine.signature_count > 0 ? engine.signature_count.toLocaleString() : "0"}
+          sub={`Database ${dbVersion}`}
+          color={engine.signature_count > 0 ? "green" : "amber"}
+          icon={<Database size={18} />}
+        />
       </div>
 
-      {/* ── Stats grid ─────────────────────────────────── */}
-      <div className="grid grid-cols-4 gap-3">
-        <StatCard
-          icon={<Database size={18} />}
-          label="Signatures"
-          value={engine.signature_count > 0 ? engine.signature_count.toLocaleString() : "—"}
-          sub={engine.db_version ? `DB v${engine.db_version}` : "No database"}
-          color="accent"
-        />
-        <StatCard
-          icon={watcher.enabled ? <Eye size={18} /> : <EyeOff size={18} />}
-          label="Real-time"
-          value={watcher.enabled ? "Active" : "Not active"}
-          sub={watcher.enabled ? `${watcher.watched_roots.length} folders` : "Watcher not implemented"}
-          color={watcher.enabled ? "success" : "warning"}
-        />
-        <StatCard
-          icon={<Activity size={18} />}
-          label="Scans"
-          value={String(stats.scans_completed)}
-          sub={scan.running ? `${scan.scan_type} scan running` : "Idle"}
-          color={scan.running ? "accent" : "muted"}
-        />
-        <StatCard
-          icon={<Clock size={18} />}
+      {/* Secondary row: Uptime + ARGUS Intelligence pill */}
+      <div className="dash-secondary-row">
+        <StatusTile
           label="Uptime"
           value={stats.uptime_human}
-          sub={`${stats.ipc_requests_served} IPC requests`}
-          color="muted"
+          sub="Daemon runtime"
+          color="accent"
+          icon={<Clock size={16} />}
         />
-      </div>
-
-      {/* ── Quick actions ──────────────────────────────── */}
-      <div>
-        <p className="text-xs font-medium text-[rgb(var(--text-muted))] mb-3 uppercase tracking-wider">Quick Actions</p>
-        <div className="grid grid-cols-4 gap-3">
-          <QuickActionCard icon={<Zap size={20} />} label="Quick Scan" description="Scan critical areas" accent
-            onClick={() => startQuickScan().catch(() => {})} />
-          <QuickActionCard icon={<HardDrive size={20} />} label="Full Scan" description="Scan entire system"
-            onClick={() => startFullScan().catch(() => {})} />
-          <QuickActionCard icon={<RefreshCw size={20} />} label="Update Sigs" description="Check for new definitions"
-            onClick={() => startSignatureUpdate().catch(() => {})} />
-          <QuickActionCard icon={<Archive size={20} />} label="Quarantine"
-            description={`${quarantineCount} item${quarantineCount !== 1 ? "s" : ""}`} />
-        </div>
-      </div>
-
-      {/* ── Engine details + activity ──────────────────── */}
-      <div className="grid grid-cols-5 gap-4">
-        {/* Engine panel */}
-        <Card className="col-span-2">
-          <div className="flex items-center gap-2 mb-3">
-            <ServerCrash size={14} className="text-[rgb(var(--accent))]" />
-            <h4 className="text-sm font-semibold">Engine</h4>
-          </div>
-          <div className="space-y-2 text-[13px]">
-            <DRow label="State" value={engine.state} color={isReady ? "success" : isError ? "danger" : undefined} />
-            <DRow label="Version" value={engine.engine_version} />
-            <DRow label="Protocol" value={`v${engine.protocol_version}`} />
-            <DRow label="Database" value={engine.db_version ? `v${engine.db_version}` : "None"} />
-            <DRow label="Signatures" value={engine.signature_count.toLocaleString()} />
-            <DRow label="Last update" value={engine.last_update ? new Date(engine.last_update * 1000).toLocaleString() : "Never"} />
-            <DRow label="Watcher" value={watcher.mode} />
-            <DRow label="Quarantine" value={`${quarantineCount} items`} />
-          </div>
-        </Card>
-
-        {/* Activity + scan history */}
-        <Card className="col-span-3">
-          <div className="flex items-center justify-between mb-3">
-            <div className="flex items-center gap-2">
-              <Clock size={14} className="text-[rgb(var(--text-muted))]" />
-              <h4 className="text-sm font-semibold">Activity</h4>
+        {stats.argus_yara_rules > 0 ? (
+          <div className="glass-card flex items-center gap-6 px-7 py-5">
+            {/* Left: icon + title */}
+            <div className="flex items-center gap-3 flex-shrink-0">
+              <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-[rgb(var(--accent))]/8">
+                <Zap size={16} className="text-[rgb(var(--accent))]" />
+              </div>
+              <div>
+                <h4 className="text-[13px] font-semibold">ARGUS Intelligence</h4>
+                <p className="text-[10px] text-[rgb(var(--t3))] mt-0.5">
+                  v{stats.argus_version} · {stats.argus_active_layers} layers · {stats.argus_yara_rules} rules
+                </p>
+              </div>
             </div>
-            <span className="text-[11px] text-[rgb(var(--text-muted))] bg-[rgb(var(--bg-elevated))] px-2 py-1 rounded-lg">
-              {activity.length} events · {scanHistory.length} scans
-            </span>
-          </div>
-
-          {activity.length > 0 ? (
-            <div className="space-y-1">
-              {activity.slice(0, 8).map((e, i) => (
-                <div key={i} className="flex items-start gap-3 px-2 py-2 rounded-lg hover:bg-[rgb(var(--bg-elevated))]/40 transition-colors">
-                  <div className={`w-7 h-7 rounded-md flex items-center justify-center flex-shrink-0 mt-0.5 ${
-                    e.event_type.includes("threat") || e.event_type.includes("error")
-                      ? "bg-[rgb(var(--danger))]/10 text-[rgb(var(--danger))]"
-                      : e.event_type.includes("scan") ? "bg-[rgb(var(--success))]/10 text-[rgb(var(--success))]"
-                      : e.event_type.includes("update") ? "bg-[rgb(var(--accent))]/10 text-[rgb(var(--accent))]"
-                      : "bg-[rgb(var(--bg-elevated))] text-[rgb(var(--text-muted))]"
-                  }`}>
-                    {e.event_type.includes("scan") ? <CheckCircle size={13} />
-                      : e.event_type.includes("threat") ? <AlertTriangle size={13} />
-                      : e.event_type.includes("update") ? <RefreshCw size={13} />
-                      : <Activity size={13} />}
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <p className="text-[13px] font-medium leading-tight">{e.message}</p>
-                    {e.detail && <p className="text-[11px] text-[rgb(var(--text-muted))] truncate mt-0.5">{e.detail}</p>}
-                  </div>
-                  <span className="text-[11px] text-[rgb(var(--text-muted))] flex-shrink-0 mt-0.5">
-                    {new Date(e.timestamp * 1000).toLocaleTimeString()}
-                  </span>
-                </div>
+            {/* Middle: tags */}
+            <div className="flex flex-wrap gap-1.5 flex-1 min-w-0">
+              {["Stealer Detection", "Script Abuse", "Deception & Evasion", "GitHub Stealers", "LOLBin Abuse", "Documents", "Persistence"].map((pack) => (
+                <span key={pack} className="text-[10px] px-2.5 py-1 rounded-full bg-[rgb(var(--raised))]/20 text-[rgb(var(--t3))] whitespace-nowrap">
+                  {pack}
+                </span>
               ))}
             </div>
-          ) : (
-            <p className="text-sm text-[rgb(var(--text-muted))] text-center py-6">No activity yet</p>
-          )}
-        </Card>
+            {/* Right: stat */}
+            {stats.argus_files_analyzed > 0 && (
+              <div className="text-right flex-shrink-0 min-w-[80px]">
+                <p className="text-[18px] font-bold text-[rgb(var(--t1))]">{stats.argus_files_analyzed.toLocaleString()}</p>
+                <p className="text-[10px] text-[rgb(var(--t3))]">files analyzed</p>
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="glass-card flex items-center gap-4 px-7 py-5">
+            <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-[rgb(var(--accent))]/8">
+              <Zap size={16} className="text-[rgb(var(--accent))]" />
+            </div>
+            <div>
+              <h4 className="text-[13px] font-semibold">ARGUS Intelligence</h4>
+              <p className="text-[10px] text-[rgb(var(--t3))] mt-0.5">Heuristic engine active · no YARA rules loaded</p>
+            </div>
+          </div>
+        )}
       </div>
+
+      <section className="section-stack">
+        <div className="flex flex-col gap-2">
+          <h4 className="text-[15px] font-semibold">Quick Actions</h4>
+          <p className="text-[12px] text-[rgb(var(--t3))]">Run the most common security tasks.</p>
+        </div>
+        <div className="card-grid-4">
+          <ActionTile
+            icon={<Search size={20} />}
+            label="Scan File"
+            description="Select and scan one file"
+            onClick={() => onNavigate("scan")}
+          />
+          <ActionTile
+            icon={<Zap size={20} />}
+            label="Quick Scan"
+            description="Scan common folders"
+            accent
+            onClick={() => {
+              startQuickScan().catch((e) => console.error("Quick scan failed:", e));
+              onNavigate("scan");
+            }}
+          />
+          <ActionTile
+            icon={<RefreshCw size={20} />}
+            label="Update"
+            description="Refresh signature database"
+            onClick={() => onNavigate("update")}
+          />
+          <ActionTile
+            icon={<Archive size={20} />}
+            label="Quarantine"
+            description="Inspect isolated items"
+            onClick={() => onNavigate("quarantine")}
+          />
+        </div>
+      </section>
+
+      <Card>
+        <div className="mb-5 flex items-center justify-between gap-4">
+          <div>
+            <h4 className="text-[15px] font-semibold">Recent Activity</h4>
+            <p className="mt-1 text-[12px] text-[rgb(var(--t3))]">Latest daemon events and scan history.</p>
+          </div>
+          <button
+            onClick={() => onNavigate("history")}
+            className="rounded-xl border border-[rgb(var(--accent))]/15 px-3 py-2 text-[11px] font-semibold text-[rgb(var(--accent))] hover:bg-[rgb(var(--accent))]/6 cursor-pointer"
+          >
+            View History
+          </button>
+        </div>
+        {activity.length > 0 ? (
+          <div className="space-y-2">
+            {activity.slice(0, 5).map((entry) => {
+              const state = entry.category.includes("scan")
+                ? "scan"
+                : entry.category.includes("threat")
+                  ? "threat"
+                  : "neutral";
+              return (
+                <div key={entry.event_id} className="flex items-start gap-4 rounded-xl px-4 py-3 hover:bg-[rgb(var(--raised))]/20 transition-colors">
+                  <div
+                    className={`mt-0.5 flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-xl ${
+                      state === "scan"
+                        ? "bg-[rgb(var(--green))]/8 text-[rgb(var(--green))]"
+                        : state === "threat"
+                          ? "bg-[rgb(var(--red))]/8 text-[rgb(var(--red))]"
+                          : "bg-[rgb(var(--raised))]/40 text-[rgb(var(--t3))]"
+                    }`}
+                  >
+                    {state === "scan" ? <CheckCircle size={15} /> : state === "threat" ? <AlertTriangle size={15} /> : <Activity size={15} />}
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <p className="text-[13px] font-medium">{entry.title}</p>
+                    {entry.message && <p className="mt-1 text-[11px] text-[rgb(var(--t3))]">{entry.message}</p>}
+                  </div>
+                  <span className="mt-1 flex-shrink-0 text-[10px] text-[rgb(var(--t3))]">
+                    {new Date(entry.timestamp * 1000).toLocaleTimeString()}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        ) : (
+          <div className="flex flex-col items-center py-10 text-center">
+            <Clock size={32} className="mb-3 text-[rgb(var(--t3))]/20" />
+            <p className="text-[14px] font-medium text-[rgb(var(--t2))]">No recent activity</p>
+            <p className="mt-1 text-[12px] text-[rgb(var(--t3))]">Activity appears here after scans and updates.</p>
+          </div>
+        )}
+      </Card>
     </div>
   );
 }
 
-function DRow({ label, value, color }: { label: string; value: string; color?: "success" | "danger" | "warning" }) {
+function HeroDetail({ label, value, sub }: { label: string; value: string; sub: string }) {
   return (
-    <div className="flex justify-between items-center">
-      <span className="text-[rgb(var(--text-muted))]">{label}</span>
-      <span className={color ? `font-medium text-[rgb(var(--${color}))]` : "font-medium"}>{value}</span>
+    <div className="rounded border border-[rgb(var(--border))]/15 bg-[rgb(var(--raised))]/20 p-4">
+      <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-[rgb(var(--t3))]">{label}</p>
+      <p className="mt-2 text-[15px] font-semibold text-[rgb(var(--t1))]">{value}</p>
+      <p className="mt-1 text-[11px] text-[rgb(var(--t3))]">{sub}</p>
     </div>
+  );
+}
+
+function StatusTile({
+  label,
+  value,
+  sub,
+  color,
+  icon,
+}: {
+  label: string;
+  value: string;
+  sub: string;
+  color: "accent" | "green" | "amber" | "red";
+  icon: React.ReactNode;
+}) {
+  const palette = {
+    accent: "var(--accent)",
+    green: "var(--green)",
+    amber: "var(--amber)",
+    red: "var(--red)",
+  }[color];
+
+  return (
+    <div className="glass-card flex flex-col gap-2 px-5 py-4 h-full">
+      {/* Header: icon + label */}
+      <div className="flex items-center gap-2.5">
+        <div
+          className="flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-md"
+          style={{ background: `rgba(${palette}, 0.08)`, color: `rgb(${palette})` }}
+        >
+          {icon}
+        </div>
+        <p className="text-[10px] font-semibold uppercase tracking-[0.14em]" style={{ color: `rgba(${palette}, 0.65)` }}>
+          {label}
+        </p>
+      </div>
+      {/* Value */}
+      <p className="text-[22px] font-bold leading-tight text-[rgb(var(--t1))]">{value}</p>
+      {/* Subtitle */}
+      <p className="text-[11px] leading-snug text-[rgb(var(--t3))]">{sub}</p>
+    </div>
+  );
+}
+
+function ActionTile({
+  icon,
+  label,
+  description,
+  accent,
+  onClick,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  description: string;
+  accent?: boolean;
+  onClick?: () => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={`flex h-full min-h-[130px] w-full flex-col items-start gap-4 rounded border p-6 text-left transition-colors cursor-pointer ${
+        accent
+          ? "border-[rgb(var(--accent))]/16 bg-[rgb(var(--accent))]/6 text-[rgb(var(--accent))] hover:bg-[rgb(var(--accent))]/10"
+          : "border-[rgb(var(--border))]/15 bg-[rgb(var(--surface))] text-[rgb(var(--t2))] hover:bg-[rgb(var(--raised))]/25 hover:text-[rgb(var(--t1))]"
+      }`}
+    >
+      <div
+        className={`flex h-10 w-10 items-center justify-center rounded-xl ${
+          accent ? "bg-[rgb(var(--accent))]/10" : "bg-[rgb(var(--raised))]/40"
+        }`}
+      >
+        {icon}
+      </div>
+      <div className="min-w-0">
+        <p className="text-[13px] font-semibold text-current">{label}</p>
+        <p className="mt-1 text-[11px] leading-relaxed text-[rgb(var(--t3))]">{description}</p>
+      </div>
+    </button>
   );
 }

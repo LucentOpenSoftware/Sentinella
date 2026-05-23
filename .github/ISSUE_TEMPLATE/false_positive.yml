@@ -1,0 +1,96 @@
+name: False Positive Report
+description: Report a legitimate file that was incorrectly flagged
+title: "[FP] "
+labels: ["false-positive"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Help us reduce false positives by reporting legitimate files that were flagged.
+
+        **Important:**
+        - Share the SHA-256 hash, NOT the file itself
+        - Do NOT paste credentials, tokens, or personal data
+        - Do NOT upload proprietary or licensed software
+
+  - type: input
+    id: file-name
+    attributes:
+      label: File Name
+      placeholder: "example-setup-1.2.3.exe"
+    validations:
+      required: true
+
+  - type: input
+    id: sha256
+    attributes:
+      label: SHA-256 Hash
+      description: "Visible in scan results or quarantine details"
+      placeholder: "a1b2c3d4..."
+    validations:
+      required: true
+
+  - type: input
+    id: detection-name
+    attributes:
+      label: Detection Name
+      description: "The signature or ARGUS rule name shown"
+      placeholder: "ARGUS/Suspicious.Generic or Win.Malware.X"
+    validations:
+      required: true
+
+  - type: input
+    id: argus-score
+    attributes:
+      label: ARGUS Score
+      description: "Score out of 100"
+      placeholder: "45"
+
+  - type: input
+    id: signer
+    attributes:
+      label: Digital Signer (if any)
+      description: "From 'Why this verdict?' section"
+      placeholder: "Microsoft Corporation"
+
+  - type: input
+    id: yara-rule
+    attributes:
+      label: YARA Rule (if shown)
+      description: "Rule name from findings list"
+      placeholder: "sentinella_suspicious_updaters_..."
+
+  - type: textarea
+    id: context-findings
+    attributes:
+      label: Context / Explanation Findings
+      description: "Copy the 'Why this verdict?' section if available"
+
+  - type: dropdown
+    id: publicly-available
+    attributes:
+      label: Is the file publicly downloadable?
+      options:
+        - "Yes — provide download URL below"
+        - "No — only hash shared"
+        - "Available on request"
+    validations:
+      required: true
+
+  - type: input
+    id: download-url
+    attributes:
+      label: Public Download URL (if available)
+      placeholder: "https://example.com/download/..."
+
+  - type: input
+    id: sentinella-version
+    attributes:
+      label: Sentinella Version
+      placeholder: "0.1.0-alpha"
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional Context
+      description: "Any other relevant information about the file or detection"

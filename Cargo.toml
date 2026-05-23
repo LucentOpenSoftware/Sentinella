@@ -3,8 +3,14 @@ resolver = "2"
 members = [
     "crates/sentinella-ipc-proto",
     "crates/sentinella-common",
+    "crates/argus",
     "crates/sentinelld",
     "crates/sentinella-cli",
+    "crates/sentinella-argus",
+    "crates/argusd",
+    "crates/clamavd",
+    "crates/sandboxd",
+    "crates/etw_probe",
 ]
 exclude = ["gui/src-tauri", "third_party"]
 
@@ -12,6 +18,7 @@ exclude = ["gui/src-tauri", "third_party"]
 version = "0.1.0"
 edition = "2024"
 license = "GPL-2.0-only"
+authors = ["Lucent Open Software"]
 repository = "https://github.com/nicfb/sentinella"
 rust-version = "1.85"
 
@@ -31,3 +38,4 @@ clap = { version = "4", features = ["derive"] }
 # IPC proto is shared between daemon, CLI, and GUI backend
 sentinella-ipc-proto = { path = "crates/sentinella-ipc-proto" }
 sentinella-common = { path = "crates/sentinella-common" }
+argus = { path = "crates/argus" }

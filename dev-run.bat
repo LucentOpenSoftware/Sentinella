@@ -6,9 +6,7 @@ cd /d %~dp0
 :: Sentinella Development Runner
 :: ============================================================
 ::
-:: Single command to bring the full dev environment online:
-::   daemon (named pipe) + Tauri GUI (hot-reload)
-::
+:: Single command: build + setup DLLs + start daemon + launch GUI.
 :: Safe to re-run: kills previous instances first.
 :: ============================================================
 
@@ -20,7 +18,7 @@ echo   Sentinella Development Runner
 echo  ======================================
 echo.
 
-:: ── [0/6] Resolve tool paths ────────────────────────────────
+:: ── [0/7] Resolve tool paths ────────────────────────────────
 
 set "PNPM_CMD="
 for /f "delims=" %%P in ('where pnpm.cmd 2^>nul') do (
@@ -46,9 +44,9 @@ echo  pnpm: !PNPM_CMD!
 echo  cargo: OK
 echo.
 
-:: ── [1/6] Kill previous Sentinella processes ────────────────
+:: ── [1/7] Kill previous Sentinella processes ────────────────
 
-echo [1/6] Cleaning up previous processes...
+echo [1/7] Cleaning up previous processes...
 
 taskkill /F /IM sentinelld.exe >nul 2>&1
 taskkill /F /IM Sentinella.exe >nul 2>&1
@@ -58,17 +56,20 @@ for /f "tokens=5" %%A in ('netstat -aon 2^>nul ^| findstr ":1420 " ^| findstr "L
     taskkill /F /PID %%A >nul 2>&1
 )
 
-:: Brief pause for OS to release file locks and pipes.
+:: Kill stale cargo processes holding target/ locks.
+taskkill /F /IM cargo.exe >nul 2>&1
+taskkill /F /IM rustc.exe >nul 2>&1
+
 timeout /t 2 /nobreak >nul
 echo        Done.
 echo.
 
-:: ── [2/6] Build Rust workspace ──────────────────────────────
+:: ── [2/7] Build Rust workspace ──────────────────────────────
 
-echo [2/6] Building Rust workspace...
+echo [2/7] Building Rust workspace (release)...
 echo.
 
-cargo build --workspace
+cargo build --workspace --release
 if errorlevel 1 (
     echo.
     echo  [ERR] Rust build FAILED. Fix errors above.
@@ -77,12 +78,63 @@ if errorlevel 1 (
 )
 
 echo.
-echo        Rust build OK.
+echo        Rust build OK (release).
 echo.
 
-:: ── [3/6] Ensure frontend dependencies ──────────────────────
+:: ── [3/7] Setup runtime (DLLs, certs, dirs) ────────────────
 
-echo [3/6] Checking frontend dependencies...
+echo [3/7] Setting up runtime environment...
+
+set "ROOT=%~dp0"
+set "TARGET=%ROOT%target\release"
+set "BUILD=%ROOT%build\clamav"
+
+:: Create runtime directories.
+if not exist "%ROOT%runtime\signatures" mkdir "%ROOT%runtime\signatures"
+if not exist "%ROOT%runtime\config" mkdir "%ROOT%runtime\config"
+if not exist "%ROOT%runtime\logs" mkdir "%ROOT%runtime\logs"
+if not exist "%ROOT%runtime\state" mkdir "%ROOT%runtime\state"
+if not exist "%ROOT%runtime\quarantine" mkdir "%ROOT%runtime\quarantine"
+if not exist "%ROOT%runtime\rules" mkdir "%ROOT%runtime\rules"
+if not exist "%ROOT%runtime\argus\rules\yara" mkdir "%ROOT%runtime\argus\rules\yara"
+if not exist "%ROOT%runtime\argus\compiled" mkdir "%ROOT%runtime\argus\compiled"
+if not exist "%ROOT%runtime\argus\manifests" mkdir "%ROOT%runtime\argus\manifests"
+
+:: Copy ClamAV DLLs to target\debug (if ClamAV was built).
+if exist "%BUILD%\libclamav\Release\libclamav.dll" (
+    for %%D in (libclamav\Release libclammspack\Release libfreshclam\Release) do (
+        for %%F in ("%BUILD%\%%D\*.dll") do (
+            if not exist "%TARGET%\%%~nxF" copy /Y "%%F" "%TARGET%\" >nul 2>&1
+        )
+    )
+    echo        DLLs copied.
+) else (
+    echo  [WARN] ClamAV not built. Daemon will start without scanning.
+    echo         Run: scripts\build-clamav-windows.bat
+)
+
+:: Copy certs.
+if not exist "%TARGET%\certs" (
+    if exist "%ROOT%third_party\clamav\certs" (
+        xcopy /E /I /Q "%ROOT%third_party\clamav\certs" "%TARGET%\certs" >nul 2>&1
+        echo        Certs copied.
+    )
+)
+
+:: Copy freshclam.
+if not exist "%TARGET%\freshclam.exe" (
+    if exist "%BUILD%\freshclam\Release\freshclam.exe" (
+        copy /Y "%BUILD%\freshclam\Release\freshclam.exe" "%TARGET%\" >nul 2>&1
+        echo        freshclam.exe copied.
+    )
+)
+
+echo        Runtime OK.
+echo.
+
+:: ── [4/7] Ensure frontend dependencies ──────────────────────
+
+echo [4/7] Checking frontend dependencies...
 
 if not exist "gui\node_modules\" (
     echo        Installing...
@@ -101,9 +153,9 @@ if not exist "gui\node_modules\" (
 )
 echo.
 
-:: ── [4/6] TypeScript check ──────────────────────────────────
+:: ── [5/7] TypeScript check ──────────────────────────────────
 
-echo [4/6] TypeScript type-check...
+echo [5/7] TypeScript type-check...
 
 pushd gui
 call "!PNPM_CMD!" exec tsc --noEmit
@@ -118,38 +170,36 @@ popd
 echo        Types OK.
 echo.
 
-:: ── [5/6] Start daemon ──────────────────────────────────────
+:: ── [6/7] Start daemon with ClamAV engine ───────────────────
 
-echo [5/6] Starting sentinelld daemon...
+echo [6/7] Starting sentinelld daemon (release)...
 
-set "DAEMON_BIN=%~dp0target\debug\sentinelld.exe"
+set "DAEMON_BIN=%TARGET%\sentinelld.exe"
 if not exist "!DAEMON_BIN!" (
-    echo  [WARN] Binary not found, falling back to cargo run
-    set "DAEMON_BIN=cargo run -p sentinelld --"
+    echo  [WARN] Release binary not found, falling back to cargo run --release
+    set "DAEMON_CMD=cargo run --release -p sentinelld -- --foreground --log-level info --dll-dir "%TARGET%" --db-dir "%ROOT%runtime\signatures""
+) else (
+    echo        Binary: !DAEMON_BIN!
+    set "DAEMON_CMD=!DAEMON_BIN! --foreground --log-level info --dll-dir "%TARGET%" --db-dir "%ROOT%runtime\signatures""
 )
 
-start "sentinelld" cmd /k "title sentinelld && cd /d %~dp0 && !DAEMON_BIN! --foreground --log-level debug"
+start "sentinelld" cmd /k "title sentinelld && cd /d %~dp0 && !DAEMON_CMD!"
 
-echo        Waiting for pipe...
-timeout /t 3 /nobreak >nul
+echo        Waiting for engine to load (this takes ~15 seconds)...
+timeout /t 5 /nobreak >nul
 
 tasklist /FI "IMAGENAME eq sentinelld.exe" /FO CSV /NH 2>nul | findstr /I "sentinelld" >nul
 if errorlevel 1 (
-    echo  [WARN] Daemon not detected. Check its window.
+    echo  [WARN] Daemon not detected. Check its window for errors.
 ) else (
     echo        Daemon running.
+    echo        Pipe: \\.\pipe\sentinelld
 )
 echo.
 
-:: ── [6/6] Launch Tauri GUI ──────────────────────────────────
-::
-:: Write a small .bat launcher to %TEMP% to avoid nested-quote
-:: issues with start + cmd /k + paths containing spaces.
-::
-:: The > redirection builds the file line by line. Each line
-:: uses >> to append after the first.
+:: ── [7/7] Launch Tauri GUI ──────────────────────────────────
 
-echo [6/6] Launching Tauri GUI...
+echo [7/7] Launching Tauri GUI...
 
 set "LAUNCHER=%TEMP%\sentinella-dev-gui.bat"
 
@@ -161,10 +211,8 @@ set "LAUNCHER=%TEMP%\sentinella-dev-gui.bat"
 >> "!LAUNCHER!" echo echo GUI exited. Press any key to close.
 >> "!LAUNCHER!" echo pause
 
-:: Verify the launcher was written.
 if not exist "!LAUNCHER!" (
-    echo  [ERR] Could not create GUI launcher at !LAUNCHER!
-    echo        Trying direct launch instead...
+    echo  [ERR] Could not create GUI launcher.
     pushd gui
     start "Sentinella GUI" cmd /k "call "!PNPM_CMD!" tauri dev"
     popd
@@ -174,7 +222,7 @@ if not exist "!LAUNCHER!" (
 start "Sentinella GUI" cmd /c "call "!LAUNCHER!""
 
 :summary
-echo        Waiting for Vite + Tauri...
+echo        Waiting for Vite + Tauri to compile...
 timeout /t 5 /nobreak >nul
 
 echo.
@@ -182,15 +230,21 @@ echo  ======================================
 echo   Sentinella dev environment ready
 echo  ======================================
 echo.
-echo   Daemon:  sentinelld.exe
-echo            Pipe \\.\pipe\sentinelld
-echo            Logs in "sentinelld" window
+echo   Daemon:  sentinelld.exe (release build)
+echo            --dll-dir %TARGET%
+echo            --db-dir  %ROOT%runtime\signatures
+echo            Pipe: \\.\pipe\sentinelld
+echo            Logs: "sentinelld" console window
+echo            Log level: info
 echo.
 echo   GUI:     Tauri + Vite on http://localhost:1420
 echo            Hot-reload active
-echo            Logs in "Sentinella GUI" window
+echo            Logs: "Sentinella GUI" console window
 echo.
 echo   Re-run:  dev-run.bat  (kills previous automatically)
+echo.
+echo   Tip: If Tauri build fails with "os error 32",
+echo        close all Sentinella windows and re-run.
 echo.
 
 pause
