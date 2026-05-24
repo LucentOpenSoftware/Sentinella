@@ -142,6 +142,57 @@ pub struct TrustQuery {
     pub stable_days: u32,
 }
 
+/// A behavioral drift event — trusted pattern mutated.
+#[derive(Debug, Clone, Serialize)]
+pub struct DriftEvent {
+    pub timestamp: i64,
+    pub entity_key: String,
+    pub drift_type: DriftType,
+    pub old_value: Option<String>,
+    pub new_value: Option<String>,
+    pub trust_impact: String,
+    pub explanation: String,
+}
+
+/// Types of behavioral drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DriftType {
+    /// Signer changed on a previously-signed binary.
+    SignerChanged,
+    /// Trusted process chain mutated (new child process).
+    ChainMutated,
+    /// Previously stable binary moved to new location.
+    PathChanged,
+    /// Trusted entity reappeared after long absence.
+    StaleReturn,
+    /// New persistence entry from previously non-persistent process.
+    NewPersistence,
+}
+
+impl DriftType {
+    /// Suspicion boost for this drift type.
+    pub fn suspicion_weight(&self) -> u32 {
+        match self {
+            Self::SignerChanged => 10,
+            Self::ChainMutated => 6,
+            Self::PathChanged => 4,
+            Self::StaleReturn => 3,
+            Self::NewPersistence => 8,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::SignerChanged => "Signer changed",
+            Self::ChainMutated => "Process chain mutated",
+            Self::PathChanged => "File path changed",
+            Self::StaleReturn => "Returned after long absence",
+            Self::NewPersistence => "New persistence entry",
+        }
+    }
+}
+
 /// The trust graph — SQLite-backed local memory.
 pub struct TrustGraph {
     conn: Mutex<Connection>,
@@ -169,6 +220,19 @@ impl TrustGraph {
 
             CREATE INDEX IF NOT EXISTS idx_trust_last_seen ON trust_nodes(last_seen);
             CREATE INDEX IF NOT EXISTS idx_trust_kind ON trust_nodes(kind);
+
+            CREATE TABLE IF NOT EXISTS drift_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER NOT NULL,
+                entity_key TEXT NOT NULL,
+                drift_type TEXT NOT NULL,
+                old_value TEXT,
+                new_value TEXT,
+                trust_impact TEXT NOT NULL,
+                explanation TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_drift_timestamp ON drift_events(timestamp);
         ").map_err(|e| format!("trust_graph schema: {e}"))?;
 
         info!("trust graph opened");
@@ -261,7 +325,148 @@ impl TrustGraph {
 
     /// Generate a chain key from a PLM process chain.
     pub fn chain_key(chain_names: &[&str]) -> String {
-        chain_names.join("→")
+        chain_names.join(">")
+    }
+
+    /// Observe with signer consistency check.
+    /// Detects drift: signer changed on previously-signed binary.
+    pub fn observe_with_signer(&self, key: &str, kind: TrustNodeKind, new_signer: Option<&str>) -> Option<DriftEvent> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Check existing signer before updating.
+        let existing_signer: Option<String> = conn.query_row(
+            "SELECT signer FROM trust_nodes WHERE key = ?1",
+            params![key],
+            |row| row.get(0),
+        ).ok().flatten();
+
+        drop(conn);
+
+        // Record observation (updates last_seen, count, etc.)
+        self.observe(key, kind, new_signer);
+
+        // Detect signer drift.
+        if let Some(ref old) = existing_signer {
+            if let Some(new) = new_signer {
+                if !old.is_empty() && old != new {
+                    let drift = DriftEvent {
+                        timestamp: chrono::Utc::now().timestamp(),
+                        entity_key: key.to_string(),
+                        drift_type: DriftType::SignerChanged,
+                        old_value: Some(old.clone()),
+                        new_value: Some(new.to_string()),
+                        trust_impact: "trust invalidated".into(),
+                        explanation: format!("Signer changed from '{}' to '{}'", old, new),
+                    };
+                    self.record_drift(&drift);
+                    // Invalidate trust: reset observation count.
+                    self.reset_trust(key);
+                    return Some(drift);
+                }
+            } else if !old.is_empty() {
+                // Was signed, now unsigned — significant drift.
+                let drift = DriftEvent {
+                    timestamp: chrono::Utc::now().timestamp(),
+                    entity_key: key.to_string(),
+                    drift_type: DriftType::SignerChanged,
+                    old_value: Some(old.clone()),
+                    new_value: None,
+                    trust_impact: "trust invalidated — unsigned".into(),
+                    explanation: format!("Previously signed by '{}', now unsigned", old),
+                };
+                self.record_drift(&drift);
+                self.reset_trust(key);
+                return Some(drift);
+            }
+        }
+
+        None
+    }
+
+    /// Detect chain mutation: trusted chain gained new child.
+    pub fn check_chain_drift(&self, base_chain_key: &str, extended_chain_key: &str) -> Option<DriftEvent> {
+        let base_q = self.query(base_chain_key);
+        let ext_q = self.query(extended_chain_key);
+
+        // Base chain is established but extended chain is unknown = mutation.
+        if base_q.trust_level >= TrustLevel::Established && ext_q.trust_level == TrustLevel::Unknown {
+            let drift = DriftEvent {
+                timestamp: chrono::Utc::now().timestamp(),
+                entity_key: extended_chain_key.to_string(),
+                drift_type: DriftType::ChainMutated,
+                old_value: Some(base_chain_key.to_string()),
+                new_value: Some(extended_chain_key.to_string()),
+                trust_impact: "new child in trusted chain".into(),
+                explanation: format!(
+                    "Trusted chain '{}' extended with new process",
+                    base_chain_key
+                ),
+            };
+            self.record_drift(&drift);
+            return Some(drift);
+        }
+
+        None
+    }
+
+    /// Record a drift event.
+    fn record_drift(&self, drift: &DriftEvent) {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let dtype = format!("{:?}", drift.drift_type);
+        let _ = conn.execute(
+            "INSERT INTO drift_events (timestamp, entity_key, drift_type, old_value, new_value, trust_impact, explanation)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![drift.timestamp, drift.entity_key, dtype, drift.old_value, drift.new_value, drift.trust_impact, drift.explanation],
+        );
+        info!(
+            entity = %drift.entity_key,
+            drift_type = %dtype,
+            "ASTRA behavioral drift detected"
+        );
+    }
+
+    /// Reset trust for an entity (signer changed, etc.)
+    fn reset_trust(&self, key: &str) {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = conn.execute(
+            "UPDATE trust_nodes SET observation_count = 1, stable_days = 0 WHERE key = ?1",
+            params![key],
+        );
+    }
+
+    /// Get recent drift events for diagnostics.
+    pub fn recent_drifts(&self, limit: usize) -> Vec<DriftEvent> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = match conn.prepare(
+            "SELECT timestamp, entity_key, drift_type, old_value, new_value, trust_impact, explanation FROM drift_events ORDER BY timestamp DESC LIMIT ?1"
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+
+        match stmt.query_map(params![limit as i64], |row| {
+            let dtype_str: String = row.get(2)?;
+            let drift_type = match dtype_str.as_str() {
+                "SignerChanged" => DriftType::SignerChanged,
+                "ChainMutated" => DriftType::ChainMutated,
+                "PathChanged" => DriftType::PathChanged,
+                "StaleReturn" => DriftType::StaleReturn,
+                "NewPersistence" => DriftType::NewPersistence,
+                _ => DriftType::ChainMutated,
+            };
+            Ok(DriftEvent {
+                timestamp: row.get(0)?,
+                entity_key: row.get(1)?,
+                drift_type,
+                old_value: row.get(3)?,
+                new_value: row.get(4)?,
+                trust_impact: row.get(5)?,
+                explanation: row.get(6)?,
+            })
+        }) {
+            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+            Err(_) => vec![],
+        }
     }
 
     /// Get diagnostics summary.
@@ -290,12 +495,21 @@ impl TrustGraph {
             |r| r.get(0),
         ).unwrap_or(0);
 
+        let drift_count: u64 = conn.query_row("SELECT COUNT(*) FROM drift_events", [], |r| r.get(0)).unwrap_or(0);
+        let recent_drifts: u64 = conn.query_row(
+            "SELECT COUNT(*) FROM drift_events WHERE timestamp > ?1",
+            params![now - 86400],
+            |r| r.get(0),
+        ).unwrap_or(0);
+
         serde_json::json!({
             "nodes": total,
             "stable_nodes": stable,
             "rare_nodes": rare,
             "recently_seen": recent,
             "stale_nodes": stale,
+            "drift_events_total": drift_count,
+            "drift_events_24h": recent_drifts,
             "max_nodes": MAX_NODES,
             "decay_days": TRUST_DECAY_DAYS,
         })
@@ -351,6 +565,25 @@ pub fn trust_finding(query: &TrustQuery) -> Option<argus::Finding> {
             query.observation_count, query.stable_days
         )),
     })
+}
+
+/// Create an ARGUS finding from behavioral drift detection.
+/// Drift INCREASES suspicion — a trusted pattern that mutated is concerning.
+pub fn drift_finding(drift: &DriftEvent) -> argus::Finding {
+    argus::Finding {
+        layer: argus::verdict::Layer::Context,
+        severity: if drift.drift_type.suspicion_weight() >= 8 {
+            argus::verdict::Severity::High
+        } else {
+            argus::verdict::Severity::Medium
+        },
+        weight: drift.drift_type.suspicion_weight(),
+        description: format!("Behavioral drift: {}", drift.explanation),
+        technical_detail: Some(format!(
+            "type={:?} old={:?} new={:?} impact={}",
+            drift.drift_type, drift.old_value, drift.new_value, drift.trust_impact
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -455,5 +688,69 @@ mod tests {
         assert!(e.contains("200"));
         assert!(e.contains("30"));
         assert!(e.contains("Trusted"));
+    }
+
+    #[test]
+    fn signer_change_detects_drift() {
+        let g = open_mem();
+        // First observation with signer A.
+        g.observe("app.exe", TrustNodeKind::Executable, Some("Company A"));
+        // Second observation with signer B.
+        let drift = g.observe_with_signer("app.exe", TrustNodeKind::Executable, Some("Company B"));
+        assert!(drift.is_some());
+        let d = drift.unwrap();
+        assert_eq!(d.drift_type, DriftType::SignerChanged);
+        // Trust should be reset.
+        let q = g.query("app.exe");
+        assert_eq!(q.observation_count, 1); // Reset to 1.
+    }
+
+    #[test]
+    fn same_signer_no_drift() {
+        let g = open_mem();
+        g.observe("app.exe", TrustNodeKind::Executable, Some("Microsoft"));
+        let drift = g.observe_with_signer("app.exe", TrustNodeKind::Executable, Some("Microsoft"));
+        assert!(drift.is_none());
+    }
+
+    #[test]
+    fn unsigned_after_signed_is_drift() {
+        let g = open_mem();
+        g.observe("tool.exe", TrustNodeKind::Executable, Some("Vendor"));
+        let drift = g.observe_with_signer("tool.exe", TrustNodeKind::Executable, None);
+        assert!(drift.is_some());
+        assert_eq!(drift.unwrap().drift_type, DriftType::SignerChanged);
+    }
+
+    #[test]
+    fn drift_suspicion_weights() {
+        assert!(DriftType::SignerChanged.suspicion_weight() > DriftType::StaleReturn.suspicion_weight());
+        assert!(DriftType::NewPersistence.suspicion_weight() > DriftType::PathChanged.suspicion_weight());
+    }
+
+    #[test]
+    fn drift_finding_has_weight() {
+        let d = DriftEvent {
+            timestamp: 0,
+            entity_key: "test".into(),
+            drift_type: DriftType::SignerChanged,
+            old_value: Some("A".into()),
+            new_value: Some("B".into()),
+            trust_impact: "invalidated".into(),
+            explanation: "Signer changed".into(),
+        };
+        let f = drift_finding(&d);
+        assert_eq!(f.weight, 10);
+        assert_eq!(f.severity, argus::verdict::Severity::High);
+    }
+
+    #[test]
+    fn recent_drifts_returns_events() {
+        let g = open_mem();
+        g.observe("test.exe", TrustNodeKind::Executable, Some("A"));
+        let _ = g.observe_with_signer("test.exe", TrustNodeKind::Executable, Some("B"));
+        let drifts = g.recent_drifts(10);
+        assert_eq!(drifts.len(), 1);
+        assert_eq!(drifts[0].drift_type, DriftType::SignerChanged);
     }
 }
