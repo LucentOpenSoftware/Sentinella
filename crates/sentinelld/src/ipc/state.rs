@@ -3890,15 +3890,19 @@ fn folder_scan_worker_inner(
                     }
                 }
 
-                // ── ADS scan (profile-aware) ───────────────
+                // ── ADS content scan (ASTRA, profile-aware) ───
                 if !tracker.is_expired() {
                     let ads_policy = crate::scan::ads::ads_policy_for_profile(&scan_profile);
                     let streams = crate::scan::ads::enumerate_ads(file);
                     let filtered = crate::scan::ads::filter_streams(streams, ads_policy);
                     for stream in &filtered {
-                        let finding = crate::scan::ads::ads_finding(stream);
-                        argus_verdict.score = argus_verdict.score.saturating_add(finding.weight).min(100);
-                        argus_verdict.findings.push(finding);
+                        if tracker.is_expired() { break; }
+                        // Real content scan — feed ADS content to ARGUS.
+                        let ads_result = crate::scan::ads::scan_ads_content(stream, state_ref.argus());
+                        for finding in ads_result.content_findings {
+                            argus_verdict.score = argus_verdict.score.saturating_add(finding.weight).min(100);
+                            argus_verdict.findings.push(finding);
+                        }
                     }
                     if !filtered.is_empty() {
                         argus_verdict.verdict = argus::verdict::Verdict::from_score(argus_verdict.score);

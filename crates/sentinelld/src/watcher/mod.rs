@@ -375,15 +375,18 @@ fn watcher_loop(
                     }
                 };
 
-                // ── ADS scan (realtime profile: executable streams only) ──
+                // ── ADS content scan (ASTRA, realtime: exe streams only) ──
                 if !rt_tracker.is_expired() {
                     let ads_policy = crate::scan::ads::ads_policy_for_profile(&rt_profile);
                     let streams = crate::scan::ads::enumerate_ads(&path);
                     let filtered = crate::scan::ads::filter_streams(streams, ads_policy);
                     for stream in &filtered {
-                        let finding = crate::scan::ads::ads_finding(stream);
-                        argus_verdict.score = argus_verdict.score.saturating_add(finding.weight).min(100);
-                        argus_verdict.findings.push(finding);
+                        if rt_tracker.is_expired() { break; }
+                        let ads_result = crate::scan::ads::scan_ads_content(stream, state.argus());
+                        for finding in ads_result.content_findings {
+                            argus_verdict.score = argus_verdict.score.saturating_add(finding.weight).min(100);
+                            argus_verdict.findings.push(finding);
+                        }
                     }
                     if !filtered.is_empty() {
                         argus_verdict.verdict = argus::verdict::Verdict::from_score(argus_verdict.score);
