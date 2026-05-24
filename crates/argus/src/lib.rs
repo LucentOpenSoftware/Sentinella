@@ -26,6 +26,7 @@ pub mod budget;
 pub mod correlation;
 pub mod engine;
 pub mod layers;
+pub mod profile;
 pub mod verdict;
 
 pub use engine::{ArgusConfig, ArgusEngine, ArgusStats, ENGINE_VERSION};

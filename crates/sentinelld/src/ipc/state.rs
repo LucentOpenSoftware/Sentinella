@@ -3796,13 +3796,9 @@ fn folder_scan_worker_inner(
                     continue;
                 }
 
-                // ── Per-file budget enforcement ────────────────
-                let budget = match scan_type_w.as_str() {
-                    "quick" | "startup" => argus::budget::ScanExecutionBudget::startup(),
-                    "folder" | "full" => argus::budget::ScanExecutionBudget::manual(),
-                    _ => argus::budget::ScanExecutionBudget::manual(),
-                };
-                let tracker = argus::budget::BudgetTracker::new(budget, Arc::clone(&cancel_ref));
+                // ── Per-file profile + budget enforcement ──────
+                let scan_profile = argus::profile::ScanProfile::for_context(&scan_type_w);
+                let tracker = argus::budget::BudgetTracker::new(scan_profile.budget.clone(), Arc::clone(&cancel_ref));
 
                 // ClamAV scan (with budget check).
                 let clamav_start = std::time::Instant::now();

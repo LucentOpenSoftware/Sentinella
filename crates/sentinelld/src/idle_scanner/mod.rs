@@ -597,7 +597,8 @@ fn idle_scanner_loop(
                 }
 
                 // ── Budget-bounded idle scan ─────────────
-                let idle_budget = argus::budget::ScanExecutionBudget::idle();
+                let idle_profile = argus::profile::ScanProfile::idle();
+                let idle_budget = idle_profile.budget.clone();
                 let idle_tracker = argus::budget::BudgetTracker::new(
                     idle_budget,
                     std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),

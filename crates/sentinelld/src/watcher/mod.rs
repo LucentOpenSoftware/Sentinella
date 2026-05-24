@@ -314,7 +314,8 @@ fn watcher_loop(
                 }
 
                 // ── Budget-bounded realtime scan ──────────────
-                let rt_budget = argus::budget::ScanExecutionBudget::realtime();
+                let rt_profile = argus::profile::ScanProfile::realtime();
+                let rt_budget = rt_profile.budget.clone();
                 let rt_cancel = std::sync::atomic::AtomicBool::new(false);
                 let rt_tracker = argus::budget::BudgetTracker::new(
                     rt_budget,
