@@ -3890,6 +3890,21 @@ fn folder_scan_worker_inner(
                     }
                 }
 
+                // ── ADS scan (profile-aware) ───────────────
+                if !tracker.is_expired() {
+                    let ads_policy = crate::scan::ads::ads_policy_for_profile(&scan_profile);
+                    let streams = crate::scan::ads::enumerate_ads(file);
+                    let filtered = crate::scan::ads::filter_streams(streams, ads_policy);
+                    for stream in &filtered {
+                        let finding = crate::scan::ads::ads_finding(stream);
+                        argus_verdict.score = argus_verdict.score.saturating_add(finding.weight).min(100);
+                        argus_verdict.findings.push(finding);
+                    }
+                    if !filtered.is_empty() {
+                        argus_verdict.verdict = argus::verdict::Verdict::from_score(argus_verdict.score);
+                    }
+                }
+
                 live_w.files_scanned.fetch_add(1, Ordering::Relaxed);
 
                 if let Some(e) = worker_error {

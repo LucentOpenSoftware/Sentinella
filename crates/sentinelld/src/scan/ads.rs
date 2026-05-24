@@ -152,6 +152,35 @@ pub fn ads_policy_for_profile(profile: &argus::profile::ScanProfile) -> AdsScanP
     }
 }
 
+/// Create an ARGUS finding for a detected ADS.
+pub fn ads_finding(stream: &AlternateStream) -> argus::Finding {
+    let weight = if stream.suspicious { 15 } else { 5 };
+    let severity = if stream.suspicious {
+        argus::verdict::Severity::High
+    } else {
+        argus::verdict::Severity::Low
+    };
+    let desc = if stream.suspicious {
+        format!(
+            "Suspicious alternate data stream detected: '{}' ({} bytes) — executable/script content hidden in ADS",
+            stream.stream_name, stream.size
+        )
+    } else {
+        format!(
+            "Non-default alternate data stream detected: '{}' ({} bytes)",
+            stream.stream_name, stream.size
+        )
+    };
+
+    argus::Finding {
+        layer: argus::verdict::Layer::AlternateDataStream,
+        severity,
+        weight,
+        description: desc,
+        technical_detail: Some(stream.full_path.clone()),
+    }
+}
+
 /// Filter streams based on scan policy.
 pub fn filter_streams(streams: Vec<AlternateStream>, policy: AdsScanPolicy) -> Vec<AlternateStream> {
     match policy {

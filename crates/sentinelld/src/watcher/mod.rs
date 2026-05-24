@@ -334,7 +334,7 @@ fn watcher_loop(
                 }
 
                 // Check total budget before ARGUS — realtime MUST NOT stall.
-                let argus_verdict = if rt_tracker.is_expired() {
+                let mut argus_verdict = if rt_tracker.is_expired() {
                     rt_tracker.record_timeout(argus::budget::TimeoutReason::TotalTimeout);
                     debug!(file = %path.display(), "realtime budget exhausted, skipping ARGUS");
                     // Partial result: ClamAV ran, ARGUS skipped.
@@ -374,6 +374,21 @@ fn watcher_loop(
                         timing: None,
                     }
                 };
+
+                // ── ADS scan (realtime profile: executable streams only) ──
+                if !rt_tracker.is_expired() {
+                    let ads_policy = crate::scan::ads::ads_policy_for_profile(&rt_profile);
+                    let streams = crate::scan::ads::enumerate_ads(&path);
+                    let filtered = crate::scan::ads::filter_streams(streams, ads_policy);
+                    for stream in &filtered {
+                        let finding = crate::scan::ads::ads_finding(stream);
+                        argus_verdict.score = argus_verdict.score.saturating_add(finding.weight).min(100);
+                        argus_verdict.findings.push(finding);
+                    }
+                    if !filtered.is_empty() {
+                        argus_verdict.verdict = argus::verdict::Verdict::from_score(argus_verdict.score);
+                    }
+                }
 
                 // ── Behavioral sandbox routing (async) ────────────
                 // ARGUS 26-75 + sandbox enabled → detonate on background thread.

@@ -801,6 +801,8 @@ pub enum Layer {
     Context,
     /// Behavioral runtime analysis (sandbox detonation findings).
     BehavioralRuntime,
+    /// NTFS Alternate Data Stream detection.
+    AlternateDataStream,
 }
 
 impl Layer {
@@ -819,6 +821,7 @@ impl Layer {
             Self::Reputation => "Software Reputation",
             Self::Context => "Origin Context",
             Self::BehavioralRuntime => "Behavioral Analysis",
+            Self::AlternateDataStream => "Alternate Data Streams",
         }
     }
 }
