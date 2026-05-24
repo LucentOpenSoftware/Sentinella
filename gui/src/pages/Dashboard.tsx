@@ -14,12 +14,14 @@ import {
   WifiOff,
   Zap,
 } from "lucide-react";
+import { useState, useEffect } from "react";
 import { Card } from "../components/Card";
 import { ShieldIcon } from "../components/ShieldIcon";
 import { useDaemonContext } from "../hooks/DaemonContext";
-import { startQuickScan } from "../api/sentinella";
+import { startQuickScan, getRuntimeIntelligence } from "../api/sentinella";
 import { t } from "../i18n";
 import type { Page } from "../components/Sidebar";
+import type { RuntimeIntelligenceStatus } from "../types/sentinella";
 
 export function Dashboard({ onNavigate }: { onNavigate: (p: Page) => void }) {
   const { data, connected, loading, error, lastRefresh, refresh } = useDaemonContext();
@@ -283,6 +285,9 @@ export function Dashboard({ onNavigate }: { onNavigate: (p: Page) => void }) {
         )}
       </div>
 
+      {/* Runtime Intelligence — compact ASTRA card */}
+      <RuntimeIntelligenceCard />
+
       <section className="section-stack">
         <div className="flex flex-col gap-2">
           <h4 className="text-[15px] font-semibold">{t("dash.quick_actions")}</h4>
@@ -463,5 +468,108 @@ function ActionTile({
         <p className="mt-1 text-[11px] leading-relaxed text-[rgb(var(--t3))]">{description}</p>
       </div>
     </button>
+  );
+}
+
+// ── Runtime Intelligence compact card ─────────────────────────
+
+function RuntimeIntelligenceCard() {
+  const [ri, setRi] = useState<RuntimeIntelligenceStatus | null>(null);
+  const { connected } = useDaemonContext();
+
+  useEffect(() => {
+    if (!connected) return;
+    getRuntimeIntelligence().then(setRi).catch(() => {});
+    const interval = setInterval(() => {
+      getRuntimeIntelligence().then(setRi).catch(() => {});
+    }, 10000); // Refresh every 10s.
+    return () => clearInterval(interval);
+  }, [connected]);
+
+  if (!ri) return null;
+
+  const plmActive = ri.plm?.enabled;
+  const psEnabled = ri.powershell?.enabled;
+  const psEvents = ri.powershell?.events_scanned ?? 0;
+  const plmNodes = ri.plm?.nodes ?? 0;
+  const plmChains = ri.plm?.suspicious_chains ?? 0;
+  const recentEvents = ri.powershell?.recent_events ?? [];
+
+  // Don't show if everything is disabled and no data.
+  if (!plmActive && !psEnabled && recentEvents.length === 0) return null;
+
+  return (
+    <div className="glass-card px-7 py-5">
+      <div className="flex items-center justify-between mb-4">
+        <div className="flex items-center gap-3">
+          <div className="flex h-8 w-8 items-center justify-center rounded-xl bg-[rgb(var(--accent))]/8">
+            <Activity size={15} className="text-[rgb(var(--accent))]" />
+          </div>
+          <div>
+            <h4 className="text-[13px] font-semibold">Runtime Intelligence</h4>
+            <p className="text-[10px] text-[rgb(var(--t3))] mt-0.5">ASTRA adaptive analysis · observe-only</p>
+          </div>
+        </div>
+        <span className="text-[10px] px-2.5 py-1 rounded-full bg-[rgb(var(--green))]/8 text-[rgb(var(--green))]">
+          {plmActive ? "Active" : "Standby"}
+        </span>
+      </div>
+
+      {/* Compact stats row */}
+      <div className="grid grid-cols-4 gap-4 mb-4">
+        <MiniStat label="PLM nodes" value={plmNodes} />
+        <MiniStat label="PS buffers" value={psEvents} />
+        <MiniStat label="Suspicious chains" value={plmChains} color={plmChains > 0 ? "amber" : undefined} />
+        <MiniStat label="SBL" value={ri.powershell?.sbl_available ? "Available" : "Unavailable"} />
+      </div>
+
+      {/* Recent events (if any) */}
+      {recentEvents.length > 0 && (
+        <div>
+          <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[rgb(var(--t3))]/40 mb-2">
+            Recent runtime events
+          </p>
+          <div className="space-y-1.5">
+            {recentEvents.slice(-5).reverse().map((evt, i) => (
+              <div key={i} className="flex items-center gap-3 text-[11px] py-1.5 px-2 rounded-lg hover:bg-[rgb(var(--raised))]/10">
+                <span className={`w-6 text-right font-mono font-bold ${evt.score >= 50 ? "text-[rgb(var(--amber))]" : evt.score > 0 ? "text-[rgb(var(--t2))]" : "text-[rgb(var(--t3))]/40"}`}>
+                  {evt.score}
+                </span>
+                <span className="text-[rgb(var(--t3))]/60 w-16 flex-shrink-0">{evt.language}</span>
+                <span className="text-[rgb(var(--t2))] truncate flex-1 min-w-0">{evt.content_name}</span>
+                {evt.findings_count > 0 && (
+                  <span className="text-[10px] text-[rgb(var(--amber))] flex-shrink-0">{evt.findings_count} findings</span>
+                )}
+                {evt.lineage_summary && (
+                  <span className="text-[10px] text-[rgb(var(--accent))]/60 truncate max-w-[150px] flex-shrink-0" title={evt.lineage_summary}>
+                    {evt.lineage_summary}
+                  </span>
+                )}
+                <span className="text-[9px] text-[rgb(var(--green))]/50 flex-shrink-0">observe</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Disabled states */}
+      {!psEnabled && (
+        <p className="text-[10px] text-[rgb(var(--t3))]/40 mt-2">
+          PowerShell bridge disabled · enable in sentinelld.toml
+        </p>
+      )}
+    </div>
+  );
+}
+
+function MiniStat({ label, value, color }: { label: string; value: string | number; color?: string }) {
+  const c = color === "amber" ? "var(--amber)" : "var(--t1)";
+  return (
+    <div>
+      <p className="text-[18px] font-bold" style={{ color: `rgb(${c})` }}>
+        {typeof value === "number" ? value.toLocaleString() : value}
+      </p>
+      <p className="text-[10px] text-[rgb(var(--t3))] mt-0.5">{label}</p>
+    </div>
   );
 }

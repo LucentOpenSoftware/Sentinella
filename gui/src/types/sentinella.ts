@@ -250,3 +250,41 @@ export interface IdleScannerStatus {
   last_pause_reason: string;
   last_completed: number | null;
 }
+
+// ── Runtime Intelligence ────────────────────────────────────
+
+export interface RuntimeIntelligenceStatus {
+  plm: {
+    enabled: boolean;
+    events_seen: number;
+    nodes: number;
+    chains_scored: number;
+    suspicious_chains: number;
+  };
+  powershell: {
+    enabled: boolean;
+    events_seen: number;
+    events_scanned: number;
+    duplicates_skipped: number;
+    last_score: number;
+    sbl_available: boolean;
+    errors: number;
+    recent_events: RuntimeRecentEvent[];
+  };
+  amsi: {
+    enabled: boolean;
+    note?: string;
+  };
+}
+
+export interface RuntimeRecentEvent {
+  timestamp: number;
+  language: string;
+  source_app: string;
+  content_name: string;
+  score: number;
+  findings_count: number;
+  lineage_summary: string | null;
+  timed_out: boolean;
+  observe_only: boolean;
+}

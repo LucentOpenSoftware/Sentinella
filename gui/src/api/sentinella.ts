@@ -172,6 +172,11 @@ export const reloadArgus = () =>
 export const getRuntimeStats = () =>
   invoke<RuntimeStats>("get_runtime_stats");
 
+// ── Runtime Intelligence ────────────────────────────────────
+
+export const getRuntimeIntelligence = () =>
+  invoke<import("../types/sentinella").RuntimeIntelligenceStatus>("get_runtime_intelligence");
+
 // ── Memory Scanner ──────────────────────────────────────────
 
 export interface ProcessInfo {
