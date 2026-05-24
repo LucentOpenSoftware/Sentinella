@@ -62,6 +62,8 @@ runtime/research_samples/*.rar
 runtime/compiled/
 runtime/clamav_tmp/
 gui/src-tauri/runtime/state/
+gui/.tmp/
+runtime/config/freshclam.resolved.conf
 
 # SQLite WAL files
 *.db-wal
