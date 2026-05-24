@@ -26,7 +26,7 @@ type HelpTopic =
 // ── Topic cards shown on Overview ────────────────────────
 const topics: { id: HelpTopic; icon: typeof Cpu; title: string; teaser: string }[] = [
   { id: "what-is-sentinella", icon: ShieldCheck, title: "What is Sentinella?",       teaser: "Security software that protects your computer, not fights against it." },
-  { id: "what-is-argus",      icon: Layers,      title: "What is ARGUS?",            teaser: "Layered suspicion scoring without binary thinking." },
+  { id: "what-is-argus",      icon: Layers,      title: "What is ARGUS?",            teaser: "Layered suspicion scoring powered by ASTRA adaptive analysis." },
   { id: "why-clamav",         icon: Microscope,  title: "Why ClamAV?",               teaser: "Battle-tested signatures, open-source trust." },
   { id: "why-sandbox",        icon: Box,          title: "Why behavioral sandboxing?", teaser: "Detonate the unknown in a sealed room." },
   { id: "why-workers",        icon: Server,       title: "Why modular workers?",       teaser: "If one crashes, the rest survive." },
@@ -75,6 +75,7 @@ export function AboutPage() {
           </div>
           <div className="space-y-3 text-[13px]">
             <AR l="Heuristic engine" v="ARGUS" />
+            <AR l="Adaptive analysis" v="ASTRA" />
             <AR l="Signature engine" v="ClamAV" />
             <AR l="Behavioral sandbox" v="ETW + Job Object" />
             <AR l="Process isolation" v="Restricted token" />
@@ -232,7 +233,7 @@ const topicContent: Record<NonNullable<HelpTopic>, TopicData> = {
       {
         heading: "Beyond binary verdicts",
         body: [
-          "Traditional antivirus gives binary answers: infected or clean. ARGUS takes a different approach. It assigns a suspicion score from 0 to 100 based on evidence from multiple independent analysis layers. No single layer can declare a file malicious alone.",
+          "Traditional antivirus gives binary answers: infected or clean. ARGUS, powered by ASTRA adaptive analysis, takes a different approach. It assigns a suspicion score from 0 to 100 based on evidence from multiple independent analysis layers. No single layer can declare a file malicious alone.",
           "This means a file with one suspicious trait stays in the \"Unusual\" range, while a file exhibiting credential theft patterns, network exfiltration, and process injection converges toward \"Malicious\" through multiple independent signals.",
         ],
       },
@@ -247,7 +248,7 @@ const topicContent: Record<NonNullable<HelpTopic>, TopicData> = {
       {
         heading: "Convergence, not thresholds",
         body: [
-          "ARGUS scores are not arbitrary thresholds. A file reaches \"High Risk\" or \"Malicious\" only when multiple categories of evidence converge: credential theft + network activity, or process injection + persistence + anti-analysis. Single-category findings are capped to prevent one noisy signal from triggering false positives.",
+          "ARGUS scores, driven by ASTRA's adaptive convergence logic, are not arbitrary thresholds. A file reaches \"High Risk\" or \"Malicious\" only when multiple categories of evidence converge: credential theft + network activity, or process injection + persistence + anti-analysis. Single-category findings are capped to prevent one noisy signal from triggering false positives.",
           "Every finding carries a BehaviorTag, an AttackStage, and a confidence weight. The final score reflects how many independent lines of evidence point to the same conclusion.",
         ],
       },
@@ -505,9 +506,9 @@ const topicContent: Record<NonNullable<HelpTopic>, TopicData> = {
         ],
       },
       {
-        heading: "ARGUS engine layers",
+        heading: "ARGUS engine layers · ASTRA adaptive analysis",
         body: [
-          "Layer 0: ClamAV signature database. Layer 1: MIME/type analysis (double extensions, RTLO, PE-as-PDF). Layer 2: PE heuristic analysis (exploit detection, import analysis, packing, structural anomalies). Layer 3: Reputation matching (domain-gated, word-boundary patterns). Layer 4: Context analysis (path, filename, environmental signals). Layer 5: IOC hash matching. Layer 6: YARA behavioral rules. Layer 7: Cross-layer correlation (convergence chains, attack stage progression). Layer 8: Behavioral runtime (sandbox detonation feedback).",
+          "Layer 0: ClamAV signature database. Layer 1: MIME/type analysis (double extensions, RTLO, PE-as-PDF). Layer 2: PE heuristic analysis (exploit detection, import analysis, packing, structural anomalies). Layer 3: Reputation matching (domain-gated, word-boundary patterns). Layer 4: Context analysis (path, filename, environmental signals). Layer 5: IOC hash matching. Layer 6: YARA behavioral rules. Layer 7: Cross-layer correlation (convergence chains, attack stage progression). Layer 8: Behavioral runtime (sandbox detonation feedback). ASTRA orchestrates these layers with profile-aware bounded execution, ensuring deterministic and resource-intelligent analysis.",
           "Scores are not arbitrary thresholds. Single-category findings are capped. A file reaches High Risk or Malicious only through multi-category convergence. Every finding carries a BehaviorTag, AttackStage, confidence weight, and ThreatMaturity classification.",
         ],
       },

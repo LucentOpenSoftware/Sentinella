@@ -240,7 +240,7 @@ export function Dashboard({ onNavigate }: { onNavigate: (p: Page) => void }) {
                 <Zap size={16} className="text-[rgb(var(--accent))]" />
               </div>
               <div>
-                <h4 className="text-[13px] font-semibold">{t("argus.intelligence")}</h4>
+                <h4 className="text-[13px] font-semibold">{t("argus.intelligence")} · ASTRA</h4>
                 <p className="text-[10px] text-[rgb(var(--t3))] mt-0.5">
                   v{stats.argus_version} · {stats.argus_active_layers} {t("argus.layers_suffix")} · {stats.argus_yara_rules} {t("argus.rules_suffix")}
                 </p>
@@ -276,7 +276,7 @@ export function Dashboard({ onNavigate }: { onNavigate: (p: Page) => void }) {
               <Zap size={16} className="text-[rgb(var(--accent))]" />
             </div>
             <div>
-              <h4 className="text-[13px] font-semibold">{t("argus.intelligence")}</h4>
+              <h4 className="text-[13px] font-semibold">{t("argus.intelligence")} · ASTRA</h4>
               <p className="text-[10px] text-[rgb(var(--t3))] mt-0.5">{t("argus.no_yara")}</p>
             </div>
           </div>

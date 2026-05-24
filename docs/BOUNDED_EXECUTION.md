@@ -2,6 +2,8 @@
 
 ## Overview
 
+Sentinella's ARGUS engine, powered by ASTRA (Adaptive Security Threat Response Architecture), uses profile-aware bounded execution to ensure deterministic, resource-intelligent scanning.
+
 Every file scan in Sentinella operates within an execution budget. Exceeding a budget is NOT failure -- it is evidence. Timeouts feed back into the ARGUS convergence model as suspicion signals.
 
 ## Scan Profiles

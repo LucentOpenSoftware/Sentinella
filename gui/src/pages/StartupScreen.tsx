@@ -163,7 +163,7 @@ export function StartupScreen({ onReady }: { onReady: (degraded: boolean) => voi
           <SubLine label="Connecting to daemon" status={subs.daemon} />
           <SubLine label="Loading ClamAV engine" status={subs.engine} />
           <SubLine label="Loading signatures" status={subs.signatures} />
-          <SubLine label="Initializing ARGUS heuristics" status={subs.argus} />
+          <SubLine label="Initializing ARGUS · ASTRA analysis" status={subs.argus} />
           <SubLine label="Preparing real-time monitoring" status={subs.watcher} />
         </div>
 

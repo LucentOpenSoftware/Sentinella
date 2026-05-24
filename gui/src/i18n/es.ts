@@ -181,6 +181,9 @@ export const es: Record<string, string> = {
   "notif.days_ago": "hace {n}d",
 
   // ── ARGUS ───────────────────────────────────────────
+  "argus.powered_by": "ARGUS impulsado por analisis adaptativo ASTRA",
+  "argus.astra": "Analisis adaptativo ASTRA",
+  "argus.astra_desc": "Motor de convergencia con perfiles y ejecucion acotada",
   "argus.intelligence": "Inteligencia ARGUS",
   "argus.files_analyzed": "archivos analizados",
   "argus.heuristic_ready": "Motor heuristico listo",
@@ -368,7 +371,7 @@ export const es: Record<string, string> = {
   "update.step_verify_desc": "Validar integridad e instalar nueva base de datos.",
   "update.step_reload": "Recargar motor",
   "update.step_reload_desc": "Recompilar motor con firmas actualizadas.",
-  "update.argus_packs": "Paquetes de inteligencia ARGUS",
+  "update.argus_packs": "Paquetes de inteligencia ARGUS · ASTRA",
   "update.rules_across_packs": "{rules} reglas conductuales en {packs} paquetes",
   "update.status_up_to_date": "Al dia",
   "update.na": "N/D",
