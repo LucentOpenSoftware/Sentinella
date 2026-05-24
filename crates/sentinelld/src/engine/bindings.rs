@@ -120,5 +120,11 @@ pub const CL_ENGINE_MAXSCANSIZE: cl_engine_field = 0;
 /// CL_ENGINE_MAX_FILESIZE — max extracted file size within compound files.
 pub const CL_ENGINE_MAXFILESIZE: cl_engine_field = 1;
 
+/// CL_ENGINE_MAX_RECURSION — max archive nesting depth.
+pub const CL_ENGINE_MAXRECURSION: cl_engine_field = 2;
+
+/// CL_ENGINE_MAX_FILES — max files extracted from a single container.
+pub const CL_ENGINE_MAXFILES: cl_engine_field = 3;
+
 /// CL_ENGINE_TMPDIR — override temp directory for compound file extraction.
 pub const CL_ENGINE_TMPDIR: cl_engine_field = 13;

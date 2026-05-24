@@ -313,19 +313,51 @@ fn watcher_loop(
                     } // Skip locked/inaccessible files.
                 }
 
-                // ── Layer 0: ClamAV signature scan ─────────────
-                let no_cancel = std::sync::atomic::AtomicBool::new(false);
-                let result = state.scan_file_clamav(&engine, &path, &no_cancel);
+                // ── Budget-bounded realtime scan ──────────────
+                let rt_budget = argus::budget::ScanExecutionBudget::realtime();
+                let rt_cancel = std::sync::atomic::AtomicBool::new(false);
+                let rt_tracker = argus::budget::BudgetTracker::new(
+                    rt_budget,
+                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                );
+
+                // Layer 0: ClamAV signature scan (with budget check).
+                let clamav_start = std::time::Instant::now();
+                let result = state.scan_file_clamav(&engine, &path, &rt_cancel);
+                if rt_tracker.phase_expired(clamav_start, rt_tracker.budget().max_clamav_duration) {
+                    rt_tracker.record_timeout(argus::budget::TimeoutReason::ClamAvTimeout);
+                }
 
                 if !path.exists() {
                     continue;
                 }
 
-                // ── Layers 1–7: ARGUS heuristic analysis ────────
-                let argus_verdict = if config.heuristic_alerts {
-                    state.argus().analyze_file(&path)
+                // Check total budget before ARGUS — realtime MUST NOT stall.
+                let argus_verdict = if rt_tracker.is_expired() {
+                    rt_tracker.record_timeout(argus::budget::TimeoutReason::TotalTimeout);
+                    debug!(file = %path.display(), "realtime budget exhausted, skipping ARGUS");
+                    // Partial result: ClamAV ran, ARGUS skipped.
+                    cache.record_with_metadata(&path, &path_meta, !result.infected);
+                    if result.infected {
+                        // ClamAV positive — still report threat even without ARGUS.
+                        let threat_name = result.virus_name.clone().unwrap_or("Unknown".into());
+                        warn!(file = %path.display(), threat = %threat_name, "REALTIME THREAT (budget-partial)");
+                        detections_count.fetch_add(1, Ordering::Relaxed);
+                        let path_str = path.to_string_lossy().to_string();
+                        match state.quarantine_file(&path_str, &threat_name, "realtime") {
+                            Ok(q) => info!(id = %q.quarantine_id, "auto-quarantined (budget-partial)"),
+                            Err(e) => warn!(%e, "auto-quarantine failed"),
+                        }
+                    }
+                    continue;
+                } else if config.heuristic_alerts {
+                    let argus_start = std::time::Instant::now();
+                    let v = state.argus().analyze_file(&path);
+                    if rt_tracker.phase_expired(argus_start, rt_tracker.budget().max_yara_duration) {
+                        rt_tracker.record_timeout(argus::budget::TimeoutReason::YaraTimeout);
+                    }
+                    v
                 } else {
-                    // Heuristics disabled — produce empty verdict.
                     argus::ArgusVerdict {
                         path: path.to_string_lossy().to_string(),
                         file_size: 0,

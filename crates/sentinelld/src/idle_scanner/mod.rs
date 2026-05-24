@@ -596,10 +596,46 @@ fn idle_scanner_loop(
                     continue;
                 }
 
-                // ── Scan ─────────────────────────────────
-                let no_cancel = std::sync::atomic::AtomicBool::new(false);
-                let clam_result = app_state.scan_file_clamav(&engine, file_path, &no_cancel);
-                let argus_verdict = app_state.argus().analyze_file(file_path);
+                // ── Budget-bounded idle scan ─────────────
+                let idle_budget = argus::budget::ScanExecutionBudget::idle();
+                let idle_tracker = argus::budget::BudgetTracker::new(
+                    idle_budget,
+                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                );
+
+                let idle_cancel = std::sync::atomic::AtomicBool::new(false);
+                let clamav_start = std::time::Instant::now();
+                let clam_result = app_state.scan_file_clamav(&engine, file_path, &idle_cancel);
+                if idle_tracker.phase_expired(clamav_start, idle_tracker.budget().max_clamav_duration) {
+                    idle_tracker.record_timeout(argus::budget::TimeoutReason::ClamAvTimeout);
+                }
+
+                // ARGUS analysis (skip if total budget exhausted).
+                let argus_verdict = if idle_tracker.is_expired() {
+                    idle_tracker.record_timeout(argus::budget::TimeoutReason::TotalTimeout);
+                    debug!(file = %file_path.display(), "idle budget exhausted, skipping ARGUS");
+                    argus::ArgusVerdict {
+                        path: file_path.to_string_lossy().to_string(),
+                        file_size: file_meta.len(),
+                        sha256: String::new(),
+                        mime_type: None,
+                        score: 0,
+                        verdict: argus::verdict::Verdict::Clean,
+                        findings: vec![],
+                        analysis_time_us: 0,
+                        engine_version: argus::ENGINE_VERSION,
+                        timestamp: chrono::Utc::now().timestamp(),
+                        explanation: argus::verdict::VerdictExplanation::default(),
+                        timing: None,
+                    }
+                } else {
+                    let argus_start = std::time::Instant::now();
+                    let v = app_state.argus().analyze_file(file_path);
+                    if idle_tracker.phase_expired(argus_start, idle_tracker.budget().max_yara_duration) {
+                        idle_tracker.record_timeout(argus::budget::TimeoutReason::YaraTimeout);
+                    }
+                    v
+                };
 
                 let (is_threat, threat_name_opt) = crate::ipc::unify_detection_filtered(
                     clam_result.infected,

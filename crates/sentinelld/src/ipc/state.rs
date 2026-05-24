@@ -202,6 +202,9 @@ pub struct AppState {
     budget_total_timeouts: AtomicU64,
     budget_partial_results: AtomicU64,
     budget_exhausted: AtomicU64,
+    budget_realtime_timeouts: AtomicU64,
+    budget_idle_timeouts: AtomicU64,
+    budget_transient_skips: AtomicU64,
 }
 
 struct Inner {
@@ -553,6 +556,9 @@ impl AppState {
             budget_total_timeouts: AtomicU64::new(0),
             budget_partial_results: AtomicU64::new(0),
             budget_exhausted: AtomicU64::new(0),
+            budget_realtime_timeouts: AtomicU64::new(0),
+            budget_idle_timeouts: AtomicU64::new(0),
+            budget_transient_skips: AtomicU64::new(0),
             inner: Mutex::new(Inner {
                 active_scan: None,
                 scan_history: Vec::new(),
@@ -3127,6 +3133,9 @@ impl AppState {
             "total_timeouts": self.budget_total_timeouts.load(Ordering::Relaxed),
             "partial_results": self.budget_partial_results.load(Ordering::Relaxed),
             "budget_exhausted": self.budget_exhausted.load(Ordering::Relaxed),
+            "realtime_timeouts": self.budget_realtime_timeouts.load(Ordering::Relaxed),
+            "idle_timeouts": self.budget_idle_timeouts.load(Ordering::Relaxed),
+            "transient_skips": self.budget_transient_skips.load(Ordering::Relaxed),
         })
     }
 

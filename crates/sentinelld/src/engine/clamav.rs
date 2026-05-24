@@ -166,6 +166,19 @@ impl ClamEngine {
                     cl_err_str(fn_strerror, ret)
                 );
             }
+            // Max archive nesting depth: 10 (default is 17, too deep for zip bombs).
+            let max_rec: i64 = 10;
+            let ret = unsafe { set_num(engine, CL_ENGINE_MAXRECURSION, max_rec) };
+            if ret == CL_SUCCESS {
+                debug!("ClamAV max recursion depth set to 10");
+            }
+
+            // Max files extracted from a single container: 5000.
+            let max_files: i64 = 5000;
+            let ret = unsafe { set_num(engine, CL_ENGINE_MAXFILES, max_files) };
+            if ret == CL_SUCCESS {
+                debug!("ClamAV max files per container set to 5000");
+            }
         }
 
         // ── Load signature database ─────────────────────
