@@ -225,68 +225,44 @@ export function Dashboard({ onNavigate }: { onNavigate: (p: Page) => void }) {
         />
       </div>
 
-      {/* Secondary row: Uptime + ARGUS Intelligence pill */}
-      <div className="dash-secondary-row">
-        <StatusTile
-          label={t("tile.uptime")}
-          value={stats.uptime_human}
-          sub={t("tile.daemon_runtime")}
-          color="accent"
-          icon={<Clock size={16} />}
-        />
-        {stats.argus_yara_rules > 0 ? (
-          <div className="glass-card flex items-center gap-6 px-7 py-5">
-            {/* Left: icon + title */}
-            <div className="flex items-center gap-3 flex-shrink-0">
-              <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-[rgb(var(--accent))]/8">
-                <Zap size={16} className="text-[rgb(var(--accent))]" />
-              </div>
-              <div>
-                <h4 className="text-[13px] font-semibold">{t("argus.intelligence")} · ASTRA</h4>
-                <p className="text-[10px] text-[rgb(var(--t3))] mt-0.5">
-                  v{stats.argus_version} · {stats.argus_active_layers} {t("argus.layers_suffix")} · {stats.argus_yara_rules} {t("argus.rules_suffix")}
-                </p>
-              </div>
+      {/* ARGUS + Runtime Intelligence — side by side */}
+      <div className="card-grid-2">
+        {/* ARGUS Intelligence */}
+        <div className="glass-card px-6 py-5">
+          <div className="flex items-center gap-3 mb-3">
+            <div className="flex h-8 w-8 items-center justify-center rounded-xl bg-[rgb(var(--accent))]/8">
+              <Zap size={15} className="text-[rgb(var(--accent))]" />
             </div>
-            {/* Middle: tags */}
-            <div className="flex flex-wrap gap-1.5 flex-1 min-w-0">
+            <div>
+              <h4 className="text-[13px] font-semibold">{t("argus.intelligence")} · ASTRA</h4>
+              <p className="text-[10px] text-[rgb(var(--t3))] mt-0.5">
+                v{stats.argus_version} · {stats.argus_active_layers} {t("argus.layers_suffix")} · {stats.argus_yara_rules} {t("argus.rules_suffix")}
+              </p>
+            </div>
+          </div>
+          {stats.argus_yara_rules > 0 && (
+            <div className="flex flex-wrap gap-1.5 mb-3">
               {[
-                t("argus.pack_stealer"),
-                t("argus.pack_script"),
-                t("argus.pack_deception"),
-                t("argus.pack_github"),
-                t("argus.pack_lolbin"),
-                t("argus.pack_documents"),
+                t("argus.pack_stealer"), t("argus.pack_script"), t("argus.pack_deception"),
+                t("argus.pack_github"), t("argus.pack_lolbin"), t("argus.pack_documents"),
                 t("argus.pack_persistence"),
               ].map((pack) => (
-                <span key={pack} className="text-[10px] px-2.5 py-1 rounded-full bg-[rgb(var(--raised))]/20 text-[rgb(var(--t3))] whitespace-nowrap">
+                <span key={pack} className="text-[9px] px-2 py-0.5 rounded-full bg-[rgb(var(--raised))]/20 text-[rgb(var(--t3))] whitespace-nowrap">
                   {pack}
                 </span>
               ))}
             </div>
-            {/* Right: stat */}
-            {stats.argus_files_analyzed > 0 && (
-              <div className="text-right flex-shrink-0 min-w-[80px]">
-                <p className="text-[18px] font-bold text-[rgb(var(--t1))]">{stats.argus_files_analyzed.toLocaleString()}</p>
-                <p className="text-[10px] text-[rgb(var(--t3))]">{t("argus.files_analyzed")}</p>
-              </div>
-            )}
-          </div>
-        ) : (
-          <div className="glass-card flex items-center gap-4 px-7 py-5">
-            <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-[rgb(var(--accent))]/8">
-              <Zap size={16} className="text-[rgb(var(--accent))]" />
-            </div>
-            <div>
-              <h4 className="text-[13px] font-semibold">{t("argus.intelligence")} · ASTRA</h4>
-              <p className="text-[10px] text-[rgb(var(--t3))] mt-0.5">{t("argus.no_yara")}</p>
-            </div>
-          </div>
-        )}
-      </div>
+          )}
+          {stats.argus_files_analyzed > 0 && (
+            <p className="text-[11px] text-[rgb(var(--t3))]">
+              {stats.argus_files_analyzed.toLocaleString()} {t("argus.files_analyzed")}
+            </p>
+          )}
+        </div>
 
-      {/* Runtime Intelligence — compact ASTRA card */}
-      <RuntimeIntelligenceCard />
+        {/* Runtime Intelligence */}
+        <RuntimeIntelligenceCard />
+      </div>
 
       <section className="section-stack">
         <div className="flex flex-col gap-2">
