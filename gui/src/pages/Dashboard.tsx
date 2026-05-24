@@ -143,20 +143,25 @@ export function Dashboard({ onNavigate }: { onNavigate: (p: Page) => void }) {
     <div className="page-stack">
       {/* Notifications now live in TopBar — dashboard content starts clean */}
 
-      <Card className={`!py-6 ${isReady ? "border-[rgb(var(--green))]/12" : "border-[rgb(var(--red))]/12"}`}>
-        <div className="grid gap-5 xl:grid-cols-[minmax(0,1.7fr)_280px] xl:items-center">
-          <div className="flex items-center gap-4">
+      <Card className={isReady ? "border-[rgb(var(--green))]/12" : "border-[rgb(var(--red))]/12"}>
+        <div className="grid gap-5 xl:grid-cols-[minmax(0,1.7fr)_280px] xl:items-start">
+          <div className="flex items-start gap-4">
             <div
-              className={`flex h-12 w-12 flex-shrink-0 items-center justify-center rounded ${
+              className={`flex h-14 w-14 flex-shrink-0 items-center justify-center rounded ${
                 isReady ? "bg-[rgb(var(--green))]/8 text-[rgb(var(--green))]" : "bg-[rgb(var(--red))]/8 text-[rgb(var(--red))]"
               }`}
             >
-              <ShieldIcon icon={isReady ? "protected" : "threat"} size={28} className={`brightness-0 invert ${isReady ? "opacity-80" : "opacity-60"}`} />
+              <ShieldIcon icon={isReady ? "protected" : "threat"} size={32} className={`brightness-0 invert ${isReady ? "opacity-80" : "opacity-60"}`} />
             </div>
-            <div className="flex min-w-0 flex-col gap-1.5">
-              <h3 className="text-[20px] font-bold leading-tight">
+            <div className="flex min-w-0 flex-col gap-2">
+              <h3 className="text-[22px] font-bold leading-tight">
                 {isReady ? t("dash.protected") : t("dash.attention")}
               </h3>
+              <p className="max-w-xl text-[13px] leading-relaxed text-[rgb(var(--t2))]">
+                {engine.signature_count > 0
+                  ? `ARGUS ${t("argus.astra")}. ${t("dash.database_prefix")} ${dbVersion}.`
+                  : t("dash.no_sigs_loaded")}
+              </p>
               <div className="flex flex-wrap items-center gap-2.5 text-[11px] text-[rgb(var(--t3))]">
                 <span className="rounded-full bg-[rgb(var(--raised))]/25 px-2.5 py-1">
                   {t("dash.engine_prefix")} {engine.engine_version}
