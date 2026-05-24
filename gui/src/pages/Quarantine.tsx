@@ -2,12 +2,13 @@ import { useState, useEffect, useCallback } from "react";
 import { RotateCcw, Trash2, FileWarning, ChevronDown, ChevronUp, Loader2, WifiOff, AlertTriangle, CheckCircle2, XCircle } from "lucide-react";
 import { ShieldIcon } from "../components/ShieldIcon";
 import { Card } from "../components/Card";
-import { getQuarantineItems, restoreQuarantine, deleteQuarantine } from "../api/sentinella";
+import { getQuarantineItems, restoreQuarantine, deleteQuarantine, reportSafe } from "../api/sentinella";
 import type { QuarantineEntry } from "../types/sentinella";
 import { t } from "../i18n";
+import { ShieldCheck } from "lucide-react";
 
 type Toast = { type: "success" | "error"; message: string };
-type ConfirmAction = { type: "restore" | "delete"; item: QuarantineEntry };
+type ConfirmAction = { type: "restore" | "delete" | "restore_safe"; item: QuarantineEntry };
 
 export function QuarantinePage() {
   const [items, setItems] = useState<QuarantineEntry[]>([]);
@@ -70,6 +71,26 @@ export function QuarantinePage() {
     refresh();
   };
 
+  const handleRestoreSafe = async (item: QuarantineEntry) => {
+    setBusy(item.id);
+    try {
+      const result = await restoreQuarantine(item.id);
+      if (result.ok) {
+        // Record as likely FP in calibration DB.
+        await reportSafe(item.id, item.sha256, item.original_path, item.signature).catch(() => {});
+        setToast({ type: "success", message: t("quar.restored_reported_safe") });
+      } else {
+        setToast({ type: "error", message: result.error || t("quar.restore_failed") });
+      }
+    } catch (e) {
+      setToast({ type: "error", message: String(e) });
+    }
+    setBusy(null);
+    setExpanded(null);
+    setConfirm(null);
+    refresh();
+  };
+
   if (loading) return <div className="flex items-center justify-center py-20"><Loader2 size={20} className="text-[rgb(var(--accent))] animate-spin"/></div>;
   if (err) return <Card className="text-center py-10"><WifiOff size={20} className="mx-auto text-[rgb(var(--amber))] mb-3"/><p className="text-[13px] text-[rgb(var(--t3))]">{t("quar.daemon_error")}</p></Card>;
 
@@ -93,15 +114,19 @@ export function QuarantinePage() {
         <div className="fixed inset-0 bg-black/40 z-40 flex items-center justify-center">
           <div className="glass-card p-6 max-w-md w-full mx-4">
             <div className="flex items-start gap-3 mb-4">
-              <AlertTriangle size={20} className={confirm.type === "restore" ? "text-[rgb(var(--amber))] mt-0.5" : "text-[rgb(var(--red))] mt-0.5"}/>
+              <AlertTriangle size={20} className={confirm.type === "delete" ? "text-[rgb(var(--red))] mt-0.5" : "text-[rgb(var(--amber))] mt-0.5"}/>
               <div>
                 <h3 className="text-[15px] font-semibold mb-1.5">
-                  {confirm.type === "restore" ? t("quar.restore_question") : t("quar.delete_question")}
+                  {confirm.type === "restore_safe" ? t("quar.report_safe_question")
+                    : confirm.type === "restore" ? t("quar.restore_question")
+                    : t("quar.delete_question")}
                 </h3>
                 <p className="text-[12px] text-[rgb(var(--t2))] leading-relaxed mb-2">
-                  {confirm.type === "restore"
-                    ? t("quar.restore_warning")
-                    : t("quar.delete_warning")}
+                  {confirm.type === "restore_safe"
+                    ? t("quar.report_safe_warning")
+                    : confirm.type === "restore"
+                      ? t("quar.restore_warning")
+                      : t("quar.delete_warning")}
                 </p>
                 <div className="text-[11px] text-[rgb(var(--t3))] bg-[rgb(var(--raised))]/15 px-3 py-2 rounded-lg">
                   <p className="font-mono truncate">{confirm.item.original_path.split('\\').pop()}</p>
@@ -116,16 +141,27 @@ export function QuarantinePage() {
                 className="text-[12px] font-medium px-5 py-2.5 rounded-xl bg-[rgb(var(--raised))]/20 text-[rgb(var(--t2))] cursor-pointer disabled:opacity-30"
               >{t("common.cancel")}</button>
               <button
-                onClick={() => confirm.type === "restore" ? handleRestore(confirm.item) : handleDelete(confirm.item)}
+                onClick={() =>
+                  confirm.type === "restore_safe" ? handleRestoreSafe(confirm.item)
+                  : confirm.type === "restore" ? handleRestore(confirm.item)
+                  : handleDelete(confirm.item)
+                }
                 disabled={!!busy}
                 className={`text-[12px] font-medium px-5 py-2.5 rounded-xl flex items-center gap-1.5 cursor-pointer disabled:opacity-30 ${
-                  confirm.type === "restore"
-                    ? "bg-[rgb(var(--amber))]/12 text-[rgb(var(--amber))]"
-                    : "bg-[rgb(var(--red))]/12 text-[rgb(var(--red))]"
+                  confirm.type === "delete"
+                    ? "bg-[rgb(var(--red))]/12 text-[rgb(var(--red))]"
+                    : confirm.type === "restore_safe"
+                      ? "bg-[rgb(var(--green))]/12 text-[rgb(var(--green))]"
+                      : "bg-[rgb(var(--amber))]/12 text-[rgb(var(--amber))]"
                 }`}
               >
-                {busy ? <Loader2 size={12} className="animate-spin"/> : confirm.type === "restore" ? <RotateCcw size={12}/> : <Trash2 size={12}/>}
-                {confirm.type === "restore" ? t("quar.restore_file") : t("quar.delete_forever")}
+                {busy ? <Loader2 size={12} className="animate-spin"/>
+                  : confirm.type === "restore_safe" ? <ShieldCheck size={12}/>
+                  : confirm.type === "restore" ? <RotateCcw size={12}/>
+                  : <Trash2 size={12}/>}
+                {confirm.type === "restore_safe" ? t("quar.report_safe_confirm")
+                  : confirm.type === "restore" ? t("quar.restore_file")
+                  : t("quar.delete_forever")}
               </button>
             </div>
           </div>
@@ -167,7 +203,7 @@ export function QuarantinePage() {
                       <div><p className="text-[rgb(var(--t3))]/30 text-[10px] uppercase">{t("quar.label_sha256")}</p><p className="font-mono text-[11px]">{item.sha256.slice(0, 24)}...</p></div>
                       <div><p className="text-[rgb(var(--t3))]/30 text-[10px] uppercase">{t("quar.label_size")}</p><p className="font-medium">{item.original_size.toLocaleString()} {t("quar.bytes")}</p></div>
                     </div>
-                    <div className="flex gap-3">
+                    <div className="flex gap-3 flex-wrap">
                       <button
                         disabled={!item.restorable || isBusy}
                         onClick={() => setConfirm({ type: "restore", item })}
@@ -176,6 +212,14 @@ export function QuarantinePage() {
                       >
                         {isBusy ? <Loader2 size={12} className="animate-spin"/> : <RotateCcw size={12}/>}
                         {t("quar.restore")}
+                      </button>
+                      <button
+                        disabled={!item.restorable || isBusy}
+                        onClick={() => setConfirm({ type: "restore_safe", item })}
+                        className="text-[11px] font-medium px-4 py-2 rounded-xl bg-[rgb(var(--green))]/6 text-[rgb(var(--green))] flex items-center gap-1.5 cursor-pointer disabled:opacity-30"
+                        title={t("quar.report_safe_tooltip")}
+                      >
+                        <ShieldCheck size={12}/>{t("quar.report_safe")}
                       </button>
                       <button
                         disabled={isBusy}

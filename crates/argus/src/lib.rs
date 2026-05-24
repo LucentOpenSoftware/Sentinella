@@ -22,6 +22,7 @@
 //! - **Layer 6**: IOC and reputation correlation
 //! - **Layer 7**: Score aggregation and explainable verdicts
 
+pub mod budget;
 pub mod correlation;
 pub mod engine;
 pub mod layers;

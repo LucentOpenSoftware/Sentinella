@@ -497,6 +497,48 @@ impl CalibrationLog {
     }
 }
 
+/// Auto-detect FP category from file path patterns.
+pub fn guess_fp_category(path: &str) -> String {
+    let p = path.to_lowercase();
+    if p.contains("android") && (p.contains("sdk") || p.contains("emulator")) {
+        return "emulator".into();
+    }
+    if p.contains("qemu") || p.contains("virtualbox") || p.contains("vmware") {
+        return "emulator".into();
+    }
+    if p.contains("\\cargo\\") || p.contains("\\target\\") || p.contains("\\.rustup\\") {
+        return "developer_tool".into();
+    }
+    if p.contains("node_modules") || p.contains("\\npm\\") || p.contains("\\yarn\\") {
+        return "node_env".into();
+    }
+    if p.contains("\\python") || p.contains("\\pip\\") || p.contains("\\conda\\") {
+        return "python_env".into();
+    }
+    if p.contains("\\steam\\") || p.contains("\\epic games\\") || p.contains("\\riot") {
+        return "game_mod".into();
+    }
+    if p.contains("\\discord\\") || p.contains("\\slack\\") || p.contains("\\teams\\") {
+        return "electron_app".into();
+    }
+    if p.contains("\\vscode\\") || p.contains("\\cursor\\") || p.contains("\\windsurf\\") {
+        return "developer_tool".into();
+    }
+    if p.contains("\\sysinternals\\") || p.contains("\\pstools\\") || p.contains("putty") {
+        return "sysadmin".into();
+    }
+    if p.contains("\\7-zip\\") || p.contains("\\winrar\\") || p.contains("\\peazip\\") {
+        return "compression".into();
+    }
+    if p.contains("\\ida\\") || p.contains("\\ghidra\\") || p.contains("\\x64dbg\\") {
+        return "reverse_engineering".into();
+    }
+    if p.contains(".onnx") || p.contains(".safetensors") || p.contains("\\ollama\\") {
+        return "ai_tool".into();
+    }
+    "unknown".into()
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  Tests
 // ═══════════════════════════════════════════════════════════════

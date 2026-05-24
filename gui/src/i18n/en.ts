@@ -220,6 +220,12 @@ export const en: Record<string, string> = {
   "quar.bytes": "bytes",
   "quar.not_restorable": "Vault file missing or already restored",
   "quar.restore_tooltip": "Restore file to original location",
+  "quar.report_safe": "Report Safe",
+  "quar.report_safe_tooltip": "Restore and mark as safe for calibration",
+  "quar.report_safe_question": "Restore & Report as Safe?",
+  "quar.report_safe_warning": "This will restore the file and record it as a likely false positive. Use this only if you are confident the file is not malicious.",
+  "quar.report_safe_confirm": "Restore & Report Safe",
+  "quar.restored_reported_safe": "File restored and reported as safe for calibration",
 
   // ── Scan (extended) ────────────────────────────────
   "scan.starting": "Starting...",

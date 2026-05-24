@@ -220,6 +220,12 @@ export const es: Record<string, string> = {
   "quar.bytes": "bytes",
   "quar.not_restorable": "Archivo de boveda faltante o ya restaurado",
   "quar.restore_tooltip": "Restaurar archivo a su ubicacion original",
+  "quar.report_safe": "Reportar seguro",
+  "quar.report_safe_tooltip": "Restaurar y marcar como seguro para calibracion",
+  "quar.report_safe_question": "Restaurar y reportar como seguro?",
+  "quar.report_safe_warning": "Esto restaurara el archivo y lo registrara como un probable falso positivo. Usa esto solo si estas seguro de que el archivo no es malicioso.",
+  "quar.report_safe_confirm": "Restaurar y reportar seguro",
+  "quar.restored_reported_safe": "Archivo restaurado y reportado como seguro para calibracion",
 
   // ── Escaneo (extendido) ────────────────────────────
   "scan.starting": "Iniciando...",

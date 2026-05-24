@@ -215,6 +215,23 @@ async fn quarantine_delete(id: String) -> Result<Value, String> {
     daemon_client::call("quarantine.delete", serde_json::json!({"id": id, "token": token})).await.map_err(Into::into)
 }
 
+/// Report a restored quarantine item as safe (likely false positive).
+/// Records evidence in the calibration database for FP tuning.
+#[tauri::command]
+async fn report_safe(
+    quarantine_id: String,
+    sha256: String,
+    file_path: String,
+    detection_name: String,
+) -> Result<Value, String> {
+    daemon_client::call_auth("calibration.report_safe", serde_json::json!({
+        "quarantine_id": quarantine_id,
+        "sha256": sha256,
+        "file_path": file_path,
+        "detection_name": detection_name,
+    })).await.map_err(Into::into)
+}
+
 // ── Watcher ─────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -694,6 +711,7 @@ pub fn run() {
             quarantine_file,
             quarantine_restore,
             quarantine_delete,
+            report_safe,
             get_watcher_status,
             get_idle_scanner_status,
             get_update_status,

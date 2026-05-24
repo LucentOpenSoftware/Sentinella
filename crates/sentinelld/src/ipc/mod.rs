@@ -507,6 +507,48 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
             }
         }
 
+        "calibration.report_safe" => {
+            // Record a restored file as likely false positive.
+            let auth = req.params.get("auth").and_then(|v| v.as_str()).unwrap_or("");
+            if !state.validate_ipc_auth(auth) {
+                return serde_json::to_vec(&RpcErrorResponse::err(
+                    req.id,
+                    error_codes::INVALID_PARAMS,
+                    "authenticated IPC update required".to_string(),
+                ))
+                .unwrap_or_default();
+            }
+            let quarantine_id = req.params.get("quarantine_id").and_then(|v| v.as_str()).unwrap_or("");
+            let sha256 = req.params.get("sha256").and_then(|v| v.as_str()).unwrap_or("");
+            let file_path = req.params.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+            let detection_name = req.params.get("detection_name").and_then(|v| v.as_str()).unwrap_or("");
+
+            if sha256.is_empty() || file_path.is_empty() {
+                Ok(serde_json::json!({"ok": false, "error": "missing sha256 or file_path"}))
+            } else {
+                let now = chrono::Utc::now().timestamp();
+                let event = crate::calibration::RestoreEvent {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    detection_event_id: quarantine_id.to_string(),
+                    timestamp: now,
+                    file_path: file_path.to_string(),
+                    file_hash: sha256.to_string(),
+                    fp_category: crate::calibration::guess_fp_category(file_path),
+                    user_notes: None,
+                };
+                state.calibration_record_restore(event);
+
+                tracing::info!(
+                    sha256 = sha256,
+                    detection = detection_name,
+                    category = crate::calibration::guess_fp_category(file_path).as_str(),
+                    "calibration: file reported as safe by user"
+                );
+
+                Ok(serde_json::json!({"ok": true}))
+            }
+        }
+
         "detections.list" => {
             let scan_id = req
                 .params

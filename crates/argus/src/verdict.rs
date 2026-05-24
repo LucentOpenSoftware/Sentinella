@@ -184,6 +184,16 @@ pub struct ScanTiming {
     pub structural_us: u64,
     /// Strategy applied to this file.
     pub strategy: Option<ScanStrategy>,
+    /// Timeout events that occurred during this scan.
+    #[serde(default)]
+    pub timeout_reasons: Vec<crate::budget::TimeoutReason>,
+    /// Whether the scan completed within its execution budget.
+    #[serde(default = "default_true")]
+    pub completed_within_budget: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 // ── Verdict ────────────────────────────────────────────────────────

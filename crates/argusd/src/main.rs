@@ -221,6 +221,8 @@ fn scan_file(engine: &ArgusEngine, path: &Path, json: bool, load_errors: Vec<Str
             yara_us: 0,
             structural_us: 0,
             strategy,
+            timeout_reasons: Vec::new(),
+            completed_within_budget: true,
         };
         &fallback_timing
     };

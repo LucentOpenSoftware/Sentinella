@@ -469,6 +469,8 @@ impl ArgusEngine {
                 yara_us,
                 structural_us: 0, // TODO: instrument per-layer
                 strategy: Some(strategy),
+                timeout_reasons: Vec::new(),
+                completed_within_budget: true,
             }),
         }
     }

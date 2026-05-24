@@ -66,6 +66,10 @@ export const restoreQuarantine = (id: string) =>
 export const deleteQuarantine = (id: string) =>
   invoke<{ ok: boolean; error?: string }>("quarantine_delete", { id });
 
+/** Report a restored file as safe (likely false positive) for calibration. */
+export const reportSafe = (quarantineId: string, sha256: string, filePath: string, detectionName: string) =>
+  invoke<{ ok: boolean }>("report_safe", { quarantineId, sha256, filePath, detectionName });
+
 // ── Detections ──────────────────────────────────────────
 
 export interface DetectionEntry {

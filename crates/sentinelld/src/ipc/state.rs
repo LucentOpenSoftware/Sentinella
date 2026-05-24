@@ -195,6 +195,13 @@ pub struct AppState {
     orchestrator_last_heartbeat: AtomicU64,
     // ── FP Calibration ──────────────────────────────
     calibration: Mutex<Option<crate::calibration::CalibrationLog>>,
+    // ── Bounded Execution counters ──────────────────
+    budget_files_with_timeouts: AtomicU64,
+    budget_clamav_timeouts: AtomicU64,
+    budget_yara_timeouts: AtomicU64,
+    budget_total_timeouts: AtomicU64,
+    budget_partial_results: AtomicU64,
+    budget_exhausted: AtomicU64,
 }
 
 struct Inner {
@@ -540,6 +547,12 @@ impl AppState {
                 )
                 .ok(),
             ),
+            budget_files_with_timeouts: AtomicU64::new(0),
+            budget_clamav_timeouts: AtomicU64::new(0),
+            budget_yara_timeouts: AtomicU64::new(0),
+            budget_total_timeouts: AtomicU64::new(0),
+            budget_partial_results: AtomicU64::new(0),
+            budget_exhausted: AtomicU64::new(0),
             inner: Mutex::new(Inner {
                 active_scan: None,
                 scan_history: Vec::new(),
@@ -3068,6 +3081,8 @@ impl AppState {
     // ── Calibration ──────────────────────────────────────
 
     /// Record a detection event in the calibration log.
+    /// Reserved for Phase 3: wiring into detection paths.
+    #[allow(dead_code)]
     pub fn calibration_record_detection(&self, event: crate::calibration::DetectionEvent) {
         if let Ok(guard) = self.calibration.lock() {
             if let Some(ref log) = *guard {
@@ -3090,6 +3105,8 @@ impl AppState {
     }
 
     /// Export calibration bundle for developer review.
+    /// Reserved for Phase 3: CLI/IPC export endpoint.
+    #[allow(dead_code)]
     pub fn calibration_export(&self) -> Option<crate::calibration::CalibrationBundle> {
         if let Ok(guard) = self.calibration.lock() {
             if let Some(ref log) = *guard {
@@ -3097,6 +3114,20 @@ impl AppState {
             }
         }
         None
+    }
+
+    /// Get bounded execution diagnostics.
+    /// Reserved: will be exposed via diagnostics.export IPC.
+    #[allow(dead_code)]
+    pub fn budget_diagnostics(&self) -> serde_json::Value {
+        serde_json::json!({
+            "files_with_timeouts": self.budget_files_with_timeouts.load(Ordering::Relaxed),
+            "clamav_timeouts": self.budget_clamav_timeouts.load(Ordering::Relaxed),
+            "yara_timeouts": self.budget_yara_timeouts.load(Ordering::Relaxed),
+            "total_timeouts": self.budget_total_timeouts.load(Ordering::Relaxed),
+            "partial_results": self.budget_partial_results.load(Ordering::Relaxed),
+            "budget_exhausted": self.budget_exhausted.load(Ordering::Relaxed),
+        })
     }
 
     /// Get resilience diagnostics.
@@ -3722,6 +3753,7 @@ fn folder_scan_worker_inner(
         let tx_ref = tx.clone();
         let files_ref = Arc::clone(&files);
         let next_ref = Arc::clone(&next_file);
+        let scan_type_w = scan_type.clone();
 
         handles.push(std::thread::spawn(move || {
             loop {
@@ -3755,9 +3787,58 @@ fn folder_scan_worker_inner(
                     continue;
                 }
 
-                // ClamAV + ARGUS analysis (routes via subprocess if configured).
+                // ── Per-file budget enforcement ────────────────
+                let budget = match scan_type_w.as_str() {
+                    "quick" | "startup" => argus::budget::ScanExecutionBudget::startup(),
+                    "folder" | "full" => argus::budget::ScanExecutionBudget::manual(),
+                    _ => argus::budget::ScanExecutionBudget::manual(),
+                };
+                let tracker = argus::budget::BudgetTracker::new(budget, Arc::clone(&cancel_ref));
+
+                // ClamAV scan (with budget check).
+                let clamav_start = std::time::Instant::now();
                 let result = state_ref.scan_file_clamav(&eng, file, &cancel_ref);
-                let (argus_verdict, worker_error) =
+                if tracker.phase_expired(clamav_start, tracker.budget().max_clamav_duration) {
+                    tracker.record_timeout(argus::budget::TimeoutReason::ClamAvTimeout);
+                }
+
+                // Check total budget before ARGUS.
+                if tracker.is_expired() {
+                    tracker.record_timeout(argus::budget::TimeoutReason::TotalTimeout);
+                    // Partial result: ClamAV ran, ARGUS skipped.
+                    live_w.files_scanned.fetch_add(1, Ordering::Relaxed);
+                    if result.infected {
+                        live_w.threats_found.fetch_add(1, Ordering::Relaxed);
+                        let vname = result.virus_name.clone().unwrap_or("Unknown".into());
+                        let _ = tx_ref.send(ScanMsg::Threat(
+                            Detection { path: file.to_string_lossy().to_string(), virus_name: vname },
+                            argus::ArgusVerdict {
+                                path: file.to_string_lossy().to_string(),
+                                file_size: file_meta.len(),
+                                sha256: String::new(),
+                                mime_type: None,
+                                score: 0,
+                                verdict: argus::verdict::Verdict::Clean,
+                                findings: vec![],
+                                analysis_time_us: 0,
+                                engine_version: argus::ENGINE_VERSION,
+                                timestamp: chrono::Utc::now().timestamp(),
+                                explanation: argus::verdict::VerdictExplanation::default(),
+                                timing: None,
+                            },
+                        ));
+                    }
+                    // Cache partial result — don't re-scan on next pass.
+                    if !result.infected {
+                        state_ref.scan_cache.record_with_metadata(file, &file_meta, true);
+                    }
+                    tracing::debug!(file = %file.display(), timeouts = ?tracker.timeouts(), "budget exhausted, partial result");
+                    continue;
+                }
+
+                // ARGUS analysis (with budget check).
+                let argus_start = std::time::Instant::now();
+                let (mut argus_verdict, worker_error) =
                     match state_ref.analyze_argus_file(file, &cancel_ref) {
                         Ok(result) => result,
                         Err(e) => {
@@ -3765,6 +3846,45 @@ fn folder_scan_worker_inner(
                             break;
                         }
                     };
+
+                // Check YARA/structural phase budgets.
+                if let Some(ref mut timing) = argus_verdict.timing {
+                    let argus_elapsed = argus_start.elapsed();
+                    if argus_elapsed >= tracker.budget().max_yara_duration {
+                        tracker.record_timeout(argus::budget::TimeoutReason::YaraTimeout);
+                    }
+                    // Record timeout evidence in verdict.
+                    timing.timeout_reasons = tracker.timeouts();
+                    timing.completed_within_budget = !tracker.is_expired() && tracker.timeouts().is_empty();
+                }
+
+                // Add timeout suspicion to ARGUS score (timeouts = evidence).
+                let timeout_weight = tracker.timeout_suspicion();
+                if timeout_weight > 0 {
+                    argus_verdict.score = argus_verdict.score.saturating_add(timeout_weight).min(100);
+                    argus_verdict.verdict = argus::verdict::Verdict::from_score(argus_verdict.score);
+
+                    // Increment diagnostics counters.
+                    state_ref.budget_files_with_timeouts.fetch_add(1, Ordering::Relaxed);
+                    for t in &tracker.timeouts() {
+                        match t {
+                            argus::budget::TimeoutReason::ClamAvTimeout => { state_ref.budget_clamav_timeouts.fetch_add(1, Ordering::Relaxed); }
+                            argus::budget::TimeoutReason::YaraTimeout => { state_ref.budget_yara_timeouts.fetch_add(1, Ordering::Relaxed); }
+                            argus::budget::TimeoutReason::TotalTimeout => { state_ref.budget_total_timeouts.fetch_add(1, Ordering::Relaxed); }
+                            _ => {}
+                        }
+                    }
+                    match tracker.outcome() {
+                        argus::budget::BudgetOutcome::Partial | argus::budget::BudgetOutcome::Suspicious => {
+                            state_ref.budget_partial_results.fetch_add(1, Ordering::Relaxed);
+                        }
+                        argus::budget::BudgetOutcome::Exhausted => {
+                            state_ref.budget_exhausted.fetch_add(1, Ordering::Relaxed);
+                        }
+                        _ => {}
+                    }
+                }
+
                 live_w.files_scanned.fetch_add(1, Ordering::Relaxed);
 
                 if let Some(e) = worker_error {
