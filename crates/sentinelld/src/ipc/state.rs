@@ -3145,6 +3145,20 @@ impl AppState {
         })
     }
 
+    /// Get runtime intelligence diagnostics (PLM + AMSI).
+    #[allow(dead_code)]
+    pub fn runtime_intelligence_diagnostics(&self) -> serde_json::Value {
+        let plm_diag = if let Some(ref plm) = self.plm {
+            plm.diagnostics.to_json(plm.graph.node_count())
+        } else {
+            serde_json::json!({"enabled": false})
+        };
+        serde_json::json!({
+            "plm": plm_diag,
+            "amsi": {"enabled": false, "note": "AMSI provider not yet registered"},
+        })
+    }
+
     /// Get resilience diagnostics.
     pub fn resilience_diagnostics(&self) -> serde_json::Value {
         let now_ts = std::time::SystemTime::now()
