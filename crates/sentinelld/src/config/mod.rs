@@ -31,6 +31,9 @@ pub struct Config {
     pub scheduled_scan_type: String,
     // ── Idle background scanner ─────────────────────────
     pub startup_critical_scan: bool,
+    // ── Runtime intelligence ────────────────────────
+    pub powershell_bridge_enabled: bool,
+    pub powershell_poll_seconds: u64,
     pub idle_scan_enabled: bool,
     pub idle_scan_on_battery: bool,
     pub idle_scan_cpu_pause_threshold: u32, // percent 0-100
@@ -172,6 +175,8 @@ impl Default for Config {
             scheduled_scan_type: "quick".into(),
             // Idle scanner defaults.
             startup_critical_scan: true,
+            powershell_bridge_enabled: false, // Disabled by default — opt-in.
+            powershell_poll_seconds: 5,
             idle_scan_enabled: true,
             idle_scan_on_battery: false,
             idle_scan_cpu_pause_threshold: 50,

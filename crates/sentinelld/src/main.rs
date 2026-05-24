@@ -291,6 +291,13 @@ async fn main() -> anyhow::Result<()> {
         info!("idle scanner skipped (audit mode)");
     }
 
+    // Start PowerShell Script Block Logging bridge (config-gated).
+    if !args.audit_mode && config.powershell_bridge_enabled {
+        server.state().start_ps_bridge(config.powershell_poll_seconds);
+    } else if !config.powershell_bridge_enabled {
+        info!("PowerShell bridge disabled by config");
+    }
+
     // Start scan scheduler — skip in audit mode.
     let scheduler = if !args.audit_mode {
         Some(scheduler::Scheduler::start(Arc::clone(server.state())))

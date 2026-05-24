@@ -207,6 +207,8 @@ pub struct AppState {
     budget_transient_skips: AtomicU64,
     // ── PLM (Process Lineage Monitor) ────────────────
     plm: Option<crate::plm::PlmMonitor>,
+    // ── PowerShell bridge ──────────────────────────
+    ps_bridge: Option<crate::amsi::ps_bridge::PsBridge>,
 }
 
 struct Inner {
@@ -561,7 +563,8 @@ impl AppState {
             budget_realtime_timeouts: AtomicU64::new(0),
             budget_idle_timeouts: AtomicU64::new(0),
             budget_transient_skips: AtomicU64::new(0),
-            plm: Some(crate::plm::PlmMonitor::start(5)), // 5-second snapshot interval.
+            plm: Some(crate::plm::PlmMonitor::start(5)),
+            ps_bridge: None, // Started later via start_ps_bridge() if config enabled.
             inner: Mutex::new(Inner {
                 active_scan: None,
                 scan_history: Vec::new(),
@@ -637,6 +640,31 @@ impl AppState {
     }
     pub fn plm(&self) -> Option<&crate::plm::PlmMonitor> {
         self.plm.as_ref()
+    }
+
+    /// Start the PowerShell Script Block Logging bridge.
+    /// Config-gated: only starts if powershell_bridge_enabled = true.
+    pub fn start_ps_bridge(self: &Arc<Self>, poll_secs: u64) {
+        let engine = Arc::clone(&self.argus);
+        let plm_graph = self.plm.as_ref().map(|p| Arc::clone(&p.graph));
+        // SAFETY: we only call this once during startup, before any concurrent access.
+        // The field is private and only set here.
+        let self_ptr = Arc::as_ptr(self) as *mut AppState;
+        unsafe {
+            (*self_ptr).ps_bridge = Some(
+                crate::amsi::ps_bridge::PsBridge::start(poll_secs, engine, plm_graph)
+            );
+        }
+        tracing::info!(poll_secs, "PowerShell Script Block Logging bridge started");
+    }
+
+    /// Get PowerShell bridge diagnostics.
+    pub fn ps_bridge_diagnostics(&self) -> serde_json::Value {
+        if let Some(ref bridge) = self.ps_bridge {
+            bridge.diagnostics.to_json()
+        } else {
+            serde_json::json!({"enabled": false})
+        }
     }
 
     /// Scan a file with ClamAV — routes through subprocess if configured.
@@ -3153,8 +3181,10 @@ impl AppState {
         } else {
             serde_json::json!({"enabled": false})
         };
+        let ps_diag = self.ps_bridge_diagnostics();
         serde_json::json!({
             "plm": plm_diag,
+            "powershell": ps_diag,
             "amsi": {"enabled": false, "note": "AMSI provider not yet registered"},
         })
     }
