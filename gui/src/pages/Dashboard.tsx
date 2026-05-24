@@ -143,36 +143,31 @@ export function Dashboard({ onNavigate }: { onNavigate: (p: Page) => void }) {
     <div className="page-stack">
       {/* Notifications now live in TopBar — dashboard content starts clean */}
 
-      <Card className={isReady ? "border-[rgb(var(--green))]/12" : "border-[rgb(var(--red))]/12"}>
-        <div className="grid gap-6 xl:grid-cols-[minmax(0,1.7fr)_300px] xl:items-start">
-          <div className="flex items-start gap-5">
+      <Card className={`!py-6 ${isReady ? "border-[rgb(var(--green))]/12" : "border-[rgb(var(--red))]/12"}`}>
+        <div className="grid gap-5 xl:grid-cols-[minmax(0,1.7fr)_280px] xl:items-center">
+          <div className="flex items-center gap-4">
             <div
-              className={`flex h-16 w-16 flex-shrink-0 items-center justify-center rounded ${
+              className={`flex h-12 w-12 flex-shrink-0 items-center justify-center rounded ${
                 isReady ? "bg-[rgb(var(--green))]/8 text-[rgb(var(--green))]" : "bg-[rgb(var(--red))]/8 text-[rgb(var(--red))]"
               }`}
             >
-              <ShieldIcon icon={isReady ? "protected" : "threat"} size={38} className={`brightness-0 invert ${isReady ? "opacity-80" : "opacity-60"}`} />
+              <ShieldIcon icon={isReady ? "protected" : "threat"} size={28} className={`brightness-0 invert ${isReady ? "opacity-80" : "opacity-60"}`} />
             </div>
-            <div className="flex min-w-0 flex-col gap-3">
-              <h3 className="text-[24px] font-bold leading-tight">
+            <div className="flex min-w-0 flex-col gap-1.5">
+              <h3 className="text-[20px] font-bold leading-tight">
                 {isReady ? t("dash.protected") : t("dash.attention")}
               </h3>
-              <p className="max-w-2xl text-[14px] leading-relaxed text-[rgb(var(--t2))]">
-                {engine.signature_count > 0
-                  ? `${engine.signature_count.toLocaleString()} ${t("dash.sigs_loaded_db")} ${dbVersion}.`
-                  : t("dash.no_sigs_loaded")}
-              </p>
-              <div className="flex flex-wrap items-center gap-3 text-[12px] text-[rgb(var(--t3))]">
-                <span className="rounded-full bg-[rgb(var(--raised))]/25 px-3 py-1.5">
+              <div className="flex flex-wrap items-center gap-2.5 text-[11px] text-[rgb(var(--t3))]">
+                <span className="rounded-full bg-[rgb(var(--raised))]/25 px-2.5 py-1">
                   {t("dash.engine_prefix")} {engine.engine_version}
                 </span>
-                <span className="rounded-full bg-[rgb(var(--raised))]/25 px-3 py-1.5">
+                <span className="rounded-full bg-[rgb(var(--raised))]/25 px-2.5 py-1">
                   {t("dash.watcher_prefix")} {watcher.mode.replace("_", " ")}
                 </span>
               </div>
             </div>
           </div>
-          <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-1">
+          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-1">
             <HeroDetail label={t("dash.last_refresh")} value={lastSeen} sub={t("dash.ui_heartbeat")} />
             <HeroDetail label={t("dash.db_updated")} value={lastDbUpdate} sub={t("dash.last_sync")} />
           </div>
