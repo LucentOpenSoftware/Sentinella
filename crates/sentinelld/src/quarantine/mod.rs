@@ -264,7 +264,7 @@ pub fn restore_file_from_row(item: &QuarantineRow) -> Result<String, String> {
         hasher.update(&plaintext);
         hex::encode(hasher.finalize())
     };
-    if restored_hash != item.sha256 {
+    if !constant_time_eq(restored_hash.as_bytes(), item.sha256.as_bytes()) {
         return Err(format!(
             "Hash mismatch: expected {}, got {}",
             item.sha256, restored_hash
@@ -322,6 +322,21 @@ fn validate_vault_path(path: &Path) -> Result<PathBuf, String> {
 }
 
 fn validate_restore_path(path: &Path) -> Result<(), String> {
+    let raw = path.to_string_lossy();
+    let lower_raw = raw.to_ascii_lowercase();
+    if lower_raw.starts_with(r"\\?\unc\")
+        || (raw.starts_with(r"\\") && !raw.starts_with(r"\\?\") && !raw.starts_with(r"\\.\"))
+        || raw.starts_with("//")
+    {
+        return Err("Network/UNC restore paths are blocked".into());
+    }
+
+    if let Some(parent) = path.parent() {
+        if parent.is_symlink() {
+            return Err("Symlink parent blocked - restore to a real directory".into());
+        }
+    }
+
     let canonical = path
         .canonicalize()
         .or_else(|_| {
@@ -357,6 +372,17 @@ fn validate_restore_path(path: &Path) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 mod hex {
@@ -514,6 +540,16 @@ mod tests {
                 "validate_restore_path should reject '{}', got Ok",
                 path_str
             );
+        }
+    }
+
+    #[test]
+    fn validate_restore_path_rejects_unc_paths() {
+        let blocked = [r"\\server\share\evil.exe", "//server/share/evil.exe"];
+
+        for path_str in &blocked {
+            let result = validate_restore_path(Path::new(path_str));
+            assert!(result.is_err(), "UNC path should be rejected: {path_str}");
         }
     }
 

@@ -1,12 +1,12 @@
 {
   "manifest_version": 1,
   "engine_min_version": "0.1.0-alpha",
-  "updated_at": "2025-05-13T00:00:00Z",
+  "updated_at": "2026-05-23T00:00:00Z",
   "packs": [
     {
       "name": "sentinella_stealers",
       "display_name": "ARGUS Stealer Intelligence Pack",
-      "version": "2024.1",
+      "version": "2026.1",
       "category": "credential_theft",
       "description": "Detection rules for Discord token theft, browser credential harvesting, crypto wallet theft, and webhook-based exfiltration.",
       "file": "yara/sentinella_stealers.yar",
@@ -16,7 +16,7 @@
     {
       "name": "sentinella_scripts",
       "display_name": "ARGUS Script Abuse Pack",
-      "version": "2024.1",
+      "version": "2026.1",
       "category": "script_abuse",
       "description": "Detection rules for PowerShell abuse, encoded commands, AMSI bypass, Defender tampering, certutil abuse, and JavaScript obfuscation.",
       "file": "yara/sentinella_scripts.yar",
@@ -26,7 +26,7 @@
     {
       "name": "sentinella_deception",
       "display_name": "ARGUS Deception & Evasion Pack",
-      "version": "2024.1",
+      "version": "2026.1",
       "category": "deception",
       "description": "Detection rules for PyInstaller abuse, Node.js SEA, persistence mechanisms, fake documents, weaponized Electron apps, and cryptominers.",
       "file": "yara/sentinella_deception.yar",
@@ -36,9 +36,9 @@
     {
       "name": "sentinella_github_stealers",
       "display_name": "ARGUS GitHub Stealer Detection Pack",
-      "version": "2025.1",
+      "version": "2026.1",
       "category": "github_stealer",
-      "description": "Detection rules for fake game mods, updaters, and cracked software distributed via GitHub that are actually information stealers. Targets PyInstaller/Pyarmor-packed stealers, .NET stealers, and multi-browser credential harvesters with webhook exfiltration.",
+      "description": "Detection rules for fake game mods, updaters, and cracked software distributed via GitHub that are actually information stealers.",
       "file": "yara/sentinella_github_stealers.yar",
       "rule_count": 5,
       "author": "Sentinella"
@@ -46,9 +46,9 @@
     {
       "name": "sentinella_lolbins",
       "display_name": "ARGUS LOLBin Detection Pack",
-      "version": "2025.1",
+      "version": "2026.1",
       "category": "lolbin",
-      "description": "Detection rules for Living-Off-The-Land binary abuse: mshta, regsvr32 Squiblydoo, WMIC process creation, rundll32 JavaScript, CMSTP INF execution, and forfiles abuse.",
+      "description": "Detection rules for Living-Off-The-Land binary abuse: mshta, regsvr32, WMIC, rundll32, CMSTP, and forfiles.",
       "file": "yara/sentinella_lolbins.yar",
       "rule_count": 6,
       "author": "Sentinella"
@@ -56,39 +56,39 @@
     {
       "name": "sentinella_documents",
       "display_name": "ARGUS Malicious Document Pack",
-      "version": "2025.1",
+      "version": "2026.1",
       "category": "document",
-      "description": "Detection rules for malicious PDFs (JavaScript exploits, embedded PE), Office macros with auto-execution and download cradles, weaponized LNK shortcuts, and ISO/IMG droppers.",
+      "description": "Detection rules for malicious PDFs, Office macros, weaponized LNK shortcuts, and ISO/IMG droppers.",
       "file": "yara/sentinella_documents.yar",
       "rule_count": 7,
       "author": "Sentinella"
     },
     {
       "name": "sentinella_persistence",
-      "display_name": "ARGUS Persistence & Evasion Pack",
-      "version": "2025.1",
+      "display_name": "ARGUS Persistence Pack",
+      "version": "2026.1",
       "category": "persistence",
-      "description": "Detection rules for scheduled task persistence, WMI event subscriptions, security tool termination, environment discovery, and UAC bypass techniques (fodhelper, eventvwr).",
+      "description": "Detection rules for scheduled task persistence, WMI event subscriptions, COM object hijacking, DLL search order hijacking, and UAC bypass.",
       "file": "yara/sentinella_persistence.yar",
-      "rule_count": 6,
+      "rule_count": 9,
       "author": "Sentinella"
     },
     {
       "name": "sentinella_ransomware",
       "display_name": "ARGUS Ransomware Detection Pack",
-      "version": "2025.1",
+      "version": "2026.1",
       "category": "ransomware",
-      "description": "Detection rules for ransomware encryption loops, shadow copy deletion, ransom note indicators, and file extension modification patterns.",
+      "description": "Detection rules for ransomware encryption, shadow copy deletion, ransom notes, LockBit 3.0, BlackCat/ALPHV, and Akira patterns.",
       "file": "yara/sentinella_ransomware.yar",
-      "rule_count": 7,
+      "rule_count": 10,
       "author": "Sentinella"
     },
     {
       "name": "sentinella_dotnet_obfuscation",
       "display_name": "ARGUS .NET Malware Pack",
-      "version": "2025.1",
+      "version": "2026.1",
       "category": "dotnet_malware",
-      "description": "Detection rules for ConfuserEx/.NET Reactor obfuscation, .NET reflection loading, .NET process injection, .NET credential stealers, and heavy obfuscation indicators.",
+      "description": "Detection rules for ConfuserEx/.NET Reactor obfuscation, reflection loading, process injection, and credential stealers.",
       "file": "yara/sentinella_dotnet_obfuscation.yar",
       "rule_count": 6,
       "author": "Sentinella"
@@ -96,9 +96,9 @@
     {
       "name": "sentinella_droppers",
       "display_name": "ARGUS Dropper & Loader Pack",
-      "version": "2025.1",
+      "version": "2026.1",
       "category": "dropper",
-      "description": "Detection rules for AutoIt droppers, HTA payloads, self-extracting archives with scripts, temp directory dropper patterns, and embedded ZIP payloads.",
+      "description": "Detection rules for AutoIt droppers, HTA payloads, self-extracting archives, temp directory patterns, and embedded ZIP payloads.",
       "file": "yara/sentinella_droppers.yar",
       "rule_count": 7,
       "author": "Sentinella"
@@ -106,9 +106,9 @@
     {
       "name": "sentinella_powershell_advanced",
       "display_name": "ARGUS Advanced PowerShell Pack",
-      "version": "2025.1",
+      "version": "2026.1",
       "category": "powershell",
-      "description": "Deep detection of PowerShell cradle variants, AMSI patch bytes, ETW bypass, base64+compression chains, scheduled task persistence, and rundll32 proxy execution.",
+      "description": "Deep detection of PowerShell cradles, AMSI patch bytes, ETW bypass, base64 chains, and rundll32 proxy execution.",
       "file": "yara/sentinella_powershell_advanced.yar",
       "rule_count": 7,
       "author": "Sentinella"
@@ -116,29 +116,29 @@
     {
       "name": "sentinella_browser_hijack",
       "display_name": "ARGUS Browser Hijacking Pack",
-      "version": "2025.1",
+      "version": "2026.1",
       "category": "browser_hijack",
-      "description": "Detection rules for browser extension sideloading, proxy injection, root certificate installation, and multi-browser history exfiltration.",
+      "description": "Detection rules for browser extension sideloading, proxy injection, root certificate installation, and history exfiltration.",
       "file": "yara/sentinella_browser_hijack.yar",
       "rule_count": 4,
       "author": "Sentinella"
     },
     {
       "name": "sentinella_credential_tools",
-      "display_name": "ARGUS Credential Tool Detection Pack",
-      "version": "2025.1",
+      "display_name": "ARGUS Credential Tool Pack",
+      "version": "2026.1",
       "category": "credential_tools",
-      "description": "Detection rules for Mimikatz, LaZagne, DPAPI extraction, clipboard stealers, and keylogger indicators.",
+      "description": "Detection rules for Mimikatz 2.2+, LaZagne, Pypykatz, LSASS dumping, DPAPI extraction, and keyloggers.",
       "file": "yara/sentinella_credential_tools.yar",
-      "rule_count": 5,
+      "rule_count": 8,
       "author": "Sentinella"
     },
     {
       "name": "sentinella_suspicious_updaters",
       "display_name": "ARGUS Suspicious Updater Pack",
-      "version": "2025.1",
+      "version": "2026.1",
       "category": "suspicious_updater",
-      "description": "Detection rules for fake updaters with download+execute, small unsigned updaters, DLL sideloading, and trojanized installers with persistence.",
+      "description": "Detection rules for fake updaters with download+execute, unsigned updaters, DLL sideloading, and trojanized installers.",
       "file": "yara/sentinella_suspicious_updaters.yar",
       "rule_count": 4,
       "author": "Sentinella"
@@ -146,19 +146,19 @@
     {
       "name": "sentinella_c2_indicators",
       "display_name": "ARGUS C2 Communication Pack",
-      "version": "2025.1",
+      "version": "2026.1",
       "category": "c2_indicators",
-      "description": "Detection rules for Pastebin C2 resolvers, Telegram bot exfiltration, Discord webhook stealer chains, Steam dead-drop resolvers, and raw socket beaconing.",
+      "description": "Detection rules for Cobalt Strike 4.x, Sliver C2, DNS-over-HTTPS tunneling, Telegram bots, Discord webhooks, and raw socket beaconing.",
       "file": "yara/sentinella_c2_indicators.yar",
-      "rule_count": 5,
+      "rule_count": 8,
       "author": "Sentinella"
     },
     {
       "name": "sentinella_stealer_exfil",
       "display_name": "ARGUS Stealer Exfiltration Pack",
-      "version": "2025.1",
+      "version": "2026.1",
       "category": "stealer_exfil",
-      "description": "Detection rules for ZIP-and-send exfiltration chains, screenshot capture stealers, WiFi password harvesting, system fingerprinting, and Telegram session theft.",
+      "description": "Detection rules for ZIP-and-send exfiltration, screenshot capture, WiFi password harvesting, and Telegram session theft.",
       "file": "yara/sentinella_stealer_exfil.yar",
       "rule_count": 5,
       "author": "Sentinella"
@@ -166,9 +166,9 @@
     {
       "name": "sentinella_evasion_techniques",
       "display_name": "ARGUS Evasion Technique Pack",
-      "version": "2025.1",
+      "version": "2026.1",
       "category": "evasion",
-      "description": "Detection rules for sandbox/VM detection, delayed execution, ntdll unhooking, PPID spoofing, timestomping, and event log tampering.",
+      "description": "Detection rules for sandbox/VM detection, delayed execution, ntdll unhooking, PPID spoofing, and event log tampering.",
       "file": "yara/sentinella_evasion_techniques.yar",
       "rule_count": 6,
       "author": "Sentinella"
@@ -176,9 +176,9 @@
     {
       "name": "sentinella_crypto_threats",
       "display_name": "ARGUS Cryptocurrency Threat Pack",
-      "version": "2025.1",
+      "version": "2026.1",
       "category": "crypto_threats",
-      "description": "Detection rules for multi-wallet file theft, clipboard address replacement, browser extension wallet theft, and seed phrase hunting.",
+      "description": "Detection rules for wallet theft, clipboard address replacement, browser extension wallet theft, and seed phrase hunting.",
       "file": "yara/sentinella_crypto_threats.yar",
       "rule_count": 4,
       "author": "Sentinella"
@@ -186,7 +186,7 @@
     {
       "name": "sentinella_backdoor_rat",
       "display_name": "ARGUS Backdoor & RAT Pack",
-      "version": "2025.1",
+      "version": "2026.1",
       "category": "backdoor",
       "description": "Detection rules for remote shells, persistent backdoors with network beaconing, and reverse-connection RATs.",
       "file": "yara/sentinella_backdoor_rat.yar",
@@ -196,7 +196,7 @@
     {
       "name": "sentinella_worm_propagation",
       "display_name": "ARGUS Worm & Propagation Pack",
-      "version": "2025.1",
+      "version": "2026.1",
       "category": "worm",
       "description": "Detection rules for autorun.inf creation, removable drive self-copying, and network share spreading.",
       "file": "yara/sentinella_worm_propagation.yar",
@@ -206,19 +206,19 @@
     {
       "name": "sentinella_generic_trojan",
       "display_name": "ARGUS Generic Trojan Pack",
-      "version": "2025.1",
+      "version": "2026.1",
       "category": "trojan",
-      "description": "Detection rules for download-execute chains, self-copy persistence, system discovery, hidden window execution, mutex enforcement, and spyware combos.",
+      "description": "Detection rules for download-execute chains, self-copy persistence, hidden window execution, and spyware combos.",
       "file": "yara/sentinella_generic_trojan.yar",
       "rule_count": 6,
       "author": "Sentinella"
     },
     {
       "name": "sentinella_packed_obfuscated",
-      "display_name": "ARGUS Packed/Obfuscated Detection Pack",
-      "version": "2025.1",
+      "display_name": "ARGUS Packed/Obfuscated Pack",
+      "version": "2026.1",
       "category": "packed_obfuscated",
-      "description": "Detection rules for Nuitka-compiled Python, high-entropy minimal-import PE files, batch-to-EXE compilers, and Go-based stealers.",
+      "description": "Detection rules for Nuitka-compiled Python, high-entropy PE files, batch-to-EXE compilers, and Go-based stealers.",
       "file": "yara/sentinella_packed_obfuscated.yar",
       "rule_count": 4,
       "author": "Sentinella"
@@ -226,11 +226,71 @@
     {
       "name": "sentinella_generic_spyware",
       "display_name": "ARGUS Generic Spyware Pack",
-      "version": "2025.1",
+      "version": "2026.1",
       "category": "spyware",
-      "description": "Detection rules for webcam capture, audio recording, and geolocation tracking combined with data collection.",
+      "description": "Detection rules for webcam capture, audio recording, and geolocation tracking.",
       "file": "yara/sentinella_generic_spyware.yar",
       "rule_count": 3,
+      "author": "Sentinella"
+    },
+    {
+      "name": "sentinella_ai_abuse",
+      "display_name": "ARGUS AI/LLM Abuse Pack",
+      "version": "2026.1",
+      "category": "deception",
+      "description": "Detection rules for fake AI tool installers, LLM API key theft, prompt injection in documents, and deepfake tool distribution.",
+      "file": "yara/sentinella_ai_abuse.yar",
+      "rule_count": 7,
+      "author": "Sentinella"
+    },
+    {
+      "name": "sentinella_infostealer_2026",
+      "display_name": "ARGUS Modern Infostealer Pack",
+      "version": "2026.1",
+      "category": "credential_theft",
+      "description": "Detection rules for Chromium v127+ cookie bypass, DPAPI abuse, MFA authenticator theft, SSH key harvesting, cloud credential theft, and password manager targeting.",
+      "file": "yara/sentinella_infostealer_2026.yar",
+      "rule_count": 8,
+      "author": "Sentinella"
+    },
+    {
+      "name": "sentinella_electron_abuse",
+      "display_name": "ARGUS Electron/Node.js Abuse Pack",
+      "version": "2026.1",
+      "category": "script_abuse",
+      "description": "Detection rules for malicious Electron apps, asar manipulation, node_modules trojanization, Discord injection, and preload script abuse.",
+      "file": "yara/sentinella_electron_abuse.yar",
+      "rule_count": 7,
+      "author": "Sentinella"
+    },
+    {
+      "name": "sentinella_supply_chain",
+      "display_name": "ARGUS Supply Chain Attack Pack",
+      "version": "2026.1",
+      "category": "deception",
+      "description": "Detection rules for typosquatted packages, malicious install scripts, dependency confusion, compromised update mechanisms, and build artifact tampering.",
+      "file": "yara/sentinella_supply_chain.yar",
+      "rule_count": 7,
+      "author": "Sentinella"
+    },
+    {
+      "name": "sentinella_defense_evasion_2026",
+      "display_name": "ARGUS Defense Evasion 2026 Pack",
+      "version": "2026.1",
+      "category": "evasion",
+      "description": "Detection rules for AMSI/ETW bypass, Defender exclusion abuse, process hollowing, direct syscalls, Heaven's Gate, and API unhooking.",
+      "file": "yara/sentinella_defense_evasion_2026.yar",
+      "rule_count": 9,
+      "author": "Sentinella"
+    },
+    {
+      "name": "sentinella_loader_techniques",
+      "display_name": "ARGUS Loader & Sideloading Pack",
+      "version": "2026.1",
+      "category": "dropper",
+      "description": "Detection rules for DLL sideloading, reflective DLL injection, .NET Assembly.Load, PowerShell cradles, LOLBin proxy execution, and ISO/VHD MotW bypass.",
+      "file": "yara/sentinella_loader_techniques.yar",
+      "rule_count": 8,
       "author": "Sentinella"
     }
   ]

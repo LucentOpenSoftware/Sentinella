@@ -1,8 +1,8 @@
 realtime_enabled = true
 realtime_roots = [
-    'C:\Users\Nicolas\Downloads',
-    'C:\Users\Nicolas\Desktop',
-    'C:\Users\Nicolas\AppData\Local\Temp',
+    '%USERPROFILE%\Downloads',
+    '%USERPROFILE%\Desktop',
+    '%TEMP%',
 ]
 max_file_size_mb = 512
 scan_archives = true

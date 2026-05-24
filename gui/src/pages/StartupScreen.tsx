@@ -147,7 +147,7 @@ export function StartupScreen({ onReady }: { onReady: (degraded: boolean) => voi
   };
 
   return (
-    <div className="h-screen w-screen flex items-center justify-center relative overflow-hidden bg-[rgb(var(--base))]">
+    <div className="h-screen w-screen relative overflow-hidden bg-[rgb(var(--base))]">
       {/* Background image */}
       <img
         src={loadBg}
@@ -156,47 +156,42 @@ export function StartupScreen({ onReady }: { onReady: (degraded: boolean) => voi
         style={{ filter: "brightness(0.5) saturate(0.8)" }}
       />
 
-      {/* Content overlay */}
-      <div className="relative z-10 flex flex-col items-center gap-8 px-8">
-        {/* Status message */}
-        <div className="text-center">
-          <p className="text-[18px] font-semibold text-white/90 mb-2">
-            {STEP_LABELS[state]}
-          </p>
-          {state !== "failed" && state !== "ready" && (
-            <p className="text-[12px] text-white/40">
-              {elapsed > 0 && `${elapsed}s`}
-            </p>
-          )}
-        </div>
-
+      {/* Content overlay — checklist pinned to bottom-right */}
+      <div className="absolute z-10 bottom-10 right-10 flex flex-col items-end gap-5">
         {/* Subsystem checklist */}
-        <div className="glass-card p-5 min-w-[280px]" style={{ background: "rgba(0,0,0,0.5)" }}>
-          <SubLine label="Daemon connection" status={subs.daemon} />
-          <SubLine label="ClamAV engine" status={subs.engine} />
-          <SubLine label="Signature database" status={subs.signatures} />
-          <SubLine label="ARGUS intelligence" status={subs.argus} />
-          <SubLine label="Real-time watcher" status={subs.watcher} />
+        <div className="p-4 min-w-[240px] rounded-lg" style={{ background: "rgba(0,0,0,0.45)", backdropFilter: "blur(8px)" }}>
+          <SubLine label="Connecting to daemon" status={subs.daemon} />
+          <SubLine label="Loading ClamAV engine" status={subs.engine} />
+          <SubLine label="Loading signatures" status={subs.signatures} />
+          <SubLine label="Initializing ARGUS heuristics" status={subs.argus} />
+          <SubLine label="Preparing real-time monitoring" status={subs.watcher} />
         </div>
 
-        {/* Actions */}
+        {/* Status + elapsed */}
+        {state !== "ready" && state !== "degraded" && state !== "failed" && (
+          <p className="text-[11px] text-white/35 pr-1">
+            {STEP_LABELS[state]}{elapsed > 0 ? ` · ${elapsed}s` : ""}
+          </p>
+        )}
+
+        {/* Actions on failure */}
         {state === "failed" && (
-          <div className="flex flex-col items-center gap-3">
-            <p className="text-[12px] text-white/50 text-center max-w-xs">
-              Sentinella could not connect to the daemon. Make sure sentinelld is running.
+          <div className="flex flex-col items-end gap-2">
+            <p className="text-[11px] text-white/40 text-right max-w-[260px]">
+              Could not connect to daemon. Make sure sentinelld is running.
             </p>
-            <button onClick={retry} className="flex items-center gap-2 px-5 py-2.5 rounded-xl bg-white/10 text-white/80 text-[13px] font-medium hover:bg-white/15 cursor-pointer">
-              <RefreshCw size={14} /> Retry Connection
+            <button onClick={retry} className="flex items-center gap-2 px-4 py-2 rounded-lg bg-white/10 text-white/70 text-[12px] font-medium hover:bg-white/15 cursor-pointer">
+              <RefreshCw size={12} /> Retry
             </button>
-            <button onClick={() => onReady(true)} className="text-[11px] text-white/30 hover:text-white/50 cursor-pointer">
+            <button onClick={() => onReady(true)} className="text-[10px] text-white/25 hover:text-white/40 cursor-pointer">
               Continue in limited mode
             </button>
           </div>
         )}
 
         {showRetry && state !== "failed" && state !== "ready" && state !== "degraded" && (
-          <p className="text-[11px] text-white/30 animate-pulse">
-            Still starting... this may take a moment.
+          <p className="text-[10px] text-white/25 animate-pulse pr-1">
+            Still starting...
           </p>
         )}
       </div>

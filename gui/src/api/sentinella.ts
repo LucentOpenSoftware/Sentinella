@@ -124,7 +124,7 @@ export const setCriticalProtection = (opts: {
   realtimeEnabled?: boolean;
   autoQuarantine?: boolean;
 }) =>
-  invoke<{ ok: boolean; changes?: string[]; error?: string }>("set_critical_protection", {
+  invoke<{ ok: boolean; changes?: string[]; error?: string; requires_elevation?: boolean }>("set_critical_protection", {
     realtimeEnabled: opts.realtimeEnabled,
     autoQuarantine: opts.autoQuarantine,
   });

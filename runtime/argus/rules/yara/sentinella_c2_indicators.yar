@@ -1,7 +1,7 @@
 /*
     Sentinella ARGUS Intelligence Pack — C2 Communication Indicators
     Category: c2_indicators
-    Version: 2025.1
+    Version: 2026.1
     Author: Sentinella
     License: GPL-2.0
 
@@ -115,4 +115,117 @@ rule c2_raw_socket_beacon {
         $connect and $send and $recv and
         any of ($sleep, $timer) and
         (any of ($evasion*) or $hidden or $cmd)
+}
+
+rule c2_cobalt_strike_beacon {
+    meta:
+        description = "ARGUS detected Cobalt Strike 4.x beacon indicators — including watermark patterns, malleable C2 profile artifacts, and named pipe signatures used by one of the most prevalent post-exploitation frameworks."
+        severity = "critical"
+        weight = 40
+        category = "c2_indicators"
+        author = "Sentinella"
+    strings:
+        // Cobalt Strike default named pipes
+        $pipe1 = "\\\\.\\pipe\\msagent_" ascii
+        $pipe2 = "\\\\.\\pipe\\MSSE-" ascii
+        $pipe3 = "\\\\.\\pipe\\postex_" ascii
+        $pipe4 = "\\\\.\\pipe\\postex_ssh_" ascii
+        $pipe5 = "\\\\.\\pipe\\status_" ascii
+        // Beacon configuration markers
+        $cfg1 = { 00 01 00 01 00 02 }  // beacon type config header
+        $cfg2 = { 00 02 00 01 00 02 }  // alternate beacon type
+        $cfg3 = "ReflectiveLoader" ascii
+        $cfg4 = "%s%s%s%s%s%s%s%s%s" ascii   // beacon format string
+        // Malleable C2 profile indicators
+        $mc2_1 = "/submit.php" ascii
+        $mc2_2 = "/pixel.gif" ascii
+        $mc2_3 = "/updates.rss" ascii
+        $mc2_4 = "Content-Type: application/octet-stream" ascii
+        $mc2_5 = "__cfduid" ascii
+        // Cobalt Strike API imports
+        $api1 = "VirtualAllocEx" ascii
+        $api2 = "CreateRemoteThread" ascii
+        $api3 = "WriteProcessMemory" ascii
+        // Beacon watermark patterns (encoded 4-byte watermark)
+        $watermark = { 2E 2F 2E 2F }
+        $beacon_str = "beacon" ascii nocase
+    condition:
+        uint16(0) == 0x5A4D and
+        (2 of ($pipe*) or
+        any of ($cfg*) or
+        (2 of ($mc2_*) and 2 of ($api*)) or
+        ($watermark and $beacon_str))
+}
+
+rule c2_sliver_implant {
+    meta:
+        description = "ARGUS detected Sliver C2 framework implant indicators — an open-source adversary emulation framework increasingly used as a Cobalt Strike alternative by threat actors."
+        severity = "critical"
+        weight = 35
+        category = "c2_indicators"
+        author = "Sentinella"
+    strings:
+        // Sliver implant Go package paths
+        $go1 = "github.com/bishopfox/sliver" ascii
+        $go2 = "sliverpb" ascii
+        $go3 = "sliver/protobuf" ascii
+        // Sliver implant function names (Go binary artifacts)
+        $fn1 = "RunSliver" ascii
+        $fn2 = "StartBeaconLoop" ascii
+        $fn3 = "ActiveC2" ascii
+        $fn4 = "GetBeaconJitter" ascii
+        $fn5 = "MtlsConnect" ascii
+        $fn6 = "WGConnect" ascii
+        $fn7 = "DnsConnect" ascii
+        // Sliver transport indicators
+        $tr1 = "wg-tunnel" ascii
+        $tr2 = ".wg.sliver" ascii
+        $tr3 = "mtls" ascii
+        // Sliver protocol buffer markers
+        $pb1 = "Envelope" ascii
+        $pb2 = "tunpb" ascii
+        $pb3 = "commonpb" ascii
+        // General Go-compiled binary markers combined with Sliver strings
+        $gobin = "Go build" ascii
+    condition:
+        (any of ($go*)) or
+        (3 of ($fn*)) or
+        ($gobin and 2 of ($tr*) and any of ($pb*))
+}
+
+rule c2_dns_over_https_tunnel {
+    meta:
+        description = "ARGUS detected DNS-over-HTTPS (DoH) endpoints used for C2 tunneling — threat actors abuse encrypted DNS to bypass network monitoring and exfiltrate data through DNS queries to DoH providers."
+        severity = "high"
+        weight = 28
+        category = "c2_indicators"
+        author = "Sentinella"
+    strings:
+        // Major DoH provider endpoints
+        $doh1 = "dns.google/resolve" ascii nocase
+        $doh2 = "cloudflare-dns.com/dns-query" ascii nocase
+        $doh3 = "dns.quad9.net/dns-query" ascii nocase
+        $doh4 = "doh.opendns.com/dns-query" ascii nocase
+        $doh5 = "dns.nextdns.io" ascii nocase
+        $doh6 = "mozilla.cloudflare-dns.com" ascii nocase
+        $doh7 = "dns.adguard.com/dns-query" ascii nocase
+        // DoH protocol markers
+        $proto1 = "application/dns-json" ascii
+        $proto2 = "application/dns-message" ascii
+        $proto3 = "accept: application/dns" ascii nocase
+        // DNS query construction for tunneling
+        $tun1 = "TXT" ascii
+        $tun2 = "CNAME" ascii
+        $tun3 = "AAAA" ascii
+        $tun4 = "base64" ascii nocase
+        $tun5 = "base32" ascii nocase
+        // Network API calls
+        $http1 = "HttpSendRequestA" ascii
+        $http2 = "InternetOpenA" ascii
+        $http3 = "WinHttpSendRequest" ascii
+        $http4 = "HttpOpenRequestA" ascii
+    condition:
+        uint16(0) == 0x5A4D and
+        (any of ($doh*) and any of ($proto*)) or
+        (any of ($doh*) and 2 of ($tun*) and any of ($http*))
 }

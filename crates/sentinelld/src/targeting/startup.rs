@@ -113,33 +113,65 @@ fn collect_recent_executables(dir: &PathBuf, targets: &mut Vec<PathBuf>, recent_
 fn collect_run_key_targets(targets: &mut Vec<PathBuf>) {
     use std::process::Command;
 
-    // Query HKCU Run key.
-    let output = Command::new("reg")
-        .args([
-            "query",
-            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
-        ])
-        .output();
+    // Query both HKCU and HKLM Run + RunOnce keys.
+    let keys = [
+        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+        r"HKCU\Software\Microsoft\Windows\CurrentVersion\RunOnce",
+        r"HKLM\Software\Microsoft\Windows\CurrentVersion\Run",
+        r"HKLM\Software\Microsoft\Windows\CurrentVersion\RunOnce",
+    ];
 
-    if let Ok(out) = output {
-        let text = String::from_utf8_lossy(&out.stdout);
-        for line in text.lines() {
-            // Lines look like: "    AppName    REG_SZ    C:\path\to\app.exe --args"
-            if line.contains("REG_SZ") || line.contains("REG_EXPAND_SZ") {
-                if let Some(value) = line.split("    ").last() {
-                    let path_str = value
-                        .split_whitespace()
-                        .next()
-                        .unwrap_or("")
-                        .trim_matches('"');
-                    if !path_str.is_empty() {
-                        let p = PathBuf::from(path_str);
-                        if p.exists() {
-                            targets.push(p);
-                        }
-                    }
-                }
-            }
+    for key in &keys {
+        let output = Command::new("reg")
+            .args(["query", key])
+            .output();
+
+        if let Ok(out) = output {
+            let text = String::from_utf8_lossy(&out.stdout);
+            parse_reg_output(&text, targets);
+        }
+    }
+}
+
+/// Parse `reg query` output to extract executable paths.
+/// Handles quoted paths, paths with spaces, and environment variable expansion.
+#[cfg(target_os = "windows")]
+fn parse_reg_output(text: &str, targets: &mut Vec<PathBuf>) {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("HKEY_") {
+            continue;
+        }
+        if !trimmed.contains("REG_SZ") && !trimmed.contains("REG_EXPAND_SZ") {
+            continue;
+        }
+
+        // Format: "    Name    REG_SZ    Value"
+        // Split on REG_SZ or REG_EXPAND_SZ to get the value part.
+        let value_part = if let Some(pos) = trimmed.find("REG_SZ") {
+            &trimmed[pos + 6..]
+        } else if let Some(pos) = trimmed.find("REG_EXPAND_SZ") {
+            &trimmed[pos + 13..]
+        } else {
+            continue;
+        };
+        let value = value_part.trim();
+        if value.is_empty() { continue; }
+
+        // Extract path: handle quoted paths and paths with arguments.
+        let path_str = if value.starts_with('"') {
+            // Quoted path: extract until closing quote.
+            value[1..].split('"').next().unwrap_or("").trim()
+        } else {
+            // Unquoted: take first token (may miss paths with spaces, but safe).
+            value.split_whitespace().next().unwrap_or("").trim()
+        };
+
+        if path_str.is_empty() || path_str.len() < 3 { continue; }
+
+        let p = PathBuf::from(path_str);
+        if p.exists() && p.is_file() {
+            targets.push(p);
         }
     }
 }

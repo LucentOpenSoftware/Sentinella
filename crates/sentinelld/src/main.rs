@@ -271,6 +271,15 @@ async fn main() -> anyhow::Result<()> {
     // Watcher runs even in audit mode (minimal protection).
     server.state().start_watcher();
 
+    // Post-boot critical areas scan — lightweight, 1 thread, BELOW_NORMAL.
+    // Fires AFTER watcher so realtime is never delayed.
+    // Skips in audit mode (minimal footprint).
+    if !args.audit_mode && config.startup_critical_scan {
+        server.state().start_startup_critical_scan();
+    } else if !config.startup_critical_scan {
+        info!("startup critical scan disabled by config");
+    }
+
     // Start idle background scanner (resource-aware) — skip in audit mode.
     if !args.audit_mode {
         server.state().start_idle_scanner();

@@ -30,6 +30,7 @@ pub struct Config {
     pub scheduled_scan_hour: u32,
     pub scheduled_scan_type: String,
     // ── Idle background scanner ─────────────────────────
+    pub startup_critical_scan: bool,
     pub idle_scan_enabled: bool,
     pub idle_scan_on_battery: bool,
     pub idle_scan_cpu_pause_threshold: u32, // percent 0-100
@@ -170,6 +171,7 @@ impl Default for Config {
             scheduled_scan_hour: 3,
             scheduled_scan_type: "quick".into(),
             // Idle scanner defaults.
+            startup_critical_scan: true,
             idle_scan_enabled: true,
             idle_scan_on_battery: false,
             idle_scan_cpu_pause_threshold: 50,
@@ -207,7 +209,7 @@ impl Config {
             match toml::from_str::<Config>(&content) {
                 Ok(config) => {
                     tracing::debug!(path = %config_path.display(), "configuration loaded");
-                    Ok(config)
+                    Ok(config.expanded())
                 }
                 Err(e) => {
                     warn!(path = %config_path.display(), %e, "config parse error, using defaults");
@@ -236,6 +238,14 @@ impl Config {
         std::fs::write(path, content).map_err(|e| format!("write: {e}"))?;
         info!(path = %path.display(), "configuration saved");
         Ok(())
+    }
+
+    fn expanded(mut self) -> Self {
+        expand_vec(&mut self.realtime_roots);
+        expand_vec(&mut self.excluded_paths);
+        self.argus_worker_path = expand_vars(&self.argus_worker_path);
+        self.scan.argus_worker_path = expand_vars(&self.scan.argus_worker_path);
+        self
     }
 
     /// Validate config values — clamp to safe ranges.
@@ -310,8 +320,50 @@ impl Config {
     }
 }
 
+fn expand_vec(values: &mut [String]) {
+    for value in values {
+        *value = expand_vars(value);
+    }
+}
+
+fn expand_vars(value: &str) -> String {
+    let mut out = value.to_string();
+    for (key, fallback) in [
+        ("USERPROFILE", ""),
+        ("HOME", ""),
+        ("TEMP", ""),
+        ("PROGRAMDATA", r"C:\ProgramData"),
+    ] {
+        if let Ok(env) = std::env::var(key) {
+            out = out.replace(&format!("%{key}%"), &env);
+            out = out.replace(&format!("${key}"), &env);
+        } else if !fallback.is_empty() {
+            out = out.replace(&format!("%{key}%"), fallback);
+            out = out.replace(&format!("${key}"), fallback);
+        }
+    }
+    out
+}
+
 pub fn load(path: Option<&str>) -> anyhow::Result<Config> {
     let mut config = Config::load(path)?;
     config.validate();
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expands_programdata_path() {
+        let expected = std::env::var("PROGRAMDATA").unwrap_or_else(|_| r"C:\ProgramData".into());
+        let config = Config {
+            excluded_paths: vec![r"%PROGRAMDATA%\Sentinella".into()],
+            ..Config::default()
+        }
+        .expanded();
+
+        assert_eq!(config.excluded_paths[0], format!(r"{expected}\Sentinella"));
+    }
 }

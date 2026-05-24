@@ -68,6 +68,14 @@ enum Commands {
     Config,
     /// Show version information.
     Version,
+    /// Disable real-time protection (requires admin).
+    DisableRealtime,
+    /// Enable real-time protection (requires admin).
+    EnableRealtime,
+    /// Pause all protection (requires admin).
+    PauseProtection,
+    /// Resume all protection (requires admin).
+    ResumeProtection,
     /// Export scan report as JSON.
     ExportReport {
         /// Output file path.
@@ -301,6 +309,50 @@ async fn main() -> Result<()> {
             println!("  Sentinella CLI v{}", sentinella_common::PRODUCT_VERSION);
             println!("  Built with ClamAV engine integration");
             println!("  License: GPLv2");
+        }
+        Commands::DisableRealtime => {
+            let token = request_challenge_token().await?;
+            let resp = send_request("protection.set_critical", serde_json::json!({
+                "token": token, "realtime_enabled": false
+            })).await?;
+            if resp.get("result").and_then(|r| r.get("ok")).and_then(|v| v.as_bool()) == Some(true) {
+                println!("  Real-time protection disabled.");
+            } else {
+                let err = resp.get("result").and_then(|r| r.get("error")).and_then(|v| v.as_str()).unwrap_or("unknown");
+                eprintln!("  Failed: {err}");
+            }
+        }
+        Commands::EnableRealtime => {
+            let token = request_challenge_token().await?;
+            let resp = send_request("protection.set_critical", serde_json::json!({
+                "token": token, "realtime_enabled": true
+            })).await?;
+            if resp.get("result").and_then(|r| r.get("ok")).and_then(|v| v.as_bool()) == Some(true) {
+                println!("  Real-time protection enabled.");
+            } else {
+                let err = resp.get("result").and_then(|r| r.get("error")).and_then(|v| v.as_str()).unwrap_or("unknown");
+                eprintln!("  Failed: {err}");
+            }
+        }
+        Commands::PauseProtection => {
+            let token = request_challenge_token().await?;
+            let resp = send_request("protection.disable", serde_json::json!({"token": token})).await?;
+            if resp.get("result").and_then(|r| r.get("ok")).and_then(|v| v.as_bool()) == Some(true) {
+                println!("  Protection paused.");
+            } else {
+                let err = resp.get("result").and_then(|r| r.get("error")).and_then(|v| v.as_str()).unwrap_or("unknown");
+                eprintln!("  Failed: {err}");
+            }
+        }
+        Commands::ResumeProtection => {
+            let token = request_challenge_token().await?;
+            let resp = send_request("protection.enable", serde_json::json!({"token": token})).await?;
+            if resp.get("result").and_then(|r| r.get("ok")).and_then(|v| v.as_bool()) == Some(true) {
+                println!("  Protection resumed.");
+            } else {
+                let err = resp.get("result").and_then(|r| r.get("error")).and_then(|v| v.as_str()).unwrap_or("unknown");
+                eprintln!("  Failed: {err}");
+            }
         }
         Commands::ExportReport { output } => {
             let status = send_request("engine.status", serde_json::Value::Null).await?;

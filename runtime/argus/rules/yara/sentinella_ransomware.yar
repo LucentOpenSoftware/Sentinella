@@ -1,7 +1,7 @@
 /*
     Sentinella ARGUS Intelligence Pack — Ransomware Indicators
     Category: ransomware
-    Version: 2025.1
+    Version: 2026.1
     Author: Sentinella
     License: GPL-2.0
 */
@@ -150,4 +150,106 @@ rule ransomware_process_termination {
         uint16(0) == 0x5A4D and
         any of ($kill*) and
         (2 of ($db*) or 2 of ($office*))
+}
+
+rule ransomware_lockbit3_blackcat_akira {
+    meta:
+        description = "ARGUS detected string patterns associated with LockBit 3.0, BlackCat (ALPHV), or Akira ransomware families — high-profile RaaS operations responsible for widespread enterprise attacks."
+        severity = "critical"
+        weight = 40
+        category = "ransomware"
+        author = "Sentinella"
+    strings:
+        // LockBit 3.0 indicators
+        $lb1 = "LockBit" ascii nocase
+        $lb2 = "lockbit3" ascii nocase
+        $lb3 = "LockBit_Ransomware" ascii nocase
+        $lb4 = { 4C 6F 63 6B 42 69 74 20 33 2E 30 }  // "LockBit 3.0"
+        $lb5 = "restorefilestx" ascii nocase
+        // BlackCat / ALPHV indicators
+        $bc1 = "ALPHV" ascii
+        $bc2 = "BlackCat" ascii nocase
+        $bc3 = "access-key" ascii
+        $bc4 = "--access-token" ascii
+        $bc5 = "esxi_vm_list" ascii
+        $bc6 = "safemode" ascii nocase
+        // Akira indicators
+        $ak1 = "akira_readme" ascii nocase
+        $ak2 = "akiralkzxzq2dsrzsrvbr2xgbbu2wgsmxryd4cez" ascii nocase
+        $ak3 = ".akira" ascii nocase
+        $ak4 = "powershell" ascii nocase
+        $ak5 = "-ep bypass" ascii nocase
+        // Common RaaS encryption markers
+        $enc1 = "CryptGenRandom" ascii
+        $enc2 = "BCryptEncrypt" ascii
+        $enc3 = "ChaChaPoly" ascii nocase
+    condition:
+        uint16(0) == 0x5A4D and
+        (2 of ($lb*) or 2 of ($bc*) or 2 of ($ak*)) and
+        any of ($enc*)
+}
+
+rule ransomware_onion_ransom_urls {
+    meta:
+        description = "ARGUS detected .onion Tor hidden service URLs embedded in executables — consistent with ransomware payment portals and leak sites used for double extortion."
+        severity = "critical"
+        weight = 35
+        category = "ransomware"
+        author = "Sentinella"
+    strings:
+        // Onion URL patterns (v2 and v3 addresses)
+        $onion_v3 = /[a-z2-7]{56}\.onion/ ascii nocase
+        $onion_v2 = /[a-z2-7]{16}\.onion/ ascii nocase
+        // Ransom note context strings
+        $note1 = "your files" ascii nocase
+        $note2 = "decrypt" ascii nocase
+        $note3 = "payment" ascii nocase
+        $note4 = "recover" ascii nocase
+        $note5 = "contact us" ascii nocase
+        $note6 = "bitcoin" ascii nocase
+        $note7 = "monero" ascii nocase
+        // Tor Browser guidance
+        $tor1 = "tor browser" ascii nocase
+        $tor2 = "torbrowser" ascii nocase
+        $tor3 = "torproject.org" ascii nocase
+    condition:
+        any of ($onion_v2, $onion_v3) and
+        (2 of ($note*) or any of ($tor*))
+}
+
+rule ransomware_shadow_delete_powershell {
+    meta:
+        description = "ARGUS detected Volume Shadow Copy deletion via PowerShell, WMI, or advanced command-line techniques — modern ransomware uses PowerShell and WMI to bypass simple vssadmin detection."
+        severity = "critical"
+        weight = 38
+        category = "ransomware"
+        author = "Sentinella"
+    strings:
+        // PowerShell shadow deletion
+        $ps1 = "Get-WmiObject" ascii nocase
+        $ps2 = "Win32_ShadowCopy" ascii nocase
+        $ps3 = "Delete()" ascii nocase
+        $ps4 = "Get-CimInstance" ascii nocase
+        $ps5 = "Remove-CimInstance" ascii nocase
+        // WMIC advanced variants
+        $wmic1 = "wmic" ascii nocase
+        $wmic2 = "shadowcopy" ascii nocase
+        $wmic3 = "delete" ascii nocase
+        // PowerShell disable recovery
+        $rec1 = "Set-MpPreference" ascii nocase
+        $rec2 = "DisableRealtimeMonitoring" ascii nocase
+        $rec3 = "bcdedit" ascii nocase
+        $rec4 = "recoveryenabled" ascii nocase
+        $rec5 = "No" ascii nocase
+        // vssadmin resize trick to invalidate shadows
+        $resize1 = "vssadmin" ascii nocase
+        $resize2 = "resize shadowstorage" ascii nocase
+        $resize3 = "MaxSize=" ascii nocase
+    condition:
+        (($ps1 or $ps4) and $ps2 and $ps3) or
+        ($ps4 and $ps5 and $ps2) or
+        ($wmic1 and $wmic2 and $wmic3) or
+        ($rec1 and $rec2) or
+        ($rec3 and $rec4 and $rec5) or
+        ($resize1 and $resize2 and $resize3)
 }

@@ -18,6 +18,7 @@ import { Card } from "../components/Card";
 import { ShieldIcon } from "../components/ShieldIcon";
 import { useDaemonContext } from "../hooks/DaemonContext";
 import { startQuickScan } from "../api/sentinella";
+import { t } from "../i18n";
 import type { Page } from "../components/Sidebar";
 
 export function Dashboard({ onNavigate }: { onNavigate: (p: Page) => void }) {
@@ -27,7 +28,7 @@ export function Dashboard({ onNavigate }: { onNavigate: (p: Page) => void }) {
     return (
       <div className="flex flex-col items-center py-32">
         <Loader2 size={24} className="mb-4 animate-spin text-[rgb(var(--accent))]" />
-        <p className="text-[13px] text-[rgb(var(--t3))]">Connecting to daemon...</p>
+        <p className="text-[13px] text-[rgb(var(--t3))]">{t("dash.connecting")}</p>
       </div>
     );
   }
@@ -42,9 +43,9 @@ export function Dashboard({ onNavigate }: { onNavigate: (p: Page) => void }) {
                 <WifiOff size={28} />
               </div>
               <div className="flex min-w-0 flex-col gap-3">
-                <h3 className="text-[24px] font-bold leading-tight">Daemon Not Connected</h3>
+                <h3 className="text-[24px] font-bold leading-tight">{t("dash.not_connected")}</h3>
                 <p className="max-w-xl text-[14px] leading-relaxed text-[rgb(var(--t2))]">
-                  Cannot reach the Sentinella daemon. Make sure sentinelld is running.
+                  {t("dash.not_connected_desc")}
                 </p>
                 {error && (
                   <div className="flex items-center gap-2 text-[12px] text-[rgb(var(--red))]">
@@ -56,14 +57,14 @@ export function Dashboard({ onNavigate }: { onNavigate: (p: Page) => void }) {
             </div>
             <div className="flex flex-col gap-4">
               <div className="rounded border border-[rgb(var(--border))]/15 bg-[rgb(var(--raised))]/25 p-4">
-                <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-[rgb(var(--t3))]">Endpoint</p>
+                <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-[rgb(var(--t3))]">{t("dash.endpoint")}</p>
                 <p className="mt-2 break-all font-mono text-[12px] text-[rgb(var(--t2))]">\\.\pipe\sentinelld</p>
               </div>
               <button
                 onClick={refresh}
                 className="rounded-xl bg-[rgb(var(--accent))] px-5 py-3 text-[13px] font-semibold text-white shadow-sm shadow-[rgb(var(--accent))]/15 hover:opacity-90 cursor-pointer"
               >
-                Retry Connection
+                {t("dash.retry")}
               </button>
             </div>
           </div>
@@ -71,30 +72,30 @@ export function Dashboard({ onNavigate }: { onNavigate: (p: Page) => void }) {
 
         <div className="card-grid-4">
           <StatusTile
-            label="Real-time"
-            value="Unavailable"
-            sub="Watcher offline"
+            label={t("tile.realtime")}
+            value={t("dash.unavailable")}
+            sub={t("dash.watcher_offline")}
             color="amber"
             icon={<Eye size={18} />}
           />
           <StatusTile
-            label="Engine"
-            value="Disconnected"
-            sub="Daemon unreachable"
+            label={t("tile.engine")}
+            value={t("tile.disconnected")}
+            sub={t("dash.daemon_unreachable")}
             color="red"
             icon={<ShieldOff size={18} />}
           />
           <StatusTile
-            label="Signatures"
-            value="Unknown"
-            sub="Database state unavailable"
+            label={t("tile.signatures")}
+            value={t("common.unknown")}
+            sub={t("dash.db_state_unavailable")}
             color="amber"
             icon={<Database size={18} />}
           />
           <StatusTile
-            label="Last Update"
-            value="Never"
-            sub="No sync detected"
+            label={t("dash.last_update")}
+            value={t("common.never")}
+            sub={t("dash.no_sync")}
             color="amber"
             icon={<Clock size={18} />}
           />
@@ -102,22 +103,22 @@ export function Dashboard({ onNavigate }: { onNavigate: (p: Page) => void }) {
 
         <section className="section-stack">
           <div className="flex flex-col gap-2">
-            <h4 className="text-[15px] font-semibold">Quick Actions</h4>
-            <p className="text-[12px] text-[rgb(var(--t3))]">Common tasks remain available once the daemon reconnects.</p>
+            <h4 className="text-[15px] font-semibold">{t("dash.quick_actions")}</h4>
+            <p className="text-[12px] text-[rgb(var(--t3))]">{t("dash.quick_actions_offline")}</p>
           </div>
           <div className="card-grid-4">
             <ActionTile
               icon={<Search size={20} />}
-              label="Scan File"
-              description="Open single-file scan"
+              label={t("scan.file")}
+              description={t("dash.scan_file_desc")}
               onClick={() => onNavigate("scan")}
             />
-            <ActionTile icon={<Zap size={20} />} label="Quick Scan" description="Requires daemon connection" />
-            <ActionTile icon={<RefreshCw size={20} />} label="Update" description="Retry signatures after reconnect" />
+            <ActionTile icon={<Zap size={20} />} label={t("scan.quick")} description={t("dash.requires_daemon")} />
+            <ActionTile icon={<RefreshCw size={20} />} label={t("nav.update")} description={t("dash.retry_sigs_desc")} />
             <ActionTile
               icon={<Archive size={20} />}
-              label="Quarantine"
-              description="Review isolated items"
+              label={t("scan.quarantine_action")}
+              description={t("dash.review_isolated")}
               onClick={() => onNavigate("quarantine")}
             />
           </div>
@@ -132,9 +133,9 @@ export function Dashboard({ onNavigate }: { onNavigate: (p: Page) => void }) {
   const activity = data!.activity;
   const idle = data!.idleScanner;
   const isReady = engine.state === "ready";
-  const lastDbUpdate = engine.last_update ? new Date(engine.last_update * 1000).toLocaleString() : "Never";
-  const lastSeen = lastRefresh ? lastRefresh.toLocaleTimeString() : "Waiting";
-  const dbVersion = engine.db_version ? `v${engine.db_version}` : "Unavailable";
+  const lastDbUpdate = engine.last_update ? new Date(engine.last_update * 1000).toLocaleString() : t("common.never");
+  const lastSeen = lastRefresh ? lastRefresh.toLocaleTimeString() : t("tile.waiting");
+  const dbVersion = engine.db_version ? `v${engine.db_version}` : t("dash.unavailable");
 
   return (
     <div className="page-stack">
@@ -148,54 +149,54 @@ export function Dashboard({ onNavigate }: { onNavigate: (p: Page) => void }) {
                 isReady ? "bg-[rgb(var(--green))]/8 text-[rgb(var(--green))]" : "bg-[rgb(var(--red))]/8 text-[rgb(var(--red))]"
               }`}
             >
-              <ShieldIcon icon={isReady ? "protected" : "threat"} size={38} className={isReady ? "" : "opacity-70"} />
+              <ShieldIcon icon={isReady ? "protected" : "threat"} size={38} className={`brightness-0 invert ${isReady ? "opacity-80" : "opacity-60"}`} />
             </div>
             <div className="flex min-w-0 flex-col gap-3">
               <h3 className="text-[24px] font-bold leading-tight">
-                {isReady ? "Your System is Protected" : "Protection Attention Needed"}
+                {isReady ? t("dash.protected") : t("dash.attention")}
               </h3>
               <p className="max-w-2xl text-[14px] leading-relaxed text-[rgb(var(--t2))]">
                 {engine.signature_count > 0
-                  ? `${engine.signature_count.toLocaleString()} signatures loaded. ARGUS heuristics active. Database ${dbVersion}.`
-                  : "No signature database loaded yet. ARGUS heuristics active."}
+                  ? `${engine.signature_count.toLocaleString()} ${t("dash.sigs_loaded_db")} ${dbVersion}.`
+                  : t("dash.no_sigs_loaded")}
               </p>
               <div className="flex flex-wrap items-center gap-3 text-[12px] text-[rgb(var(--t3))]">
                 <span className="rounded-full bg-[rgb(var(--raised))]/25 px-3 py-1.5">
-                  Engine {engine.engine_version}
+                  {t("dash.engine_prefix")} {engine.engine_version}
                 </span>
                 <span className="rounded-full bg-[rgb(var(--raised))]/25 px-3 py-1.5">
-                  Watcher {watcher.mode.replace("_", " ")}
+                  {t("dash.watcher_prefix")} {watcher.mode.replace("_", " ")}
                 </span>
               </div>
             </div>
           </div>
           <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-1">
-            <HeroDetail label="Last Refresh" value={lastSeen} sub="UI heartbeat" />
-            <HeroDetail label="Database Updated" value={lastDbUpdate} sub="Last signatures sync" />
+            <HeroDetail label={t("dash.last_refresh")} value={lastSeen} sub={t("dash.ui_heartbeat")} />
+            <HeroDetail label={t("dash.db_updated")} value={lastDbUpdate} sub={t("dash.last_sync")} />
           </div>
         </div>
       </Card>
 
       <div className="card-grid-4">
         <StatusTile
-          label="Real-time"
-          value={watcher.enabled ? "Active" : "Disabled"}
-          sub={watcher.enabled ? `${watcher.events_per_sec} events/sec` : "Watcher inactive"}
+          label={t("tile.realtime")}
+          value={watcher.enabled ? t("tile.active") : t("tile.disabled")}
+          sub={watcher.enabled ? `${watcher.events_per_sec} ${t("dash.events_per_sec_suffix")}` : t("tile.watcher_inactive")}
           color={watcher.enabled ? "green" : "amber"}
           icon={<Eye size={18} />}
         />
         <StatusTile
-          label="Background"
-          value={idle.state === "disabled" ? "Off"
-            : idle.state.startsWith("scanning") ? "Scanning"
-            : idle.state.startsWith("paused") ? "Paused"
-            : idle.state === "completed" ? "Done"
-            : "Waiting"}
-          sub={idle.state === "disabled" ? "Idle scanner disabled"
-            : idle.state.startsWith("scanning") ? `${idle.files_scanned_session} files · ${idle.current_target || "..."}`
+          label={t("tile.background")}
+          value={idle.state === "disabled" ? t("tile.off")
+            : idle.state.startsWith("scanning") ? t("tile.scanning")
+            : idle.state.startsWith("paused") ? t("tile.paused")
+            : idle.state === "completed" ? t("tile.done")
+            : t("tile.waiting")}
+          sub={idle.state === "disabled" ? t("dash.idle_disabled")
+            : idle.state.startsWith("scanning") ? `${idle.files_scanned_session} ${t("dash.files_suffix")} · ${idle.current_target || "..."}`
             : idle.state.startsWith("paused") ? idle.last_pause_reason.replace("_", " ")
-            : idle.state === "completed" ? `${idle.files_scanned_session} files checked`
-            : "Waiting for capacity"}
+            : idle.state === "completed" ? `${idle.files_scanned_session} ${t("dash.files_checked")}`
+            : t("dash.waiting_capacity")}
           color={idle.state === "disabled" ? "amber"
             : idle.state.startsWith("scanning") ? "green"
             : idle.state === "completed" ? "green"
@@ -203,20 +204,20 @@ export function Dashboard({ onNavigate }: { onNavigate: (p: Page) => void }) {
           icon={<Search size={18} />}
         />
         <StatusTile
-          label="ARGUS"
-          value={stats.argus_active_layers > 0 ? `${stats.argus_active_layers} Layers` : "Active"}
+          label={t("tile.argus")}
+          value={stats.argus_active_layers > 0 ? `${stats.argus_active_layers} ${t("argus.layers_suffix")}` : t("tile.active")}
           sub={stats.argus_yara_rules > 0
-            ? `${stats.argus_yara_rules} rules · ${stats.argus_files_analyzed} analyzed`
+            ? `${stats.argus_yara_rules} ${t("argus.rules_suffix")} · ${stats.argus_files_analyzed} ${t("argus.analyzed_suffix")}`
             : stats.argus_files_analyzed > 0
-              ? `${stats.argus_files_analyzed} files analyzed`
-              : "Heuristic engine ready"}
+              ? `${stats.argus_files_analyzed} ${t("argus.files_analyzed_suffix")}`
+              : t("argus.heuristic_ready")}
           color="accent"
           icon={<Zap size={18} />}
         />
         <StatusTile
-          label="Signatures"
+          label={t("tile.signatures")}
           value={engine.signature_count > 0 ? engine.signature_count.toLocaleString() : "0"}
-          sub={`Database ${dbVersion}`}
+          sub={`${t("dash.database_prefix")} ${dbVersion}`}
           color={engine.signature_count > 0 ? "green" : "amber"}
           icon={<Database size={18} />}
         />
@@ -225,9 +226,9 @@ export function Dashboard({ onNavigate }: { onNavigate: (p: Page) => void }) {
       {/* Secondary row: Uptime + ARGUS Intelligence pill */}
       <div className="dash-secondary-row">
         <StatusTile
-          label="Uptime"
+          label={t("tile.uptime")}
           value={stats.uptime_human}
-          sub="Daemon runtime"
+          sub={t("tile.daemon_runtime")}
           color="accent"
           icon={<Clock size={16} />}
         />
@@ -239,15 +240,23 @@ export function Dashboard({ onNavigate }: { onNavigate: (p: Page) => void }) {
                 <Zap size={16} className="text-[rgb(var(--accent))]" />
               </div>
               <div>
-                <h4 className="text-[13px] font-semibold">ARGUS Intelligence</h4>
+                <h4 className="text-[13px] font-semibold">{t("argus.intelligence")}</h4>
                 <p className="text-[10px] text-[rgb(var(--t3))] mt-0.5">
-                  v{stats.argus_version} · {stats.argus_active_layers} layers · {stats.argus_yara_rules} rules
+                  v{stats.argus_version} · {stats.argus_active_layers} {t("argus.layers_suffix")} · {stats.argus_yara_rules} {t("argus.rules_suffix")}
                 </p>
               </div>
             </div>
             {/* Middle: tags */}
             <div className="flex flex-wrap gap-1.5 flex-1 min-w-0">
-              {["Stealer Detection", "Script Abuse", "Deception & Evasion", "GitHub Stealers", "LOLBin Abuse", "Documents", "Persistence"].map((pack) => (
+              {[
+                t("argus.pack_stealer"),
+                t("argus.pack_script"),
+                t("argus.pack_deception"),
+                t("argus.pack_github"),
+                t("argus.pack_lolbin"),
+                t("argus.pack_documents"),
+                t("argus.pack_persistence"),
+              ].map((pack) => (
                 <span key={pack} className="text-[10px] px-2.5 py-1 rounded-full bg-[rgb(var(--raised))]/20 text-[rgb(var(--t3))] whitespace-nowrap">
                   {pack}
                 </span>
@@ -257,7 +266,7 @@ export function Dashboard({ onNavigate }: { onNavigate: (p: Page) => void }) {
             {stats.argus_files_analyzed > 0 && (
               <div className="text-right flex-shrink-0 min-w-[80px]">
                 <p className="text-[18px] font-bold text-[rgb(var(--t1))]">{stats.argus_files_analyzed.toLocaleString()}</p>
-                <p className="text-[10px] text-[rgb(var(--t3))]">files analyzed</p>
+                <p className="text-[10px] text-[rgb(var(--t3))]">{t("argus.files_analyzed")}</p>
               </div>
             )}
           </div>
@@ -267,8 +276,8 @@ export function Dashboard({ onNavigate }: { onNavigate: (p: Page) => void }) {
               <Zap size={16} className="text-[rgb(var(--accent))]" />
             </div>
             <div>
-              <h4 className="text-[13px] font-semibold">ARGUS Intelligence</h4>
-              <p className="text-[10px] text-[rgb(var(--t3))] mt-0.5">Heuristic engine active · no YARA rules loaded</p>
+              <h4 className="text-[13px] font-semibold">{t("argus.intelligence")}</h4>
+              <p className="text-[10px] text-[rgb(var(--t3))] mt-0.5">{t("argus.no_yara")}</p>
             </div>
           </div>
         )}
@@ -276,20 +285,20 @@ export function Dashboard({ onNavigate }: { onNavigate: (p: Page) => void }) {
 
       <section className="section-stack">
         <div className="flex flex-col gap-2">
-          <h4 className="text-[15px] font-semibold">Quick Actions</h4>
-          <p className="text-[12px] text-[rgb(var(--t3))]">Run the most common security tasks.</p>
+          <h4 className="text-[15px] font-semibold">{t("dash.quick_actions")}</h4>
+          <p className="text-[12px] text-[rgb(var(--t3))]">{t("dash.quick_actions_desc")}</p>
         </div>
         <div className="card-grid-4">
           <ActionTile
             icon={<Search size={20} />}
-            label="Scan File"
-            description="Select and scan one file"
+            label={t("scan.file")}
+            description={t("dash.select_scan_one")}
             onClick={() => onNavigate("scan")}
           />
           <ActionTile
             icon={<Zap size={20} />}
-            label="Quick Scan"
-            description="Scan common folders"
+            label={t("scan.quick")}
+            description={t("dash.scan_common_folders")}
             accent
             onClick={() => {
               startQuickScan().catch((e) => console.error("Quick scan failed:", e));
@@ -298,14 +307,14 @@ export function Dashboard({ onNavigate }: { onNavigate: (p: Page) => void }) {
           />
           <ActionTile
             icon={<RefreshCw size={20} />}
-            label="Update"
-            description="Refresh signature database"
+            label={t("nav.update")}
+            description={t("dash.refresh_sig_db")}
             onClick={() => onNavigate("update")}
           />
           <ActionTile
             icon={<Archive size={20} />}
-            label="Quarantine"
-            description="Inspect isolated items"
+            label={t("scan.quarantine_action")}
+            description={t("dash.inspect_isolated")}
             onClick={() => onNavigate("quarantine")}
           />
         </div>
@@ -314,14 +323,14 @@ export function Dashboard({ onNavigate }: { onNavigate: (p: Page) => void }) {
       <Card>
         <div className="mb-5 flex items-center justify-between gap-4">
           <div>
-            <h4 className="text-[15px] font-semibold">Recent Activity</h4>
-            <p className="mt-1 text-[12px] text-[rgb(var(--t3))]">Latest daemon events and scan history.</p>
+            <h4 className="text-[15px] font-semibold">{t("dash.recent_activity")}</h4>
+            <p className="mt-1 text-[12px] text-[rgb(var(--t3))]">{t("dash.recent_activity_desc")}</p>
           </div>
           <button
             onClick={() => onNavigate("history")}
             className="rounded-xl border border-[rgb(var(--accent))]/15 px-3 py-2 text-[11px] font-semibold text-[rgb(var(--accent))] hover:bg-[rgb(var(--accent))]/6 cursor-pointer"
           >
-            View History
+            {t("dash.view_history")}
           </button>
         </div>
         {activity.length > 0 ? (
@@ -359,8 +368,8 @@ export function Dashboard({ onNavigate }: { onNavigate: (p: Page) => void }) {
         ) : (
           <div className="flex flex-col items-center py-10 text-center">
             <Clock size={32} className="mb-3 text-[rgb(var(--t3))]/20" />
-            <p className="text-[14px] font-medium text-[rgb(var(--t2))]">No recent activity</p>
-            <p className="mt-1 text-[12px] text-[rgb(var(--t3))]">Activity appears here after scans and updates.</p>
+            <p className="text-[14px] font-medium text-[rgb(var(--t2))]">{t("dash.no_activity")}</p>
+            <p className="mt-1 text-[12px] text-[rgb(var(--t3))]">{t("dash.no_activity_desc")}</p>
           </div>
         )}
       </Card>

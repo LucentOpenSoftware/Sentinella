@@ -63,7 +63,7 @@ fn generate_ipc_secret() -> String {
 }
 
 fn load_or_create_ipc_secret() -> Option<String> {
-    let path = PathBuf::from("runtime/state/ipc_secret");
+    let path = ipc_secret_path();
     let env_secret = std::env::var("SENTINELLA_IPC_SECRET")
         .ok()
         .filter(|s| s.len() >= 32);
@@ -99,6 +99,20 @@ fn load_or_create_ipc_secret() -> Option<String> {
             None
         }
     }
+}
+
+fn ipc_secret_path() -> PathBuf {
+    // Dev mode: if running from project tree (CWD has crates/sentinelld),
+    // use project-local runtime/state/ipc_secret so GUI can find the same file.
+    if let Ok(cwd) = std::env::current_dir() {
+        if cwd.join("crates").join("sentinelld").exists() {
+            return cwd.join("runtime").join("state").join("ipc_secret");
+        }
+    }
+    // Installed mode: ProgramData.
+    sentinella_common::paths::data_dir()
+        .join("state")
+        .join("ipc_secret")
 }
 
 #[derive(Clone, Default)]
@@ -2436,6 +2450,7 @@ impl AppState {
         match ClamEngine::load(dll_dir, db_dir) {
             Ok(new_engine) => {
                 let sigs = new_engine.signature_count() as u64;
+                self.scan_cache.invalidate_all();
                 *self.write_engine() = Some(Arc::new(new_engine));
                 *self.write_engine_error() = None;
                 self.signature_count.store(sigs, Ordering::Relaxed);
@@ -2448,7 +2463,6 @@ impl AppState {
                 );
                 tracing::info!(sigs, "engine reloaded successfully");
                 // Invalidate scan cache — new signatures may detect previously-clean files.
-                self.scan_cache.invalidate_all();
                 Ok(sigs)
             }
             Err(e) => {
@@ -2557,6 +2571,34 @@ impl AppState {
             Arc::clone(&self.scan_cache),
         );
         *self.idle_scanner.lock().unwrap_or_else(|e| e.into_inner()) = Some(scanner);
+    }
+
+    /// Run a lightweight startup critical areas scan.
+    ///
+    /// Fires AFTER watcher is running — realtime is never delayed.
+    /// Scans: Startup folder, Run/RunOnce keys, recent Downloads/Desktop,
+    /// Temp executables. 1 worker, BELOW_NORMAL priority, yields under pressure.
+    /// Skips files already in scan cache.
+    pub fn start_startup_critical_scan(self: &Arc<Self>) {
+        let engine = match &*self.read_engine() {
+            Some(e) => Arc::clone(e),
+            None => {
+                tracing::info!("startup critical scan skipped: engine not loaded");
+                return;
+            }
+        };
+
+        let state = Arc::clone(self);
+        let cache = Arc::clone(&self.scan_cache);
+
+        if let Err(e) = std::thread::Builder::new()
+            .name("startup-critical".into())
+            .spawn(move || {
+                startup_critical_scan(state, engine, cache);
+            })
+        {
+            tracing::warn!(error = %e, "failed to spawn startup critical scan thread");
+        }
     }
 
     /// Get idle scanner stats for IPC.
@@ -3354,6 +3396,174 @@ fn startup_scan_worker(
     let targets = dedup::deduplicate(targets);
     tracing::info!(job = %job_id, targets = targets.len(), "startup scan starting");
     folder_scan_worker(state, job_id, engine, cancel, targets, "startup");
+}
+
+/// Lightweight post-boot scan of critical system areas.
+///
+/// Runs once after daemon startup. Not a user-visible scan — no progress bar,
+/// no scan history entry. Just quiet background verification.
+///
+/// - 1 thread, BELOW_NORMAL priority
+/// - Yields if memory pressure is Warning+
+/// - Skips files already in scan cache
+/// - Scans: Startup folder, Run keys, recent Downloads/Desktop, Temp executables
+fn startup_critical_scan(
+    state: Arc<AppState>,
+    engine: Arc<ClamEngine>,
+    cache: Arc<crate::scan::cache::ScanCache>,
+) {
+    use tracing::{debug, info, warn};
+
+    // Set thread priority to BELOW_NORMAL — never compete with realtime or user scans.
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
+        unsafe {
+            let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        }
+    }
+
+    // Brief delay — let watcher fully initialize first.
+    std::thread::sleep(std::time::Duration::from_secs(5));
+
+    info!("startup critical scan: collecting targets...");
+
+    // Collect high-risk targets.
+    use crate::targeting::{TargetConfig, TargetProvider, startup::StartupTargets};
+    let config = TargetConfig {
+        startup_scan_enabled: true,
+        startup_recent_days: 7,
+        ..TargetConfig::default()
+    };
+    let mut targets: Vec<PathBuf> = StartupTargets.collect(&config);
+
+    // Also check Temp for recent executables (last 24h only — tighter than full startup scan).
+    let temp = std::env::var("TEMP").unwrap_or_default();
+    if !temp.is_empty() {
+        let temp_dir = PathBuf::from(&temp);
+        let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(86400);
+        if let Ok(entries) = std::fs::read_dir(&temp_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_file() { continue; }
+                if let Some(ext) = path.extension() {
+                    let el = ext.to_string_lossy().to_lowercase();
+                    if !matches!(el.as_str(), "exe" | "scr" | "bat" | "cmd" | "ps1" | "vbs" | "msi") {
+                        continue;
+                    }
+                } else { continue; }
+                if let Ok(meta) = path.metadata() {
+                    if let Ok(mtime) = meta.modified() {
+                        if mtime >= cutoff {
+                            targets.push(path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Dedup.
+    targets.sort();
+    targets.dedup();
+
+    // Filter out Sentinella's own files and cached-clean files.
+    let daemon_config = crate::config::Config::load(None).unwrap_or_default();
+    targets.retain(|path| {
+        if crate::scan::is_sentinella_path(path) { return false; }
+        if crate::scan::is_excluded(path, &daemon_config.excluded_paths, &daemon_config.excluded_extensions) { return false; }
+        if let Ok(meta) = path.metadata() {
+            if let Some(true) = cache.check_with_metadata(path, &meta) { return false; }
+        }
+        true
+    });
+
+    if targets.is_empty() {
+        info!("startup critical scan: all targets cached clean — nothing to do");
+        state.log_activity("info", "system", "Startup check: all clear", "Critical areas verified", None);
+        return;
+    }
+
+    info!(files = targets.len(), "startup critical scan: scanning critical areas");
+    state.log_activity(
+        "info", "system",
+        &format!("Performing startup protection verification... ({} files)", targets.len()),
+        "Post-boot critical areas check",
+        None,
+    );
+
+    let mut scanned = 0u64;
+    let mut threats = 0u64;
+    let no_cancel = AtomicBool::new(false);
+
+    for path in &targets {
+        // Yield under memory pressure.
+        let pressure = state.update_pressure();
+        if matches!(pressure, crate::footprint::pressure::PressureState::Warning | crate::footprint::pressure::PressureState::Critical) {
+            debug!("startup critical scan: pausing for memory pressure");
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            continue; // Skip this file, will catch it on idle scan later.
+        }
+
+        // Check file still exists and is readable.
+        if !path.exists() || !path.is_file() { continue; }
+        if let Ok(meta) = path.metadata() {
+            if meta.len() > 100 * 1024 * 1024 { continue; } // Skip >100MB.
+            if meta.len() == 0 { continue; }
+        }
+
+        // ClamAV signature scan.
+        let result = state.scan_file_clamav(&engine, path, &no_cancel);
+
+        // ARGUS heuristic analysis.
+        let argus_verdict = state.argus().analyze_file(path);
+
+        scanned += 1;
+
+        let (is_threat, threat_name_opt) = crate::ipc::unify_detection_filtered(
+            result.infected,
+            result.virus_name.as_deref(),
+            &argus_verdict,
+            &state.detection_exclusions(),
+        );
+
+        if let Ok(meta) = path.metadata() {
+            cache.record_with_metadata(path, &meta, !is_threat);
+        }
+
+        if is_threat {
+            threats += 1;
+            let threat_name = threat_name_opt.unwrap_or_default();
+            warn!(
+                file = %path.display(),
+                threat = %threat_name,
+                "STARTUP CRITICAL: threat in autorun/recent files"
+            );
+            // Auto-quarantine startup threats.
+            let path_str = path.to_string_lossy().to_string();
+            match state.quarantine_file(&path_str, &threat_name, "startup-critical") {
+                Ok(q) => info!(id = %q.quarantine_id, "startup threat quarantined"),
+                Err(e) => warn!(%e, "startup quarantine failed"),
+            }
+        }
+
+        // Brief sleep between files — don't spike CPU on boot.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    let summary = if threats > 0 {
+        format!("Startup check: {threats} threat(s) found in {scanned} files")
+    } else {
+        format!("Startup verification complete: {scanned} critical files clean")
+    };
+    info!("{summary}");
+    state.log_activity(
+        if threats > 0 { "warning" } else { "info" },
+        "system",
+        &summary,
+        "Post-boot critical areas verification",
+        None,
+    );
 }
 
 fn folder_scan_worker(

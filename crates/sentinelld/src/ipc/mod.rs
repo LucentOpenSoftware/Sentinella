@@ -20,6 +20,80 @@ pub use state::{AppState, unify_detection_filtered};
 /// Min valid JSON-RPC frame: `{}`
 const MIN_FRAME_SIZE: usize = 2;
 
+#[cfg(target_os = "windows")]
+struct PipeSecurity {
+    descriptor: windows::Win32::Security::PSECURITY_DESCRIPTOR,
+    attrs: windows::Win32::Security::SECURITY_ATTRIBUTES,
+}
+
+#[cfg(target_os = "windows")]
+impl PipeSecurity {
+    fn new() -> Result<Self> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::Win32::Foundation::BOOL;
+        use windows::Win32::Security::{
+            Authorization::{
+                ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+            },
+            PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+        };
+        use windows::core::PCWSTR;
+
+        // SYSTEM + Administrators: full access.
+        // Authenticated Users: read+write (connect + IPC only).
+        // Critical ops still gated by IPC auth + challenge token + elevation check.
+        let mut wide: Vec<u16> = std::ffi::OsStr::new("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                PCWSTR(wide.as_mut_ptr()),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                None,
+            )?;
+        }
+        let attrs = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor.0,
+            bInheritHandle: BOOL(0),
+        };
+        Ok(Self { descriptor, attrs })
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for PipeSecurity {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::Foundation::LocalFree(windows::Win32::Foundation::HLOCAL(
+                self.descriptor.0,
+            ));
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn create_pipe_server(
+    pipe_name: &str,
+    first_instance: bool,
+    security: &PipeSecurity,
+) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+    use tokio::net::windows::named_pipe::ServerOptions;
+    let mut options = ServerOptions::new();
+    options.first_pipe_instance(first_instance);
+    unsafe {
+        options.create_with_security_attributes_raw(
+            pipe_name,
+            (&security.attrs as *const windows::Win32::Security::SECURITY_ATTRIBUTES)
+                .cast_mut()
+                .cast(),
+        )
+    }
+}
+
 pub struct Server {
     state: Arc<AppState>,
 }
@@ -52,14 +126,12 @@ impl Server {
 
     #[cfg(target_os = "windows")]
     async fn run_named_pipe(&self) -> Result<()> {
-        use tokio::net::windows::named_pipe::ServerOptions;
         let pipe_name = sentinella_common::IPC_PIPE_NAME;
         info!(pipe = pipe_name, "listening on named pipe");
+        let pipe_security = PipeSecurity::new()?;
 
         // Create first pipe instance.
-        let mut server = ServerOptions::new()
-            .first_pipe_instance(true)
-            .create(pipe_name)?;
+        let mut server = create_pipe_server(pipe_name, true, &pipe_security)?;
 
         loop {
             // Wait for client connection.
@@ -68,10 +140,7 @@ impl Server {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 self.state.record_ipc_error();
                 debug!(%e, "pipe connect error, recreating");
-                server = match ServerOptions::new()
-                    .first_pipe_instance(false)
-                    .create(pipe_name)
-                {
+                server = match create_pipe_server(pipe_name, false, &pipe_security) {
                     Ok(s) => s,
                     Err(e) => {
                         error!(%e, "failed to recreate pipe, backing off");
@@ -85,10 +154,7 @@ impl Server {
             // IMMEDIATELY create next pipe instance BEFORE handling connection.
             // This eliminates the PIPE_BUSY window — a new listener is always ready.
             let connected_pipe = server;
-            server = match ServerOptions::new()
-                .first_pipe_instance(false)
-                .create(pipe_name)
-            {
+            server = match create_pipe_server(pipe_name, false, &pipe_security) {
                 Ok(s) => s,
                 Err(e) => {
                     error!(%e, "failed to create next pipe instance");
@@ -100,9 +166,7 @@ impl Server {
                         }
                     });
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    server = ServerOptions::new()
-                        .first_pipe_instance(false)
-                        .create(pipe_name)?;
+                    server = create_pipe_server(pipe_name, false, &pipe_security)?;
                     continue;
                 }
             };

@@ -42,10 +42,15 @@ where
 
     info!(path = %freshclam_path.display(), "starting freshclam update");
 
+    // Resolve relative paths in config to absolute paths.
+    // freshclam on Windows requires absolute paths with backslashes.
+    let effective_config = resolve_freshclam_config(config_path);
+    let config_arg = effective_config.as_deref().unwrap_or(config_path);
+
     // Spawn with piped stdout/stderr for real-time reading.
     let mut child = match Command::new(freshclam_path)
         .arg("--config-file")
-        .arg(config_path)
+        .arg(config_arg)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -195,4 +200,53 @@ pub fn find_freshclam() -> Option<PathBuf> {
     }
 
     None
+}
+
+/// Resolve relative paths in freshclam.conf to absolute paths.
+/// Returns path to a temp config file with resolved paths, or None if
+/// the original config already uses absolute paths.
+fn resolve_freshclam_config(config_path: &Path) -> Option<PathBuf> {
+    let content = std::fs::read_to_string(config_path).ok()?;
+    let cwd = std::env::current_dir().ok()?;
+
+    let mut rewritten = String::new();
+    let mut changed = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        // Resolve DatabaseDirectory and UpdateLogFile paths.
+        if let Some(rest) = trimmed.strip_prefix("DatabaseDirectory") {
+            let val = rest.trim();
+            if !val.is_empty() && !Path::new(val).is_absolute() {
+                let abs = cwd.join(val);
+                let _ = std::fs::create_dir_all(&abs);
+                rewritten.push_str(&format!("DatabaseDirectory {}\n", abs.display()));
+                changed = true;
+                continue;
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("UpdateLogFile") {
+            let val = rest.trim();
+            if !val.is_empty() && !Path::new(val).is_absolute() {
+                let abs = cwd.join(val);
+                if let Some(parent) = abs.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                rewritten.push_str(&format!("UpdateLogFile {}\n", abs.display()));
+                changed = true;
+                continue;
+            }
+        }
+        rewritten.push_str(line);
+        rewritten.push('\n');
+    }
+
+    if !changed {
+        return None;
+    }
+
+    // Write resolved config to temp file.
+    let tmp = cwd.join("runtime").join("config").join("freshclam.resolved.conf");
+    std::fs::write(&tmp, &rewritten).ok()?;
+    info!(path = %tmp.display(), "freshclam config resolved to absolute paths");
+    Some(tmp)
 }

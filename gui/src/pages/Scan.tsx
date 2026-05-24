@@ -6,6 +6,7 @@ import { Card } from "../components/Card";
 import { scanFile, scanFolder, startQuickScan, startFullScan, startStartupScan, getScanStatus, cancelScan, getScanHistory, notifyThreat, quarantineFile, notifyQuarantine } from "../api/sentinella";
 import { FolderOpen, HardDrive, RotateCcw } from "lucide-react";
 import type { FileScanResponse, ScanRecord, ScanStatusResponse, EngineStatus, ArgusVerdict, ArgusFinding } from "../types/sentinella";
+import { t } from "../i18n";
 
 type St = {k:"idle"}|{k:"picked";path:string}|{k:"scanning";path:string}|{k:"result";r:FileScanResponse;argus?:ArgusVerdict}|{k:"quick"}|{k:"error";msg:string};
 
@@ -64,7 +65,7 @@ export function ScanPage({ droppedFile, onConsumeDroppedFile, connected, engineS
     <div className="page-stack">
       {!up && (
         <div className="flex items-center gap-3 px-5 py-3 rounded-xl bg-[rgb(var(--amber))]/6 border border-[rgb(var(--amber))]/10 text-[12px] text-[rgb(var(--amber))]">
-          <WifiOff size={14} /> Daemon not connected — scanning unavailable
+          <WifiOff size={14} /> {t("scan.not_connected")}
         </div>
       )}
 
@@ -72,20 +73,20 @@ export function ScanPage({ droppedFile, onConsumeDroppedFile, connected, engineS
       {(st.k === "idle" || st.k === "picked") && (
         <>
           <div className="grid gap-6 md:grid-cols-2 xl:grid-cols-3">
-            <ScanTypeCard icon={<FileSearch size={22}/>} title="Scan File" desc="Signature + ARGUS heuristic analysis on a single file." accent disabled={!ready}
-              onClick={async () => { const p = await open({multiple:false,directory:false,title:"Select file"}); if (p) setSt({k:"picked",path:p as string}); }} />
-            <ScanTypeCard icon={<Zap size={22}/>} title="Quick Scan" desc="Downloads, Desktop, Temp — fast check." disabled={!ready}
+            <ScanTypeCard icon={<FileSearch size={22}/>} title={t("scan.file")} desc={t("scan.file_desc")} accent disabled={!ready}
+              onClick={async () => { const p = await open({multiple:false,directory:false,title:t("scan.file")}); if (p) setSt({k:"picked",path:p as string}); }} />
+            <ScanTypeCard icon={<Zap size={22}/>} title={t("scan.quick")} desc={t("scan.quick_desc")} disabled={!ready}
               onClick={async () => { try { await startQuickScan(); setSt({k:"quick"}); } catch(e) { setSt({k:"error",msg:String(e)}); }}} />
-            <ScanTypeCard icon={<FolderOpen size={22}/>} title="Scan Folder" desc="Multi-engine scan across all files in a folder." disabled={!ready}
+            <ScanTypeCard icon={<FolderOpen size={22}/>} title={t("scan.folder")} desc={t("scan.folder_desc")} disabled={!ready}
               onClick={async () => {
-                const p = await open({multiple:false, directory:true, title:"Select folder to scan"});
+                const p = await open({multiple:false, directory:true, title:t("scan.folder")});
                 if (p) { try { await scanFolder(p as string); setSt({k:"quick"}); } catch(e) { setSt({k:"error",msg:String(e)}); } }
               }} />
           </div>
           <div className="grid gap-6 md:grid-cols-2 xl:grid-cols-3">
-            <ScanTypeCard icon={<HardDrive size={22}/>} title="Full Scan" desc="Scan all fixed drives — thorough but slow." disabled={!ready}
+            <ScanTypeCard icon={<HardDrive size={22}/>} title={t("scan.full")} desc={t("scan.full_desc")} disabled={!ready}
               onClick={async () => { try { await startFullScan(); setSt({k:"quick"}); } catch(e) { setSt({k:"error",msg:String(e)}); }}} />
-            <ScanTypeCard icon={<RotateCcw size={22}/>} title="Startup Scan" desc="Autorun entries, Run keys, recent executables." disabled={!ready}
+            <ScanTypeCard icon={<RotateCcw size={22}/>} title={t("scan.startup")} desc={t("scan.startup_desc")} disabled={!ready}
               onClick={async () => { try { await startStartupScan(); setSt({k:"quick"}); } catch(e) { setSt({k:"error",msg:String(e)}); }}} />
           </div>
         </>
@@ -99,7 +100,7 @@ export function ScanPage({ droppedFile, onConsumeDroppedFile, connected, engineS
               <FileSearch size={18} className="text-[rgb(var(--accent))]" />
             </div>
             <div className="flex-1 min-w-0">
-              <p className="text-[14px] font-semibold">Selected file</p>
+              <p className="text-[14px] font-semibold">{t("scan.selected_file")}</p>
               <p className="text-[12px] text-[rgb(var(--t3))] truncate mt-0.5">{st.path}</p>
             </div>
             <button disabled={!ready} onClick={async () => {
@@ -118,7 +119,7 @@ export function ScanPage({ droppedFile, onConsumeDroppedFile, connected, engineS
               }
               catch(e) { setSt({k:"error",msg:String(e)}); }
             }} className="px-5 py-2.5 bg-[rgb(var(--accent))] text-white rounded-xl text-[13px] font-semibold hover:opacity-90 cursor-pointer disabled:opacity-40 shadow-sm shadow-[rgb(var(--accent))]/10">
-              Scan Now
+              {t("scan.now")}
             </button>
           </div>
         </Card>
@@ -128,7 +129,7 @@ export function ScanPage({ droppedFile, onConsumeDroppedFile, connected, engineS
       {st.k === "scanning" && (
         <Card><div className="flex items-center gap-4 py-2">
           <Loader2 size={20} className="text-[rgb(var(--accent))] animate-spin" />
-          <div className="flex-1 min-w-0"><p className="text-[14px] font-semibold">Scanning...</p><p className="text-[12px] text-[rgb(var(--t3))] truncate">{st.path}</p></div>
+          <div className="flex-1 min-w-0"><p className="text-[14px] font-semibold">{t("scan.scanning")}</p><p className="text-[12px] text-[rgb(var(--t3))] truncate">{st.path}</p></div>
         </div></Card>
       )}
 
@@ -147,10 +148,10 @@ export function ScanPage({ droppedFile, onConsumeDroppedFile, connected, engineS
           <div className="flex items-center gap-4 py-2">
             <Loader2 size={20} className="text-[rgb(var(--accent))] animate-spin" />
             <div className="flex-1 min-w-0">
-              <p className="text-[14px] font-semibold">Scan Queued</p>
-              <p className="text-[12px] text-[rgb(var(--t3))]">Waiting for available worker...</p>
+              <p className="text-[14px] font-semibold">{t("scan.queued")}</p>
+              <p className="text-[12px] text-[rgb(var(--t3))]">{t("scan.queued_desc")}</p>
             </div>
-            <button onClick={() => cancelScan().catch(()=>{})} className="flex items-center gap-2 px-4 py-2 rounded-xl bg-[rgb(var(--raised))]/40 text-[12px] text-[rgb(var(--t2))] hover:text-[rgb(var(--red))] cursor-pointer"><Square size={11}/>Cancel</button>
+            <button onClick={() => cancelScan().catch(()=>{})} className="flex items-center gap-2 px-4 py-2 rounded-xl bg-[rgb(var(--raised))]/40 text-[12px] text-[rgb(var(--t2))] hover:text-[rgb(var(--red))] cursor-pointer"><Square size={11}/>{t("scan.cancel")}</button>
           </div>
         </Card>
       )}
@@ -161,8 +162,8 @@ export function ScanPage({ droppedFile, onConsumeDroppedFile, connected, engineS
           <div className="flex items-center gap-4 py-2">
             <Loader2 size={20} className="text-[rgb(var(--amber))] animate-spin" />
             <div className="flex-1 min-w-0">
-              <p className="text-[14px] font-semibold text-[rgb(var(--amber))]">Cancelling...</p>
-              <p className="text-[12px] text-[rgb(var(--t3))]">{ss.files_scanned.toLocaleString()} files scanned before cancel</p>
+              <p className="text-[14px] font-semibold text-[rgb(var(--amber))]">{t("scan.cancelling")}</p>
+              <p className="text-[12px] text-[rgb(var(--t3))]">{ss.files_scanned.toLocaleString()} {t("scan.files_scanned_before_cancel")}</p>
             </div>
           </div>
         </Card>
@@ -175,21 +176,21 @@ export function ScanPage({ droppedFile, onConsumeDroppedFile, connected, engineS
             <div className="flex items-center justify-between mb-6">
               <div className="flex items-center gap-4">
                 <div className="relative flex-shrink-0">
-                  <ShieldIcon icon="scan" size={28} className="opacity-80" />
+                  <ShieldIcon icon="scan" size={28} className="brightness-0 invert opacity-70" />
                   <Loader2 size={12} className="text-[rgb(var(--accent))] animate-spin absolute -bottom-0.5 -right-0.5" />
                 </div>
                 <div>
-                  <p className="text-[15px] font-semibold">{ss.scan_type === "folder" ? "Folder" : "Quick"} Scan Running</p>
-                  <p className="text-[12px] text-[rgb(var(--t3))] truncate max-w-[400px]">{ss.current_path || "Starting..."}</p>
+                  <p className="text-[15px] font-semibold">{ss.scan_type === "folder" ? t("scan.folder") : t("scan.quick")} {t("scan.running_suffix")}</p>
+                  <p className="text-[12px] text-[rgb(var(--t3))] truncate max-w-[400px]">{ss.current_path || t("scan.starting")}</p>
                 </div>
               </div>
-              <button onClick={() => cancelScan().catch(()=>{})} className="flex items-center gap-2 px-4 py-2 rounded-xl bg-[rgb(var(--raised))]/40 text-[12px] text-[rgb(var(--t2))] hover:text-[rgb(var(--red))] cursor-pointer"><Square size={11}/>Cancel</button>
+              <button onClick={() => cancelScan().catch(()=>{})} className="flex items-center gap-2 px-4 py-2 rounded-xl bg-[rgb(var(--raised))]/40 text-[12px] text-[rgb(var(--t2))] hover:text-[rgb(var(--red))] cursor-pointer"><Square size={11}/>{t("scan.cancel")}</button>
             </div>
             {/* Progress bar */}
             {ss.files_total > 0 && (
               <div className="mb-5">
                 <div className="flex items-center justify-between mb-2">
-                  <span className="text-[11px] text-[rgb(var(--t3))]">{ss.files_scanned.toLocaleString()} / {ss.files_total.toLocaleString()} files</span>
+                  <span className="text-[11px] text-[rgb(var(--t3))]">{ss.files_scanned.toLocaleString()} / {ss.files_total.toLocaleString()} {t("scan.files")}</span>
                   <span className="text-[13px] font-bold text-[rgb(var(--accent))]">{ss.progress_percent < 1 && ss.progress_percent > 0 ? ss.progress_percent.toFixed(1) : Math.round(ss.progress_percent)}%</span>
                 </div>
                 <div className="w-full h-2 bg-[rgb(var(--raised))]/40 rounded-full overflow-hidden">
@@ -198,9 +199,9 @@ export function ScanPage({ droppedFile, onConsumeDroppedFile, connected, engineS
               </div>
             )}
             <div className="grid gap-5 text-center md:grid-cols-3">
-              <div><p className="text-[24px] font-bold">{ss.files_scanned.toLocaleString()}</p><p className="text-[11px] text-[rgb(var(--t3))] mt-1">Files Scanned</p></div>
-              <div><p className={`text-[24px] font-bold ${ss.threats_found > 0 ? "text-[rgb(var(--red))]" : ""}`}>{ss.threats_found}</p><p className="text-[11px] text-[rgb(var(--t3))] mt-1">Threats Found</p></div>
-              <div><p className="text-[24px] font-bold">{ss.started_at ? `${Math.max(0, Math.floor(Date.now()/1000 - ss.started_at))}s` : "—"}</p><p className="text-[11px] text-[rgb(var(--t3))] mt-1">Elapsed</p></div>
+              <div><p className="text-[24px] font-bold">{ss.files_scanned.toLocaleString()}</p><p className="text-[11px] text-[rgb(var(--t3))] mt-1">{t("scan.files_scanned")}</p></div>
+              <div><p className={`text-[24px] font-bold ${ss.threats_found > 0 ? "text-[rgb(var(--red))]" : ""}`}>{ss.threats_found}</p><p className="text-[11px] text-[rgb(var(--t3))] mt-1">{t("scan.threats_found")}</p></div>
+              <div><p className="text-[24px] font-bold">{ss.started_at ? `${Math.max(0, Math.floor(Date.now()/1000 - ss.started_at))}s` : "—"}</p><p className="text-[11px] text-[rgb(var(--t3))] mt-1">{t("scan.elapsed")}</p></div>
             </div>
           </Card>
 
@@ -213,9 +214,9 @@ export function ScanPage({ droppedFile, onConsumeDroppedFile, connected, engineS
                 </div>
                 <div>
                   <h4 className="text-[14px] font-semibold">
-                    {ss.detections.length} Threat{ss.detections.length > 1 ? "s" : ""} Detected
+                    {ss.detections.length} {t("scan.threats_detected")}
                   </h4>
-                  <p className="text-[11px] text-[rgb(var(--t3))] mt-0.5">Live feed — threats appear as ARGUS identifies them</p>
+                  <p className="text-[11px] text-[rgb(var(--t3))] mt-0.5">{t("scan.live_feed")}</p>
                 </div>
               </div>
               <div className="space-y-2">
@@ -242,7 +243,7 @@ export function ScanPage({ droppedFile, onConsumeDroppedFile, connected, engineS
                               ? "bg-[rgb(var(--amber))]/8 text-[rgb(var(--amber))]"
                               : "bg-[rgb(var(--red))]/8 text-[rgb(var(--red))]"
                           }`}>
-                            {isArgus ? "Heuristic" : "Signature"}
+                            {isArgus ? t("scan.heuristic") : t("scan.signature")}
                           </span>
                         </div>
                         <p className="text-[12px] font-medium text-[rgb(var(--t1))] mt-1 truncate" title={d.path}>{fileName}</p>
@@ -262,14 +263,14 @@ export function ScanPage({ droppedFile, onConsumeDroppedFile, connected, engineS
 
       {/* ── ERROR ── */}
       {st.k === "error" && (
-        <Card className="border-[rgb(var(--red))]/12"><div className="flex items-center gap-4"><XCircle size={18} className="text-[rgb(var(--red))]"/><div className="flex-1"><p className="text-[14px] font-semibold text-[rgb(var(--red))]">Scan Failed</p><p className="text-[12px] text-[rgb(var(--t3))]">{st.msg}</p></div><button onClick={() => setSt({k:"idle"})} className="px-4 py-2 rounded-xl bg-[rgb(var(--raised))]/40 text-[12px] cursor-pointer">Dismiss</button></div></Card>
+        <Card className="border-[rgb(var(--red))]/12"><div className="flex items-center gap-4"><XCircle size={18} className="text-[rgb(var(--red))]"/><div className="flex-1"><p className="text-[14px] font-semibold text-[rgb(var(--red))]">{t("scan.failed")}</p><p className="text-[12px] text-[rgb(var(--t3))]">{st.msg}</p></div><button onClick={() => setSt({k:"idle"})} className="px-4 py-2 rounded-xl bg-[rgb(var(--raised))]/40 text-[12px] cursor-pointer">{t("scan.dismiss")}</button></div></Card>
       )}
 
       {/* ── RECENT SCANS ── */}
       <Card>
-        <h4 className="text-[15px] font-semibold mb-5">Recent Scans</h4>
+        <h4 className="text-[15px] font-semibold mb-5">{t("scan.recent")}</h4>
         {hist.length === 0 ? (
-          <p className="text-[13px] text-[rgb(var(--t3))]/40 py-6 text-center">No scans recorded yet</p>
+          <p className="text-[13px] text-[rgb(var(--t3))]/40 py-6 text-center">{t("scan.no_scans")}</p>
         ) : (
           <div className="space-y-2">
             {hist.slice(0,5).map(s => (
@@ -278,12 +279,12 @@ export function ScanPage({ droppedFile, onConsumeDroppedFile, connected, engineS
                   {s.threats_found > 0 ? <AlertTriangle size={14}/> : s.status === "cancelled" ? <XCircle size={14}/> : <CheckCircle size={14}/>}
                 </div>
                 <div className="flex-1 min-w-0">
-                  <p className="text-[13px] font-medium capitalize">{s.scan_type} Scan</p>
+                  <p className="text-[13px] font-medium capitalize">{s.scan_type} {t("scan.scan_suffix")}</p>
                   <p className="text-[11px] text-[rgb(var(--t3))]/40">{new Date(s.started_at * 1000).toLocaleString()}</p>
                 </div>
-                <p className="text-[13px] font-medium">{s.files_scanned} files</p>
+                <p className="text-[13px] font-medium">{s.files_scanned} {t("scan.files")}</p>
                 <p className={`text-[13px] font-semibold min-w-[60px] text-right ${s.threats_found > 0 ? "text-[rgb(var(--red))]" : s.status === "cancelled" ? "text-[rgb(var(--amber))]" : "text-[rgb(var(--green))]"}`}>
-                  {s.threats_found > 0 ? `${s.threats_found} threat${s.threats_found > 1 ? "s" : ""}` : s.status === "cancelled" ? "Cancelled" : "Clean"}
+                  {s.threats_found > 0 ? `${s.threats_found} ${s.threats_found > 1 ? t("scan.threats_word") : t("scan.threat_word")}` : s.status === "cancelled" ? t("common.cancelled") : t("common.clean")}
                 </p>
               </div>
             ))}
@@ -319,27 +320,27 @@ function ScanReport({ ss, onNewScan }: { ss: ScanStatusResponse; onNewScan: () =
           <div className="flex-1 min-w-0">
             <h3 className="text-[22px] font-bold leading-tight">
               {cancelled
-                ? "Scan Cancelled"
+                ? t("scan.scan_cancelled")
                 : hasThreats
-                  ? `${ss.threats_found} Threat${ss.threats_found > 1 ? "s" : ""} Found`
-                  : "Scan Complete — No Threats Found"}
+                  ? t("scan.threats_result").replace("{count}", String(ss.threats_found))
+                  : t("scan.complete_no_threats")}
             </h3>
             <p className="text-[13px] text-[rgb(var(--t2))] mt-2 leading-relaxed">
               {cancelled
-                ? `The ${scanType} scan was stopped after scanning ${ss.files_scanned.toLocaleString()} files.${hasThreats ? ` ${ss.threats_found} threat${ss.threats_found > 1 ? "s were" : " was"} detected before cancellation.` : ""}`
+                ? `${scanType} ${t("scan.scan_suffix")} — ${ss.files_scanned.toLocaleString()} ${t("scan.files_scanned_before_cancel")}.${hasThreats ? ` ${ss.threats_found} ${ss.threats_found > 1 ? t("scan.threats_word") : t("scan.threat_word")}.` : ""}`
                 : hasThreats
-                  ? `ARGUS and ClamAV analyzed ${ss.files_scanned.toLocaleString()} files and identified ${ss.threats_found} threat${ss.threats_found > 1 ? "s" : ""}. Review the detections below and take appropriate action.`
-                  : `${ss.files_scanned.toLocaleString()} files were analyzed by ClamAV signatures and ARGUS heuristics. No malicious content was detected.`}
+                  ? `ARGUS + ClamAV — ${ss.files_scanned.toLocaleString()} ${t("scan.files")} — ${ss.threats_found} ${ss.threats_found > 1 ? t("scan.threats_word") : t("scan.threat_word")}.`
+                  : `${ss.files_scanned.toLocaleString()} ${t("scan.files")} — ${t("scan.clean_desc")}`}
             </p>
           </div>
         </div>
 
         {/* Stats grid */}
         <div className="grid grid-cols-2 xl:grid-cols-4 gap-3 mt-6">
-          <StatBox label="Files Scanned" value={ss.files_scanned.toLocaleString()} />
-          <StatBox label="Threats" value={String(ss.threats_found)} color={hasThreats ? "red" : undefined} />
-          <StatBox label="Duration" value={elapsed > 0 ? formatDuration(elapsed) : "—"} />
-          <StatBox label="Errors" value={String(ss.errors_count)} color={ss.errors_count > 0 ? "amber" : undefined} />
+          <StatBox label={t("scan.files_scanned")} value={ss.files_scanned.toLocaleString()} />
+          <StatBox label={t("scan.threats_found")} value={String(ss.threats_found)} color={hasThreats ? "red" : undefined} />
+          <StatBox label={t("scan.duration")} value={elapsed > 0 ? formatDuration(elapsed) : "—"} />
+          <StatBox label={t("scan.errors")} value={String(ss.errors_count)} color={ss.errors_count > 0 ? "amber" : undefined} />
         </div>
 
         {/* Actions */}
@@ -347,11 +348,11 @@ function ScanReport({ ss, onNewScan }: { ss: ScanStatusResponse; onNewScan: () =
           <button onClick={onNewScan}
             className="flex items-center gap-2 px-5 py-2.5 rounded-xl bg-[rgb(var(--accent))] text-white text-[13px] font-semibold hover:opacity-90 cursor-pointer shadow-sm shadow-[rgb(var(--accent))]/10">
             <Search size={14} />
-            New Scan
+            {t("scan.new_scan")}
           </button>
           {hasThreats && !cancelled && (
             <p className="text-[11px] text-[rgb(var(--t3))] ml-2">
-              Detected threats should be quarantined or reviewed in the History page.
+              {t("scan.threats_review_hint")}
             </p>
           )}
         </div>
@@ -366,9 +367,9 @@ function ScanReport({ ss, onNewScan }: { ss: ScanStatusResponse; onNewScan: () =
                 <AlertTriangle size={16} className="text-[rgb(var(--red))]" />
               </div>
               <div>
-                <h4 className="text-[15px] font-semibold">Detected Threats</h4>
+                <h4 className="text-[15px] font-semibold">{t("scan.detected_threats")}</h4>
                 <p className="text-[11px] text-[rgb(var(--t3))] mt-0.5">
-                  {ss.detections.length} item{ss.detections.length > 1 ? "s" : ""} identified during scan
+                  {ss.detections.length} {t("scan.items_identified")}
                 </p>
               </div>
             </div>
@@ -400,11 +401,11 @@ function ScanReport({ ss, onNewScan }: { ss: ScanStatusResponse; onNewScan: () =
                       <span className={`text-[9px] font-semibold uppercase px-1.5 py-0.5 rounded ${
                         isArgus ? "bg-[rgb(var(--amber))]/8 text-[rgb(var(--amber))]" : "bg-[rgb(var(--red))]/8 text-[rgb(var(--red))]"
                       }`}>
-                        {isArgus ? "Heuristic" : "Signature"}
+                        {isArgus ? t("scan.heuristic") : t("scan.signature")}
                       </span>
                       {score !== null && (
                         <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded bg-[rgb(var(--raised))]/30 text-[rgb(var(--t3))]">
-                          Score: {score}/100
+                          {t("scan.suspicion_score")}: {score}/100
                         </span>
                       )}
                     </div>
@@ -425,10 +426,9 @@ function ScanReport({ ss, onNewScan }: { ss: ScanStatusResponse; onNewScan: () =
             <div className="flex h-16 w-16 items-center justify-center rounded bg-[rgb(var(--green))]/8 mb-4">
               <CheckCircle size={28} className="text-[rgb(var(--green))]" />
             </div>
-            <p className="text-[15px] font-semibold text-[rgb(var(--t1))]">All Clear</p>
+            <p className="text-[15px] font-semibold text-[rgb(var(--t1))]">{t("scan.all_clear")}</p>
             <p className="text-[12px] text-[rgb(var(--t3))] mt-2 max-w-md leading-relaxed">
-              No threats were detected in the {ss.files_scanned.toLocaleString()} files analyzed.
-              ClamAV signatures and ARGUS heuristics found no malicious indicators.
+              {ss.files_scanned.toLocaleString()} {t("scan.files")} — {t("scan.clean_desc")}
             </p>
           </div>
         </Card>
@@ -471,12 +471,12 @@ function ScanTypeCard({ icon, title, desc, accent, disabled, onClick }: { icon: 
 
 /* ─── ARGUS-enriched file scan result ─── */
 
-const VERDICT_STYLE: Record<string, { color: string; label: string }> = {
-  clean: { color: "var(--green)", label: "Clean" },
-  low_suspicion: { color: "var(--accent)", label: "Low Suspicion" },
-  suspicious: { color: "var(--amber)", label: "Suspicious" },
-  high_suspicion: { color: "var(--amber)", label: "High Suspicion" },
-  malicious: { color: "var(--red)", label: "Malicious" },
+const VERDICT_STYLE: Record<string, { color: string; labelKey: string }> = {
+  clean: { color: "var(--green)", labelKey: "scan.verdict_clean" },
+  low_suspicion: { color: "var(--accent)", labelKey: "scan.verdict_low_suspicion" },
+  suspicious: { color: "var(--amber)", labelKey: "scan.verdict_suspicious" },
+  high_suspicion: { color: "var(--amber)", labelKey: "scan.verdict_high_suspicion" },
+  malicious: { color: "var(--red)", labelKey: "scan.verdict_malicious" },
 };
 
 const SEV_COLORS: Record<string, string> = {
@@ -496,12 +496,12 @@ function BehavioralPanel({ findings }: { findings: ArgusFinding[] }) {
   const groups: Record<string, ArgusFinding[]> = {};
   for (const f of behavioral) {
     const desc = f.description.toLowerCase();
-    const group = desc.includes("spawn") || desc.includes("process") ? "Process"
-      : desc.includes("registry") || desc.includes("run key") ? "Registry"
-      : desc.includes("network") || desc.includes("tcp") || desc.includes("connect") ? "Network"
-      : desc.includes("dll") || desc.includes("image") || desc.includes("loaded") ? "Image Load"
-      : desc.includes("containment") || desc.includes("job object") || desc.includes("token") ? "Containment"
-      : "Other";
+    const group = desc.includes("spawn") || desc.includes("process") ? "process"
+      : desc.includes("registry") || desc.includes("run key") ? "registry"
+      : desc.includes("network") || desc.includes("tcp") || desc.includes("connect") ? "network"
+      : desc.includes("dll") || desc.includes("image") || desc.includes("loaded") ? "image_load"
+      : desc.includes("containment") || desc.includes("job object") || desc.includes("token") ? "containment"
+      : "other";
     (groups[group] ??= []).push(f);
   }
 
@@ -516,25 +516,25 @@ function BehavioralPanel({ findings }: { findings: ArgusFinding[] }) {
             <Eye size={14} />
           </div>
           <div>
-            <p className="text-[13px] font-semibold">Behavioral Analysis</p>
-            <p className="text-[10px] text-[rgb(var(--t3))]">Sandbox detonation — experimental</p>
+            <p className="text-[13px] font-semibold">{t("scan.behavioral_analysis")}</p>
+            <p className="text-[10px] text-[rgb(var(--t3))]">{t("scan.sandbox_experimental")}</p>
           </div>
         </div>
         {totalDelta > 0 && (
-          <span className="text-[12px] font-bold text-[rgb(var(--amber))]">+{totalDelta} score impact</span>
+          <span className="text-[12px] font-bold text-[rgb(var(--amber))]">+{totalDelta} {t("scan.score_impact_suffix")}</span>
         )}
       </div>
 
       {hasDegraded && (
         <div className="flex items-center gap-2 px-3 py-2 rounded bg-[rgb(var(--amber))]/8 text-[11px] text-[rgb(var(--amber))]">
           <AlertTriangle size={13} />
-          Containment degraded — some sandbox protections were unavailable
+          {t("scan.containment_degraded")}
         </div>
       )}
 
-      {Object.entries(groups).filter(([k]) => k !== "Containment").map(([group, items]) => (
+      {Object.entries(groups).filter(([k]) => k !== "containment").map(([group, items]) => (
         <div key={group}>
-          <p className="text-[10px] font-semibold uppercase tracking-wider text-[rgb(var(--t3))]/50 mb-1">{group}</p>
+          <p className="text-[10px] font-semibold uppercase tracking-wider text-[rgb(var(--t3))]/50 mb-1">{t(`scan.group_${group}`)}</p>
           {items.map((f, i) => {
             const sevColor = f.severity === "critical" ? "var(--red)"
               : f.severity === "high" ? "var(--red)"
@@ -554,19 +554,19 @@ function BehavioralPanel({ findings }: { findings: ArgusFinding[] }) {
   );
 }
 
-const LAYER_NAMES: Record<string, string> = {
-  signatures: "Signature Analysis",
-  yara_rules: "Behavioral Rules",
-  mime_validation: "File Integrity",
-  structural_analysis: "Structural Analysis",
-  packer_detection: "Packer Detection",
-  script_analysis: "Script Analysis",
-  ioc_correlation: "Threat Intelligence",
-  pattern_detection: "Pattern Detection",
-  file_deception: "Deception Detection",
-  reputation: "Software Reputation",
-  context: "Origin Context",
-  behavioral_runtime: "Behavioral Analysis",
+const LAYER_KEYS: Record<string, string> = {
+  signatures: "scan.layer_signatures",
+  yara_rules: "scan.layer_yara_rules",
+  mime_validation: "scan.layer_mime_validation",
+  structural_analysis: "scan.layer_structural_analysis",
+  packer_detection: "scan.layer_packer_detection",
+  script_analysis: "scan.layer_script_analysis",
+  ioc_correlation: "scan.layer_ioc_correlation",
+  pattern_detection: "scan.layer_pattern_detection",
+  file_deception: "scan.layer_file_deception",
+  reputation: "scan.layer_reputation",
+  context: "scan.layer_context",
+  behavioral_runtime: "scan.layer_behavioral_runtime",
 };
 
 function FileResult({ r, argus, onDismiss, onQuarantine }: {
@@ -589,19 +589,19 @@ function FileResult({ r, argus, onDismiss, onQuarantine }: {
             {inf ? <ShieldAlert size={22} /> : <ShieldCheck size={22} />}
           </div>
           <div className="flex-1 min-w-0">
-            <p className="text-[15px] font-semibold">{inf ? `Threat: ${r.virus_name}` : "File is clean"}</p>
+            <p className="text-[15px] font-semibold">{inf ? `${t("common.threat")}: ${r.virus_name}` : t("scan.file_clean")}</p>
             <p className="text-[12px] text-[rgb(var(--t3))] truncate mt-0.5">{r.path}</p>
           </div>
           <div className="flex gap-2 flex-shrink-0">
             {inf && (
               <button onClick={onQuarantine}
                 className="px-4 py-2 rounded-xl bg-[rgb(var(--red))]/8 text-[12px] font-semibold text-[rgb(var(--red))] hover:bg-[rgb(var(--red))]/15 cursor-pointer">
-                Quarantine
+                {t("scan.quarantine_action")}
               </button>
             )}
             <button onClick={onDismiss}
               className="px-4 py-2 rounded-xl bg-[rgb(var(--raised))]/40 text-[12px] text-[rgb(var(--t2))] hover:text-[rgb(var(--t1))] cursor-pointer">
-              {inf ? "Ignore" : "Scan Another"}
+              {inf ? t("scan.ignore") : t("scan.scan_another")}
             </button>
           </div>
         </div>
@@ -616,9 +616,9 @@ function FileResult({ r, argus, onDismiss, onQuarantine }: {
                 <Eye size={16} className="text-[rgb(var(--accent))]" />
               </div>
               <div>
-                <h4 className="text-[14px] font-semibold">ARGUS Analysis</h4>
+                <h4 className="text-[14px] font-semibold">{t("scan.argus_analysis")}</h4>
                 <p className="text-[11px] text-[rgb(var(--t3))] mt-0.5">
-                  Heuristic engine v{argus.engine_version} · {(argus.analysis_time_us / 1000).toFixed(1)}ms
+                  {t("scan.heuristic_engine")} v{argus.engine_version} · {(argus.analysis_time_us / 1000).toFixed(1)}ms
                 </p>
               </div>
             </div>
@@ -626,7 +626,7 @@ function FileResult({ r, argus, onDismiss, onQuarantine }: {
             {/* Score badge */}
             <div className="flex items-center gap-3">
               <div className="text-right">
-                <p className="text-[11px] text-[rgb(var(--t3))]">Suspicion Score</p>
+                <p className="text-[11px] text-[rgb(var(--t3))]">{t("scan.suspicion_score")}</p>
                 <p className="text-[20px] font-bold leading-none mt-1" style={{ color: vs ? `rgb(${vs.color})` : undefined }}>
                   {argus.score}<span className="text-[12px] font-normal text-[rgb(var(--t3))]">/100</span>
                 </p>
@@ -638,28 +638,28 @@ function FileResult({ r, argus, onDismiss, onQuarantine }: {
                   color: vs ? `rgb(${vs.color})` : undefined,
                 }}
               >
-                {vs?.label ?? "Clean"}
+                {vs ? t(vs.labelKey) : t("scan.verdict_clean")}
               </div>
             </div>
           </div>
 
           {/* File metadata */}
           <div className="grid grid-cols-2 xl:grid-cols-4 gap-3 mb-5">
-            <MetaItem label="File Size" value={formatBytes(argus.file_size)} />
-            <MetaItem label="MIME Type" value={argus.mime_type ?? "Unknown"} />
-            <MetaItem label="SHA-256" value={argus.sha256.slice(0, 16) + "..."} title={argus.sha256} />
-            <MetaItem label="Findings" value={String(argus.findings.length)} />
+            <MetaItem label={t("scan.file_size")} value={formatBytes(argus.file_size)} />
+            <MetaItem label={t("scan.mime_type")} value={argus.mime_type ?? t("common.unknown")} />
+            <MetaItem label={t("scan.sha256")} value={argus.sha256.slice(0, 16) + "..."} title={argus.sha256} />
+            <MetaItem label={t("scan.findings")} value={String(argus.findings.length)} />
           </div>
 
           {/* Why this verdict? — explainable scoring */}
           {argus.explanation && (argus.explanation.suspicion_reasons.length > 0 || argus.explanation.trust_reasons.length > 0) && (
             <div className="mb-5 rounded-xl border border-[rgb(var(--border))]/8 p-4">
-              <p className="text-[12px] font-semibold text-[rgb(var(--t2))] mb-3">Why this verdict?</p>
+              <p className="text-[12px] font-semibold text-[rgb(var(--t2))] mb-3">{t("scan.why_verdict")}</p>
               <div className="grid gap-4 md:grid-cols-2">
                 {argus.explanation.suspicion_reasons.length > 0 && (
                   <div>
                     <p className="text-[10px] font-semibold uppercase tracking-wider text-[rgb(var(--amber))] mb-2">
-                      Suspicion increased (+{argus.explanation.raw_score})
+                      {t("scan.suspicion_increased")} (+{argus.explanation.raw_score})
                     </p>
                     <ul className="space-y-1.5">
                       {argus.explanation.suspicion_reasons.map((r, i) => (
@@ -674,7 +674,7 @@ function FileResult({ r, argus, onDismiss, onQuarantine }: {
                 {argus.explanation.trust_reasons.length > 0 && (
                   <div>
                     <p className="text-[10px] font-semibold uppercase tracking-wider text-[rgb(var(--green))] mb-2">
-                      Trust applied (−{argus.explanation.reputation_discount + argus.explanation.authenticode_discount})
+                      {t("scan.trust_applied")} (−{argus.explanation.reputation_discount + argus.explanation.authenticode_discount})
                     </p>
                     <ul className="space-y-1.5">
                       {argus.explanation.trust_reasons.map((r, i) => (
@@ -691,17 +691,17 @@ function FileResult({ r, argus, onDismiss, onQuarantine }: {
                 <div className="flex flex-wrap gap-2 mt-3 pt-3 border-t border-[rgb(var(--border))]/8">
                   {argus.explanation.signer && (
                     <span className="text-[10px] px-2 py-0.5 rounded bg-[rgb(var(--green))]/8 text-[rgb(var(--green))]">
-                      Signed: {argus.explanation.signer}
+                      {t("scan.signed_prefix")}: {argus.explanation.signer}
                     </span>
                   )}
                   {argus.explanation.recognized_software && (
                     <span className="text-[10px] px-2 py-0.5 rounded bg-[rgb(var(--accent))]/8 text-[rgb(var(--accent))]">
-                      Known: {argus.explanation.recognized_software}
+                      {t("scan.known_prefix")}: {argus.explanation.recognized_software}
                     </span>
                   )}
                   {argus.explanation.installer_discount_applied && (
                     <span className="text-[10px] px-2 py-0.5 rounded bg-[rgb(var(--raised))]/30 text-[rgb(var(--t3))]">
-                      Installer framework
+                      {t("scan.installer_framework")}
                     </span>
                   )}
                 </div>
@@ -730,7 +730,7 @@ function FileResult({ r, argus, onDismiss, onQuarantine }: {
                         <p className="text-[12px] leading-relaxed">{f.description}</p>
                         <div className="flex items-center gap-2 mt-1.5">
                           <span className="text-[10px] px-2 py-0.5 rounded bg-[rgb(var(--raised))]/30 text-[rgb(var(--t3))]">
-                            {LAYER_NAMES[f.layer] ?? f.layer}
+                            {LAYER_KEYS[f.layer] ? t(LAYER_KEYS[f.layer]) : f.layer}
                           </span>
                           <span className="text-[10px] font-semibold uppercase" style={{ color: `rgb(${sevColor})` }}>
                             {f.severity}
@@ -750,14 +750,14 @@ function FileResult({ r, argus, onDismiss, onQuarantine }: {
                 <button onClick={() => setExpanded(!expanded)}
                   className="flex items-center gap-1.5 mt-3 text-[11px] font-semibold text-[rgb(var(--accent))] cursor-pointer hover:underline">
                   {expanded ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
-                  {expanded ? "Show Less" : `Show All ${argus.findings.length} Findings`}
+                  {expanded ? t("scan.show_less") : `${t("scan.show_all").replace("{count}", String(argus.findings.length))}`}
                 </button>
               )}
             </>
           ) : (
             <div className="flex items-center gap-3 py-4 text-[12px] text-[rgb(var(--green))]">
               <CheckCircle size={15} />
-              No suspicious indicators detected by ARGUS heuristics.
+              {t("scan.no_suspicious")}
             </div>
           )}
         </Card>

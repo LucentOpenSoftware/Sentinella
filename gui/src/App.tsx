@@ -28,23 +28,20 @@ function App() {
   // Initialize locale from saved preference or browser language.
   useEffect(() => { initLocale(); }, []);
 
-  // Disable right-click context menu + keyboard shortcuts in production.
+  // Disable right-click context menu + dev shortcuts in all modes.
   useEffect(() => {
-    if (import.meta.env.PROD) {
-      const blockMenu = (e: MouseEvent) => e.preventDefault();
-      const blockKeys = (e: KeyboardEvent) => {
-        // Block F12, Ctrl+Shift+I, Ctrl+Shift+J, Ctrl+U
-        if (e.key === "F12") e.preventDefault();
-        if (e.ctrlKey && e.shiftKey && (e.key === "I" || e.key === "J")) e.preventDefault();
-        if (e.ctrlKey && e.key === "u") e.preventDefault();
-      };
-      document.addEventListener("contextmenu", blockMenu);
-      document.addEventListener("keydown", blockKeys);
-      return () => {
-        document.removeEventListener("contextmenu", blockMenu);
-        document.removeEventListener("keydown", blockKeys);
-      };
-    }
+    const blockMenu = (e: MouseEvent) => e.preventDefault();
+    const blockKeys = (e: KeyboardEvent) => {
+      if (e.key === "F12") e.preventDefault();
+      if (e.ctrlKey && e.shiftKey && (e.key === "I" || e.key === "J")) e.preventDefault();
+      if (e.ctrlKey && e.key === "u") e.preventDefault();
+    };
+    document.addEventListener("contextmenu", blockMenu);
+    document.addEventListener("keydown", blockKeys);
+    return () => {
+      document.removeEventListener("contextmenu", blockMenu);
+      document.removeEventListener("keydown", blockKeys);
+    };
   }, []);
 
   // Restore persisted theme + accent color on startup.

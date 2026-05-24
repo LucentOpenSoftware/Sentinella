@@ -61,6 +61,7 @@ runtime/research_samples/*.zip
 runtime/research_samples/*.rar
 runtime/compiled/
 runtime/clamav_tmp/
+gui/src-tauri/runtime/state/
 
 # SQLite WAL files
 *.db-wal

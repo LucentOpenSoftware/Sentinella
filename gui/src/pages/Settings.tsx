@@ -9,13 +9,13 @@ import * as i18n from "../i18n";
 
 type Tab = "general" | "appearance" | "protection" | "notifications" | "updates" | "advanced";
 
-const tabs: { id: Tab; label: string; Icon: React.ComponentType<{ size?: number }> }[] = [
-  { id: "general", label: "General", Icon: Globe },
-  { id: "appearance", label: "Appearance", Icon: Palette },
-  { id: "protection", label: "Protection", Icon: Shield },
-  { id: "notifications", label: "Notifications", Icon: Bell },
-  { id: "updates", label: "Updates", Icon: RefreshCw },
-  { id: "advanced", label: "Advanced", Icon: Wrench },
+const tabs: { id: Tab; labelKey: string; Icon: React.ComponentType<{ size?: number }> }[] = [
+  { id: "general", labelKey: "settings.general", Icon: Globe },
+  { id: "appearance", labelKey: "settings.appearance", Icon: Palette },
+  { id: "protection", labelKey: "settings.protection", Icon: Shield },
+  { id: "notifications", labelKey: "settings.notifications", Icon: Bell },
+  { id: "updates", labelKey: "settings.updates", Icon: RefreshCw },
+  { id: "advanced", labelKey: "settings.advanced", Icon: Wrench },
 ];
 
 export function SettingsPage() {
@@ -35,13 +35,13 @@ export function SettingsPage() {
               className={`flex w-full items-center gap-3 rounded-xl px-4 py-3 text-[13px] font-medium transition-colors cursor-pointer ${
                 tab === item.id ? "bg-[rgb(var(--accent))]/10 text-[rgb(var(--accent))]" : "text-[rgb(var(--t2))] hover:bg-[rgb(var(--raised))]/30 hover:text-[rgb(var(--t1))]"
               }`}>
-              <item.Icon size={16} />{item.label}
+              <item.Icon size={16} />{i18n.t(item.labelKey)}
             </button>
           ))}
         </div>
-        {settings.saving && <p className="text-[9px] text-[rgb(var(--accent))] mt-3 px-4">Saving...</p>}
-        {settings.saveOk && <p className="text-[9px] text-[rgb(var(--green))] mt-1 px-4">Saved</p>}
-        {settings.saveError && <p className="text-[9px] text-[rgb(var(--red))] mt-1 px-4 truncate" title={settings.saveError}>Save failed</p>}
+        {settings.saving && <p className="text-[9px] text-[rgb(var(--accent))] mt-3 px-4">{i18n.t("settings.saving")}</p>}
+        {settings.saveOk && <p className="text-[9px] text-[rgb(var(--green))] mt-1 px-4">{i18n.t("settings.saved")}</p>}
+        {settings.saveError && <p className="text-[9px] text-[rgb(var(--red))] mt-1 px-4 truncate" title={settings.saveError}>{i18n.t("settings.save_failed")}</p>}
       </Card>
 
       <div className="page-stack min-w-0">
@@ -94,7 +94,7 @@ function GeneralTab() {
   const [locale, setLocaleState] = useState(() => i18n.getLocale());
   return (
     <>
-      <Section title="Language" desc="Display language. Takes effect on next page navigation.">
+      <Section title={i18n.t("settings.language")} desc={i18n.t("settings.language_desc")}>
         <select
           value={locale}
           onChange={e => { i18n.setLocale(e.target.value); setLocaleState(e.target.value); }}
@@ -140,16 +140,16 @@ function AppearanceTab() {
   };
   return (
     <>
-      <Section title="Theme" desc="Appearance mode.">
+      <Section title={i18n.t("settings.theme")} desc={i18n.t("settings.theme_desc")}>
         <div className="flex flex-wrap gap-3">
           {(["dark", "light"] as const).map(t => (
             <button key={t} onClick={() => handleTheme(t)} className={`rounded-xl border px-5 py-2 text-[13px] font-medium capitalize cursor-pointer ${
               theme === t ? "border-[rgb(var(--accent))]/20 bg-[rgb(var(--accent))]/6 text-[rgb(var(--accent))]" : "border-[rgb(var(--border))]/15 text-[rgb(var(--t2))]"
-            }`}>{t}</button>
+            }`}>{i18n.t(`settings.theme_${t}`)}</button>
           ))}
         </div>
       </Section>
-      <Section title="Accent Color" desc="Primary highlight color.">
+      <Section title={i18n.t("settings.accent")} desc={i18n.t("settings.accent_desc")}>
         <div className="flex flex-wrap gap-3">
           {colors.map((c, i) => (
             <button key={c.n} onClick={() => handleAccent(i)} title={c.n} className={`h-9 w-9 rounded-full cursor-pointer transition-transform ${
@@ -165,35 +165,37 @@ function AppearanceTab() {
 function ProtectionTab({ config, update }: { config: DaemonConfig; update: (p: Partial<DaemonConfig>) => void }) {
   return (
     <>
-      <Section title="Real-time Protection" desc="Filesystem monitoring. Changes require administrator privileges.">
-        <Toggle icon={<Eye size={14} />} label="Enable real-time protection" desc="User-mode watcher"
+      <Section title={i18n.t("settings.realtime_protection")} desc={i18n.t("settings.realtime_desc")}>
+        <Toggle icon={<Eye size={14} />} label={i18n.t("settings.enable_realtime")} desc={i18n.t("settings.enable_realtime_desc")}
           checked={config.realtime_enabled} onChange={async (v) => {
             const { setCriticalProtection } = await import("../api/sentinella");
             const result = await setCriticalProtection({ realtimeEnabled: v });
+            if (result?.requires_elevation) { alert(result.error || i18n.t("settings.requires_admin")); return; }
             if (result?.ok) {
               update({}); // Reload config from daemon.
             }
           }} />
-        <Toggle icon={<Archive size={14} />} label="Auto-quarantine" desc="Automatically isolate detected threats"
+        <Toggle icon={<Archive size={14} />} label={i18n.t("settings.auto_quarantine")} desc={i18n.t("settings.auto_quarantine_desc")}
           checked={config.auto_quarantine} onChange={async (v) => {
             const { setCriticalProtection } = await import("../api/sentinella");
             const result = await setCriticalProtection({ autoQuarantine: v });
+            if (result?.requires_elevation) { alert(result.error || i18n.t("settings.requires_admin")); return; }
             if (result?.ok) {
               update({});
             }
           }} />
       </Section>
-      <Section title="Scan Options" desc="Default scan behavior.">
-        <Toggle icon={<FileSearch size={14} />} label="Scan archives" desc="ZIP, 7z, TAR"
+      <Section title={i18n.t("settings.scan_options")} desc={i18n.t("settings.scan_options_desc")}>
+        <Toggle icon={<FileSearch size={14} />} label={i18n.t("settings.scan_archives")} desc={i18n.t("settings.scan_archives_desc")}
           checked={config.scan_archives} onChange={(v) => update({ scan_archives: v })} />
-        <Toggle icon={<Bug size={14} />} label="Heuristic alerts" desc="Suspicious patterns"
+        <Toggle icon={<Bug size={14} />} label={i18n.t("settings.heuristic_alerts")} desc={i18n.t("settings.heuristic_alerts_desc")}
           checked={config.heuristic_alerts} onChange={(v) => update({ heuristic_alerts: v })} />
       </Section>
-      <Section title="Quarantine Retention" desc="Auto-cleanup period.">
+      <Section title={i18n.t("settings.quarantine_retention")} desc={i18n.t("settings.quarantine_retention_desc")}>
         <select value={String(config.quarantine_retention_days)} onChange={e => update({ quarantine_retention_days: parseInt(e.target.value) })}
           className="w-56 rounded-xl border border-[rgb(var(--border))]/15 bg-[rgb(var(--raised))]/30 px-4 py-2.5 text-[13px] text-[rgb(var(--t1))] outline-none">
-          <option value="30">30 days</option><option value="60">60 days</option><option value="90">90 days</option>
-          <option value="180">180 days</option><option value="365">1 year</option>
+          <option value="30">{i18n.t("settings.retention_30")}</option><option value="60">{i18n.t("settings.retention_60")}</option><option value="90">{i18n.t("settings.retention_90")}</option>
+          <option value="180">{i18n.t("settings.retention_180")}</option><option value="365">{i18n.t("settings.retention_365")}</option>
         </select>
       </Section>
     </>
@@ -203,25 +205,25 @@ function ProtectionTab({ config, update }: { config: DaemonConfig; update: (p: P
 function UpdatesTab({ config, update }: { config: DaemonConfig; update: (p: Partial<DaemonConfig>) => void }) {
   return (
     <>
-      <Section title="Automatic Updates" desc="Signature database updates.">
-        <Toggle icon={<RefreshCw size={14} />} label="Auto-update signatures" desc="Check periodically"
+      <Section title={i18n.t("settings.auto_updates")} desc={i18n.t("settings.auto_updates_desc")}>
+        <Toggle icon={<RefreshCw size={14} />} label={i18n.t("settings.auto_update_sigs")} desc={i18n.t("settings.auto_update_sigs_desc")}
           checked={config.auto_update} onChange={(v) => update({ auto_update: v })} />
         <div className="pt-3">
-          <p className="text-[13px] font-medium mb-2">Interval</p>
+          <p className="text-[13px] font-medium mb-2">{i18n.t("settings.interval")}</p>
           <select value={String(config.update_interval_hours)} onChange={e => update({ update_interval_hours: parseInt(e.target.value) })}
             disabled={!config.auto_update}
             className="w-48 rounded-xl border border-[rgb(var(--border))]/15 bg-[rgb(var(--raised))]/30 px-4 py-2.5 text-[13px] text-[rgb(var(--t1))] outline-none disabled:opacity-40">
-            <option value="1">Every hour</option><option value="2">2 hours</option><option value="4">4 hours</option>
-            <option value="12">12 hours</option><option value="24">Daily</option>
+            <option value="1">{i18n.t("settings.every_hour")}</option><option value="2">{i18n.t("settings.every_2h")}</option><option value="4">{i18n.t("settings.every_4h")}</option>
+            <option value="12">{i18n.t("settings.every_12h")}</option><option value="24">{i18n.t("settings.daily")}</option>
           </select>
         </div>
       </Section>
-      <Section title="Scheduled Scans" desc="Automatic daily scan.">
-        <Toggle icon={<Clock size={14} />} label="Enable scheduled scan" desc="Run automatically at the configured time"
+      <Section title={i18n.t("settings.scheduled_scans")} desc={i18n.t("settings.scheduled_scans_desc")}>
+        <Toggle icon={<Clock size={14} />} label={i18n.t("settings.enable_scheduled_scan")} desc={i18n.t("settings.enable_scheduled_scan_desc")}
           checked={config.scheduled_scan_enabled} onChange={(v) => update({ scheduled_scan_enabled: v })} />
         <div className="flex flex-wrap gap-4 pt-3">
           <div>
-            <p className="text-[13px] font-medium mb-2">Time</p>
+            <p className="text-[13px] font-medium mb-2">{i18n.t("settings.time")}</p>
             <select value={String(config.scheduled_scan_hour)} onChange={e => update({ scheduled_scan_hour: parseInt(e.target.value) })}
               disabled={!config.scheduled_scan_enabled}
               className="w-36 rounded-xl border border-[rgb(var(--border))]/15 bg-[rgb(var(--raised))]/30 px-4 py-2.5 text-[13px] text-[rgb(var(--t1))] outline-none disabled:opacity-40">
@@ -231,12 +233,12 @@ function UpdatesTab({ config, update }: { config: DaemonConfig; update: (p: Part
             </select>
           </div>
           <div>
-            <p className="text-[13px] font-medium mb-2">Scan Type</p>
+            <p className="text-[13px] font-medium mb-2">{i18n.t("settings.scan_type")}</p>
             <select value={config.scheduled_scan_type} onChange={e => update({ scheduled_scan_type: e.target.value })}
               disabled={!config.scheduled_scan_enabled}
               className="w-36 rounded-xl border border-[rgb(var(--border))]/15 bg-[rgb(var(--raised))]/30 px-4 py-2.5 text-[13px] text-[rgb(var(--t1))] outline-none disabled:opacity-40">
-              <option value="quick">Quick Scan</option>
-              <option value="full">Full Scan</option>
+              <option value="quick">{i18n.t("settings.scan_type_quick")}</option>
+              <option value="full">{i18n.t("settings.scan_type_full")}</option>
             </select>
           </div>
         </div>
@@ -252,7 +254,7 @@ function AdvancedTab({ config, update }: { config: DaemonConfig; update: (p: Par
 
   return (
     <>
-      <Section title="Exclusions" desc="Paths excluded from all scans and real-time monitoring.">
+      <Section title={i18n.t("settings.exclusions")} desc={i18n.t("settings.exclusions_desc")}>
         {config.excluded_paths.length > 0 && (
           <div className="space-y-2 mb-4">
             {config.excluded_paths.map((p, i) => (
@@ -262,7 +264,7 @@ function AdvancedTab({ config, update }: { config: DaemonConfig; update: (p: Par
                 <button
                   onClick={() => update({ excluded_paths: config.excluded_paths.filter((_, j) => j !== i) })}
                   className="opacity-0 group-hover:opacity-100 flex-shrink-0 p-1 rounded-lg hover:bg-[rgb(var(--red))]/10 text-[rgb(var(--t3))] hover:text-[rgb(var(--red))] transition-all cursor-pointer"
-                  title="Remove exclusion"
+                  title={i18n.t("settings.remove_exclusion")}
                 >
                   <X size={13} />
                 </button>
@@ -272,7 +274,7 @@ function AdvancedTab({ config, update }: { config: DaemonConfig; update: (p: Par
         )}
         <button
           onClick={async () => {
-            const selected = await open({ multiple: false, directory: true, title: "Select folder to exclude" });
+            const selected = await open({ multiple: false, directory: true, title: i18n.t("settings.select_folder_title") });
             if (selected && typeof selected === "string") {
               if (!config.excluded_paths.includes(selected)) {
                 update({ excluded_paths: [...config.excluded_paths, selected] });
@@ -282,27 +284,27 @@ function AdvancedTab({ config, update }: { config: DaemonConfig; update: (p: Par
           className="flex items-center gap-2 rounded-xl border border-dashed border-[rgb(var(--border))]/15 px-4 py-3 text-[12px] text-[rgb(var(--t3))] hover:border-[rgb(var(--accent))]/30 hover:text-[rgb(var(--accent))] transition-colors cursor-pointer w-full justify-center"
         >
           <Plus size={14} />
-          Add Excluded Folder
+          {i18n.t("settings.add_folder")}
         </button>
         {config.excluded_paths.length > 0 && (
           <p className="text-[10px] text-[rgb(var(--t3))]/40 mt-3">
-            {config.excluded_paths.length} path{config.excluded_paths.length > 1 ? "s" : ""} excluded from scanning
+            {i18n.t("settings.paths_excluded").replace("{count}", String(config.excluded_paths.length))}
           </p>
         )}
       </Section>
 
-      <Section title="Detection Exclusions" desc="Detection names to ignore. Use names from scan results (case-insensitive substring match).">
+      <Section title={i18n.t("settings.detection_excl")} desc={i18n.t("settings.detection_excl_full_desc")}>
         <ExclusionList
           items={config.excluded_detections}
           onAdd={(v) => update({ excluded_detections: [...config.excluded_detections, v] })}
           onRemove={(i) => update({ excluded_detections: config.excluded_detections.filter((_, j) => j !== i) })}
           placeholder='e.g. "Win.Test.EICAR_HDB-1" or "ARGUS/Suspicious.Generic"'
           icon={<ShieldOff size={14} className="text-[rgb(var(--t3))] flex-shrink-0" />}
-          addLabel="Add Detection Exclusion"
+          addLabel={i18n.t("settings.add_detection")}
         />
       </Section>
 
-      <Section title="Trusted Hashes" desc="SHA-256 hashes of files to always allow. Paste full 64-character hex hash.">
+      <Section title={i18n.t("settings.trusted_hashes")} desc={i18n.t("settings.trusted_hashes_full_desc")}>
         <ExclusionList
           items={config.trusted_hashes}
           onAdd={(v) => {
@@ -312,58 +314,57 @@ function AdvancedTab({ config, update }: { config: DaemonConfig; update: (p: Par
             }
           }}
           onRemove={(i) => update({ trusted_hashes: config.trusted_hashes.filter((_, j) => j !== i) })}
-          placeholder="Paste SHA-256 hash (64 hex characters)"
+          placeholder={i18n.t("settings.trusted_hash_placeholder")}
           icon={<CheckCircle size={14} className="text-[rgb(var(--green))] flex-shrink-0" />}
-          addLabel="Add Trusted Hash"
+          addLabel={i18n.t("settings.add_hash")}
           mono
         />
       </Section>
 
-      <Section title="Logging" desc="Daemon log level.">
+      <Section title={i18n.t("settings.logging")} desc={i18n.t("settings.logging_desc")}>
         <select value={config.log_level} onChange={e => update({ log_level: e.target.value })}
           className="w-48 rounded-xl border border-[rgb(var(--border))]/15 bg-[rgb(var(--raised))]/30 px-4 py-2.5 text-[13px] text-[rgb(var(--t1))] outline-none">
-          <option value="error">Error</option><option value="warn">Warning</option><option value="info">Info</option>
-          <option value="debug">Debug</option><option value="trace">Trace</option>
+          <option value="error">{i18n.t("settings.log_error")}</option><option value="warn">{i18n.t("settings.log_warn")}</option><option value="info">{i18n.t("settings.log_info")}</option>
+          <option value="debug">{i18n.t("settings.log_debug")}</option><option value="trace">{i18n.t("settings.log_trace")}</option>
         </select>
       </Section>
-      <Section title="Engine Limits">
+      <Section title={i18n.t("settings.engine_limits")}>
         <div className="space-y-3 text-[13px]">
-          <LR l="Max file size" v={`${config.max_file_size_mb} MB`} />
-          <LR l="Named pipe" v="\\.\pipe\sentinelld" />
-          <LR l="Quarantine retention" v={`${config.quarantine_retention_days} days`} />
-          <LR l="Update mirror" v={config.update_mirror} />
+          <LR l={i18n.t("settings.max_file_size")} v={`${config.max_file_size_mb} MB`} />
+          <LR l={i18n.t("settings.named_pipe")} v="\\.\pipe\sentinelld" />
+          <LR l={i18n.t("settings.quarantine_retention")} v={`${config.quarantine_retention_days} ${i18n.t("settings.days_unit")}`} />
+          <LR l={i18n.t("settings.update_mirror")} v={config.update_mirror} />
         </div>
       </Section>
 
       {/* Protection Shutdown — guarded by confirmation */}
-      <Section title="Protection Control" desc="Disable protection and exit Sentinella.">
+      <Section title={i18n.t("settings.protection_control")} desc={i18n.t("settings.protection_control_desc")}>
         {!showShutdown ? (
           <button onClick={() => setShowShutdown(true)}
             className="flex items-center gap-2 text-[12px] text-[rgb(var(--red))]/60 hover:text-[rgb(var(--red))] cursor-pointer transition-colors">
             <AlertTriangle size={13} />
-            Disable Protection & Exit...
+            {i18n.t("settings.disable_protection")}
           </button>
         ) : (
           <div className="rounded-xl border border-[rgb(var(--red))]/15 bg-[rgb(var(--red))]/5 p-5">
             <div className="flex items-start gap-3 mb-4">
               <AlertTriangle size={18} className="text-[rgb(var(--red))] flex-shrink-0 mt-0.5" />
               <div>
-                <p className="text-[13px] font-semibold text-[rgb(var(--red))]">Disable All Protection</p>
+                <p className="text-[13px] font-semibold text-[rgb(var(--red))]">{i18n.t("settings.disable_all_protection")}</p>
                 <p className="text-[12px] text-[rgb(var(--t2))] mt-1.5 leading-relaxed">
-                  This will stop the Sentinella GUI. The daemon will continue running independently,
-                  but real-time monitoring, ARGUS heuristics, and scheduled scans will no longer be
-                  visible or controllable.
+                  {i18n.t("settings.shutdown_warning")}
                 </p>
               </div>
             </div>
             <p className="text-[11px] text-[rgb(var(--t3))] mb-3">
-              Type <strong className="text-[rgb(var(--red))] font-mono">DISABLE PROTECTION</strong> to confirm:
+              {i18n.t("settings.type_to_confirm").replace("{phrase}", "")}
+              <strong className="text-[rgb(var(--red))] font-mono">DISABLE PROTECTION</strong>
             </p>
             <input
               type="text"
               value={shutdownPhrase}
               onChange={(e) => { setShutdownPhrase(e.target.value); setShutdownError(""); }}
-              placeholder="Type confirmation phrase..."
+              placeholder={i18n.t("settings.confirmation_placeholder")}
               className="w-full rounded-xl border border-[rgb(var(--red))]/20 bg-[rgb(var(--base))] px-4 py-2.5 text-[13px] text-[rgb(var(--t1))] outline-none font-mono mb-3"
               autoComplete="off"
               spellCheck={false}
@@ -374,21 +375,25 @@ function AdvancedTab({ config, update }: { config: DaemonConfig; update: (p: Par
             <div className="flex gap-3">
               <button onClick={async () => {
                 if (shutdownPhrase !== "DISABLE PROTECTION") {
-                  setShutdownError("Incorrect confirmation phrase.");
+                  setShutdownError(i18n.t("settings.incorrect_phrase"));
                   return;
                 }
                 try {
-                  await invoke("confirmed_shutdown", { confirmation: shutdownPhrase });
+                  const result = await invoke<any>("confirmed_shutdown", { confirmation: shutdownPhrase });
+                  if (result?.requires_elevation) {
+                    setShutdownError(result.error || i18n.t("settings.requires_admin"));
+                    return;
+                  }
                 } catch (e) {
                   setShutdownError(String(e));
                 }
               }} disabled={shutdownPhrase.length < 5}
                 className="px-4 py-2 rounded-xl bg-[rgb(var(--red))] text-white text-[12px] font-semibold hover:opacity-90 cursor-pointer disabled:opacity-30">
-                Confirm Shutdown
+                {i18n.t("settings.confirm_shutdown")}
               </button>
               <button onClick={() => { setShowShutdown(false); setShutdownPhrase(""); setShutdownError(""); }}
                 className="px-4 py-2 rounded-xl bg-[rgb(var(--raised))]/40 text-[12px] text-[rgb(var(--t2))] cursor-pointer">
-                Cancel
+                {i18n.t("common.cancel")}
               </button>
             </div>
           </div>
@@ -423,7 +428,7 @@ function ExclusionList({ items, onAdd, onRemove, placeholder, icon, addLabel, mo
               <button
                 onClick={() => onRemove(i)}
                 className="opacity-0 group-hover:opacity-100 flex-shrink-0 p-1 rounded-lg hover:bg-[rgb(var(--red))]/10 text-[rgb(var(--t3))] hover:text-[rgb(var(--red))] transition-all cursor-pointer"
-                title="Remove"
+                title={i18n.t("settings.remove")}
               >
                 <X size={13} />
               </button>
@@ -455,7 +460,7 @@ function ExclusionList({ items, onAdd, onRemove, placeholder, icon, addLabel, mo
       </div>
       {items.length > 0 && (
         <p className="text-[10px] text-[rgb(var(--t3))]/40 mt-3">
-          {items.length} entr{items.length > 1 ? "ies" : "y"}
+          {i18n.t("settings.entries_count").replace("{count}", String(items.length))}
         </p>
       )}
     </>
@@ -475,19 +480,19 @@ function NotificationsTab() {
 
   return (
     <>
-      <Section title="Windows Notifications" desc="Control when Sentinella shows desktop toasts.">
-        <Toggle label="Enable notifications" desc="Master switch for all Windows toasts" checked={ns.enabled} onChange={() => toggle("enabled")} />
+      <Section title={i18n.t("settings.win_notifications")} desc={i18n.t("settings.win_notifications_desc")}>
+        <Toggle label={i18n.t("settings.enable_notifications")} desc={i18n.t("settings.enable_notifications_desc")} checked={ns.enabled} onChange={() => toggle("enabled")} />
       </Section>
 
-      <Section title="Notification Events" desc="Choose which events trigger a toast.">
-        <Toggle label="Threat detected" desc="A virus or suspicious file was found" checked={ns.onThreat} onChange={() => toggle("onThreat")} disabled={!ns.enabled} />
-        <Toggle label="File quarantined" desc="A threat was moved to the quarantine vault" checked={ns.onQuarantine} onChange={() => toggle("onQuarantine")} disabled={!ns.enabled} />
-        <Toggle label="Scan completed with threats" desc="A scan finished and found threats (clean scans are always silent)" checked={ns.onScanComplete} onChange={() => toggle("onScanComplete")} disabled={!ns.enabled} />
-        <Toggle label="Signature update failed" desc="Virus definitions could not be updated" checked={ns.onUpdateFailure} onChange={() => toggle("onUpdateFailure")} disabled={!ns.enabled} />
-        <Toggle label="Protection degraded" desc="A subsystem went down or became unavailable" checked={ns.onDegraded} onChange={() => toggle("onDegraded")} disabled={!ns.enabled} />
+      <Section title={i18n.t("settings.notification_events")} desc={i18n.t("settings.notification_events_desc")}>
+        <Toggle label={i18n.t("settings.threat_detected")} desc={i18n.t("settings.threat_detected_desc")} checked={ns.onThreat} onChange={() => toggle("onThreat")} disabled={!ns.enabled} />
+        <Toggle label={i18n.t("settings.file_quarantined")} desc={i18n.t("settings.file_quarantined_desc")} checked={ns.onQuarantine} onChange={() => toggle("onQuarantine")} disabled={!ns.enabled} />
+        <Toggle label={i18n.t("settings.scan_completed_threats")} desc={i18n.t("settings.scan_completed_threats_desc")} checked={ns.onScanComplete} onChange={() => toggle("onScanComplete")} disabled={!ns.enabled} />
+        <Toggle label={i18n.t("settings.sig_update_failed")} desc={i18n.t("settings.sig_update_failed_desc")} checked={ns.onUpdateFailure} onChange={() => toggle("onUpdateFailure")} disabled={!ns.enabled} />
+        <Toggle label={i18n.t("settings.protection_degraded")} desc={i18n.t("settings.protection_degraded_desc")} checked={ns.onDegraded} onChange={() => toggle("onDegraded")} disabled={!ns.enabled} />
       </Section>
 
-      <Section title="Severity Threshold" desc="Only show notifications at or above this level.">
+      <Section title={i18n.t("settings.severity_threshold")} desc={i18n.t("settings.severity_threshold_desc")}>
         <div className={`grid grid-cols-4 gap-1 rounded-xl bg-[rgb(var(--raised))]/15 p-1 ${!ns.enabled ? "opacity-40 pointer-events-none" : ""}`}>
           {(["info", "warning", "threat", "critical"] as NotificationSeverity[]).map((level) => (
             <button key={level} onClick={() => {
@@ -498,19 +503,19 @@ function NotificationsTab() {
               ns.minSeverity === level
                 ? "bg-[rgb(var(--accent))] text-white shadow-sm"
                 : "text-[rgb(var(--t2))] hover:bg-[rgb(var(--raised))]/30"
-            }`}>{level === "info" ? "All" : level}</button>
+            }`}>{level === "info" ? i18n.t("settings.severity_all") : level}</button>
           ))}
         </div>
         <p className="text-[11px] text-[rgb(var(--t3))] mt-2">
-          {ns.minSeverity === "info" && "All meaningful events will trigger toasts."}
-          {ns.minSeverity === "warning" && "Only warnings, threats, and critical events."}
-          {ns.minSeverity === "threat" && "Only threat detections and critical events."}
-          {ns.minSeverity === "critical" && "Only critical events (quarantine failure, protection loss)."}
+          {ns.minSeverity === "info" && i18n.t("settings.severity_info_desc")}
+          {ns.minSeverity === "warning" && i18n.t("settings.severity_warning_desc")}
+          {ns.minSeverity === "threat" && i18n.t("settings.severity_threat_desc")}
+          {ns.minSeverity === "critical" && i18n.t("settings.severity_critical_desc")}
         </p>
       </Section>
 
-      <Section title="Quiet Mode" desc="Temporarily suppress all notifications without changing individual settings.">
-        <Toggle label="Quiet mode" desc="No toasts until you turn this off" checked={ns.quietMode} onChange={() => toggle("quietMode")} disabled={!ns.enabled} />
+      <Section title={i18n.t("settings.quiet_mode")} desc={i18n.t("settings.quiet_mode_desc")}>
+        <Toggle label={i18n.t("settings.quiet_toggle")} desc={i18n.t("settings.quiet_toggle_desc")} checked={ns.quietMode} onChange={() => toggle("quietMode")} disabled={!ns.enabled} />
       </Section>
     </>
   );

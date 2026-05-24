@@ -14,36 +14,51 @@ fn load_or_create_secret() -> String {
     if let Ok(secret) = std::env::var(ENV_NAME) {
         if secret.len() >= 32 {
             persist_if_missing(&secret);
+            eprintln!("[ipc_auth] loaded secret from env var");
             return secret;
         }
     }
 
     let path = secret_path();
+    eprintln!("[ipc_auth] secret_path resolved to: {}", path.display());
     if let Ok(secret) = std::fs::read_to_string(&path) {
         let trimmed = secret.trim().to_string();
         if trimmed.len() >= 32 {
+            eprintln!("[ipc_auth] loaded secret from file ({} chars)", trimmed.len());
             return trimmed;
         }
     }
 
+    eprintln!("[ipc_auth] WARNING: generating NEW secret (daemon will reject!)");
     let secret = generate_secret();
     persist_secret(&secret);
     secret
 }
 
 fn secret_path() -> PathBuf {
+    // Dev mode: walk up from CWD to find project root (has crates/sentinelld).
     if let Ok(cwd) = std::env::current_dir() {
         for dir in cwd.ancestors() {
             if dir.join("crates").join("sentinelld").exists() {
                 return dir.join("runtime").join("state").join("ipc_secret");
             }
         }
-        for dir in cwd.ancestors() {
-            let candidate = dir.join("runtime").join("state").join("ipc_secret");
-            if candidate.exists() {
-                return candidate;
+    }
+    // Installed mode: walk up from exe location.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            for ancestor in dir.ancestors() {
+                if ancestor.join("crates").join("sentinelld").exists() {
+                    return ancestor.join("runtime").join("state").join("ipc_secret");
+                }
             }
         }
+    }
+    // Fallback: ProgramData or CWD-relative.
+    let pd = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into());
+    let installed = PathBuf::from(&pd).join("Sentinella").join("state").join("ipc_secret");
+    if installed.exists() {
+        return installed;
     }
     PathBuf::from("runtime/state/ipc_secret")
 }

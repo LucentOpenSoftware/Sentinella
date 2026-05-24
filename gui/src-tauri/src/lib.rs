@@ -9,6 +9,118 @@ mod supervisor;
 
 use serde_json::Value;
 
+// ── Elevation check ────────────────────────────────────────────
+
+/// Check if the current process has administrator privileges.
+/// Critical protection changes (disable realtime, pause protection,
+/// confirmed shutdown) require elevation.
+#[cfg(windows)]
+fn is_elevated() -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    unsafe {
+        let mut token = windows::Win32::Foundation::HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return false;
+        }
+        let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+        let mut size = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            Some(&mut elevation as *mut _ as *mut std::ffi::c_void),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut size,
+        );
+        let _ = CloseHandle(token);
+        ok.is_ok() && elevation.TokenIsElevated != 0
+    }
+}
+
+#[cfg(not(windows))]
+fn is_elevated() -> bool {
+    // Unix: check euid == 0.
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// Spawn the Sentinella CLI with `runas` verb to trigger UAC prompt.
+/// Returns Ok(true) if the elevated command succeeded, Ok(false) if user denied UAC.
+#[cfg(windows)]
+fn spawn_elevated_cli(args: &[&str]) -> Result<bool, String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
+    use windows::core::PCWSTR;
+
+    // Find sentinella CLI binary.
+    let cli_path = find_cli_binary().ok_or("sentinella CLI not found")?;
+    let cli_wide: Vec<u16> = std::ffi::OsStr::new(&cli_path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let args_str = args.join(" ");
+    let args_wide: Vec<u16> = std::ffi::OsStr::new(&args_str)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let verb: Vec<u16> = std::ffi::OsStr::new("runas")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            PCWSTR(verb.as_ptr()),
+            PCWSTR(cli_wide.as_ptr()),
+            PCWSTR(args_wide.as_ptr()),
+            PCWSTR::null(),
+            SW_HIDE,
+        )
+    };
+
+    // ShellExecuteW returns HINSTANCE > 32 on success.
+    let code = result.0 as isize;
+    if code > 32 {
+        // UAC accepted, command launched. Brief wait for it to complete.
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        Ok(true)
+    } else {
+        // User denied UAC or other error.
+        Ok(false)
+    }
+}
+
+#[cfg(windows)]
+fn find_cli_binary() -> Option<String> {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            // Same directory as GUI.
+            let candidate = dir.join("sentinella.exe");
+            if candidate.exists() {
+                return Some(candidate.to_string_lossy().to_string());
+            }
+            // Dev layout: target/release or target/debug.
+            for ancestor in dir.ancestors().skip(1) {
+                for profile in &["release", "debug"] {
+                    let c = ancestor.join("target").join(profile).join("sentinella.exe");
+                    if c.exists() {
+                        return Some(c.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(windows))]
+fn spawn_elevated_cli(_args: &[&str]) -> Result<bool, String> {
+    Err("Elevation not supported on this platform".into())
+}
+
 // ── Engine ──────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -221,6 +333,7 @@ async fn request_challenge_token() -> Result<Value, String> {
 
 /// Confirmed protection shutdown. Requires the exact phrase "DISABLE PROTECTION".
 /// Logs the event and exits the GUI (daemon continues until manually stopped).
+/// Triggers UAC if not elevated.
 #[tauri::command]
 async fn confirmed_shutdown(confirmation: String, app: tauri::AppHandle) -> Result<Value, String> {
     if confirmation != "DISABLE PROTECTION" {
@@ -286,14 +399,31 @@ async fn get_connection_state(
 // ── Protection critical settings (UAC-gated) ──────────────────
 
 /// Change security-critical settings (realtime, auto-quarantine).
-/// Checks if current process is elevated. If not, returns requires_elevation=true
-/// so the GUI can prompt UAC.
+/// If GUI is not elevated, triggers UAC prompt via elevated CLI helper.
 #[tauri::command]
 async fn set_critical_protection(
     realtime_enabled: Option<bool>,
     auto_quarantine: Option<bool>,
 ) -> Result<Value, String> {
-    // Get challenge token first (requires IPC auth).
+    if !is_elevated() {
+        // Trigger UAC via CLI for realtime changes.
+        if let Some(rt) = realtime_enabled {
+            let cmd = if rt { "enable-realtime" } else { "disable-realtime" };
+            return match spawn_elevated_cli(&[cmd]) {
+                Ok(true) => Ok(serde_json::json!({"ok": true, "elevated": true})),
+                Ok(false) => Ok(serde_json::json!({"ok": false, "requires_elevation": true,
+                    "error": "Administrator privileges required. UAC prompt was denied."})),
+                Err(e) => Ok(serde_json::json!({"ok": false, "requires_elevation": true, "error": e})),
+            };
+        }
+        // auto_quarantine change also needs elevation.
+        if auto_quarantine.is_some() {
+            return Ok(serde_json::json!({"ok": false, "requires_elevation": true,
+                "error": "Administrator privileges required for this setting."}));
+        }
+    }
+
+    // Already elevated — proceed directly via IPC.
     let token_resp = daemon_client::call_auth("security.challenge", serde_json::json!({}))
         .await
         .map_err(|e| e.to_string())?;
@@ -315,9 +445,18 @@ async fn set_critical_protection(
         .map_err(Into::into)
 }
 
-/// Pause protection temporarily (challenge-token gated).
+/// Pause protection temporarily. Triggers UAC if not elevated.
 #[tauri::command]
 async fn pause_protection() -> Result<Value, String> {
+    if !is_elevated() {
+        return match spawn_elevated_cli(&["pause-protection"]) {
+            Ok(true) => Ok(serde_json::json!({"ok": true, "elevated": true})),
+            Ok(false) => Ok(serde_json::json!({"ok": false, "requires_elevation": true,
+                "error": "Administrator privileges required. UAC prompt was denied."})),
+            Err(e) => Ok(serde_json::json!({"ok": false, "requires_elevation": true, "error": e})),
+        };
+    }
+
     let token_resp = daemon_client::call_auth("security.challenge", serde_json::json!({}))
         .await
         .map_err(|e| e.to_string())?;
@@ -333,7 +472,7 @@ async fn pause_protection() -> Result<Value, String> {
     .map_err(Into::into)
 }
 
-/// Resume protection (challenge-token gated).
+/// Resume protection. No elevation required (enabling protection is safe).
 #[tauri::command]
 async fn resume_protection() -> Result<Value, String> {
     let token_resp = daemon_client::call_auth("security.challenge", serde_json::json!({}))

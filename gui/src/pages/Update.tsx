@@ -15,6 +15,7 @@ import { useDaemonContext } from "../hooks/DaemonContext";
 import { startSignatureUpdate, getUpdateStatus, getArgusPacks, reloadArgus } from "../api/sentinella";
 import type { ArgusPackInfo } from "../types/sentinella";
 import type { UpdateStatus } from "../types/sentinella";
+import { t } from "../i18n";
 
 export function UpdatePage() {
   const { data, connected } = useDaemonContext();
@@ -40,7 +41,7 @@ export function UpdatePage() {
           setLastResult({ ok: false, message: status.last_error });
         } else if (status.state === "idle" && updating) {
           // Went from running -> idle = success.
-          setLastResult({ ok: true, message: "Signature database updated successfully." });
+          setLastResult({ ok: true, message: t("update.success") });
         }
       }
     } catch {
@@ -87,13 +88,13 @@ export function UpdatePage() {
   const engine = data?.engine;
   const stats = data?.stats;
   const sigCount = engine?.signature_count ?? 0;
-  const dbVersion = engine?.db_version ? `v${engine.db_version}` : "N/A";
-  const engineVersion = engine?.engine_version ?? "Unknown";
+  const dbVersion = engine?.db_version ? `v${engine.db_version}` : t("update.na");
+  const engineVersion = engine?.engine_version ?? t("common.unknown");
   const lastUpdate = stats?.last_update_timestamp
     ? new Date(stats.last_update_timestamp * 1000).toLocaleString()
     : engine?.last_update
       ? new Date(engine.last_update * 1000).toLocaleString()
-      : "Never";
+      : t("common.never");
   const dbTimestamp = engine?.db_timestamp
     ? new Date(engine.db_timestamp * 1000).toLocaleString()
     : null;
@@ -102,14 +103,14 @@ export function UpdatePage() {
 
   const statusLabel =
     updateStatus?.state === "downloading" || updateStatus?.state === "checking"
-      ? "Updating..."
+      ? t("update.updating")
       : updateStatus?.state === "applying"
-        ? "Applying..."
+        ? t("update.applying")
         : updating
-          ? "Updating..."
+          ? t("update.updating")
           : isStale
-            ? "Update available"
-            : "Up to date";
+            ? t("update.available")
+            : t("update.status_up_to_date");
 
   const statusColor = updating
     ? "accent"
@@ -142,16 +143,16 @@ export function UpdatePage() {
             </div>
             <div className="flex min-w-0 flex-col gap-3">
               <h3 className="text-[24px] font-bold leading-tight">
-                {updating ? "Updating Signatures..." : isStale ? "Update Available" : "Signatures Up to Date"}
+                {updating ? t("update.hero_updating") : isStale ? t("update.hero_available") : t("update.hero_up_to_date")}
               </h3>
               <p className="max-w-2xl text-[14px] leading-relaxed text-[rgb(var(--t2))]">
                 {updating
-                  ? "Downloading the latest virus definitions from ClamAV mirrors. The engine will reload automatically when done."
+                  ? t("update.desc_updating")
                   : isStale && staleHours > 0
-                    ? `Your signature database is ${staleHours} hours old. Update recommended for full protection.`
+                    ? t("update.desc_stale").replace("{hours}", String(staleHours))
                     : sigCount > 0
-                      ? `${sigCount.toLocaleString()} virus signatures loaded and active.`
-                      : "No signature database loaded. Run an update to download definitions."}
+                      ? t("update.desc_active").replace("{count}", sigCount.toLocaleString())
+                      : t("update.desc_empty")}
               </p>
 
               {/* Progress bar + current file */}
@@ -167,12 +168,12 @@ export function UpdatePage() {
                   <div className="flex items-center justify-between">
                     <p className="text-[11px] text-[rgb(var(--t3))]">
                       {updateStatus.current_file
-                        ? `Downloading ${updateStatus.current_file}`
+                        ? t("update.downloading").replace("{file}", updateStatus.current_file)
                         : updateStatus.state === "checking"
-                          ? "Checking for updates..."
+                          ? t("update.checking")
                           : updateStatus.state === "applying"
-                            ? "Applying updates..."
-                            : "Processing..."}
+                            ? t("update.applying_updates")
+                            : t("update.processing")}
                     </p>
                     <p className="text-[11px] font-semibold text-[rgb(var(--accent))]">
                       {Math.round(updateStatus.percent ?? 0)}%
@@ -213,11 +214,11 @@ export function UpdatePage() {
               ) : (
                 <RefreshCw size={16} />
               )}
-              {updating ? "Updating..." : "Check for Updates"}
+              {updating ? t("update.updating") : t("update.check")}
             </button>
             {!connected && (
               <p className="text-center text-[11px] text-[rgb(var(--amber))]">
-                Daemon not connected
+                {t("update.daemon_not_connected")}
               </p>
             )}
           </div>
@@ -228,95 +229,90 @@ export function UpdatePage() {
       <div className="card-grid-4">
         <InfoTile
           icon={<Database size={18} />}
-          label="Database Version"
+          label={t("update.db_version")}
           value={dbVersion}
-          sub={dbTimestamp ? `Built ${dbTimestamp}` : "Build date unknown"}
+          sub={dbTimestamp ? t("update.build_date").replace("{date}", dbTimestamp) : t("update.build_date_unknown")}
           color="accent"
         />
         <InfoTile
           icon={<Shield size={18} />}
-          label="Signatures"
+          label={t("update.signatures_label")}
           value={sigCount > 0 ? sigCount.toLocaleString() : "0"}
-          sub="Virus definitions loaded"
+          sub={t("update.signatures_sub")}
           color={sigCount > 0 ? "green" : "amber"}
         />
         <InfoTile
           icon={<Clock size={18} />}
-          label="Last Updated"
-          value={lastUpdate === "Never" ? "Never" : new Date(
+          label={t("update.last_updated")}
+          value={lastUpdate === t("common.never") ? t("common.never") : new Date(
             stats?.last_update_timestamp
               ? stats.last_update_timestamp * 1000
               : engine?.last_update
                 ? engine.last_update * 1000
                 : 0
           ).toLocaleDateString()}
-          sub={lastUpdate === "Never" ? "No updates performed" : lastUpdate}
+          sub={lastUpdate === t("common.never") ? t("update.no_updates_performed") : lastUpdate}
           color={isStale ? "amber" : "accent"}
         />
         <InfoTile
           icon={<Globe size={18} />}
-          label="Engine"
+          label={t("update.engine")}
           value={engineVersion}
-          sub="ClamAV engine version"
+          sub={t("update.engine_version_sub")}
           color="accent"
         />
       </div>
 
-      {/* Update details */}
-      <Card>
-        <h4 className="text-[15px] font-semibold">Update Details</h4>
-        <p className="mb-5 mt-1 text-[12px] text-[rgb(var(--t3))]">
-          Signature database and engine information.
-        </p>
+      {/* Update details + ARGUS packs — side by side */}
+      <div className="card-grid-2">
+        <Card>
+          <h4 className="text-[14px] font-semibold">{t("update.details_title")}</h4>
+          <p className="mb-4 mt-1 text-[11px] text-[rgb(var(--t3))]">
+            {t("update.details_desc")}
+          </p>
+          <div className="space-y-0">
+            <DetailRow label={t("update.update_source")} value={t("update.source_full")} />
+            <DetailRow label={t("update.database_format")} value={t("update.format_value")} />
+            <DetailRow label={t("update.engine_version_label")} value={engineVersion} />
+            <DetailRow label={t("update.signatures_loaded")} value={sigCount > 0 ? sigCount.toLocaleString() : t("update.none")} />
+            <DetailRow label={t("update.last_successful_update")} value={lastUpdate} />
+            <DetailRow
+              label={t("update.db_status")}
+              value={statusLabel}
+              valueColor={updating ? "accent" : isStale ? "amber" : "green"}
+            />
+            <DetailRow label={t("update.tool")} value={t("update.tool_value")} />
+          </div>
+        </Card>
 
-        <div className="space-y-4">
-          <DetailRow label="Update Source" value="ClamAV Official Mirrors (database.clamav.net)" />
-          <DetailRow label="Database Format" value="ClamAV CVD" />
-          <DetailRow label="Engine Version" value={engineVersion} />
-          <DetailRow label="Database Version" value={dbVersion} />
-          <DetailRow label="Signatures Loaded" value={sigCount > 0 ? sigCount.toLocaleString() : "None"} />
-          <DetailRow label="Last Successful Update" value={lastUpdate} />
-          <DetailRow
-            label="Database Status"
-            value={statusLabel}
-            valueColor={updating ? "accent" : isStale ? "amber" : "green"}
-          />
-          {isStale && staleHours > 0 && (
-            <DetailRow label="Database Age" value={`${staleHours} hours`} valueColor="amber" />
-          )}
-          <DetailRow label="Protocol Version" value={engine?.protocol_version ? String(engine.protocol_version) : "N/A"} />
-          <DetailRow label="Update Tool" value="freshclam (ClamAV)" />
-        </div>
-      </Card>
-
-      {/* ARGUS Intelligence Packs */}
-      <ArgusPacksSection />
+        <ArgusPacksSection />
+      </div>
 
       {/* How updates work */}
       <Card>
-        <h4 className="text-[15px] font-semibold">How Updates Work</h4>
+        <h4 className="text-[15px] font-semibold">{t("update.how_updates_work")}</h4>
         <p className="mb-5 mt-1 text-[12px] text-[rgb(var(--t3))]">
-          Sentinella uses ClamAV's official signature distribution infrastructure.
+          {t("update.how_updates_desc")}
         </p>
 
         <div className="grid gap-4 sm:grid-cols-3">
           <StepCard
             step="1"
             icon={<Download size={16} />}
-            title="Download"
-            desc="freshclam checks ClamAV mirrors for new virus definitions and downloads incremental updates."
+            title={t("update.step_download")}
+            desc={t("update.step_download_desc_full")}
           />
           <StepCard
             step="2"
             icon={<Database size={16} />}
-            title="Verify & Apply"
-            desc="Downloaded signatures are verified for integrity, then written to the local database directory."
+            title={t("update.step_verify")}
+            desc={t("update.step_verify_desc_full")}
           />
           <StepCard
             step="3"
             icon={<RefreshCw size={16} />}
-            title="Engine Reload"
-            desc="The ClamAV engine reloads with updated signatures. No restart needed — the swap is atomic."
+            title={t("update.step_reload")}
+            desc={t("update.step_reload_desc_full")}
           />
         </div>
       </Card>
@@ -371,16 +367,16 @@ function ArgusPacksSection() {
             <Shield size={16} className="text-[rgb(var(--accent))]" />
           </div>
           <div>
-            <h4 className="text-[15px] font-semibold">ARGUS Intelligence Packs</h4>
+            <h4 className="text-[15px] font-semibold">{t("update.argus_packs")}</h4>
             <p className="text-[11px] text-[rgb(var(--t3))] mt-0.5">
-              {totalRules} behavioral rules across {packs.length} packs
+              {t("update.rules_across_packs").replace("{rules}", String(totalRules)).replace("{packs}", String(packs.length))}
             </p>
           </div>
         </div>
         <button onClick={handleReload} disabled={reloading}
           className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-semibold text-[rgb(var(--accent))] border border-[rgb(var(--accent))]/15 hover:bg-[rgb(var(--accent))]/5 cursor-pointer disabled:opacity-40">
           {reloading ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
-          Reload Rules
+          {t("update.reload_rules")}
         </button>
       </div>
 
@@ -405,7 +401,7 @@ function ArgusPacksSection() {
               </div>
               <div className="text-right flex-shrink-0">
                 <p className="text-[12px] font-semibold">{pack.rule_count}</p>
-                <p className="text-[9px] text-[rgb(var(--t3))]">rules</p>
+                <p className="text-[9px] text-[rgb(var(--t3))]">{t("update.rules_label")}</p>
               </div>
               <span className="text-[9px] px-1.5 py-0.5 rounded bg-[rgb(var(--raised))]/30 text-[rgb(var(--t3))] flex-shrink-0">
                 v{pack.version}
@@ -439,23 +435,21 @@ function InfoTile({
   }[color];
 
   return (
-    <Card className="h-full">
-      <div className="flex items-start gap-4">
+    <div className="glass-card flex flex-col gap-1.5 px-5 py-4 h-full">
+      <div className="flex items-center gap-2.5">
         <div
-          className="flex h-12 w-12 flex-shrink-0 items-center justify-center rounded-xl"
+          className="flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-md"
           style={{ background: `rgba(${palette}, 0.08)`, color: `rgb(${palette})` }}
         >
           {icon}
         </div>
-        <div className="min-w-0">
-          <p className="text-[10px] font-semibold uppercase tracking-[0.16em]" style={{ color: `rgba(${palette}, 0.68)` }}>
-            {label}
-          </p>
-          <p className="mt-2 text-[20px] font-bold leading-none text-[rgb(var(--t1))]">{value}</p>
-          <p className="mt-2 text-[11px] leading-relaxed text-[rgb(var(--t3))]">{sub}</p>
-        </div>
+        <p className="text-[10px] font-semibold uppercase tracking-[0.14em]" style={{ color: `rgba(${palette}, 0.65)` }}>
+          {label}
+        </p>
       </div>
-    </Card>
+      <p className="text-[20px] font-bold leading-tight text-[rgb(var(--t1))]">{value}</p>
+      <p className="text-[11px] leading-snug text-[rgb(var(--t3))]">{sub}</p>
+    </div>
   );
 }
 

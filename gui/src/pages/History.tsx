@@ -6,6 +6,7 @@ import {
 import { Card } from "../components/Card";
 import { getScanHistory, getDetections, getArgusVerdicts, exportScanReport, type DetectionEntry } from "../api/sentinella";
 import type { ScanRecord, ArgusVerdictRecord, ArgusFinding } from "../types/sentinella";
+import { t } from "../i18n";
 
 type View = { k: "list" } | { k: "detail"; scan: ScanRecord };
 
@@ -26,7 +27,7 @@ export function HistoryPage() {
   }, []);
 
   if (loading) return <div className="flex items-center justify-center py-20"><Loader2 size={20} className="text-[rgb(var(--accent))] animate-spin" /></div>;
-  if (err) return <Card className="text-center py-10"><WifiOff size={20} className="mx-auto text-[rgb(var(--amber))] mb-3" /><p className="text-[13px] text-[rgb(var(--t3))]">Could not reach daemon</p></Card>;
+  if (err) return <Card className="text-center py-10"><WifiOff size={20} className="mx-auto text-[rgb(var(--amber))] mb-3" /><p className="text-[13px] text-[rgb(var(--t3))]">{t("history.daemon_error")}</p></Card>;
 
   if (view.k === "detail") {
     return <ScanDetail scan={view.scan} onBack={() => setView({ k: "list" })} />;
@@ -44,7 +45,7 @@ export function HistoryPage() {
       <div className="flex flex-wrap items-center gap-3">
         <div className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-[rgb(var(--surface))] border border-[rgb(var(--border))]/12 flex-1 max-w-[280px]">
           <Search size={14} className="text-[rgb(var(--t3))]/30" />
-          <input type="text" placeholder="Search scans..." value={search} onChange={(e) => setSearch(e.target.value)}
+          <input type="text" placeholder={t("history.search")} value={search} onChange={(e) => setSearch(e.target.value)}
             className="bg-transparent text-[13px] outline-none w-full text-[rgb(var(--t1))] placeholder:text-[rgb(var(--t3))]/25" />
         </div>
         {(["all", "threats"] as const).map((f) => (
@@ -52,9 +53,9 @@ export function HistoryPage() {
             className={`text-[12px] font-medium px-4 py-2.5 rounded-xl border cursor-pointer capitalize ${filter === f
               ? "border-[rgb(var(--accent))]/15 text-[rgb(var(--accent))] bg-[rgb(var(--accent))]/5"
               : "border-[rgb(var(--border))]/12 text-[rgb(var(--t3))] bg-[rgb(var(--surface))]"
-            }`}>{f === "threats" ? "With threats" : f}</button>
+            }`}>{f === "threats" ? t("history.with_threats") : t("history.all")}</button>
         ))}
-        <span className="text-[11px] text-[rgb(var(--t3))]/25 md:ml-auto">{records.length} total</span>
+        <span className="text-[11px] text-[rgb(var(--t3))]/25 md:ml-auto">{records.length} {t("history.total")}</span>
         <button onClick={async () => {
           try {
             const report = await exportScanReport();
@@ -69,7 +70,7 @@ export function HistoryPage() {
             URL.revokeObjectURL(url);
           } catch {}
         }} className="flex items-center gap-1.5 text-[11px] text-[rgb(var(--accent))] hover:underline cursor-pointer">
-          <Download size={12} /> Export
+          <Download size={12} /> {t("history.export")}
         </button>
       </div>
 
@@ -77,7 +78,7 @@ export function HistoryPage() {
       {filtered.length === 0 ? (
         <Card className="text-center py-12">
           <Clock size={28} className="mx-auto text-[rgb(var(--t3))]/15 mb-3" />
-          <p className="text-[14px] font-medium text-[rgb(var(--t2))]">{records.length === 0 ? "No scans recorded yet" : "No matching scans"}</p>
+          <p className="text-[14px] font-medium text-[rgb(var(--t2))]">{records.length === 0 ? t("history.no_scans") : t("history.no_matching")}</p>
         </Card>
       ) : (
         <Card>
@@ -90,13 +91,13 @@ export function HistoryPage() {
                   {r.threats_found > 0 ? <AlertTriangle size={15} /> : r.status === "cancelled" ? <XCircle size={15} /> : <CheckCircle size={15} />}
                 </div>
                 <div className="flex-1 min-w-0">
-                  <p className="text-[13px] font-semibold capitalize">{r.scan_type} Scan</p>
+                  <p className="text-[13px] font-semibold capitalize">{r.scan_type} {t("history.scan_suffix")}</p>
                   <p className="text-[11px] text-[rgb(var(--t3))]/40 mt-0.5">{new Date(r.started_at * 1000).toLocaleString()}</p>
                 </div>
-                <p className="text-[13px] font-medium text-[rgb(var(--t2))]">{r.files_scanned} files</p>
+                <p className="text-[13px] font-medium text-[rgb(var(--t2))]">{r.files_scanned} {t("history.files")}</p>
                 <p className="text-[13px] font-medium w-[55px] text-right">{Math.floor(r.duration_ms / 1000)}s</p>
                 <p className={`text-[13px] font-semibold w-[80px] text-right ${r.threats_found > 0 ? "text-[rgb(var(--red))]" : r.status === "cancelled" ? "text-[rgb(var(--amber))]" : "text-[rgb(var(--green))]"}`}>
-                  {r.threats_found > 0 ? `${r.threats_found} threat${r.threats_found > 1 ? "s" : ""}` : r.status === "cancelled" ? "Cancelled" : "Clean"}
+                  {r.threats_found > 0 ? `${r.threats_found} ${r.threats_found > 1 ? t("history.threats") : t("history.threat")}` : r.status === "cancelled" ? t("history.cancelled") : t("history.clean")}
                 </p>
               </button>
             ))}
@@ -106,7 +107,7 @@ export function HistoryPage() {
               onClick={() => setPageSize((s) => s + 50)}
               className="mt-4 w-full py-3 text-[12px] text-[rgb(var(--accent))] hover:bg-[rgb(var(--accent))]/5 rounded cursor-pointer transition-colors"
             >
-              Load more ({filtered.length - pageSize} remaining)
+              {t("history.load_more")} ({filtered.length - pageSize} {t("history.remaining")})
             </button>
           )}
         </Card>
@@ -124,14 +125,14 @@ const SEV_COLORS: Record<string, string> = {
   low: "var(--accent)", info: "var(--t3)",
 };
 
-const LAYER_NAMES: Record<string, string> = {
-  signatures: "Signature Analysis", yara_rules: "Behavioral Rules",
-  mime_validation: "File Integrity", structural_analysis: "Structural Analysis",
-  packer_detection: "Packer Detection", script_analysis: "Script Analysis",
-  ioc_correlation: "Threat Intelligence", pattern_detection: "Pattern Detection",
-  file_deception: "Deception Detection",
-  reputation: "Software Reputation",
-  context: "Origin Context",
+const LAYER_KEYS: Record<string, string> = {
+  signatures: "history.layer_signatures", yara_rules: "history.layer_yara",
+  mime_validation: "history.layer_mime", structural_analysis: "history.layer_structural",
+  packer_detection: "history.layer_packer", script_analysis: "history.layer_script",
+  ioc_correlation: "history.layer_ioc", pattern_detection: "history.layer_pattern",
+  file_deception: "history.layer_deception",
+  reputation: "history.layer_reputation",
+  context: "history.layer_context",
 };
 
 function ScanDetail({ scan, onBack }: { scan: ScanRecord; onBack: () => void }) {
@@ -159,7 +160,7 @@ function ScanDetail({ scan, onBack }: { scan: ScanRecord; onBack: () => void }) 
       {/* Back button */}
       <button onClick={onBack}
         className="flex items-center gap-2 text-[12px] text-[rgb(var(--t3))] hover:text-[rgb(var(--t1))] cursor-pointer transition-colors self-start">
-        <ArrowLeft size={14} /> Back to History
+        <ArrowLeft size={14} /> {t("history.back")}
       </button>
 
       {/* Summary card */}
@@ -170,10 +171,10 @@ function ScanDetail({ scan, onBack }: { scan: ScanRecord; onBack: () => void }) 
             {scan.threats_found > 0 ? <AlertTriangle size={24} /> : scan.status === "cancelled" ? <XCircle size={24} /> : <Shield size={24} />}
           </div>
           <div className="flex-1 min-w-0">
-            <h3 className="text-[20px] font-bold capitalize">{scan.scan_type} Scan</h3>
+            <h3 className="text-[20px] font-bold capitalize">{scan.scan_type} {t("history.scan_suffix")}</h3>
             <p className="text-[13px] text-[rgb(var(--t3))] mt-1">
               {started.toLocaleString()}
-              {finished && ` — ${Math.floor(scan.duration_ms / 1000)}s duration`}
+              {finished && ` — ${Math.floor(scan.duration_ms / 1000)}s ${t("history.duration_suffix")}`}
             </p>
           </div>
           <div className="text-right">
@@ -181,17 +182,17 @@ function ScanDetail({ scan, onBack }: { scan: ScanRecord; onBack: () => void }) 
               {scan.threats_found > 0 ? scan.threats_found : scan.status === "cancelled" ? "—" : "0"}
             </p>
             <p className="text-[11px] text-[rgb(var(--t3))] mt-1">
-              {scan.threats_found > 0 ? "threats found" : scan.status === "cancelled" ? "cancelled" : "threats found"}
+              {scan.threats_found > 0 ? t("history.threats_found") : scan.status === "cancelled" ? t("history.status_cancelled") : t("history.threats_found")}
             </p>
           </div>
         </div>
 
         {/* Metadata grid */}
         <div className="grid grid-cols-2 xl:grid-cols-4 gap-3 mt-6">
-          <MetaBox label="Files Scanned" value={scan.files_scanned.toLocaleString()} />
-          <MetaBox label="Duration" value={`${(scan.duration_ms / 1000).toFixed(1)}s`} />
-          <MetaBox label="Errors" value={String(scan.errors_count)} />
-          <MetaBox label="Scan ID" value={scan.scan_id.slice(0, 8)} title={scan.scan_id} />
+          <MetaBox label={t("history.files_scanned")} value={scan.files_scanned.toLocaleString()} />
+          <MetaBox label={t("history.duration")} value={`${(scan.duration_ms / 1000).toFixed(1)}s`} />
+          <MetaBox label={t("history.errors")} value={String(scan.errors_count)} />
+          <MetaBox label={t("history.scan_id")} value={scan.scan_id.slice(0, 8)} title={scan.scan_id} />
         </div>
       </Card>
 
@@ -204,7 +205,7 @@ function ScanDetail({ scan, onBack }: { scan: ScanRecord; onBack: () => void }) 
       {/* Detections */}
       {!loading && detections.length > 0 && (
         <Card>
-          <h4 className="text-[15px] font-semibold mb-4">Detections</h4>
+          <h4 className="text-[15px] font-semibold mb-4">{t("history.detections")}</h4>
           <div className="space-y-2">
             {detections.map((d) => (
               <div key={d.detection_id} className="flex items-center gap-3 rounded-xl bg-[rgb(var(--red))]/5 px-4 py-3">
@@ -226,8 +227,8 @@ function ScanDetail({ scan, onBack }: { scan: ScanRecord; onBack: () => void }) 
           <div className="flex items-center gap-3 mb-5">
             <Eye size={16} className="text-[rgb(var(--accent))]" />
             <div>
-              <h4 className="text-[15px] font-semibold">ARGUS Analysis Results</h4>
-              <p className="text-[11px] text-[rgb(var(--t3))] mt-0.5">{verdicts.length} file{verdicts.length > 1 ? "s" : ""} analyzed with heuristic intelligence</p>
+              <h4 className="text-[15px] font-semibold">{t("history.argus_results")}</h4>
+              <p className="text-[11px] text-[rgb(var(--t3))] mt-0.5">{t("history.files_analyzed").replace("{count}", String(verdicts.length))}</p>
             </div>
           </div>
           <div className="space-y-3">
@@ -243,7 +244,7 @@ function ScanDetail({ scan, onBack }: { scan: ScanRecord; onBack: () => void }) 
       {!loading && detections.length === 0 && verdicts.length === 0 && (
         <Card className="text-center py-10">
           <CheckCircle size={24} className="mx-auto text-[rgb(var(--green))]/40 mb-3" />
-          <p className="text-[13px] text-[rgb(var(--t3))]">No detailed analysis records available for this scan.</p>
+          <p className="text-[13px] text-[rgb(var(--t3))]">{t("history.no_analysis")}</p>
         </Card>
       )}
     </div>
@@ -284,7 +285,7 @@ function VerdictRow({ v }: { v: ArgusVerdictRecord }) {
         {/* Finding count */}
         {findings.length > 0 && (
           <span className="text-[10px] text-[rgb(var(--t3))] px-2 py-0.5 rounded bg-[rgb(var(--raised))]/20">
-            {findings.length} finding{findings.length > 1 ? "s" : ""}
+            {findings.length} {findings.length > 1 ? t("history.findings") : t("history.finding")}
           </span>
         )}
         {findings.length > 0 && (expanded ? <ChevronUp size={14} className="text-[rgb(var(--t3))]" /> : <ChevronDown size={14} className="text-[rgb(var(--t3))]" />)}
@@ -294,10 +295,10 @@ function VerdictRow({ v }: { v: ArgusVerdictRecord }) {
         <div className="border-t border-[rgb(var(--border))]/8 px-4 py-3 space-y-2 bg-[rgb(var(--raised))]/5">
           {/* File metadata */}
           <div className="grid grid-cols-2 xl:grid-cols-4 gap-2 mb-3">
-            <MiniMeta label="SHA-256" value={v.sha256.slice(0, 16) + "..."} title={v.sha256} />
-            <MiniMeta label="Analysis Time" value={`${(v.analysis_time_us / 1000).toFixed(1)}ms`} />
-            <MiniMeta label="Engine" value={`ARGUS ${v.engine_version}`} />
-            <MiniMeta label="Analyzed" value={new Date(v.timestamp * 1000).toLocaleTimeString()} />
+            <MiniMeta label={t("history.sha256")} value={v.sha256.slice(0, 16) + "..."} title={v.sha256} />
+            <MiniMeta label={t("history.analysis_time")} value={`${(v.analysis_time_us / 1000).toFixed(1)}ms`} />
+            <MiniMeta label={t("history.engine")} value={`ARGUS ${v.engine_version}`} />
+            <MiniMeta label={t("history.analyzed")} value={new Date(v.timestamp * 1000).toLocaleTimeString()} />
           </div>
 
           {/* Findings */}
@@ -313,7 +314,7 @@ function VerdictRow({ v }: { v: ArgusVerdictRecord }) {
                   <p className="text-[11px] leading-relaxed">{f.description}</p>
                   <div className="flex items-center gap-2 mt-1">
                     <span className="text-[9px] px-1.5 py-0.5 rounded bg-[rgb(var(--raised))]/30 text-[rgb(var(--t3))]">
-                      {LAYER_NAMES[f.layer] ?? f.layer}
+                      {LAYER_KEYS[f.layer] ? t(LAYER_KEYS[f.layer]) : f.layer}
                     </span>
                     <span className="text-[9px] font-semibold uppercase" style={{ color: `rgb(${sevColor})` }}>
                       {f.severity}

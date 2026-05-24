@@ -1,8 +1,8 @@
 realtime_enabled = true
 realtime_roots = [
-    'C:\Users\Nicolas\Downloads',
-    'C:\Users\Nicolas\Desktop',
-    'C:\Users\Nicolas\AppData\Local\Temp',
+    '%USERPROFILE%\Downloads',
+    '%USERPROFILE%\Desktop',
+    '%TEMP%',
 ]
 max_file_size_mb = 512
 scan_archives = true
@@ -43,7 +43,7 @@ clamav_worker_timeout_sec = 30
 argus_worker_enabled = false
 argus_worker_path = "argusd.exe"
 argus_worker_timeout_sec = 15
-orchestrator_file_scan_enabled = false
+orchestrator_file_scan_enabled = true
 orchestrator_folder_scan_enabled = false
 orchestrator_quick_scan_enabled = false
 
