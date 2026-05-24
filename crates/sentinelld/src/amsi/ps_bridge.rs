@@ -17,6 +17,23 @@ use std::time::Duration;
 
 use super::{RuntimeBuffer, ScriptLanguage};
 
+/// Max recent events to keep for diagnostics UI.
+const MAX_RECENT_EVENTS: usize = 10;
+
+/// A recent runtime event summary (no raw content — privacy-safe).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RuntimeEventSummary {
+    pub timestamp: i64,
+    pub language: String,
+    pub source_app: String,
+    pub content_name: String,
+    pub score: u32,
+    pub findings_count: usize,
+    pub lineage_summary: Option<String>,
+    pub timed_out: bool,
+    pub observe_only: bool,
+}
+
 /// PowerShell bridge diagnostics.
 pub struct PsBridgeDiagnostics {
     pub events_seen: AtomicU64,
@@ -26,6 +43,8 @@ pub struct PsBridgeDiagnostics {
     pub last_score: AtomicU64,
     pub sbl_available: AtomicBool,
     pub errors: AtomicU64,
+    /// Bounded ring buffer of recent event summaries.
+    pub recent_events: std::sync::Mutex<Vec<RuntimeEventSummary>>,
 }
 
 impl PsBridgeDiagnostics {
@@ -38,11 +57,27 @@ impl PsBridgeDiagnostics {
             last_score: AtomicU64::new(0),
             sbl_available: AtomicBool::new(false),
             errors: AtomicU64::new(0),
+            recent_events: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Record a recent event summary (bounded ring buffer).
+    pub fn record_event(&self, summary: RuntimeEventSummary) {
+        if let Ok(mut events) = self.recent_events.lock() {
+            events.push(summary);
+            let len = events.len();
+            if len > MAX_RECENT_EVENTS {
+                events.drain(..len - MAX_RECENT_EVENTS);
+            }
         }
     }
 
     pub fn to_json(&self) -> serde_json::Value {
+        let recent = self.recent_events.lock()
+            .map(|e| serde_json::to_value(&*e).unwrap_or_default())
+            .unwrap_or(serde_json::json!([]));
         serde_json::json!({
+            "enabled": true,
             "events_seen": self.events_seen.load(Ordering::Relaxed),
             "events_scanned": self.events_scanned.load(Ordering::Relaxed),
             "duplicates_skipped": self.duplicates_skipped.load(Ordering::Relaxed),
@@ -50,6 +85,7 @@ impl PsBridgeDiagnostics {
             "last_score": self.last_score.load(Ordering::Relaxed),
             "sbl_available": self.sbl_available.load(Ordering::Relaxed),
             "errors": self.errors.load(Ordering::Relaxed),
+            "recent_events": recent,
         })
     }
 }
@@ -162,6 +198,26 @@ fn ps_bridge_loop(
                     } else { 0 };
 
                     let total = result.score.saturating_add(plm_boost).min(100);
+
+                    // Record event summary for diagnostics UI.
+                    let lineage_desc = if let Some(ref graph) = plm {
+                        if buffer.source_pid > 0 {
+                            let chain = graph.get_chain(buffer.source_pid);
+                            if chain.depth > 1 { Some(chain.description.clone()) } else { None }
+                        } else { None }
+                    } else { None };
+
+                    diag.record_event(RuntimeEventSummary {
+                        timestamp: buffer.timestamp,
+                        language: buffer.language.label().to_string(),
+                        source_app: buffer.source_app.clone(),
+                        content_name: buffer.content_name.clone(),
+                        score: total,
+                        findings_count: result.findings.len(),
+                        lineage_summary: lineage_desc,
+                        timed_out: false,
+                        observe_only: true,
+                    });
 
                     if total > 0 || !result.findings.is_empty() {
                         tracing::debug!(

@@ -549,6 +549,12 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
             }
         }
 
+        "runtime.status" => {
+            // Runtime intelligence diagnostics — PLM + PowerShell + AMSI.
+            let diag = state.runtime_intelligence_diagnostics();
+            Ok(diag)
+        }
+
         "runtime.scan_buffer" => {
             // Dev/test: scan a runtime buffer through ASTRA runtime pipeline.
             let auth = req.params.get("auth").and_then(|v| v.as_str()).unwrap_or("");
