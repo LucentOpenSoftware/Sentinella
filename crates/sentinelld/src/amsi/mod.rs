@@ -11,14 +11,16 @@
 //! This approach avoids COM DLL registration complexity while still
 //! capturing runtime-deobfuscated content from PowerShell, cscript, etc.
 
-#![allow(dead_code)]
+#[allow(dead_code)]
+pub mod ps_bridge;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use serde::Serialize;
 
-/// AMSI runtime inspection state.
+/// AMSI runtime inspection state (reserved for future COM provider).
+#[allow(dead_code)]
 pub struct AmsiMonitor {
     running: Arc<AtomicBool>,
     diagnostics: Arc<AmsiDiagnostics>,
