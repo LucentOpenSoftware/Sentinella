@@ -258,6 +258,214 @@ pub fn lineage_finding(chain: &ProcessChain) -> Option<argus::Finding> {
     })
 }
 
+// ═══════════════════════════════════════════════════════════════
+//  Live PLM Monitor — background process snapshot intake
+// ═══════════════════════════════════════════════════════════════
+
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+
+/// PLM diagnostics — atomic counters.
+pub struct PlmDiagnostics {
+    pub events_seen: AtomicU64,
+    pub chains_scored: AtomicU64,
+    pub dropped_events: AtomicU64,
+    pub suspicious_chains: AtomicU64,
+}
+
+impl PlmDiagnostics {
+    pub fn new() -> Self {
+        Self {
+            events_seen: AtomicU64::new(0),
+            chains_scored: AtomicU64::new(0),
+            dropped_events: AtomicU64::new(0),
+            suspicious_chains: AtomicU64::new(0),
+        }
+    }
+
+    pub fn to_json(&self, node_count: usize) -> serde_json::Value {
+        serde_json::json!({
+            "enabled": true,
+            "events_seen": self.events_seen.load(Ordering::Relaxed),
+            "nodes": node_count,
+            "chains_scored": self.chains_scored.load(Ordering::Relaxed),
+            "dropped_events": self.dropped_events.load(Ordering::Relaxed),
+            "suspicious_chains": self.suspicious_chains.load(Ordering::Relaxed),
+        })
+    }
+}
+
+/// Live PLM monitor — runs a background thread snapshotting processes.
+pub struct PlmMonitor {
+    pub graph: Arc<LineageGraph>,
+    pub diagnostics: Arc<PlmDiagnostics>,
+    running: Arc<AtomicBool>,
+    _thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PlmMonitor {
+    /// Start the PLM monitor on a background thread.
+    /// Snapshots active processes every `interval` seconds.
+    pub fn start(interval_secs: u64) -> Self {
+        let graph = Arc::new(LineageGraph::new());
+        let diagnostics = Arc::new(PlmDiagnostics::new());
+        let running = Arc::new(AtomicBool::new(true));
+
+        let g = Arc::clone(&graph);
+        let d = Arc::clone(&diagnostics);
+        let r = Arc::clone(&running);
+
+        let thread = std::thread::Builder::new()
+            .name("plm-monitor".into())
+            .spawn(move || {
+                plm_loop(g, d, r, interval_secs);
+            })
+            .ok();
+
+        Self {
+            graph,
+            diagnostics,
+            running,
+            _thread: thread,
+        }
+    }
+
+    /// Query lineage for a file path — find recent processes matching this image.
+    pub fn query_by_image_path(&self, path: &std::path::Path) -> Option<ProcessChain> {
+        let p = path.to_string_lossy().to_lowercase();
+        let map = self.graph.nodes.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Find most recent process with matching image path.
+        let target_pid = map.values()
+            .filter(|n| n.image_path.to_lowercase() == p)
+            .max_by_key(|n| n.timestamp)
+            .map(|n| n.pid);
+        drop(map);
+
+        if let Some(pid) = target_pid {
+            self.diagnostics.chains_scored.fetch_add(1, Ordering::Relaxed);
+            let chain = self.graph.get_chain(pid);
+            if chain.chain_suspicion > 0 {
+                self.diagnostics.suspicious_chains.fetch_add(1, Ordering::Relaxed);
+            }
+            Some(chain)
+        } else {
+            None
+        }
+    }
+
+    pub fn stop(&self) {
+        self.running.store(false, Ordering::Relaxed);
+    }
+}
+
+impl Drop for PlmMonitor {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Relaxed);
+    }
+}
+
+/// Background loop: snapshot processes and feed into graph.
+fn plm_loop(
+    graph: Arc<LineageGraph>,
+    diagnostics: Arc<PlmDiagnostics>,
+    running: Arc<AtomicBool>,
+    interval_secs: u64,
+) {
+    tracing::info!("PLM monitor started (interval={}s)", interval_secs);
+
+    // Initial snapshot.
+    snapshot_processes(&graph, &diagnostics);
+
+    while running.load(Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_secs(interval_secs));
+        if !running.load(Ordering::Relaxed) { break; }
+
+        snapshot_processes(&graph, &diagnostics);
+
+        // Periodic eviction.
+        graph.evict_expired();
+    }
+
+    tracing::info!("PLM monitor stopped");
+}
+
+/// Snapshot all running processes and add to graph.
+#[cfg(target_os = "windows")]
+fn snapshot_processes(graph: &LineageGraph, diagnostics: &PlmDiagnostics) {
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW,
+        PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+    };
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    let snapshot = match snapshot {
+        Ok(h) if !h.is_invalid() => h,
+        _ => {
+            diagnostics.dropped_events.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    };
+
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+
+    let ok = unsafe { Process32FirstW(snapshot, &mut entry) };
+    if ok.is_err() {
+        unsafe { let _ = windows::Win32::Foundation::CloseHandle(snapshot); }
+        return;
+    }
+
+    let now = Instant::now();
+    let ts = chrono::Utc::now().timestamp();
+    let mut count = 0u64;
+
+    loop {
+        let exe_name = wide_to_string_plm(&entry.szExeFile);
+        let pid = entry.th32ProcessID;
+        let ppid = entry.th32ParentProcessID;
+
+        if !exe_name.is_empty() && pid != 0 {
+            // Only insert if not already tracked (avoid overwriting timestamps).
+            let map = graph.nodes.lock().unwrap_or_else(|e| e.into_inner());
+            let already_tracked = map.contains_key(&pid);
+            drop(map);
+
+            if !already_tracked {
+                graph.record_process(ProcessNode {
+                    pid,
+                    parent_pid: ppid,
+                    image_path: exe_name.clone(),
+                    image_name: exe_name.rsplit('\\').next().unwrap_or(&exe_name).to_string(),
+                    command_line: None, // ToolHelp32 doesn't provide cmdline.
+                    is_signed: None,
+                    integrity_level: None,
+                    created_at: now,
+                    timestamp: ts,
+                });
+                count += 1;
+            }
+        }
+
+        let ok = unsafe { Process32NextW(snapshot, &mut entry) };
+        if ok.is_err() { break; }
+    }
+
+    unsafe { let _ = windows::Win32::Foundation::CloseHandle(snapshot); }
+    diagnostics.events_seen.fetch_add(count, Ordering::Relaxed);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn snapshot_processes(_graph: &LineageGraph, _diagnostics: &PlmDiagnostics) {
+    // PLM not available on non-Windows platforms.
+}
+
+#[cfg(target_os = "windows")]
+fn wide_to_string_plm(wide: &[u16]) -> String {
+    let len = wide.iter().position(|&c| c == 0).unwrap_or(wide.len());
+    String::from_utf16_lossy(&wide[..len])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

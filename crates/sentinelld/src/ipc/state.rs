@@ -205,6 +205,8 @@ pub struct AppState {
     budget_realtime_timeouts: AtomicU64,
     budget_idle_timeouts: AtomicU64,
     budget_transient_skips: AtomicU64,
+    // ── PLM (Process Lineage Monitor) ────────────────
+    plm: Option<crate::plm::PlmMonitor>,
 }
 
 struct Inner {
@@ -559,6 +561,7 @@ impl AppState {
             budget_realtime_timeouts: AtomicU64::new(0),
             budget_idle_timeouts: AtomicU64::new(0),
             budget_transient_skips: AtomicU64::new(0),
+            plm: Some(crate::plm::PlmMonitor::start(5)), // 5-second snapshot interval.
             inner: Mutex::new(Inner {
                 active_scan: None,
                 scan_history: Vec::new(),
@@ -3915,6 +3918,17 @@ fn folder_scan_worker_inner(
                     argus_verdict.score = argus_verdict.score.saturating_add(finding.weight).min(100);
                     argus_verdict.findings.push(finding);
                     argus_verdict.verdict = argus::verdict::Verdict::from_score(argus_verdict.score);
+                }
+
+                // ── PLM lineage correlation ──────────────
+                if let Some(ref plm) = state_ref.plm {
+                    if let Some(chain) = plm.query_by_image_path(file) {
+                        if let Some(finding) = crate::plm::lineage_finding(&chain) {
+                            argus_verdict.score = argus_verdict.score.saturating_add(finding.weight).min(100);
+                            argus_verdict.findings.push(finding);
+                            argus_verdict.verdict = argus::verdict::Verdict::from_score(argus_verdict.score);
+                        }
+                    }
                 }
 
                 live_w.files_scanned.fetch_add(1, Ordering::Relaxed);
