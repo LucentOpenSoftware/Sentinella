@@ -220,7 +220,7 @@ fn watcher_loop(
             for path in batch {
                 events_count.fetch_add(1, Ordering::Relaxed);
 
-                // Skip excluded / system files / own files / build dirs.
+                // Skip excluded / system files / own files / build dirs / transient artifacts.
                 if crate::scan::should_skip_file(&path) {
                     continue;
                 }
@@ -228,6 +228,9 @@ fn watcher_loop(
                     continue;
                 }
                 if crate::scan::is_build_or_dev_path(&path) {
+                    continue;
+                }
+                if crate::scan::is_transient_build_artifact(&path) {
                     continue;
                 }
                 if crate::scan::is_excluded(
@@ -279,6 +282,17 @@ fn watcher_loop(
                     Err(_) => continue,
                     Ok(meta) => meta,
                 };
+
+                // Cooldown: skip files created less than 500ms ago.
+                // Build tools create+delete files rapidly — scanning during
+                // this window causes file lock contention.
+                if let Ok(created) = path_meta.created() {
+                    if let Ok(age) = created.elapsed() {
+                        if age < std::time::Duration::from_millis(500) {
+                            continue;
+                        }
+                    }
+                }
 
                 // Skip symlinks (SEV-MEDIUM: prevent scanning through symlinks).
                 if path.is_symlink() {

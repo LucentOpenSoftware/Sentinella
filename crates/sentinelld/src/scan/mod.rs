@@ -305,3 +305,78 @@ pub fn is_clamav_temp_artifact(path: &Path) -> bool {
 
     false
 }
+
+/// Check if a path is a transient build/dev tool artifact.
+///
+/// Build tools (esbuild, webpack, tsc, cargo, msbuild) create and delete
+/// temporary files rapidly in %TEMP% and project directories. Scanning these
+/// files causes contention: the watcher opens the file for scanning while
+/// the build tool tries to delete/rename it, causing "access denied" build
+/// failures.
+///
+/// These are ALWAYS skipped by the watcher. Manual scans still cover them.
+pub fn is_transient_build_artifact(path: &Path) -> bool {
+    let p = path.to_string_lossy().to_lowercase();
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+
+    // esbuild temp files (esbuild-<hash> in %TEMP%).
+    if name.starts_with("esbuild-") || name.starts_with("esbuild_") {
+        return true;
+    }
+
+    // Vite/Rollup temp files.
+    if name.starts_with("vite-") || name.starts_with("rollup-") {
+        return true;
+    }
+
+    // TypeScript compiler temp files.
+    if name.starts_with("tsc-") || name.starts_with("tsserver-") {
+        return true;
+    }
+
+    // Cargo/rustc incremental compilation artifacts in temp.
+    if name.starts_with("rustc") && (name.ends_with(".o") || name.ends_with(".rcgu")) {
+        return true;
+    }
+
+    // MSBuild/Visual Studio temp.
+    if name.starts_with("msbuild") || name.starts_with("vctmp") {
+        return true;
+    }
+
+    // npm/pnpm staging files.
+    if p.contains("\\.staging\\") || p.contains("\\pnpm-") || p.contains("\\_cacache\\") {
+        return true;
+    }
+
+    // Go compiler temp.
+    if name.starts_with("go-build") || name.starts_with("go-link") {
+        return true;
+    }
+
+    // Python/pip temp.
+    if name.starts_with("pip-") && (name.contains("install") || name.contains("build")) {
+        return true;
+    }
+
+    // Webpack hot-update files.
+    if name.ends_with(".hot-update.js") || name.ends_with(".hot-update.json") {
+        return true;
+    }
+
+    // Generic: files in AppData\Local\Temp with hex hash names (32+ chars, no extension).
+    // These are typically build tool intermediates.
+    if p.contains("\\temp\\") || p.contains("\\tmp\\") {
+        if name.len() >= 32
+            && !name.contains('.')
+            && name.chars().all(|c| c.is_ascii_hexdigit() || c == '-' || c == '_')
+        {
+            return true;
+        }
+    }
+
+    false
+}
