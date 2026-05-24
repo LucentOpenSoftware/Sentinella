@@ -19,6 +19,7 @@ mod idle_scanner;
 mod ipc;
 mod memory_scanner;
 mod orchestrator;
+pub mod persistence;
 mod quarantine;
 #[allow(dead_code)]
 mod sandbox_worker;

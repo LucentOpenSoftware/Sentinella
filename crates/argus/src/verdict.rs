@@ -803,6 +803,8 @@ pub enum Layer {
     BehavioralRuntime,
     /// NTFS Alternate Data Stream detection.
     AlternateDataStream,
+    /// Persistence location intelligence (autorun, scheduled tasks, services).
+    Persistence,
 }
 
 impl Layer {
@@ -822,6 +824,7 @@ impl Layer {
             Self::Context => "Origin Context",
             Self::BehavioralRuntime => "Behavioral Analysis",
             Self::AlternateDataStream => "Alternate Data Streams",
+            Self::Persistence => "Persistence Intelligence",
         }
     }
 }

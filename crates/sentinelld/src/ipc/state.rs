@@ -3909,6 +3909,14 @@ fn folder_scan_worker_inner(
                     }
                 }
 
+                // ── Persistence intelligence ───────────────
+                if let Some(ptype) = crate::persistence::check_persistence_context(file) {
+                    let finding = crate::persistence::persistence_finding(ptype, file, false);
+                    argus_verdict.score = argus_verdict.score.saturating_add(finding.weight).min(100);
+                    argus_verdict.findings.push(finding);
+                    argus_verdict.verdict = argus::verdict::Verdict::from_score(argus_verdict.score);
+                }
+
                 live_w.files_scanned.fetch_add(1, Ordering::Relaxed);
 
                 if let Some(e) = worker_error {
