@@ -193,6 +193,8 @@ pub struct AppState {
     watcher_last_heartbeat: AtomicU64,
     /// Orchestrator heartbeat: unix timestamp of last completed job.
     orchestrator_last_heartbeat: AtomicU64,
+    // ── FP Calibration ──────────────────────────────
+    calibration: Mutex<Option<crate::calibration::CalibrationLog>>,
 }
 
 struct Inner {
@@ -532,6 +534,12 @@ impl AppState {
             last_recovery_reason: Mutex::new(None),
             watcher_last_heartbeat: AtomicU64::new(0),
             orchestrator_last_heartbeat: AtomicU64::new(0),
+            calibration: Mutex::new(
+                crate::calibration::CalibrationLog::open(
+                    &std::path::PathBuf::from("runtime/state/calibration.db"),
+                )
+                .ok(),
+            ),
             inner: Mutex::new(Inner {
                 active_scan: None,
                 scan_history: Vec::new(),
@@ -3055,6 +3063,40 @@ impl AppState {
             .as_secs();
         self.orchestrator_last_heartbeat
             .store(ts, Ordering::Relaxed);
+    }
+
+    // ── Calibration ──────────────────────────────────────
+
+    /// Record a detection event in the calibration log.
+    pub fn calibration_record_detection(&self, event: crate::calibration::DetectionEvent) {
+        if let Ok(guard) = self.calibration.lock() {
+            if let Some(ref log) = *guard {
+                if let Err(e) = log.record_detection(&event) {
+                    tracing::debug!(error = %e, "calibration record_detection failed");
+                }
+            }
+        }
+    }
+
+    /// Record a restore event (likely FP) in the calibration log.
+    pub fn calibration_record_restore(&self, event: crate::calibration::RestoreEvent) {
+        if let Ok(guard) = self.calibration.lock() {
+            if let Some(ref log) = *guard {
+                if let Err(e) = log.record_restore(&event) {
+                    tracing::debug!(error = %e, "calibration record_restore failed");
+                }
+            }
+        }
+    }
+
+    /// Export calibration bundle for developer review.
+    pub fn calibration_export(&self) -> Option<crate::calibration::CalibrationBundle> {
+        if let Ok(guard) = self.calibration.lock() {
+            if let Some(ref log) = *guard {
+                return Some(log.export_calibration_bundle());
+            }
+        }
+        None
     }
 
     /// Get resilience diagnostics.

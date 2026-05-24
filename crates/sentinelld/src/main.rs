@@ -5,6 +5,7 @@
 //! orchestrates signature updates.
 
 mod argus_worker;
+pub mod calibration;
 #[allow(dead_code)]
 mod clamav_worker;
 mod config;
