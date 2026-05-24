@@ -1,5 +1,6 @@
-//! Scan utilities — exclusion checking, file classification, scan cache.
+//! Scan utilities — exclusion checking, file classification, scan cache, ADS.
 
+pub mod ads;
 pub mod cache;
 
 use std::path::Path;
