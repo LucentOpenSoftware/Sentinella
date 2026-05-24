@@ -27,6 +27,7 @@ mod sandbox_worker;
 mod scan;
 mod scheduler;
 mod targeting;
+pub mod trust_graph;
 mod updater;
 mod watcher;
 

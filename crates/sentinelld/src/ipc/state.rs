@@ -209,6 +209,8 @@ pub struct AppState {
     plm: Option<crate::plm::PlmMonitor>,
     // ── PowerShell bridge ──────────────────────────
     ps_bridge: Option<crate::amsi::ps_bridge::PsBridge>,
+    // ── Trust Graph ────────────────────────────────
+    trust_graph: Option<crate::trust_graph::TrustGraph>,
 }
 
 struct Inner {
@@ -564,7 +566,10 @@ impl AppState {
             budget_idle_timeouts: AtomicU64::new(0),
             budget_transient_skips: AtomicU64::new(0),
             plm: Some(crate::plm::PlmMonitor::start(5)),
-            ps_bridge: None, // Started later via start_ps_bridge() if config enabled.
+            ps_bridge: None,
+            trust_graph: crate::trust_graph::TrustGraph::open(
+                &std::path::PathBuf::from("runtime/state/trust_graph.db"),
+            ).ok(),
             inner: Mutex::new(Inner {
                 active_scan: None,
                 scan_history: Vec::new(),
@@ -656,6 +661,12 @@ impl AppState {
             );
         }
         tracing::info!(poll_secs, "PowerShell Script Block Logging bridge started");
+    }
+
+    /// Access the trust graph.
+    #[allow(dead_code)]
+    pub fn trust_graph(&self) -> Option<&crate::trust_graph::TrustGraph> {
+        self.trust_graph.as_ref()
     }
 
     /// Get PowerShell bridge diagnostics.
@@ -3182,9 +3193,13 @@ impl AppState {
             serde_json::json!({"enabled": false})
         };
         let ps_diag = self.ps_bridge_diagnostics();
+        let trust_diag = self.trust_graph.as_ref()
+            .map(|tg| tg.diagnostics())
+            .unwrap_or(serde_json::json!({"enabled": false}));
         serde_json::json!({
             "plm": plm_diag,
             "powershell": ps_diag,
+            "trust_graph": trust_diag,
             "amsi": {"enabled": false, "note": "AMSI provider not yet registered"},
         })
     }
@@ -3974,6 +3989,26 @@ fn folder_scan_worker_inner(
                             argus_verdict.score = argus_verdict.score.saturating_add(finding.weight).min(100);
                             argus_verdict.findings.push(finding);
                             argus_verdict.verdict = argus::verdict::Verdict::from_score(argus_verdict.score);
+                        }
+                    }
+                }
+
+                // ── Trust graph: observe + confidence shaping ──
+                if let Some(ref tg) = state_ref.trust_graph {
+                    let file_key = file.to_string_lossy().to_lowercase();
+                    // Observe this file (builds familiarity over time).
+                    tg.observe(&file_key, crate::trust_graph::TrustNodeKind::Executable, None);
+                    // Query trust level for confidence adjustment.
+                    let trust_q = tg.query(&file_key);
+                    if trust_q.confidence_discount > 0 && argus_verdict.score > 0 {
+                        // Trust discount: reduce score for familiar entities.
+                        // NEVER below 0, NEVER suppresses ClamAV positives.
+                        if !result.infected {
+                            argus_verdict.score = argus_verdict.score.saturating_sub(trust_q.confidence_discount);
+                            argus_verdict.verdict = argus::verdict::Verdict::from_score(argus_verdict.score);
+                        }
+                        if let Some(finding) = crate::trust_graph::trust_finding(&trust_q) {
+                            argus_verdict.findings.push(finding);
                         }
                     }
                 }
