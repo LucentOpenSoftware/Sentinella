@@ -549,6 +549,76 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
             }
         }
 
+        "runtime.scan_buffer" => {
+            // Dev/test: scan a runtime buffer through ASTRA runtime pipeline.
+            let auth = req.params.get("auth").and_then(|v| v.as_str()).unwrap_or("");
+            if !state.validate_ipc_auth(auth) {
+                return serde_json::to_vec(&RpcErrorResponse::err(
+                    req.id, error_codes::INVALID_PARAMS,
+                    "authenticated IPC required".to_string(),
+                )).unwrap_or_default();
+            }
+
+            let content_b64 = req.params.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            let language = req.params.get("language").and_then(|v| v.as_str()).unwrap_or("other");
+            let source_app = req.params.get("source_app").and_then(|v| v.as_str()).unwrap_or("dev-inject");
+            let content_name = req.params.get("content_name").and_then(|v| v.as_str()).unwrap_or("manual");
+
+            // Decode base64 content or use raw UTF-8.
+            let content = if content_b64.is_empty() {
+                vec![]
+            } else {
+                // Try raw UTF-8 first (for plain text injection).
+                content_b64.as_bytes().to_vec()
+            };
+
+            if content.is_empty() {
+                Ok(serde_json::json!({"ok": false, "error": "empty content"}))
+            } else {
+                let buffer = crate::amsi::RuntimeBuffer {
+                    source_app: source_app.to_string(),
+                    source_pid: 0,
+                    content_name: content_name.to_string(),
+                    language: crate::amsi::ScriptLanguage::from_app_name(
+                        &format!("{language}.exe")
+                    ),
+                    content,
+                    original_size: content_b64.len(),
+                    timestamp: chrono::Utc::now().timestamp(),
+                };
+
+                let result = crate::amsi::scan_runtime_buffer(&buffer, state.argus());
+
+                // PLM correlation: check if source process has suspicious lineage.
+                let plm_boost = if let Some(plm) = state.plm() {
+                    if buffer.source_pid > 0 {
+                        let chain = plm.graph.get_chain(buffer.source_pid);
+                        chain.chain_suspicion
+                    } else { 0 }
+                } else { 0 };
+
+                let total_score = result.score.saturating_add(plm_boost).min(100);
+
+                Ok(serde_json::json!({
+                    "ok": true,
+                    "score": total_score,
+                    "runtime_score": result.score,
+                    "plm_boost": plm_boost,
+                    "should_block": result.should_block,
+                    "findings_count": result.findings.len(),
+                    "scan_duration_us": result.scan_duration_us,
+                    "language": format!("{:?}", buffer.language),
+                    "findings": result.findings.iter().map(|f| {
+                        serde_json::json!({
+                            "layer": f.layer.display_name(),
+                            "weight": f.weight,
+                            "description": f.description,
+                        })
+                    }).collect::<Vec<_>>(),
+                }))
+            }
+        }
+
         "detections.list" => {
             let scan_id = req
                 .params

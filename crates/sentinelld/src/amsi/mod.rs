@@ -256,4 +256,50 @@ mod tests {
         let j = d.to_json();
         assert_eq!(j["buffers_seen"], 42);
     }
+
+    #[test]
+    fn benign_powershell_scores_low() {
+        let engine = argus::ArgusEngine::with_defaults();
+        let buf = RuntimeBuffer {
+            source_app: "powershell.exe".into(),
+            source_pid: 1234,
+            content_name: "benign.ps1".into(),
+            language: ScriptLanguage::PowerShell,
+            content: b"Write-Host 'Hello World'\nGet-Date\nGet-Process | Format-Table".to_vec(),
+            original_size: 60,
+            timestamp: chrono::Utc::now().timestamp(),
+        };
+        let result = scan_runtime_buffer(&buf, &engine);
+        // Benign PowerShell should not trigger high scores.
+        assert!(result.score < 50, "benign PS scored {}", result.score);
+        assert!(!result.should_block);
+    }
+
+    #[test]
+    fn runtime_scan_respects_max_buffer() {
+        let engine = argus::ArgusEngine::with_defaults();
+        let large_content = vec![b'A'; MAX_RUNTIME_BUFFER + 1000];
+        let buf = RuntimeBuffer {
+            source_app: "powershell.exe".into(),
+            source_pid: 0,
+            content_name: "large".into(),
+            language: ScriptLanguage::PowerShell,
+            content: large_content,
+            original_size: MAX_RUNTIME_BUFFER + 1000,
+            timestamp: 0,
+        };
+        // Should not panic, should truncate to MAX_RUNTIME_BUFFER.
+        let result = scan_runtime_buffer(&buf, &engine);
+        assert!(result.scan_duration_us > 0 || result.score == 0);
+    }
+
+    #[test]
+    fn language_labels() {
+        assert_eq!(ScriptLanguage::PowerShell.label(), "PowerShell");
+        assert_eq!(ScriptLanguage::JScript.label(), "JScript");
+        assert_eq!(ScriptLanguage::VBScript.label(), "VBScript");
+        assert_eq!(ScriptLanguage::Mshta.label(), "mshta");
+        assert_eq!(ScriptLanguage::DotNet.label(), ".NET");
+        assert_eq!(ScriptLanguage::Other.label(), "Other");
+    }
 }

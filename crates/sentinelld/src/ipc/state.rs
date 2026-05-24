@@ -635,6 +635,9 @@ impl AppState {
     pub fn argus(&self) -> &argus::ArgusEngine {
         &self.argus
     }
+    pub fn plm(&self) -> Option<&crate::plm::PlmMonitor> {
+        self.plm.as_ref()
+    }
 
     /// Scan a file with ClamAV — routes through subprocess if configured.
     pub fn scan_file_clamav(
