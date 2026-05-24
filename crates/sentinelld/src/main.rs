@@ -4,6 +4,7 @@
 //! manages the quarantine vault, drives the real-time watcher, and
 //! orchestrates signature updates.
 
+pub mod amsi;
 mod argus_worker;
 pub mod calibration;
 #[allow(dead_code)]
