@@ -3227,7 +3227,17 @@ impl AppState {
     #[allow(dead_code)]
     pub fn runtime_intelligence_diagnostics(&self) -> serde_json::Value {
         let plm_diag = if let Some(ref plm) = self.plm {
-            plm.diagnostics.to_json(plm.graph.node_count())
+            let mut d = plm.diagnostics.to_json(plm.graph.node_count());
+            if let Some(obj) = d.as_object_mut() {
+                obj.insert("mode".into(), serde_json::json!(format!("{:?}", plm.mode)));
+                #[cfg(target_os = "windows")]
+                if let Some(ref etw_d) = plm.etw_diagnostics {
+                    obj.insert("etw_events".into(), serde_json::json!(etw_d.events_seen.load(std::sync::atomic::Ordering::Relaxed)));
+                    obj.insert("etw_running".into(), serde_json::json!(etw_d.etw_running.load(std::sync::atomic::Ordering::Relaxed)));
+                    obj.insert("etw_reconnects".into(), serde_json::json!(etw_d.reconnects.load(std::sync::atomic::Ordering::Relaxed)));
+                }
+            }
+            d
         } else {
             serde_json::json!({"enabled": false})
         };

@@ -16,6 +16,9 @@
 
 #![allow(dead_code)]
 
+#[cfg(target_os = "windows")]
+pub mod etw_intake;
+
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -295,38 +298,82 @@ impl PlmDiagnostics {
     }
 }
 
-/// Live PLM monitor — runs a background thread snapshotting processes.
+/// PLM intake mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlmMode {
+    /// Real-time ETW kernel process events.
+    Etw,
+    /// Periodic process snapshot polling.
+    Snapshot,
+}
+
+/// Live PLM monitor — background process lineage tracking.
+/// Tries ETW first for real-time events, falls back to snapshot polling.
 pub struct PlmMonitor {
     pub graph: Arc<LineageGraph>,
     pub diagnostics: Arc<PlmDiagnostics>,
+    pub mode: PlmMode,
     running: Arc<AtomicBool>,
-    _thread: Option<std::thread::JoinHandle<()>>,
+    _snapshot_thread: Option<std::thread::JoinHandle<()>>,
+    #[cfg(target_os = "windows")]
+    _etw_thread: Option<std::thread::JoinHandle<()>>,
+    #[cfg(target_os = "windows")]
+    pub etw_diagnostics: Option<Arc<etw_intake::EtwIntakeDiagnostics>>,
 }
 
 impl PlmMonitor {
-    /// Start the PLM monitor on a background thread.
-    /// Snapshots active processes every `interval` seconds.
+    /// Start the PLM monitor. Tries ETW first, falls back to snapshot.
     pub fn start(interval_secs: u64) -> Self {
         let graph = Arc::new(LineageGraph::new());
         let diagnostics = Arc::new(PlmDiagnostics::new());
         let running = Arc::new(AtomicBool::new(true));
 
+        // Try ETW first (requires admin).
+        #[cfg(target_os = "windows")]
+        let (etw_thread, etw_diag, mode) = {
+            let etw_d = Arc::new(etw_intake::EtwIntakeDiagnostics::new());
+            match etw_intake::start_etw_intake(
+                Arc::clone(&graph),
+                Arc::clone(&etw_d),
+                Arc::clone(&running),
+            ) {
+                Ok(thread) => {
+                    tracing::info!("PLM: ETW real-time mode active");
+                    (Some(thread), Some(etw_d), PlmMode::Etw)
+                }
+                Err(e) => {
+                    tracing::info!(error = %e, "PLM: ETW unavailable, using snapshot mode");
+                    (None, Some(etw_d), PlmMode::Snapshot)
+                }
+            }
+        };
+
+        #[cfg(not(target_os = "windows"))]
+        let mode = PlmMode::Snapshot;
+
+        // Always run snapshot thread (as primary or supplemental cleanup).
         let g = Arc::clone(&graph);
         let d = Arc::clone(&diagnostics);
         let r = Arc::clone(&running);
+        let snapshot_interval = if mode == PlmMode::Etw { interval_secs * 6 } else { interval_secs };
 
-        let thread = std::thread::Builder::new()
-            .name("plm-monitor".into())
+        let snapshot_thread = std::thread::Builder::new()
+            .name("plm-snapshot".into())
             .spawn(move || {
-                plm_loop(g, d, r, interval_secs);
+                plm_loop(g, d, r, snapshot_interval);
             })
             .ok();
 
         Self {
             graph,
             diagnostics,
+            mode,
             running,
-            _thread: thread,
+            _snapshot_thread: snapshot_thread,
+            #[cfg(target_os = "windows")]
+            _etw_thread: etw_thread,
+            #[cfg(target_os = "windows")]
+            etw_diagnostics: etw_diag,
         }
     }
 
