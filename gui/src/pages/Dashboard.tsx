@@ -174,29 +174,46 @@ export function Dashboard({ onNavigate }: { onNavigate: (p: Page) => void }) {
                 </div>
               </div>
             </div>
-            {/* Quick actions — inline */}
-            <div className="flex flex-wrap gap-2 mt-1">
-              <button
-                onClick={() => onNavigate("scan")}
-                className="flex items-center gap-2 rounded-xl border border-[rgb(var(--border))]/15 bg-[rgb(var(--surface))] px-4 py-2.5 text-[12px] text-[rgb(var(--t2))] hover:bg-[rgb(var(--raised))]/25 hover:text-[rgb(var(--t1))] cursor-pointer"
-              >
-                <Search size={14} /> {t("scan.file")}
-              </button>
-              <button
-                onClick={() => {
-                  startQuickScan().catch((e) => console.error("Quick scan failed:", e));
-                  onNavigate("scan");
-                }}
-                className="flex items-center gap-2 rounded-xl border border-[rgb(var(--accent))]/16 bg-[rgb(var(--accent))]/6 px-4 py-2.5 text-[12px] font-semibold text-[rgb(var(--accent))] hover:bg-[rgb(var(--accent))]/10 cursor-pointer"
-              >
-                <Zap size={14} /> {t("scan.quick")}
-              </button>
-              <button
-                onClick={() => onNavigate("quarantine")}
-                className="flex items-center gap-2 rounded-xl border border-[rgb(var(--border))]/15 bg-[rgb(var(--surface))] px-4 py-2.5 text-[12px] text-[rgb(var(--t2))] hover:bg-[rgb(var(--raised))]/25 hover:text-[rgb(var(--t1))] cursor-pointer"
-              >
-                <Archive size={14} /> {t("nav.quarantine")}
-              </button>
+            {/* Quick actions — inline with helper */}
+            <div className="mt-3">
+              <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[rgb(var(--t3))]/40 mb-2">
+                {t("dash.quick_actions")}
+              </p>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  onClick={() => onNavigate("scan")}
+                  className="flex items-center gap-2.5 rounded-xl border border-[rgb(var(--border))]/15 bg-[rgb(var(--surface))] px-4 py-2.5 text-left hover:bg-[rgb(var(--raised))]/25 hover:text-[rgb(var(--t1))] cursor-pointer group"
+                >
+                  <Search size={14} className="text-[rgb(var(--t3))] group-hover:text-[rgb(var(--t2))]" />
+                  <div>
+                    <p className="text-[12px] font-medium text-[rgb(var(--t2))]">{t("scan.file")}</p>
+                    <p className="text-[9px] text-[rgb(var(--t3))]/50">{t("dash.select_scan_one")}</p>
+                  </div>
+                </button>
+                <button
+                  onClick={() => {
+                    startQuickScan().catch((e) => console.error("Quick scan failed:", e));
+                    onNavigate("scan");
+                  }}
+                  className="flex items-center gap-2.5 rounded-xl border border-[rgb(var(--accent))]/16 bg-[rgb(var(--accent))]/6 px-4 py-2.5 text-left hover:bg-[rgb(var(--accent))]/10 cursor-pointer"
+                >
+                  <Zap size={14} className="text-[rgb(var(--accent))]" />
+                  <div>
+                    <p className="text-[12px] font-semibold text-[rgb(var(--accent))]">{t("scan.quick")}</p>
+                    <p className="text-[9px] text-[rgb(var(--accent))]/50">{t("dash.scan_common_folders")}</p>
+                  </div>
+                </button>
+                <button
+                  onClick={() => onNavigate("quarantine")}
+                  className="flex items-center gap-2.5 rounded-xl border border-[rgb(var(--border))]/15 bg-[rgb(var(--surface))] px-4 py-2.5 text-left hover:bg-[rgb(var(--raised))]/25 hover:text-[rgb(var(--t1))] cursor-pointer group"
+                >
+                  <Archive size={14} className="text-[rgb(var(--t3))] group-hover:text-[rgb(var(--t2))]" />
+                  <div>
+                    <p className="text-[12px] font-medium text-[rgb(var(--t2))]">{t("nav.quarantine")}</p>
+                    <p className="text-[9px] text-[rgb(var(--t3))]/50">{t("dash.inspect_isolated")}</p>
+                  </div>
+                </button>
+              </div>
             </div>
           </div>
           {/* Right: refresh + database updated with update button */}
