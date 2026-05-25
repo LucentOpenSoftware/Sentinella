@@ -260,6 +260,10 @@ export interface RuntimeIntelligenceStatus {
     nodes: number;
     chains_scored: number;
     suspicious_chains: number;
+    mode?: string;
+    etw_events?: number;
+    etw_running?: boolean;
+    etw_reconnects?: number;
   };
   powershell: {
     enabled: boolean;

@@ -510,14 +510,20 @@ function RuntimeIntelligenceCard() {
             <p className="text-[10px] text-[rgb(var(--t3))] mt-0.5">ASTRA adaptive analysis · observe-only</p>
           </div>
         </div>
-        <span className="text-[10px] px-2.5 py-1 rounded-full bg-[rgb(var(--green))]/8 text-[rgb(var(--green))]">
-          {plmActive ? "Active" : "Standby"}
+        <span className={`text-[10px] px-2.5 py-1 rounded-full ${
+          ri.plm?.etw_running
+            ? "bg-[rgb(var(--green))]/8 text-[rgb(var(--green))]"
+            : plmActive
+              ? "bg-[rgb(var(--accent))]/8 text-[rgb(var(--accent))]"
+              : "bg-[rgb(var(--raised))]/20 text-[rgb(var(--t3))]"
+        }`}>
+          {ri.plm?.etw_running ? "ETW Realtime" : plmActive ? "Snapshot" : "Standby"}
         </span>
       </div>
 
       {/* Compact stats row */}
       <div className="grid grid-cols-4 gap-4 mb-4">
-        <MiniStat label="PLM nodes" value={plmNodes} />
+        <MiniStat label={ri.plm?.mode === "Etw" ? "PLM (ETW)" : "PLM nodes"} value={plmNodes} />
         <MiniStat label="PS buffers" value={psEvents} />
         <MiniStat label="Suspicious chains" value={plmChains} color={plmChains > 0 ? "amber" : undefined} />
         <MiniStat label="SBL" value={ri.powershell?.sbl_available ? "Available" : "Unavailable"} />
