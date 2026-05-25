@@ -177,6 +177,11 @@ export const getRuntimeStats = () =>
 export const getRuntimeIntelligence = () =>
   invoke<import("../types/sentinella").RuntimeIntelligenceStatus>("get_runtime_intelligence");
 
+// ── Trust Graph ─────────────────────────────────────────────
+
+export const getTrustStatus = () =>
+  invoke<import("../types/sentinella").TrustGraphStatus>("get_trust_status");
+
 // ── Memory Scanner ──────────────────────────────────────────
 
 export interface ProcessInfo {

@@ -18,10 +18,10 @@ import { useState, useEffect } from "react";
 import { Card } from "../components/Card";
 import { ShieldIcon } from "../components/ShieldIcon";
 import { useDaemonContext } from "../hooks/DaemonContext";
-import { startQuickScan, getRuntimeIntelligence } from "../api/sentinella";
+import { startQuickScan, getRuntimeIntelligence, getTrustStatus } from "../api/sentinella";
 import { t } from "../i18n";
 import type { Page } from "../components/Sidebar";
-import type { RuntimeIntelligenceStatus } from "../types/sentinella";
+import type { RuntimeIntelligenceStatus, TrustGraphStatus } from "../types/sentinella";
 
 export function Dashboard({ onNavigate }: { onNavigate: (p: Page) => void }) {
   const { data, connected, loading, error, lastRefresh, refresh } = useDaemonContext();
@@ -263,6 +263,9 @@ export function Dashboard({ onNavigate }: { onNavigate: (p: Page) => void }) {
         {/* Runtime Intelligence */}
         <RuntimeIntelligenceCard />
       </div>
+
+      {/* Behavioral Familiarity */}
+      <BehavioralFamiliarityCard />
 
       <section className="section-stack">
         <div className="flex flex-col gap-2">
@@ -546,6 +549,76 @@ function MiniStat({ label, value, color }: { label: string; value: string | numb
         {typeof value === "number" ? value.toLocaleString() : value}
       </p>
       <p className="text-[10px] text-[rgb(var(--t3))] mt-0.5">{label}</p>
+    </div>
+  );
+}
+
+// ── Behavioral Familiarity card ───────────────────────────
+
+function BehavioralFamiliarityCard() {
+  const [ts, setTs] = useState<TrustGraphStatus | null>(null);
+  const { connected } = useDaemonContext();
+
+  useEffect(() => {
+    if (!connected) return;
+    getTrustStatus().then(setTs).catch(() => {});
+    const interval = setInterval(() => {
+      getTrustStatus().then(setTs).catch(() => {});
+    }, 15000);
+    return () => clearInterval(interval);
+  }, [connected]);
+
+  if (!ts || !ts.nodes) return null;
+
+  const drifts = ts.recent_drift_events ?? [];
+
+  return (
+    <div className="glass-card px-7 py-5">
+      <div className="flex items-center justify-between mb-4">
+        <div className="flex items-center gap-3">
+          <div className="flex h-8 w-8 items-center justify-center rounded-xl bg-[rgb(var(--accent))]/8">
+            <Eye size={15} className="text-[rgb(var(--accent))]" />
+          </div>
+          <div>
+            <h4 className="text-[13px] font-semibold">Behavioral Familiarity</h4>
+            <p className="text-[10px] text-[rgb(var(--t3))] mt-0.5">ASTRA local behavioral memory</p>
+          </div>
+        </div>
+        {ts.drift_events_24h > 0 && (
+          <span className="text-[10px] px-2.5 py-1 rounded-full bg-[rgb(var(--amber))]/8 text-[rgb(var(--amber))]">
+            {ts.drift_events_24h} drift{ts.drift_events_24h > 1 ? "s" : ""} today
+          </span>
+        )}
+      </div>
+
+      {/* Stats */}
+      <div className="grid grid-cols-4 gap-4 mb-4">
+        <MiniStat label="Stable" value={ts.stable_nodes} />
+        <MiniStat label="Rare" value={ts.rare_nodes} color={ts.rare_nodes > 10 ? "amber" : undefined} />
+        <MiniStat label="Recent" value={ts.recently_seen} />
+        <MiniStat label="Drifts" value={ts.drift_events_total} color={ts.drift_events_total > 0 ? "amber" : undefined} />
+      </div>
+
+      {/* Recent drift events */}
+      {drifts.length > 0 && (
+        <div>
+          <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[rgb(var(--t3))]/40 mb-2">
+            Recent behavioral drift
+          </p>
+          <div className="space-y-1.5">
+            {drifts.slice(0, 5).map((d, i) => (
+              <div key={i} className="flex items-start gap-3 text-[11px] py-1.5 px-2 rounded-lg bg-[rgb(var(--amber))]/3">
+                <span className="text-[rgb(var(--amber))] font-bold flex-shrink-0 w-5 text-right">+{d.weight}</span>
+                <div className="min-w-0 flex-1">
+                  <p className="text-[rgb(var(--t2))] truncate">{d.explanation}</p>
+                  <p className="text-[9px] text-[rgb(var(--t3))]/50 mt-0.5 truncate">{d.entity}</p>
+                </div>
+                <span className="text-[9px] text-[rgb(var(--t3))]/40 flex-shrink-0">{d.type}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

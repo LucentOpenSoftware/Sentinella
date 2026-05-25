@@ -536,6 +536,11 @@ async fn get_runtime_intelligence() -> Result<Value, String> {
     daemon_client::call_simple("runtime.status").await.map_err(Into::into)
 }
 
+#[tauri::command]
+async fn get_trust_status() -> Result<Value, String> {
+    daemon_client::call_simple("trust.status").await.map_err(Into::into)
+}
+
 // ── App entry with system tray ───────────────────────────────────
 
 use tauri::{
@@ -744,6 +749,7 @@ pub fn run() {
             get_recovery_state,
             get_connection_state,
             get_runtime_intelligence,
+            get_trust_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

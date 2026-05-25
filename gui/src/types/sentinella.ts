@@ -288,3 +288,29 @@ export interface RuntimeRecentEvent {
   timed_out: boolean;
   observe_only: boolean;
 }
+
+// ── Trust Graph ─────────────────────────────────────────────
+
+export interface TrustGraphStatus {
+  nodes: number;
+  stable_nodes: number;
+  rare_nodes: number;
+  recently_seen: number;
+  stale_nodes: number;
+  drift_events_total: number;
+  drift_events_24h: number;
+  max_nodes: number;
+  decay_days: number;
+  recent_drift_events: TrustDriftEvent[];
+}
+
+export interface TrustDriftEvent {
+  timestamp: number;
+  entity: string;
+  type: string;
+  old: string | null;
+  new: string | null;
+  impact: string;
+  explanation: string;
+  weight: number;
+}

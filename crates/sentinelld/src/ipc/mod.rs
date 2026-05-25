@@ -550,9 +550,34 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
         }
 
         "runtime.status" => {
-            // Runtime intelligence diagnostics — PLM + PowerShell + AMSI.
             let diag = state.runtime_intelligence_diagnostics();
             Ok(diag)
+        }
+
+        "trust.status" => {
+            // Trust graph diagnostics + recent drift events.
+            if let Some(tg) = state.trust_graph() {
+                let mut diag = tg.diagnostics();
+                let drifts = tg.recent_drifts(10);
+                let drift_json: Vec<serde_json::Value> = drifts.iter().map(|d| {
+                    serde_json::json!({
+                        "timestamp": d.timestamp,
+                        "entity": d.entity_key,
+                        "type": format!("{:?}", d.drift_type),
+                        "old": d.old_value,
+                        "new": d.new_value,
+                        "impact": d.trust_impact,
+                        "explanation": d.explanation,
+                        "weight": d.drift_type.suspicion_weight(),
+                    })
+                }).collect();
+                if let Some(obj) = diag.as_object_mut() {
+                    obj.insert("recent_drift_events".into(), serde_json::json!(drift_json));
+                }
+                Ok(diag)
+            } else {
+                Ok(serde_json::json!({"enabled": false}))
+            }
         }
 
         "runtime.scan_buffer" => {
