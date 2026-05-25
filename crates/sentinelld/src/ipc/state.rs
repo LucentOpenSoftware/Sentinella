@@ -1079,6 +1079,7 @@ impl AppState {
 
     pub fn engine_status(&self) -> EngineStatus {
         let inner = self.lock_inner();
+        let (db_ver, db_ts) = self.read_cvd_version();
         EngineStatus {
             state: if self.read_engine().is_some() {
                 EngineState::Ready
@@ -1086,12 +1087,50 @@ impl AppState {
                 EngineState::Error
             },
             protocol_version: 1,
-            db_version: None,
-            db_timestamp: None,
+            db_version: db_ver,
+            db_timestamp: db_ts,
             signature_count: self.signature_count.load(Ordering::Relaxed),
             last_update: inner.last_update_timestamp,
             engine_version: sentinella_common::PRODUCT_VERSION.into(),
         }
+    }
+
+    /// Read ClamAV database version from CVD file header.
+    /// CVD format: first line = `ClamAV-VDB:time:version:sigs:func_level:md5:builder:stime`
+    /// `stime` (field 7) is unix timestamp.
+    fn read_cvd_version(&self) -> (Option<u32>, Option<i64>) {
+        let db_dir = match &self.db_dir {
+            Some(d) => d,
+            None => return (None, None),
+        };
+
+        // Try daily.cvd first (most frequently updated), then main.cvd.
+        for name in &["daily.cvd", "daily.cld", "main.cvd", "main.cld"] {
+            let path = db_dir.join(name);
+            if let Ok(file) = std::fs::File::open(&path) {
+                use std::io::Read;
+                let mut header = [0u8; 512];
+                let mut reader = std::io::BufReader::new(file);
+                if reader.read(&mut header).unwrap_or(0) > 20 {
+                    let line = String::from_utf8_lossy(&header);
+                    if let Some(first_line) = line.lines().next() {
+                        let parts: Vec<&str> = first_line.split(':').collect();
+                        if parts.len() >= 3 && parts[0].starts_with("ClamAV-VDB") {
+                            let version = parts[2].parse::<u32>().ok();
+                            // Field 7 (index 7) is unix timestamp if available.
+                            let stime = if parts.len() > 7 {
+                                parts[7].trim().parse::<i64>().ok()
+                            } else {
+                                None
+                            };
+                            return (version, stime);
+                        }
+                    }
+                }
+            }
+        }
+
+        (None, None)
     }
 
     // ═══════════════════════════════════════════════════════
