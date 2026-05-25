@@ -12,6 +12,7 @@ mod clamav_worker;
 mod config;
 // Sandbox worker is called from scan flow when config.sandbox.enabled = true.
 pub mod db;
+pub mod ecosystem;
 mod engine;
 mod fish;
 mod footprint;

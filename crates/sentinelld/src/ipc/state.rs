@@ -211,6 +211,8 @@ pub struct AppState {
     ps_bridge: Option<crate::amsi::ps_bridge::PsBridge>,
     // ── Trust Graph ────────────────────────────────
     trust_graph: Option<crate::trust_graph::TrustGraph>,
+    // ── Ecosystem Tracker ─────────────────────────
+    ecosystem: crate::ecosystem::EcosystemTracker,
 }
 
 struct Inner {
@@ -570,6 +572,7 @@ impl AppState {
             trust_graph: crate::trust_graph::TrustGraph::open(
                 &std::path::PathBuf::from("runtime/state/trust_graph.db"),
             ).ok(),
+            ecosystem: crate::ecosystem::EcosystemTracker::new(),
             inner: Mutex::new(Inner {
                 active_scan: None,
                 scan_history: Vec::new(),
@@ -3249,6 +3252,7 @@ impl AppState {
             "plm": plm_diag,
             "powershell": ps_diag,
             "trust_graph": trust_diag,
+            "ecosystem": self.ecosystem.diagnostics(),
             "amsi": {"enabled": false, "note": "AMSI provider not yet registered"},
         })
     }
@@ -4058,6 +4062,29 @@ fn folder_scan_worker_inner(
                         }
                         if let Some(finding) = crate::trust_graph::trust_finding(&trust_q) {
                             argus_verdict.findings.push(finding);
+                        }
+                    }
+                }
+
+                // ── Ecosystem convergence ─────────────────
+                // Feed evidence from all sources into ecosystem tracker.
+                if argus_verdict.score > 0 {
+                    let file_key = file.to_string_lossy().to_string();
+                    // ARGUS findings.
+                    if !argus_verdict.findings.is_empty() {
+                        state_ref.ecosystem.add_evidence(&file_key, crate::ecosystem::EcosystemEvidence {
+                            source: crate::ecosystem::EvidenceSource::Argus,
+                            timestamp: chrono::Utc::now().timestamp(),
+                            description: format!("{} findings, score {}", argus_verdict.findings.len(), argus_verdict.score),
+                            weight: (argus_verdict.score / 10).min(10),
+                        });
+                    }
+                    // Check if ecosystem has reached escalation threshold.
+                    if let Some(eco) = state_ref.ecosystem.get(&file_key) {
+                        if let Some(finding) = crate::ecosystem::ecosystem_finding(&eco) {
+                            argus_verdict.score = argus_verdict.score.saturating_add(finding.weight).min(100);
+                            argus_verdict.findings.push(finding);
+                            argus_verdict.verdict = argus::verdict::Verdict::from_score(argus_verdict.score);
                         }
                     }
                 }
