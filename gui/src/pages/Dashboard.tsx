@@ -18,7 +18,7 @@ import { useState, useEffect } from "react";
 import { Card } from "../components/Card";
 import { ShieldIcon } from "../components/ShieldIcon";
 import { useDaemonContext } from "../hooks/DaemonContext";
-import { startQuickScan, getRuntimeIntelligence, getTrustStatus } from "../api/sentinella";
+import { startQuickScan, startSignatureUpdate, getRuntimeIntelligence, getTrustStatus } from "../api/sentinella";
 import { t } from "../i18n";
 import type { Page } from "../components/Sidebar";
 import type { RuntimeIntelligenceStatus, TrustGraphStatus } from "../types/sentinella";
@@ -144,37 +144,78 @@ export function Dashboard({ onNavigate }: { onNavigate: (p: Page) => void }) {
       {/* Notifications now live in TopBar — dashboard content starts clean */}
 
       <Card className={isReady ? "border-[rgb(var(--green))]/12" : "border-[rgb(var(--red))]/12"}>
-        <div className="grid gap-5 xl:grid-cols-[minmax(0,1.7fr)_280px] xl:items-start">
-          <div className="flex items-start gap-4">
-            <div
-              className={`flex h-14 w-14 flex-shrink-0 items-center justify-center rounded ${
-                isReady ? "bg-[rgb(var(--green))]/8 text-[rgb(var(--green))]" : "bg-[rgb(var(--red))]/8 text-[rgb(var(--red))]"
-              }`}
-            >
-              <ShieldIcon icon={isReady ? "protected" : "threat"} size={32} className={`brightness-0 invert ${isReady ? "opacity-80" : "opacity-60"}`} />
-            </div>
-            <div className="flex min-w-0 flex-col gap-2">
-              <h3 className="text-[22px] font-bold leading-tight">
-                {isReady ? t("dash.protected") : t("dash.attention")}
-              </h3>
-              <p className="max-w-xl text-[13px] leading-relaxed text-[rgb(var(--t2))]">
-                {engine.signature_count > 0
-                  ? `ARGUS ${t("argus.astra")}. ${t("dash.database_prefix")} ${dbVersion}.`
-                  : t("dash.no_sigs_loaded")}
-              </p>
-              <div className="flex flex-wrap items-center gap-2.5 text-[11px] text-[rgb(var(--t3))]">
-                <span className="rounded-full bg-[rgb(var(--raised))]/25 px-2.5 py-1">
-                  {t("dash.engine_prefix")} {engine.engine_version}
-                </span>
-                <span className="rounded-full bg-[rgb(var(--raised))]/25 px-2.5 py-1">
-                  {t("dash.watcher_prefix")} {watcher.mode.replace("_", " ")}
-                </span>
+        <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_auto] xl:items-start">
+          {/* Left: status + quick actions */}
+          <div>
+            <div className="flex items-start gap-4 mb-4">
+              <div
+                className={`flex h-12 w-12 flex-shrink-0 items-center justify-center rounded ${
+                  isReady ? "bg-[rgb(var(--green))]/8 text-[rgb(var(--green))]" : "bg-[rgb(var(--red))]/8 text-[rgb(var(--red))]"
+                }`}
+              >
+                <ShieldIcon icon={isReady ? "protected" : "threat"} size={28} className={`brightness-0 invert ${isReady ? "opacity-80" : "opacity-60"}`} />
+              </div>
+              <div className="flex min-w-0 flex-col gap-1.5">
+                <h3 className="text-[20px] font-bold leading-tight">
+                  {isReady ? t("dash.protected") : t("dash.attention")}
+                </h3>
+                <p className="max-w-lg text-[12px] leading-relaxed text-[rgb(var(--t2))]">
+                  {engine.signature_count > 0
+                    ? `ARGUS ${t("argus.astra")}. ${t("dash.database_prefix")} ${dbVersion}.`
+                    : t("dash.no_sigs_loaded")}
+                </p>
+                <div className="flex flex-wrap items-center gap-2 text-[10px] text-[rgb(var(--t3))]">
+                  <span className="rounded-full bg-[rgb(var(--raised))]/25 px-2 py-0.5">
+                    {t("dash.engine_prefix")} {engine.engine_version}
+                  </span>
+                  <span className="rounded-full bg-[rgb(var(--raised))]/25 px-2 py-0.5">
+                    {t("dash.watcher_prefix")} {watcher.mode.replace("_", " ")}
+                  </span>
+                </div>
               </div>
             </div>
+            {/* Quick actions — inline */}
+            <div className="flex flex-wrap gap-2 mt-1">
+              <button
+                onClick={() => onNavigate("scan")}
+                className="flex items-center gap-2 rounded-xl border border-[rgb(var(--border))]/15 bg-[rgb(var(--surface))] px-4 py-2.5 text-[12px] text-[rgb(var(--t2))] hover:bg-[rgb(var(--raised))]/25 hover:text-[rgb(var(--t1))] cursor-pointer"
+              >
+                <Search size={14} /> {t("scan.file")}
+              </button>
+              <button
+                onClick={() => {
+                  startQuickScan().catch((e) => console.error("Quick scan failed:", e));
+                  onNavigate("scan");
+                }}
+                className="flex items-center gap-2 rounded-xl border border-[rgb(var(--accent))]/16 bg-[rgb(var(--accent))]/6 px-4 py-2.5 text-[12px] font-semibold text-[rgb(var(--accent))] hover:bg-[rgb(var(--accent))]/10 cursor-pointer"
+              >
+                <Zap size={14} /> {t("scan.quick")}
+              </button>
+              <button
+                onClick={() => onNavigate("quarantine")}
+                className="flex items-center gap-2 rounded-xl border border-[rgb(var(--border))]/15 bg-[rgb(var(--surface))] px-4 py-2.5 text-[12px] text-[rgb(var(--t2))] hover:bg-[rgb(var(--raised))]/25 hover:text-[rgb(var(--t1))] cursor-pointer"
+              >
+                <Archive size={14} /> {t("nav.quarantine")}
+              </button>
+            </div>
           </div>
-          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-1">
+          {/* Right: refresh + database updated with update button */}
+          <div className="grid gap-3 xl:min-w-[240px]">
             <HeroDetail label={t("dash.last_refresh")} value={lastSeen} sub={t("dash.ui_heartbeat")} />
-            <HeroDetail label={t("dash.db_updated")} value={lastDbUpdate} sub={t("dash.last_sync")} />
+            <div className="rounded border border-[rgb(var(--border))]/15 bg-[rgb(var(--raised))]/20 p-3 flex items-center gap-3">
+              <div className="flex-1 min-w-0">
+                <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-[rgb(var(--t3))]">{t("dash.db_updated")}</p>
+                <p className="mt-1.5 text-[14px] font-semibold text-[rgb(var(--t1))]">{lastDbUpdate}</p>
+                <p className="mt-0.5 text-[10px] text-[rgb(var(--t3))]">{t("dash.last_sync")}</p>
+              </div>
+              <button
+                onClick={() => { startSignatureUpdate().catch(() => {}); }}
+                className="flex-shrink-0 w-9 h-9 rounded-xl bg-[rgb(var(--accent))]/8 flex items-center justify-center text-[rgb(var(--accent))] hover:bg-[rgb(var(--accent))]/15 cursor-pointer"
+                title={t("update.check")}
+              >
+                <RefreshCw size={15} />
+              </button>
+            </div>
           </div>
         </div>
       </Card>
@@ -266,43 +307,6 @@ export function Dashboard({ onNavigate }: { onNavigate: (p: Page) => void }) {
 
       {/* Behavioral Familiarity */}
       <BehavioralFamiliarityCard />
-
-      <section className="section-stack">
-        <div className="flex flex-col gap-2">
-          <h4 className="text-[15px] font-semibold">{t("dash.quick_actions")}</h4>
-          <p className="text-[12px] text-[rgb(var(--t3))]">{t("dash.quick_actions_desc")}</p>
-        </div>
-        <div className="card-grid-4">
-          <ActionTile
-            icon={<Search size={20} />}
-            label={t("scan.file")}
-            description={t("dash.select_scan_one")}
-            onClick={() => onNavigate("scan")}
-          />
-          <ActionTile
-            icon={<Zap size={20} />}
-            label={t("scan.quick")}
-            description={t("dash.scan_common_folders")}
-            accent
-            onClick={() => {
-              startQuickScan().catch((e) => console.error("Quick scan failed:", e));
-              onNavigate("scan");
-            }}
-          />
-          <ActionTile
-            icon={<RefreshCw size={20} />}
-            label={t("nav.update")}
-            description={t("dash.refresh_sig_db")}
-            onClick={() => onNavigate("update")}
-          />
-          <ActionTile
-            icon={<Archive size={20} />}
-            label={t("scan.quarantine_action")}
-            description={t("dash.inspect_isolated")}
-            onClick={() => onNavigate("quarantine")}
-          />
-        </div>
-      </section>
 
       <Card>
         <div className="mb-5 flex items-center justify-between gap-4">
