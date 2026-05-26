@@ -1,7 +1,7 @@
 # ClamAV Engine Cache Research
 
-Research branch for reducing Sentinella's memory footprint from ~974 MB to competitive
-levels with ESET NOD32 (~80 MB effective).
+Research branch for reducing Sentinella's memory footprint from ~974 MB private bytes
+down to a single-digit megabytes effective RAM via file-backed memory mapping.
 
 ## Problem
 
@@ -10,9 +10,9 @@ memory (VirtualAlloc/mmap). With 3.6M signatures, this consumes ~900 MB of priva
 committed pages. The OS cannot efficiently page these out because they're anonymous
 (not file-backed).
 
-ESET's engine uses memory-mapped files for compiled signatures — the OS can freely
-discard and reload pages from disk. Effective RAM usage is only the working set
-(pages currently accessed), typically ~80-200 MB.
+The goal is to back the engine pages with a file on disk so the OS can freely
+discard and reload pages on demand. Effective RAM usage drops to just the working
+set (pages currently accessed), typically a fraction of total mapped size.
 
 ## Architecture
 
@@ -96,8 +96,9 @@ before `cl_engine_new()`.
 | Detection | ✅ | ✅ | Identical |
 | Tests | 389/389 | 389/389 | No regression |
 
-**Key insight:** Private Bytes 17 MB is BETTER than ESET NOD32 (~80 MB).
+**Key insight:** Private Bytes drop from 989 MB to 17 MB — a 58× reduction.
 The engine is no longer "heavy" — it collaborates with the OS memory manager.
+Pages on disk are loaded on demand; unused signature pages can be evicted under pressure.
 
 ### Phase 2P: Residency Lifecycle Manager (IMPLEMENTED)
 - `MpoolResidencyManager` in `engine/residency.rs`

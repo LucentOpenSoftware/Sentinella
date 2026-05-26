@@ -2,7 +2,10 @@
 
 > Behavioral and architectural baseline inspired by mature desktop antivirus products.
 >
-> This document is **not** a reverse-engineering document and does not describe proprietary internals. It summarizes observable, product-documented behavior and translates it into realistic implementation guidance for Sentinella, built around the unmodified ClamAV engine.
+> This document is **not** a reverse-engineering document and does not describe
+> proprietary internals. It summarizes commonly documented end-user behaviors and
+> translates them into realistic implementation guidance for Sentinella, built
+> around the unmodified ClamAV engine.
 
 ---
 
@@ -843,17 +846,15 @@ When implementing new features:
 
 ## 15. Reference Sources
 
-These public and product documentation sources informed the behavioral baseline:
+These categories of publicly documented behavior informed the baseline:
 
-- ESET real-time filesystem protection documentation
-- ESET Endpoint real-time scan triggers including open/create/execution/removable media
-- ESET ThreatSense configurable scan parameters
-- ESET idle-state scan documentation
-- ESET idle-state detection triggers
-- ESET startup scan documentation
-- ESET quarantine documentation
-- ESET quarantine restore support articles
-- ESET NOD32 product overview documents describing scan-while-downloading and idle-state scanning
-- General antivirus industry best practices observed across multiple products
+- Real-time filesystem protection (open/create/execution/removable media triggers)
+- Configurable scan parameters (file types, sizes, archives, heuristics levels)
+- Idle-state scanning and detection triggers
+- Startup / boot-time scanning
+- Quarantine semantics (encrypt, isolate, restore, delete)
+- Scan-while-downloading patterns
+- General antivirus industry best practices documented across multiple products
 
-All references describe publicly documented, observable product behavior. No proprietary internals are described or speculated upon.
+All references describe publicly documented, observable end-user behavior.
+No proprietary internals are described or speculated upon.
