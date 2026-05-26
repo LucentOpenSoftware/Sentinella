@@ -1,6 +1,6 @@
 # Sentinella — Antivirus Behavior Baseline Reference
 
-> Behavioral and architectural baseline inspired by mature desktop antivirus products such as ESET NOD32 Antivirus, ESET Internet Security, and ESET Smart Security.
+> Behavioral and architectural baseline inspired by mature desktop antivirus products.
 >
 > This document is **not** a reverse-engineering document and does not describe proprietary internals. It summarizes observable, product-documented behavior and translates it into realistic implementation guidance for Sentinella, built around the unmodified ClamAV engine.
 
