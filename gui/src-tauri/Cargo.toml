@@ -5,6 +5,10 @@ description = "Sentinella desktop GUI"
 authors = ["Lucent Open Software"]
 edition = "2021"
 
+[[bin]]
+name = "Sentinella"
+path = "src/main.rs"
+
 [lib]
 name = "gui_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]

@@ -252,7 +252,7 @@ rule loader_lolbin_proxy_execution {
     condition:
         (any of ($mshta1, $mshta2) and (any of ($mshta3, $mshta4) or any of ($script*))) or
         ($reg1 and $reg3 and any of ($reg4, $reg5, $remote1, $remote2)) or
-        (any of ($rund1, $rund2) and any of ($remote*) and any of ($script*)) or
+        (any of ($rund1, $rund2) and (any of ($remote*) or $rund3 or $rund4 or $rund5) and any of ($script*)) or
         (any of ($mshta1, $mshta2, $reg1, $rund1) and any of ($remote*) and any of ($script*))
 }
 

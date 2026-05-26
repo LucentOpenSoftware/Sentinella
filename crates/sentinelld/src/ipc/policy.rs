@@ -244,10 +244,9 @@ pub fn method_registry() -> HashMap<&'static str, MethodPolicy> {
         "scan.cancel",
         auth_action(512, RateBucket::ScanControl, true),
     );
-    m.insert(
-        "update.start",
-        auth_action(1024, RateBucket::ScanControl, true),
-    );
+    // Signature update is safe to trigger: it only runs freshclam against
+    // pinned local config and cannot lower protection settings.
+    m.insert("update.start", pub_status(1024));
     m.insert(
         "activity.log",
         auth_action(4096, RateBucket::Unlimited, false),

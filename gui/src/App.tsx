@@ -87,15 +87,6 @@ function App() {
     return file;
   };
 
-  // First-run wizard gate.
-  if (showWizard) {
-    return (
-      <ErrorBoundary>
-        <FirstRunWizard onComplete={() => setShowWizard(false)} />
-      </ErrorBoundary>
-    );
-  }
-
   // ── Scan completion notice (auto-dismiss after 15s) ─────
   const [scanDoneNotice, setScanDoneNotice] = useState<{ type: string; files: number; threats: number } | null>(null);
   const scanDoneTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -233,6 +224,15 @@ function App() {
 
     return notices;
   }, [daemon.connected, daemon.connectionState, daemon.data?.stats, daemon.data?.scan, scanDoneNotice, dismissScanDone]);
+
+  // First-run wizard gate.
+  if (showWizard) {
+    return (
+      <ErrorBoundary>
+        <FirstRunWizard onComplete={() => setShowWizard(false)} />
+      </ErrorBoundary>
+    );
+  }
 
   return (
     <ErrorBoundary>

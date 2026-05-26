@@ -132,22 +132,21 @@ extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let shutdown_flag = Arc::clone(&shutdown);
 
-    let status_handle = match service_control_handler::register("SentinellaDaemon", move |control| {
-        match control {
+    let status_handle =
+        match service_control_handler::register("SentinellaDaemon", move |control| match control {
             ServiceControl::Stop | ServiceControl::Shutdown => {
                 shutdown_flag.store(true, std::sync::atomic::Ordering::Relaxed);
                 ServiceControlHandlerResult::NoError
             }
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
             _ => ServiceControlHandlerResult::NotImplemented,
-        }
-    }) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("service control handler registration failed: {e}");
-            return;
-        }
-    };
+        }) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("service control handler registration failed: {e}");
+                return;
+            }
+        };
 
     // Report: starting.
     let _ = status_handle.set_service_status(ServiceStatus {
@@ -220,7 +219,6 @@ extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
 }
 
 async fn run_daemon(args: Args) -> anyhow::Result<()> {
-
     // Initialize PathManager — centralized path resolution.
     if let Some(ref root) = args.runtime_root {
         paths::init(std::path::PathBuf::from(root));

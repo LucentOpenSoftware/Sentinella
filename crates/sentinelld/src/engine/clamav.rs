@@ -151,10 +151,7 @@ impl ClamEngine {
         // Dedicated temp directory: prevents ClamAV from polluting %TEMP%
         // and eliminates race conditions when multiple scan threads extract
         // compound files (HTML/PDF/OLE2) simultaneously.
-        let clamav_tmp = std::env::current_dir()
-            .unwrap_or_else(|_| std::path::PathBuf::from("."))
-            .join("runtime")
-            .join("clamav_tmp");
+        let clamav_tmp = crate::paths::paths().clamav_tmp();
         let _ = std::fs::create_dir_all(&clamav_tmp);
 
         if let Some(set_str) = fn_engine_set_str {

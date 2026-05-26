@@ -32,7 +32,8 @@
         "center": true,
         "decorations": false,
         "transparent": true,
-        "alwaysOnTop": false
+        "alwaysOnTop": false,
+        "visible": false
       }
     ],
     "security": {
@@ -41,7 +42,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["nsis"],
     "publisher": "Lucent Open Software",
     "copyright": "Copyright (c) 2024-2026 Lucent Open Software. GPLv2.",
     "category": "Utility",
@@ -61,11 +62,22 @@
       "../../release/staging/windows/libclamav.dll": "daemon/libclamav.dll",
       "../../release/staging/windows/libclammspack.dll": "daemon/libclammspack.dll",
       "../../release/staging/windows/libfreshclam.dll": "daemon/libfreshclam.dll",
+      "../../release/staging/windows/zlib1.dll": "daemon/zlib1.dll",
+      "../../release/staging/windows/bz2.dll": "daemon/bz2.dll",
+      "../../release/staging/windows/iconv-2.dll": "daemon/iconv-2.dll",
+      "../../release/staging/windows/json-c.dll": "daemon/json-c.dll",
+      "../../release/staging/windows/libcrypto-3-x64.dll": "daemon/libcrypto-3-x64.dll",
+      "../../release/staging/windows/libcurl.dll": "daemon/libcurl.dll",
+      "../../release/staging/windows/libssl-3-x64.dll": "daemon/libssl-3-x64.dll",
+      "../../release/staging/windows/libxml2.dll": "daemon/libxml2.dll",
+      "../../release/staging/windows/pcre2-8.dll": "daemon/pcre2-8.dll",
+      "../../release/staging/windows/pthreadVC3.dll": "daemon/pthreadVC3.dll",
       "../../release/staging/windows/certs": "daemon/certs",
       "../../release/staging/windows/runtime/config": "daemon/runtime/config",
       "../../release/staging/windows/runtime/argus/rules/yara": "daemon/runtime/argus/rules/yara",
       "../../release/staging/windows/runtime/argus/manifests": "daemon/runtime/argus/manifests",
       "../../release/staging/windows/runtime/rules": "daemon/runtime/rules",
+      "../../release/staging/windows/runtime/signatures_bootstrap": "daemon/runtime/signatures_bootstrap",
       "../../release/staging/windows/LICENSE": "daemon/LICENSE",
       "../../release/staging/windows/NOTICE.md": "daemon/NOTICE.md"
     },
@@ -74,7 +86,7 @@
       "digestAlgorithm": "sha256",
       "timestampUrl": "",
       "nsis": {
-        "installMode": "both",
+        "installMode": "perMachine",
         "displayLanguageSelector": false,
         "installerIcon": "icons/icon.ico",
         "installerHooks": "nsis-hooks.nsh"

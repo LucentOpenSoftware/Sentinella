@@ -97,17 +97,33 @@ fn spawn_elevated_cli(args: &[&str]) -> Result<bool, String> {
 fn find_cli_binary() -> Option<String> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            // Same directory as GUI.
-            let candidate = dir.join("sentinella.exe");
-            if candidate.exists() {
-                return Some(candidate.to_string_lossy().to_string());
+            // Packaged Tauri layouts.
+            for candidate in [
+                dir.join("resources").join("daemon").join("sentinella-cli.exe"),
+                dir.join("daemon").join("sentinella-cli.exe"),
+                dir.join("sentinella-cli.exe"),
+                dir.join("sentinella.exe"),
+            ] {
+                if candidate.exists() {
+                    return Some(candidate.to_string_lossy().to_string());
+                }
             }
             // Dev layout: target/release or target/debug.
             for ancestor in dir.ancestors().skip(1) {
                 for profile in &["release", "debug"] {
-                    let c = ancestor.join("target").join(profile).join("sentinella.exe");
-                    if c.exists() {
-                        return Some(c.to_string_lossy().to_string());
+                    for c in [
+                        ancestor
+                            .join("target")
+                            .join(profile)
+                            .join("sentinella.exe"),
+                        ancestor
+                            .join("target")
+                            .join(profile)
+                            .join("sentinella-cli.exe"),
+                    ] {
+                        if c.exists() {
+                            return Some(c.to_string_lossy().to_string());
+                        }
                     }
                 }
             }
@@ -255,7 +271,7 @@ async fn get_update_status() -> Result<Value, String> {
 
 #[tauri::command]
 async fn start_signature_update() -> Result<Value, String> {
-    daemon_client::call_auth("update.start", serde_json::json!({})).await.map_err(Into::into)
+    daemon_client::call("update.start", serde_json::json!({})).await.map_err(Into::into)
 }
 
 // ── Scan report export ──────────────────────────────────────────
@@ -594,12 +610,15 @@ use tauri::{
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Detect --minimized flag (autostart at login → tray only, no UI).
+    let start_minimized = std::env::args().any(|a| a == "--minimized");
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .setup(|app| {
+        .setup(move |app| {
             // ── Daemon supervisor ────────────────────────────
             let supervisor_state = std::sync::Arc::new(supervisor::SupervisorState::new());
             app.manage(supervisor_state.clone());
@@ -673,33 +692,38 @@ pub fn run() {
                 .build(app)?;
 
             // ── Splash → main window lifecycle ─────────────────
-            // Poll daemon from Rust — splash.html is static, no IPC bridge.
-            // When daemon ready: close splash, show main.
-            {
+            // Minimized autostart: close splash + main never shown, only tray.
+            // Normal launch: show splash → wait for daemon → swap to main.
+            if start_minimized {
+                // Close splash window (it's hidden but exists) — frees resources.
+                if let Some(splash) = app.get_webview_window("splash") {
+                    let _ = splash.close();
+                }
+                // Main window stays hidden (visible: false in config).
+                // User opens it via tray "Open Sentinella" menu.
+            } else {
+                // Show splash (it's created hidden by default now).
+                if let Some(splash) = app.get_webview_window("splash") {
+                    let _ = splash.show();
+                    let _ = splash.set_focus();
+                }
                 let splash_handle = app.handle().clone();
                 std::thread::spawn(move || {
-                    // Wait briefly for splash to render.
                     std::thread::sleep(std::time::Duration::from_millis(800));
 
                     let mut attempts = 0u32;
-                    let max_attempts = 45; // 45 seconds max
+                    let max_attempts = 15;
 
                     loop {
                         attempts += 1;
                         if attempts > max_attempts { break; }
-
-                        // Check daemon via sync pipe.
-                        if let Some((state, sigs)) = tray_check_daemon_sync() {
-                            if state == "ready" && sigs > 0 {
-                                // Daemon ready — brief pause then transition.
-                                std::thread::sleep(std::time::Duration::from_millis(500));
-                                break;
-                            }
+                        if tray_check_daemon_sync().is_some() {
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                            break;
                         }
                         std::thread::sleep(std::time::Duration::from_secs(1));
                     }
 
-                    // Close splash, show main.
                     if let Some(splash) = splash_handle.get_webview_window("splash") {
                         let _ = splash.close();
                     }

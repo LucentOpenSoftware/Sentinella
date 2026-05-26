@@ -21,6 +21,18 @@ call :check "%STAGE%\argusd.exe" "ARGUS worker binary"
 
 :: Check ClamAV DLLs.
 call :check "%STAGE%\libclamav.dll" "ClamAV engine DLL"
+call :check "%STAGE%\libclammspack.dll" "ClamAV mspack DLL"
+call :check "%STAGE%\libfreshclam.dll" "Freshclam DLL"
+call :check "%STAGE%\zlib1.dll" "zlib runtime DLL"
+call :check "%STAGE%\bz2.dll" "bzip2 runtime DLL"
+call :check "%STAGE%\iconv-2.dll" "iconv runtime DLL"
+call :check "%STAGE%\json-c.dll" "json-c runtime DLL"
+call :check "%STAGE%\libcrypto-3-x64.dll" "OpenSSL crypto DLL"
+call :check "%STAGE%\libcurl.dll" "curl runtime DLL"
+call :check "%STAGE%\libssl-3-x64.dll" "OpenSSL SSL DLL"
+call :check "%STAGE%\libxml2.dll" "libxml2 runtime DLL"
+call :check "%STAGE%\pcre2-8.dll" "PCRE2 runtime DLL"
+call :check "%STAGE%\pthreadVC3.dll" "pthread runtime DLL"
 
 :: Check ARGUS rules.
 call :check_dir "%STAGE%\runtime\argus\rules\yara" "YARA rules directory"
@@ -30,6 +42,9 @@ call :check "%STAGE%\runtime\rules\ioc_hashes.txt" "IOC hashes"
 :: Check config.
 call :check_dir "%STAGE%\runtime\config" "Config directory"
 call :check "%STAGE%\runtime\config\freshclam.conf" "Freshclam config"
+call :check "%STAGE%\runtime\signatures_bootstrap\main.cvd" "Bootstrap main signatures"
+call :check "%STAGE%\runtime\signatures_bootstrap\daily.cvd" "Bootstrap daily signatures"
+call :check "%STAGE%\runtime\signatures_bootstrap\bytecode.cvd" "Bootstrap bytecode signatures"
 
 :: Check legal.
 call :check "%STAGE%\LICENSE" "LICENSE file"
@@ -45,7 +60,7 @@ if errorlevel 1 ( echo  [FAIL] Freshclam config missing ProgramData path & set /
 call :check "%STAGE%\sentinella.ico" "Application icon"
 
 :: Safety checks — these should NOT exist.
-call :reject "%STAGE%\runtime\signatures" "Signature databases should download at runtime"
+call :reject "%STAGE%\runtime\signatures" "Mutable signature database"
 call :reject "%STAGE%\runtime\quarantine" "Quarantine vault"
 call :reject "%STAGE%\runtime\research_samples" "Research samples"
 call :reject "%STAGE%\runtime\state" "State database"

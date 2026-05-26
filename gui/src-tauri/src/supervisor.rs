@@ -5,6 +5,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -223,6 +224,77 @@ fn blocking_daemon_call_simple(method: &str) -> Option<serde_json::Value> {
     })
 }
 
+struct DaemonLayout {
+    exe: PathBuf,
+    daemon_dir: PathBuf,
+    runtime_root: PathBuf,
+}
+
+fn program_data_root() -> PathBuf {
+    let base = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into());
+    PathBuf::from(base).join("Sentinella")
+}
+
+fn is_installed_context(gui_dir: &Path) -> bool {
+    let lower = gui_dir.to_string_lossy().to_ascii_lowercase();
+    lower.contains(r"\program files\") || lower.contains(r"\program files (x86)\")
+}
+
+fn daemon_candidates(gui_dir: &Path) -> [PathBuf; 4] {
+    [
+        gui_dir.join("resources").join("daemon").join("sentinelld.exe"),
+        gui_dir.join("daemon").join("sentinelld.exe"),
+        gui_dir.join("sentinelld.exe"),
+        gui_dir.join("resources").join("sentinelld.exe"),
+    ]
+}
+
+fn find_daemon_layout() -> Option<DaemonLayout> {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            for candidate in daemon_candidates(dir) {
+                if candidate.exists() {
+                    let daemon_dir = candidate.parent()?.to_path_buf();
+                    let portable_root = daemon_dir.join("runtime");
+                    let runtime_root = if is_installed_context(dir) {
+                        program_data_root()
+                    } else if portable_root.exists() {
+                        portable_root
+                    } else {
+                        program_data_root()
+                    };
+                    return Some(DaemonLayout {
+                        exe: candidate,
+                        daemon_dir,
+                        runtime_root,
+                    });
+                }
+            }
+
+            for ancestor in dir.ancestors().skip(1) {
+                let dev = ancestor.join("target").join("release").join("sentinelld.exe");
+                if dev.exists() {
+                    return Some(DaemonLayout {
+                        daemon_dir: dev.parent()?.to_path_buf(),
+                        exe: dev,
+                        runtime_root: ancestor.join("runtime"),
+                    });
+                }
+                let dev_debug = ancestor.join("target").join("debug").join("sentinelld.exe");
+                if dev_debug.exists() {
+                    return Some(DaemonLayout {
+                        daemon_dir: dev_debug.parent()?.to_path_buf(),
+                        exe: dev_debug,
+                        runtime_root: ancestor.join("runtime"),
+                    });
+                }
+            }
+        }
+    }
+    None
+}
+
+#[allow(dead_code)]
 /// Find the daemon executable.
 fn find_daemon_exe() -> Option<std::path::PathBuf> {
     // Try relative to our own exe first (installed layout).
@@ -255,44 +327,31 @@ fn spawn_daemon(state: &SupervisorState) -> bool {
 }
 
 fn spawn_daemon_mode(state: &SupervisorState, audit: bool) -> bool {
-    let exe = match find_daemon_exe() {
-        Some(e) => e,
+    let layout = match find_daemon_layout() {
+        Some(layout) => layout,
         None => {
             log::warn!("supervisor: sentinelld.exe not found — cannot spawn");
             return false;
         }
     };
 
-    // Resolve project root for --dll-dir and --db-dir.
-    let project_root = exe.parent()
-        .and_then(|p| {
-            // If in target/release or target/debug, go up to project root.
-            let name = p.file_name()?.to_string_lossy().to_ascii_lowercase();
-            if name == "release" || name == "debug" {
-                p.parent()?.parent().map(|r| r.to_path_buf())
-            } else {
-                Some(p.to_path_buf())
-            }
-        });
+    let dll_dir = layout.daemon_dir.clone();
+    let db_dir = layout.runtime_root.join("signatures");
+    let state_db = layout.runtime_root.join("state").join("sentinella.db");
+    let work_dir = layout.daemon_dir.clone();
 
-    let dll_dir = exe.parent().unwrap_or(std::path::Path::new(".")).to_string_lossy().to_string();
-    let db_dir = project_root.as_ref()
-        .map(|r| r.join("runtime").join("signatures"))
-        .filter(|p| p.exists())
-        .unwrap_or_else(|| std::path::PathBuf::from("runtime/signatures"))
-        .to_string_lossy().to_string();
-
-    // Working directory must be project root so daemon finds runtime/ paths.
-    let work_dir = project_root.clone()
-        .unwrap_or_else(|| exe.parent().unwrap_or(std::path::Path::new(".")).to_path_buf());
-
-    log::info!("supervisor: spawning daemon — {} (cwd: {}) audit={audit}", exe.display(), work_dir.display());
+    log::info!(
+        "supervisor: spawning daemon - {} (cwd: {}, runtime: {}) audit={audit}",
+        layout.exe.display(),
+        work_dir.display(),
+        layout.runtime_root.display()
+    );
     state.record_attempt(if audit { "crash_loop_audit" } else { "pipe_lost" });
 
     // Spawn detached — daemon runs independently of GUI.
     #[cfg(target_os = "windows")]
     use std::os::windows::process::CommandExt;
-    let mut cmd = std::process::Command::new(&exe);
+    let mut cmd = std::process::Command::new(&layout.exe);
     cmd.current_dir(&work_dir)
         .env(crate::ipc_auth::ENV_NAME, crate::ipc_auth::secret())
         .arg("--foreground")
@@ -300,6 +359,10 @@ fn spawn_daemon_mode(state: &SupervisorState, audit: bool) -> bool {
         .arg("info")
         .arg("--dll-dir")
         .arg(&dll_dir)
+        .arg("--runtime-root")
+        .arg(&layout.runtime_root)
+        .arg("--state-db")
+        .arg(&state_db)
         .arg("--db-dir")
         .arg(&db_dir);
     if audit {

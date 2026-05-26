@@ -425,6 +425,7 @@ impl AppState {
                     (Some(Arc::new(eng)), None, sigs)
                 }
                 Err(e) => {
+                    tracing::error!(error = %e, "ClamAV engine failed to load");
                     activity.push(ActivityEntry {
                         event_type: "engine_error".into(),
                         message: format!("Engine failed: {e}"),

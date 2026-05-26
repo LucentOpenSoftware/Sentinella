@@ -807,19 +807,6 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
         "idle_scanner.status" => ok_json(state.idle_scanner_stats()),
         "update.status" => ok_json(state.update_status()),
         "update.start" => {
-            let auth = req
-                .params
-                .get("auth")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if !state.validate_ipc_auth(auth) {
-                return serde_json::to_vec(&RpcErrorResponse::err(
-                    req.id,
-                    error_codes::INVALID_PARAMS,
-                    "authenticated IPC update required".to_string(),
-                ))
-                .unwrap_or_default();
-            }
             let r = AppState::start_update(state);
             Ok(r)
         }

@@ -61,6 +61,8 @@ runtime/research_samples/
 runtime/test_runtime/
 runtime/compiled/
 runtime/config/freshclam.resolved.conf
+runtime/freshclam-bootstrap.conf
+runtime/signatures_bootstrap/
 
 # Fuzz build artifacts
 fuzz/target/
