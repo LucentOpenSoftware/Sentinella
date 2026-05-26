@@ -14,8 +14,8 @@
 #[allow(dead_code)]
 pub mod ps_bridge;
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde::Serialize;
 
@@ -99,14 +99,18 @@ pub enum ScriptLanguage {
 impl ScriptLanguage {
     pub fn from_app_name(app: &str) -> Self {
         let lower = app.to_lowercase();
-        if lower.contains("powershell") { Self::PowerShell }
-        else if lower.contains("cscript") || lower.contains("wscript") {
+        if lower.contains("powershell") {
+            Self::PowerShell
+        } else if lower.contains("cscript") || lower.contains("wscript") {
             // Ambiguous — could be JS or VBS. Default to JScript.
             Self::JScript
+        } else if lower.contains("mshta") {
+            Self::Mshta
+        } else if lower.contains("dotnet") || lower.contains("clr") {
+            Self::DotNet
+        } else {
+            Self::Other
         }
-        else if lower.contains("mshta") { Self::Mshta }
-        else if lower.contains("dotnet") || lower.contains("clr") { Self::DotNet }
-        else { Self::Other }
     }
 
     pub fn label(&self) -> &'static str {
@@ -190,18 +194,18 @@ pub fn runtime_profile() -> argus::profile::ScanProfile {
             max_clamav_duration: std::time::Duration::from_millis(500),
             max_yara_duration: std::time::Duration::from_secs(1),
             max_structural_duration: std::time::Duration::from_millis(100),
-            max_archive_depth: 0,     // No archive parsing for runtime buffers.
+            max_archive_depth: 0, // No archive parsing for runtime buffers.
             max_extracted_bytes: 0,
             max_yara_matches: 30,
         },
         yara_enabled: true,
         yara_max_matches: 30,
-        pe_heuristics_enabled: false,  // Runtime buffers are not PE files.
+        pe_heuristics_enabled: false, // Runtime buffers are not PE files.
         reputation_enabled: false,
         context_enabled: false,
-        ioc_enabled: true,             // Hash matching still useful.
+        ioc_enabled: true, // Hash matching still useful.
         packer_detection_enabled: false,
-        convergence_threshold: 20,     // Lower threshold — deobfuscated content is cleaner signal.
+        convergence_threshold: 20, // Lower threshold — deobfuscated content is cleaner signal.
         quarantine_threshold: 80,
         max_archive_depth: 0,
         max_extracted_bytes: 0,
@@ -217,11 +221,28 @@ mod tests {
 
     #[test]
     fn script_language_detection() {
-        assert_eq!(ScriptLanguage::from_app_name("powershell.exe"), ScriptLanguage::PowerShell);
-        assert_eq!(ScriptLanguage::from_app_name("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"), ScriptLanguage::PowerShell);
-        assert_eq!(ScriptLanguage::from_app_name("cscript.exe"), ScriptLanguage::JScript);
-        assert_eq!(ScriptLanguage::from_app_name("mshta.exe"), ScriptLanguage::Mshta);
-        assert_eq!(ScriptLanguage::from_app_name("notepad.exe"), ScriptLanguage::Other);
+        assert_eq!(
+            ScriptLanguage::from_app_name("powershell.exe"),
+            ScriptLanguage::PowerShell
+        );
+        assert_eq!(
+            ScriptLanguage::from_app_name(
+                "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+            ),
+            ScriptLanguage::PowerShell
+        );
+        assert_eq!(
+            ScriptLanguage::from_app_name("cscript.exe"),
+            ScriptLanguage::JScript
+        );
+        assert_eq!(
+            ScriptLanguage::from_app_name("mshta.exe"),
+            ScriptLanguage::Mshta
+        );
+        assert_eq!(
+            ScriptLanguage::from_app_name("notepad.exe"),
+            ScriptLanguage::Other
+        );
     }
 
     #[test]

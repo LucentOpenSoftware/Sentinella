@@ -39,6 +39,12 @@ const QUICK_SCAN_SKIP_DIRS: &[&str] = &[
     "programdata",
 ];
 
+/// System-managed pseudo directories skipped in every scan profile.
+///
+/// They contain tombstoned or privileged artifacts that can pin in-process
+/// scanners and prevent cancellation from completing.
+const ALWAYS_SKIP_SYSTEM_DIRS: &[&str] = &["$recycle.bin", "system volume information"];
+
 /// Check if a file path should be excluded from scanning.
 pub fn is_excluded(path: &Path, excluded_paths: &[String], excluded_extensions: &[String]) -> bool {
     let path_str = path.to_string_lossy().to_lowercase();
@@ -46,7 +52,9 @@ pub fn is_excluded(path: &Path, excluded_paths: &[String], excluded_extensions: 
     // Check path exclusions.
     for excl in excluded_paths {
         let excl_lower = excl.to_lowercase();
-        if path_str.starts_with(&excl_lower) || path_str.contains(&excl_lower) {
+        // C2 fix: prefix matching only — prevents overly broad substring matches
+        // (e.g. excluded_paths = ["user"] matching every path containing "user").
+        if path_str.starts_with(&excl_lower) {
             return true;
         }
     }
@@ -79,6 +87,12 @@ pub fn should_skip_dir(path: &Path, quick_scan: bool) -> bool {
     // extracted content → scan → ClamAV extracts again → ...
     if let Some(name) = path.file_name() {
         let name_lower = name.to_string_lossy().to_lowercase();
+        if ALWAYS_SKIP_SYSTEM_DIRS
+            .iter()
+            .any(|skip| name_lower == *skip)
+        {
+            return true;
+        }
         if name_lower.starts_with("html-tmp.")
             || name_lower.starts_with("pdf-tmp.")
             || name_lower.starts_with("ole2-tmp.")
@@ -165,65 +179,139 @@ pub fn is_sentinella_path(path: &Path) -> bool {
         return true;
     }
 
-    // Research samples — never auto-scanned by watcher (manual only).
+    // C1 fix: removed global "research_samples" substring bypass.
+    // Previously, ANY path containing "research_samples" was skipped.
+    // Now, only Sentinella's own installed directories are skipped.
+
+    // Sentinel quarantine/runtime dirs — only under Sentinella's own install tree.
+    // Use the daemon directory as anchor, not global substring.
+    if let Ok(daemon_dir) = std::env::current_dir() {
+        let daemon_lower = daemon_dir.to_string_lossy().to_lowercase();
+        let p = path.to_string_lossy().to_lowercase();
+        if p.starts_with(&daemon_lower) {
+            // Inside daemon directory — skip runtime artifacts.
+            if p.contains("\\quarantine\\")
+                || p.contains("/quarantine/")
+                || p.contains("\\signatures\\")
+                || p.contains("/signatures/")
+                || p.contains("\\logs\\")
+                || p.contains("/logs/")
+                || p.contains("\\clamav_tmp\\")
+                || p.contains("/clamav_tmp/")
+            {
+                return true;
+            }
+        }
+    }
+
+    // Installed mode: ProgramData\Sentinella paths.
     let p = path.to_string_lossy().to_lowercase();
-    if p.contains("research_samples") {
-        return true;
-    }
-
-    // Sentinel quarantine/runtime dirs (installed mode).
-    if p.contains("sentinella\\quarantine")
-        || p.contains("sentinella/quarantine")
-        || p.contains("sentinella\\signatures")
-        || p.contains("sentinella/signatures")
-        || p.contains("sentinella\\logs")
-        || p.contains("sentinella/logs")
+    if p.contains("\\programdata\\sentinella\\quarantine")
+        || p.contains("\\programdata\\sentinella\\signatures")
+        || p.contains("\\programdata\\sentinella\\logs")
+        || p.contains("\\programdata\\sentinella\\clamav_tmp")
     {
-        return true;
-    }
-
-    // ClamAV dedicated temp directory (runtime/clamav_tmp).
-    if p.contains("\\clamav_tmp\\") || p.contains("/clamav_tmp/") {
         return true;
     }
 
     false
 }
 
-/// Directories that are always build/dev artifacts — watcher + idle scanner skip.
+/// Build/dev directory names — only skipped when inside a verified project tree.
+/// H1 fix: previously skipped globally (any `\build\` anywhere → bypass).
+/// Now requires a project marker file in an ancestor directory.
 const BUILD_DEV_DIRS: &[&str] = &[
     "target",       // Rust
     "node_modules", // Node
-    ".git",         // Git
     "dist",         // Bundler output
     "build",        // CMake / generic
     ".next",        // Next.js
     ".vite",        // Vite cache
-    ".cargo",       // Cargo home cache
-    ".rustup",      // Rust toolchains
-    ".npm",         // npm cache
-    ".pnpm-store",  // pnpm store
     "__pycache__",  // Python
     ".fingerprint", // Rust incremental
     "incremental",  // Rust incremental
     ".gradle",      // Gradle
     ".m2",          // Maven
     ".nuget",       // .NET
-    "release",      // Release staging (under project)
+                    // Removed: "release" — too common in non-dev contexts.
+                    // Removed: ".git" — not a build artifact dir, and can contain hooks.
+];
+
+/// Dotfiles/caches that are safe to skip unconditionally (always hidden, never user content).
+const ALWAYS_SKIP_DIRS: &[&str] = &[
+    ".cargo",      // Cargo home cache
+    ".rustup",     // Rust toolchains
+    ".npm",        // npm cache
+    ".pnpm-store", // pnpm store
+];
+
+/// Project marker files — if any exist in an ancestor directory,
+/// the path is considered inside a verified development workspace.
+const PROJECT_MARKERS: &[&str] = &[
+    "Cargo.toml",
+    "package.json",
+    "go.mod",
+    "pyproject.toml",
+    "setup.py",
+    "CMakeLists.txt",
+    "Makefile",
+    "build.gradle",
+    "pom.xml",
+    ".sln",
+    ".csproj",
 ];
 
 /// Check if path passes through a build/dev directory.
-/// Returns true if any path component matches BUILD_DEV_DIRS.
+///
+/// H1 fix: DOMAIN-CONSTRAINED. Only skips if:
+/// 1. Path contains a build dir component, AND
+/// 2. An ancestor directory contains a project marker file (Cargo.toml, package.json, etc.)
+///
+/// Unconditionally safe dirs (.cargo, .rustup, .npm) are always skipped.
 pub fn is_build_or_dev_path(path: &Path) -> bool {
     let p = path.to_string_lossy().to_lowercase();
-    for &dir in BUILD_DEV_DIRS {
+
+    // Always-safe hidden caches — no project verification needed.
+    for &dir in ALWAYS_SKIP_DIRS {
         let sep_dir = format!("\\{dir}\\");
         let sep_dir_fwd = format!("/{dir}/");
         if p.contains(&sep_dir) || p.contains(&sep_dir_fwd) {
             return true;
         }
     }
-    false
+
+    // Build dirs require project tree verification.
+    let mut found_build_dir = false;
+    for &dir in BUILD_DEV_DIRS {
+        let sep_dir = format!("\\{dir}\\");
+        let sep_dir_fwd = format!("/{dir}/");
+        if p.contains(&sep_dir) || p.contains(&sep_dir_fwd) {
+            found_build_dir = true;
+            break;
+        }
+    }
+
+    if !found_build_dir {
+        return false;
+    }
+
+    // Walk ancestors looking for a project marker.
+    let mut ancestor = path.parent();
+    let mut depth = 0;
+    while let Some(dir) = ancestor {
+        if depth > 10 {
+            break;
+        } // Don't walk too far up.
+        for &marker in PROJECT_MARKERS {
+            if dir.join(marker).exists() {
+                return true; // Verified project tree.
+            }
+        }
+        ancestor = dir.parent();
+        depth += 1;
+    }
+
+    false // Build dir found but NO project marker → not a real dev workspace.
 }
 
 /// Check if a file should be skipped (system files, temp locks, etc.).
@@ -269,33 +357,44 @@ pub fn should_skip_file(path: &Path) -> bool {
 
 /// Check if a path is a ClamAV temporary extraction artifact.
 ///
+/// H3 fix: DOMAIN-CONSTRAINED. ClamAV temp patterns only recognized inside
+/// temp directories or ClamAV's dedicated temp dir. Previously, creating
+/// `html-tmp.evil` anywhere on the filesystem bypassed all scanning.
+///
 /// ClamAV creates temp directories/files when scanning compound files:
 ///   - `html-tmp.<hash>/javascript`   (HTML script extraction)
 ///   - `pdf-tmp.<hash>/pdf obj N N`   (PDF object extraction)
 ///   - `ole2-tmp.<hash>/...`          (OLE2/Office extraction)
 ///   - `clamav-<hash>.tmp`            (generic temp files)
-///
-/// These MUST be skipped by all scan paths to prevent infinite loops
-/// where ClamAV scans its own extraction output.
 pub fn is_clamav_temp_artifact(path: &Path) -> bool {
     let p = path.to_string_lossy().to_lowercase();
 
-    // ClamAV extraction temp directories.
-    if p.contains("\\html-tmp.")
-        || p.contains("/html-tmp.")
-        || p.contains("\\pdf-tmp.")
-        || p.contains("/pdf-tmp.")
-        || p.contains("\\ole2-tmp.")
-        || p.contains("/ole2-tmp.")
-        || p.contains("\\ooxml-tmp.")
-        || p.contains("/ooxml-tmp.")
-        || p.contains("\\swf-tmp.")
-        || p.contains("/swf-tmp.")
-    {
-        return true;
+    // H3 domain check: must be inside a temp directory.
+    let in_temp = p.contains("\\temp\\")
+        || p.contains("\\tmp\\")
+        || p.contains("/temp/")
+        || p.contains("/tmp/")
+        || p.contains("\\clamav_tmp\\")
+        || p.contains("/clamav_tmp/");
+
+    if !in_temp {
+        return false;
     }
 
-    // ClamAV generic temp files (clamav-<hash>.tmp).
+    // ClamAV extraction temp directory patterns (component-level check).
+    for component in path.components() {
+        let c = component.as_os_str().to_string_lossy().to_lowercase();
+        if c.starts_with("html-tmp.")
+            || c.starts_with("pdf-tmp.")
+            || c.starts_with("ole2-tmp.")
+            || c.starts_with("ooxml-tmp.")
+            || c.starts_with("swf-tmp.")
+        {
+            return true;
+        }
+    }
+
+    // ClamAV generic temp files.
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_lowercase())
@@ -309,13 +408,12 @@ pub fn is_clamav_temp_artifact(path: &Path) -> bool {
 
 /// Check if a path is a transient build/dev tool artifact.
 ///
-/// Build tools (esbuild, webpack, tsc, cargo, msbuild) create and delete
-/// temporary files rapidly in %TEMP% and project directories. Scanning these
-/// files causes contention: the watcher opens the file for scanning while
-/// the build tool tries to delete/rename it, causing "access denied" build
-/// failures.
+/// H2 fix: DOMAIN-CONSTRAINED. Build tool artifacts are only skipped when:
+/// 1. The file is inside a temp directory (%TEMP%, %TMP%, AppData\Local\Temp), OR
+/// 2. The file is inside a verified project tree (has project marker ancestor).
 ///
-/// These are ALWAYS skipped by the watcher. Manual scans still cover them.
+/// Previously, `esbuild-*` or `msbuild*` filenames were skipped ANYWHERE,
+/// allowing trivial bypass by renaming malware.
 pub fn is_transient_build_artifact(path: &Path) -> bool {
     let p = path.to_string_lossy().to_lowercase();
     let name = path
@@ -323,60 +421,57 @@ pub fn is_transient_build_artifact(path: &Path) -> bool {
         .map(|n| n.to_string_lossy().to_lowercase())
         .unwrap_or_default();
 
-    // esbuild temp files (esbuild-<hash> in %TEMP%).
+    // Domain check: is this file in a temp directory or verified project?
+    let in_temp = p.contains("\\temp\\")
+        || p.contains("\\tmp\\")
+        || p.contains("/temp/")
+        || p.contains("/tmp/");
+    let in_project = is_build_or_dev_path(path); // Already verified project tree.
+
+    if !in_temp && !in_project {
+        return false; // H2 fix: outside safe domains, never skip by name alone.
+    }
+
+    // Build tool temp files — only valid inside temp or project dirs.
     if name.starts_with("esbuild-") || name.starts_with("esbuild_") {
         return true;
     }
-
-    // Vite/Rollup temp files.
     if name.starts_with("vite-") || name.starts_with("rollup-") {
         return true;
     }
-
-    // TypeScript compiler temp files.
     if name.starts_with("tsc-") || name.starts_with("tsserver-") {
         return true;
     }
-
-    // Cargo/rustc incremental compilation artifacts in temp.
     if name.starts_with("rustc") && (name.ends_with(".o") || name.ends_with(".rcgu")) {
         return true;
     }
-
-    // MSBuild/Visual Studio temp.
     if name.starts_with("msbuild") || name.starts_with("vctmp") {
         return true;
     }
-
-    // npm/pnpm staging files.
-    if p.contains("\\.staging\\") || p.contains("\\pnpm-") || p.contains("\\_cacache\\") {
-        return true;
-    }
-
-    // Go compiler temp.
     if name.starts_with("go-build") || name.starts_with("go-link") {
         return true;
     }
-
-    // Python/pip temp.
     if name.starts_with("pip-") && (name.contains("install") || name.contains("build")) {
         return true;
     }
-
-    // Webpack hot-update files.
     if name.ends_with(".hot-update.js") || name.ends_with(".hot-update.json") {
         return true;
     }
 
-    // Generic: files in AppData\Local\Temp with hex hash names (32+ chars, no extension).
-    // These are typically build tool intermediates.
-    if p.contains("\\temp\\") || p.contains("\\tmp\\") {
-        if name.len() >= 32
-            && !name.contains('.')
-            && name.chars().all(|c| c.is_ascii_hexdigit() || c == '-' || c == '_')
-        {
-            return true;
-        }
+    // npm/pnpm staging — substring-based but requires temp/project context.
+    if p.contains("\\.staging\\") || p.contains("\\pnpm-") || p.contains("\\_cacache\\") {
+        return true;
+    }
+
+    // Generic hex-hash temp files — only in actual temp directories.
+    if in_temp
+        && name.len() >= 32
+        && !name.contains('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() || c == '-' || c == '_')
+    {
+        return true;
     }
 
     false

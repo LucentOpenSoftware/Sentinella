@@ -4,6 +4,7 @@
 //! Diagnostic-only — does not optimize or free memory.
 
 pub mod pressure;
+pub mod residency;
 
 use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};

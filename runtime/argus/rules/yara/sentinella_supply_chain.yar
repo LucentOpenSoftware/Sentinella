@@ -257,5 +257,6 @@ rule supply_chain_build_artifact_tampering {
 
     condition:
         2 of ($ci*) and any of ($inject*) or
-        (any of ($ci*) and any of ($inject*) and any of ($exfil*))
+        (any of ($ci*) and any of ($inject*) and any of ($exfil*)) or
+        (any of ($build*) and any of ($inject*) and any of ($exfil*))
 }

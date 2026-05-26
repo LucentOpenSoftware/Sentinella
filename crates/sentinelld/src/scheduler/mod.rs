@@ -105,6 +105,15 @@ fn scheduler_loop(state: Arc<crate::ipc::AppState>, running: Arc<AtomicBool>) {
             }
         }
 
+        // ── Ecosystem lifecycle maintenance ────────────────────
+        // Runs every cycle: transitions Active→Cooling→Expired, prunes expired.
+        state.ecosystem.expire();
+
+        // ── Working set residency management ──────────────────
+        // Trims working set after quiet periods to keep Task Manager
+        // appearance lightweight. Respects active scans and cooldown.
+        state.check_residency_trim();
+
         // ── Quarantine retention cleanup at 4 AM ───────────────
         if hour == 4 && last_cleanup_day != Some(day) {
             last_cleanup_day = Some(day);

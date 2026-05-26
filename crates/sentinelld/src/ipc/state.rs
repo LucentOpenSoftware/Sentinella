@@ -12,7 +12,7 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
-    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Instant;
 use uuid::Uuid;
@@ -28,6 +28,10 @@ use crate::engine::ClamEngine;
 
 /// Default max file size to scan (512 MB). Overridden by config.max_file_size_mb.
 const DEFAULT_MAX_FILE_SIZE: u64 = 512 * 1024 * 1024;
+
+/// Engine reload concurrency guard — module-level so policy layer can check it.
+static ENGINE_RELOAD_IN_PROGRESS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Get max file size from config (or default).
 fn max_file_size() -> u64 {
@@ -93,12 +97,42 @@ fn load_or_create_ipc_secret() -> Option<String> {
         }
     }
     match std::fs::write(&path, &secret) {
-        Ok(()) => Some(secret),
+        Ok(()) => {
+            // C2 fix: restrict IPC secret file permissions — only SYSTEM
+            // and Administrators should be able to read the shared secret.
+            restrict_ipc_secret_permissions(&path);
+            Some(secret)
+        }
         Err(e) => {
             tracing::warn!(%e, "cannot persist IPC secret");
             None
         }
     }
+}
+
+/// C2 fix: restrict IPC secret file so only SYSTEM and Administrators can read it.
+#[cfg(target_os = "windows")]
+fn restrict_ipc_secret_permissions(path: &Path) {
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+    let path_str = path.to_string_lossy();
+    let _ = Command::new("icacls")
+        .args([
+            path_str.as_ref(),
+            "/inheritance:r",
+            "/grant:r",
+            "SYSTEM:(R)",
+            "/grant:r",
+            "BUILTIN\\Administrators:(R)",
+        ])
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+        .output();
+}
+
+#[cfg(not(target_os = "windows"))]
+fn restrict_ipc_secret_permissions(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
 }
 
 fn ipc_secret_path() -> PathBuf {
@@ -149,10 +183,12 @@ pub struct AppState {
     orchestrator_file_scan_enabled: bool,
     orchestrator_folder_scan_enabled: bool,
     orchestrator_quick_scan_enabled: bool,
+    orchestrator_full_scan_enabled: bool,
     last_orchestrated_job: Mutex<Option<OrchestratedJobResult>>,
     orchestrated_completed_file: AtomicU64,
     orchestrated_completed_folder: AtomicU64,
     orchestrated_completed_quick: AtomicU64,
+    orchestrated_completed_full: AtomicU64,
     orchestrated_cancelled_jobs: AtomicU64,
     orchestrated_failed_jobs: AtomicU64,
     ipc_secret: Option<String>,
@@ -208,11 +244,16 @@ pub struct AppState {
     // ── PLM (Process Lineage Monitor) ────────────────
     plm: Option<crate::plm::PlmMonitor>,
     // ── PowerShell bridge ──────────────────────────
-    ps_bridge: Option<crate::amsi::ps_bridge::PsBridge>,
+    ps_bridge: Mutex<Option<crate::amsi::ps_bridge::PsBridge>>,
     // ── Trust Graph ────────────────────────────────
     trust_graph: Option<crate::trust_graph::TrustGraph>,
     // ── Ecosystem Tracker ─────────────────────────
-    ecosystem: crate::ecosystem::EcosystemTracker,
+    pub(crate) ecosystem: crate::ecosystem::EcosystemTracker,
+    // ── Working Set Residency ────────────────────
+    pub(crate) activity_tracker: crate::footprint::residency::ActivityTracker,
+    residency_manager: crate::footprint::residency::ResidencyManager,
+    // ── IPC Rate Limiter ──────────────────────────
+    pub(crate) rate_limiter: super::policy::RateLimiter,
 }
 
 struct Inner {
@@ -435,11 +476,7 @@ impl AppState {
 
         // ── Load ARGUS intelligence packs ──────────────────
         // IOC hash database.
-        let ioc_paths = [
-            std::path::PathBuf::from("runtime/rules/ioc_hashes.txt"),
-            std::path::PathBuf::from("runtime/argus/rules/ioc/ioc_hashes.txt"),
-            std::path::PathBuf::from("runtime/signatures/ioc_hashes.txt"),
-        ];
+        let ioc_paths = crate::paths::paths().ioc_hash_paths();
         for ioc_path in &ioc_paths {
             if ioc_path.exists() {
                 match argus_engine.ioc.load_from_file(ioc_path) {
@@ -460,10 +497,7 @@ impl AppState {
 
         // YARA rule engine — compiled on a dedicated thread with 8 MB stack
         // because wasmtime/cranelift JIT uses deep call stacks during compilation.
-        let yara_dirs = vec![
-            std::path::PathBuf::from("runtime/argus/rules/yara"),
-            std::path::PathBuf::from("runtime/rules"),
-        ];
+        let yara_dirs = crate::paths::paths().yara_rule_dirs();
         let yara_result = argus_engine.yara.load_rules_on_large_stack(&yara_dirs);
 
         match yara_result {
@@ -509,9 +543,17 @@ impl AppState {
             db: Mutex::new(database),
             watcher: Mutex::new(None),
             idle_scanner: Mutex::new(None),
-            scan_cache: Arc::new(crate::scan::cache::ScanCache::with_persistence(
-                &std::path::PathBuf::from("runtime/state/scan_cache.db"),
-            )),
+            scan_cache: {
+                // D-3 fix: seed cache integrity from vault key before loading DB.
+                // Entries without a matching integrity hash are rejected as tampered.
+                let p = crate::paths::paths();
+                if let Ok(key_data) = std::fs::read(p.vault_integrity_key()) {
+                    crate::scan::cache::set_cache_integrity_secret(&key_data);
+                }
+                Arc::new(crate::scan::cache::ScanCache::with_persistence(
+                    &p.scan_cache_db(),
+                ))
+            },
             orchestrator: crate::orchestrator::ScanOrchestrator::start(),
             argus: argus_engine,
             argus_worker,
@@ -522,10 +564,12 @@ impl AppState {
             orchestrator_file_scan_enabled: daemon_config.scan.orchestrator_file_scan_enabled,
             orchestrator_folder_scan_enabled: daemon_config.scan.orchestrator_folder_scan_enabled,
             orchestrator_quick_scan_enabled: daemon_config.scan.orchestrator_quick_scan_enabled,
+            orchestrator_full_scan_enabled: daemon_config.scan.orchestrator_full_scan_enabled,
             last_orchestrated_job: Mutex::new(None),
             orchestrated_completed_file: AtomicU64::new(0),
             orchestrated_completed_folder: AtomicU64::new(0),
             orchestrated_completed_quick: AtomicU64::new(0),
+            orchestrated_completed_full: AtomicU64::new(0),
             orchestrated_cancelled_jobs: AtomicU64::new(0),
             orchestrated_failed_jobs: AtomicU64::new(0),
             ipc_secret: load_or_create_ipc_secret(),
@@ -553,10 +597,8 @@ impl AppState {
             watcher_last_heartbeat: AtomicU64::new(0),
             orchestrator_last_heartbeat: AtomicU64::new(0),
             calibration: Mutex::new(
-                crate::calibration::CalibrationLog::open(
-                    &std::path::PathBuf::from("runtime/state/calibration.db"),
-                )
-                .ok(),
+                crate::calibration::CalibrationLog::open(&crate::paths::paths().calibration_db())
+                    .ok(),
             ),
             budget_files_with_timeouts: AtomicU64::new(0),
             budget_clamav_timeouts: AtomicU64::new(0),
@@ -568,11 +610,20 @@ impl AppState {
             budget_idle_timeouts: AtomicU64::new(0),
             budget_transient_skips: AtomicU64::new(0),
             plm: Some(crate::plm::PlmMonitor::start(5)),
-            ps_bridge: None,
-            trust_graph: crate::trust_graph::TrustGraph::open(
-                &std::path::PathBuf::from("runtime/state/trust_graph.db"),
-            ).ok(),
+            ps_bridge: Mutex::new(None),
+            trust_graph: {
+                let p = crate::paths::paths();
+                if let Ok(key_data) = std::fs::read(p.vault_integrity_key()) {
+                    crate::trust_graph::set_trust_integrity_secret(&key_data);
+                }
+                crate::trust_graph::TrustGraph::open(&p.trust_graph_db()).ok()
+            },
             ecosystem: crate::ecosystem::EcosystemTracker::new(),
+            activity_tracker: crate::footprint::residency::ActivityTracker::new(),
+            residency_manager: crate::footprint::residency::ResidencyManager::new(
+                crate::footprint::residency::ResidencyConfig::default(),
+            ),
+            rate_limiter: super::policy::RateLimiter::new(),
             inner: Mutex::new(Inner {
                 active_scan: None,
                 scan_history: Vec::new(),
@@ -640,6 +691,17 @@ impl AppState {
     pub fn db_ref(&self) -> &Mutex<Option<Database>> {
         &self.db
     }
+    /// Check and apply quiet working set trim if conditions are met.
+    pub fn check_residency_trim(&self) {
+        self.residency_manager
+            .check_and_trim(&self.activity_tracker);
+    }
+
+    /// Get residency diagnostics.
+    pub fn residency_diagnostics(&self) -> serde_json::Value {
+        self.residency_manager.diagnostics(&self.activity_tracker)
+    }
+
     pub fn uptime_secs(&self) -> u64 {
         self.started_at.elapsed().as_secs()
     }
@@ -655,14 +717,8 @@ impl AppState {
     pub fn start_ps_bridge(self: &Arc<Self>, poll_secs: u64) {
         let engine = Arc::clone(&self.argus);
         let plm_graph = self.plm.as_ref().map(|p| Arc::clone(&p.graph));
-        // SAFETY: we only call this once during startup, before any concurrent access.
-        // The field is private and only set here.
-        let self_ptr = Arc::as_ptr(self) as *mut AppState;
-        unsafe {
-            (*self_ptr).ps_bridge = Some(
-                crate::amsi::ps_bridge::PsBridge::start(poll_secs, engine, plm_graph)
-            );
-        }
+        let bridge = crate::amsi::ps_bridge::PsBridge::start(poll_secs, engine, plm_graph);
+        *self.ps_bridge.lock().unwrap_or_else(|e| e.into_inner()) = Some(bridge);
         tracing::info!(poll_secs, "PowerShell Script Block Logging bridge started");
     }
 
@@ -674,7 +730,8 @@ impl AppState {
 
     /// Get PowerShell bridge diagnostics.
     pub fn ps_bridge_diagnostics(&self) -> serde_json::Value {
-        if let Some(ref bridge) = self.ps_bridge {
+        let guard = self.ps_bridge.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref bridge) = *guard {
             bridge.diagnostics.to_json()
         } else {
             serde_json::json!({"enabled": false})
@@ -788,8 +845,15 @@ impl AppState {
             .lock()
             .ok()
             .and_then(|live| {
-                live.as_ref()
-                    .and_then(|state| state.current_path.lock().ok().map(|path| path.clone()))
+                live.as_ref().and_then(|state| {
+                    if !matches!(
+                        state.status_enum(),
+                        ScanJobStatus::Running | ScanJobStatus::Draining
+                    ) {
+                        return None;
+                    }
+                    state.current_path.lock().ok().map(|path| path.clone())
+                })
             })
             .filter(|path| !path.is_empty())
             .or_else(|| {
@@ -831,6 +895,7 @@ impl AppState {
             "enabled_file_scan": self.orchestrator_file_scan_enabled,
             "enabled_folder_scan": self.orchestrator_folder_scan_enabled,
             "enabled_quick_scan": self.orchestrator_quick_scan_enabled,
+            "enabled_full_scan": self.orchestrator_full_scan_enabled,
             "state": state,
             "last_orchestrated_job": last_orchestrated_job,
             "manual_queue_depth": manual_queue_depth,
@@ -838,6 +903,7 @@ impl AppState {
             "completed_file": self.orchestrated_completed_file.load(Ordering::Relaxed),
             "completed_folder": self.orchestrated_completed_folder.load(Ordering::Relaxed),
             "completed_quick": self.orchestrated_completed_quick.load(Ordering::Relaxed),
+            "completed_full": self.orchestrated_completed_full.load(Ordering::Relaxed),
             "cancelled_jobs": self.orchestrated_cancelled_jobs.load(Ordering::Relaxed),
             "failed_jobs": self.orchestrated_failed_jobs.load(Ordering::Relaxed),
             "worker_fallbacks": self.argus_worker_fallback_count.load(Ordering::Relaxed),
@@ -1163,6 +1229,9 @@ impl AppState {
         };
         drop(engine_guard);
 
+        // Record manual scan activity — blocks quiet re-trim.
+        self.activity_tracker.record_manual_scan();
+
         match scan_type {
             "file" if self.orchestrator_file_scan_enabled => {
                 self.start_orchestrated_file_scan(engine, target)
@@ -1176,6 +1245,9 @@ impl AppState {
                 self.start_orchestrated_folder_scan(engine, target)
             }
             "folder" => self.start_folder_scan(engine, target),
+            "full" if self.orchestrator_full_scan_enabled => {
+                self.start_orchestrated_full_scan(engine)
+            }
             "full" => self.start_full_scan(engine),
             "startup" => self.start_startup_scan(engine),
             _ => ScanStartResponse {
@@ -2180,6 +2252,110 @@ impl AppState {
     }
 
     // ═══════════════════════════════════════════════════════
+    //  scan.start type="full" — orchestrator-routed
+    // ═══════════════════════════════════════════════════════
+
+    fn start_orchestrated_full_scan(
+        self: &Arc<Self>,
+        engine: Arc<ClamEngine>,
+    ) -> ScanStartResponse {
+        let id = Uuid::new_v4();
+        let now = chrono::Utc::now().timestamp();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let token = crate::orchestrator::CancellationToken::from_flag(Arc::clone(&cancel_flag));
+
+        let live = Arc::new(ScanLiveState {
+            id: id.to_string(),
+            kind: "full".into(),
+            started_at: now,
+            files_total: AtomicU64::new(0),
+            files_scanned: AtomicU64::new(0),
+            threats_found: AtomicU64::new(0),
+            cancel_flag: Arc::clone(&cancel_flag),
+            status: std::sync::atomic::AtomicU8::new(0), // queued
+            current_path: Mutex::new("Enumerating drives...".into()),
+        });
+
+        {
+            *self.scan_live.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&live));
+            let mut inner = self.lock_inner();
+            inner.active_scan = Some(ScanJob {
+                id,
+                kind: "full".into(),
+                status: ScanJobStatus::Pending,
+                started_at: now,
+                finished_at: None,
+                files_scanned: 0,
+                files_total: 0,
+                threats_found: 0,
+                current_path: "Queued: full disk scan".into(),
+                detections: Vec::new(),
+                errors: Vec::new(),
+                cancel_flag: Arc::clone(&cancel_flag),
+                perf_summary: ScanPerformanceSummary::default(),
+                live: Some(Arc::clone(&live)),
+            });
+        }
+
+        self.log_activity(
+            "info",
+            "scan",
+            "Full disk scan queued (orchestrated)",
+            "",
+            None,
+        );
+
+        let state = Arc::clone(self);
+        let live_ref = Arc::clone(&live);
+        let submit_result = self.orchestrator.submit(
+            crate::orchestrator::QueueKind::Manual,
+            token.clone(),
+            move |_token| {
+                use crate::targeting::{
+                    TargetConfig, TargetProvider, dedup, full_disk::FullDiskTargets,
+                };
+                let config = TargetConfig {
+                    full_scan_fixed_drives: true,
+                    full_scan_max_depth: 15,
+                    ..TargetConfig::default()
+                };
+                let targets = dedup::deduplicate(FullDiskTargets.collect(&config));
+                tracing::info!(
+                    drives = targets.len(),
+                    "orchestrated full disk scan starting"
+                );
+                let cancel = Arc::clone(&live_ref.cancel_flag);
+                folder_scan_worker_inner(
+                    state,
+                    id,
+                    engine,
+                    cancel,
+                    targets,
+                    "full",
+                    Some(live_ref),
+                );
+            },
+        );
+
+        if let Err(e) = submit_result {
+            tracing::error!(%e, "orchestrator full scan submit failed");
+            return ScanStartResponse {
+                job_id: id.to_string(),
+                status: "error".into(),
+                result: None,
+                error: Some(e),
+            };
+        }
+
+        ScanStartResponse {
+            job_id: id.to_string(),
+            status: "queued".into(),
+            result: None,
+            error: None,
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════
     //  scan.start type="startup" — autorun + recent executables
     // ═══════════════════════════════════════════════════════
 
@@ -2440,7 +2616,7 @@ impl AppState {
         virus_name: &str,
         scan_id: &str,
     ) -> Result<crate::quarantine::QuarantineResult, String> {
-        let vault_dir = std::path::PathBuf::from("runtime/quarantine");
+        let vault_dir = crate::paths::paths().quarantine_dir();
         std::fs::create_dir_all(&vault_dir).map_err(|e| format!("Cannot create vault dir: {e}"))?;
 
         let prepared = crate::quarantine::prepare_quarantine_file(
@@ -2504,6 +2680,30 @@ impl AppState {
         Ok(path)
     }
 
+    pub fn quarantine_restore_as(&self, id: &str, dest: &str) -> Result<String, String> {
+        let item = {
+            let db_guard = self.db.lock().map_err(|e| format!("DB lock: {e}"))?;
+            let db = db_guard.as_ref().ok_or("Database not available")?;
+            db.get_quarantine_item(id)
+                .ok_or_else(|| format!("Not found: {id}"))?
+        };
+        let dest_path = std::path::Path::new(dest);
+        let path = crate::quarantine::restore_file_as(&item, dest_path)?;
+        {
+            let db_guard = self.db.lock().map_err(|e| format!("DB lock: {e}"))?;
+            let db = db_guard.as_ref().ok_or("Database not available")?;
+            db.update_quarantine_status(id, "restored");
+        }
+        self.log_activity(
+            "warning",
+            "quarantine",
+            "File restored to alternate path",
+            &path,
+            None,
+        );
+        Ok(path)
+    }
+
     pub fn quarantine_delete(&self, id: &str) -> Result<(), String> {
         let item = {
             let db_guard = self.db.lock().map_err(|e| format!("DB lock: {e}"))?;
@@ -2552,15 +2752,57 @@ impl AppState {
     }
 
     /// Reload the ClamAV engine after a signature update.
-    /// Creates a new engine, loads new sigs, compiles, then swaps atomically.
-    /// If reload fails, the old engine stays active.
+    ///
+    /// State machine: idle → loading → ready/failed
+    /// Rejects concurrent reloads. Drops old engine before loading new one
+    /// to prevent 2× memory spike.
+    pub fn is_engine_reloading(&self) -> bool {
+        ENGINE_RELOAD_IN_PROGRESS.load(Ordering::Relaxed)
+    }
+
     pub fn reload_engine(&self) -> Result<u64, String> {
+        self.activity_tracker.record_reload();
+        let reload_in_progress = &ENGINE_RELOAD_IN_PROGRESS;
+        if reload_in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err("engine reload already in progress".into());
+        }
+
+        let reload_start = std::time::Instant::now();
+
+        let result = self.reload_engine_inner();
+
+        let reload_ms = reload_start.elapsed().as_millis();
+        match &result {
+            Ok(sigs) => tracing::info!(reload_ms, sigs, "engine reload complete"),
+            Err(e) => tracing::error!(reload_ms, error = e.as_str(), "engine reload failed"),
+        }
+
+        reload_in_progress.store(false, Ordering::SeqCst);
+        result
+    }
+
+    fn reload_engine_inner(&self) -> Result<u64, String> {
         let (dll_dir, db_dir) = match (&self.dll_dir, &self.db_dir) {
             (Some(d), Some(db)) => (d, db),
             _ => return Err("DLL or DB directory not configured".into()),
         };
 
         tracing::info!("reloading ClamAV engine...");
+
+        // Drop the old engine BEFORE loading the new one.
+        // Without this, both engines coexist briefly → 2× memory (~2 GB).
+        // With file-backed mpool, this prevents creating 2 cache files simultaneously.
+        {
+            let mut engine_guard = self.write_engine();
+            if let Some(old) = engine_guard.take() {
+                drop(old);
+                tracing::debug!("old engine freed before reload");
+            }
+        }
+
         match ClamEngine::load(dll_dir, db_dir) {
             Ok(new_engine) => {
                 let sigs = new_engine.signature_count() as u64;
@@ -2575,12 +2817,10 @@ impl AppState {
                     "",
                     None,
                 );
-                tracing::info!(sigs, "engine reloaded successfully");
-                // Invalidate scan cache — new signatures may detect previously-clean files.
                 Ok(sigs)
             }
             Err(e) => {
-                tracing::error!(%e, "engine reload failed — keeping old engine");
+                tracing::error!(%e, "engine reload failed");
                 self.log_activity("warning", "engine", "Engine reload failed", &e, None);
                 Err(e)
             }
@@ -2787,6 +3027,9 @@ impl AppState {
     /// Start a signature update in the background.
     /// Returns immediately so the IPC handler is NOT blocked.
     pub fn start_update(self: &Arc<Self>) -> serde_json::Value {
+        // Record update activity — blocks quiet re-trim.
+        self.activity_tracker.record_update();
+
         // Prevent concurrent updates.
         {
             let mut inner = self.lock_inner();
@@ -2807,26 +3050,21 @@ impl AppState {
 
         // Find freshclam + config BEFORE spawning thread (cheap filesystem lookups).
         let freshclam = crate::updater::find_freshclam();
+        let p = crate::paths::paths();
+        let primary_conf = p.freshclam_config();
         let config_candidates = [
-            std::path::PathBuf::from("runtime/config/freshclam.conf"),
+            primary_conf.clone(),
             std::path::PathBuf::from(r"C:\ProgramData\Sentinella\config\freshclam.conf"),
             std::env::current_exe()
                 .ok()
-                .and_then(|p| {
-                    p.parent()
-                        .map(|d| d.join("../../../runtime/config/freshclam.conf"))
-                })
-                .unwrap_or_default(),
-            std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.join("config/freshclam.conf")))
+                .and_then(|exe| exe.parent().map(|d| d.join("config/freshclam.conf")))
                 .unwrap_or_default(),
         ];
         let config_path = config_candidates
             .iter()
-            .find(|p| p.exists())
+            .find(|cp| cp.exists())
             .cloned()
-            .unwrap_or_else(|| std::path::PathBuf::from("runtime/config/freshclam.conf"));
+            .unwrap_or(primary_conf);
 
         let fc_path = match freshclam {
             Some(p) if config_path.exists() => p,
@@ -2846,7 +3084,7 @@ impl AppState {
 
         // Spawn the heavy work on a background thread so IPC stays responsive.
         let state = Arc::clone(self);
-        let db_dir = std::path::PathBuf::from("runtime/signatures");
+        let db_dir = crate::paths::paths().signatures_dir();
         std::thread::spawn(move || {
             // Phase 1: Checking for updates.
             {
@@ -2915,10 +3153,7 @@ impl AppState {
                     inner.update_phase = UpdatePhase::ReloadingArgus;
                 }
                 {
-                    let yara_dirs = vec![
-                        std::path::PathBuf::from("runtime/argus/rules/yara"),
-                        std::path::PathBuf::from("runtime/rules"),
-                    ];
+                    let yara_dirs = crate::paths::paths().yara_rule_dirs();
                     match state.argus().yara.load_rules_on_large_stack(&yara_dirs) {
                         Ok(count) => {
                             tracing::info!(count, "ARGUS YARA rules reloaded after update");
@@ -2928,13 +3163,9 @@ impl AppState {
                         }
                     }
                     // Reload IOC hashes.
-                    let ioc_paths = [
-                        std::path::PathBuf::from("runtime/rules/ioc_hashes.txt"),
-                        std::path::PathBuf::from("runtime/argus/rules/ioc/ioc_hashes.txt"),
-                    ];
-                    for p in &ioc_paths {
-                        if p.exists() {
-                            if let Ok(c) = state.argus().ioc.load_from_file(p) {
+                    for ip in &crate::paths::paths().ioc_hash_paths() {
+                        if ip.exists() {
+                            if let Ok(c) = state.argus().ioc.load_from_file(ip) {
                                 tracing::info!(count = c, "IOC hashes reloaded after update");
                                 break;
                             }
@@ -3235,9 +3466,24 @@ impl AppState {
                 obj.insert("mode".into(), serde_json::json!(format!("{:?}", plm.mode)));
                 #[cfg(target_os = "windows")]
                 if let Some(ref etw_d) = plm.etw_diagnostics {
-                    obj.insert("etw_events".into(), serde_json::json!(etw_d.events_seen.load(std::sync::atomic::Ordering::Relaxed)));
-                    obj.insert("etw_running".into(), serde_json::json!(etw_d.etw_running.load(std::sync::atomic::Ordering::Relaxed)));
-                    obj.insert("etw_reconnects".into(), serde_json::json!(etw_d.reconnects.load(std::sync::atomic::Ordering::Relaxed)));
+                    obj.insert(
+                        "etw_events".into(),
+                        serde_json::json!(
+                            etw_d.events_seen.load(std::sync::atomic::Ordering::Relaxed)
+                        ),
+                    );
+                    obj.insert(
+                        "etw_running".into(),
+                        serde_json::json!(
+                            etw_d.etw_running.load(std::sync::atomic::Ordering::Relaxed)
+                        ),
+                    );
+                    obj.insert(
+                        "etw_reconnects".into(),
+                        serde_json::json!(
+                            etw_d.reconnects.load(std::sync::atomic::Ordering::Relaxed)
+                        ),
+                    );
                 }
             }
             d
@@ -3245,7 +3491,9 @@ impl AppState {
             serde_json::json!({"enabled": false})
         };
         let ps_diag = self.ps_bridge_diagnostics();
-        let trust_diag = self.trust_graph.as_ref()
+        let trust_diag = self
+            .trust_graph
+            .as_ref()
             .map(|tg| tg.diagnostics())
             .unwrap_or(serde_json::json!({"enabled": false}));
         serde_json::json!({
@@ -3493,7 +3741,7 @@ impl AppState {
                         argus_score,
                         "auto memory scan: suspicious process is running"
                     );
-                    let result = crate::memory_scanner::scan_process(proc.pid, self.argus());
+                    let result = crate::memory_scanner::scan_process_simple(proc.pid, self.argus());
                     let severity = if result.findings.is_empty() {
                         "info"
                     } else {
@@ -3617,7 +3865,9 @@ fn startup_critical_scan(
     // Set thread priority to BELOW_NORMAL — never compete with realtime or user scans.
     #[cfg(target_os = "windows")]
     {
-        use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
+        use windows::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+        };
         unsafe {
             let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         }
@@ -3645,13 +3895,20 @@ fn startup_critical_scan(
         if let Ok(entries) = std::fs::read_dir(&temp_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if !path.is_file() { continue; }
+                if !path.is_file() {
+                    continue;
+                }
                 if let Some(ext) = path.extension() {
                     let el = ext.to_string_lossy().to_lowercase();
-                    if !matches!(el.as_str(), "exe" | "scr" | "bat" | "cmd" | "ps1" | "vbs" | "msi") {
+                    if !matches!(
+                        el.as_str(),
+                        "exe" | "scr" | "bat" | "cmd" | "ps1" | "vbs" | "msi"
+                    ) {
                         continue;
                     }
-                } else { continue; }
+                } else {
+                    continue;
+                }
                 if let Ok(meta) = path.metadata() {
                     if let Ok(mtime) = meta.modified() {
                         if mtime >= cutoff {
@@ -3670,24 +3927,47 @@ fn startup_critical_scan(
     // Filter out Sentinella's own files and cached-clean files.
     let daemon_config = crate::config::Config::load(None).unwrap_or_default();
     targets.retain(|path| {
-        if crate::scan::is_sentinella_path(path) { return false; }
-        if crate::scan::is_excluded(path, &daemon_config.excluded_paths, &daemon_config.excluded_extensions) { return false; }
+        if crate::scan::is_sentinella_path(path) {
+            return false;
+        }
+        if crate::scan::is_excluded(
+            path,
+            &daemon_config.excluded_paths,
+            &daemon_config.excluded_extensions,
+        ) {
+            return false;
+        }
         if let Ok(meta) = path.metadata() {
-            if let Some(true) = cache.check_with_metadata(path, &meta) { return false; }
+            if let Some(true) = cache.check_with_metadata(path, &meta) {
+                return false;
+            }
         }
         true
     });
 
     if targets.is_empty() {
         info!("startup critical scan: all targets cached clean — nothing to do");
-        state.log_activity("info", "system", "Startup check: all clear", "Critical areas verified", None);
+        state.log_activity(
+            "info",
+            "system",
+            "Startup check: all clear",
+            "Critical areas verified",
+            None,
+        );
         return;
     }
 
-    info!(files = targets.len(), "startup critical scan: scanning critical areas");
+    info!(
+        files = targets.len(),
+        "startup critical scan: scanning critical areas"
+    );
     state.log_activity(
-        "info", "system",
-        &format!("Performing startup protection verification... ({} files)", targets.len()),
+        "info",
+        "system",
+        &format!(
+            "Performing startup protection verification... ({} files)",
+            targets.len()
+        ),
         "Post-boot critical areas check",
         None,
     );
@@ -3699,17 +3979,27 @@ fn startup_critical_scan(
     for path in &targets {
         // Yield under memory pressure.
         let pressure = state.update_pressure();
-        if matches!(pressure, crate::footprint::pressure::PressureState::Warning | crate::footprint::pressure::PressureState::Critical) {
+        if matches!(
+            pressure,
+            crate::footprint::pressure::PressureState::Warning
+                | crate::footprint::pressure::PressureState::Critical
+        ) {
             debug!("startup critical scan: pausing for memory pressure");
             std::thread::sleep(std::time::Duration::from_secs(10));
             continue; // Skip this file, will catch it on idle scan later.
         }
 
         // Check file still exists and is readable.
-        if !path.exists() || !path.is_file() { continue; }
+        if !path.exists() || !path.is_file() {
+            continue;
+        }
         if let Ok(meta) = path.metadata() {
-            if meta.len() > 100 * 1024 * 1024 { continue; } // Skip >100MB.
-            if meta.len() == 0 { continue; }
+            if meta.len() > 100 * 1024 * 1024 {
+                continue;
+            } // Skip >100MB.
+            if meta.len() == 0 {
+                continue;
+            }
         }
 
         // ClamAV signature scan.
@@ -3794,83 +4084,93 @@ fn folder_scan_worker_inner(
 
     info!(job = %job_id, dirs = targets.len(), mode = scan_type_name, "scan worker started");
 
-    // Collect files. Quick scan skips build caches/node_modules for speed;
-    // full/folder scans collect everything.
-    let mut files: Vec<PathBuf> = Vec::new();
+    // Streaming traversal: a producer thread walks directories and feeds paths
+    // into a bounded channel. Workers pull from the channel. This avoids
+    // pre-collecting millions of PathBufs into a Vec for full-disk scans.
     let max_depth = if is_quick { 3 } else { 10 };
     let config = crate::config::Config::load(None).unwrap_or_default();
-    for dir in &targets {
-        collect_files(
-            dir,
-            &mut files,
-            max_depth,
-            &cancel,
-            is_quick,
-            &config.excluded_paths,
-            &config.excluded_extensions,
-        );
-        if cancel.load(Ordering::Relaxed) {
-            break;
-        }
-    }
+    let orchestrated_scan = existing_live.is_some();
+    let target_summary = targets
+        .iter()
+        .map(|path| path.to_string_lossy().to_string())
+        .collect::<Vec<_>>()
+        .join(";");
 
-    let total_files = files.len() as u64;
-    info!(job = %job_id, files = total_files, "file collection complete, scanning");
+    // Bounded file channel: limits memory to ~4096 PathBufs in flight.
+    let (file_tx, file_rx) = std::sync::mpsc::sync_channel::<PathBuf>(4096);
+    let file_rx = Arc::new(Mutex::new(file_rx));
 
-    // Use existing live state (orchestrated path) or create new (legacy path).
+    // files_discovered counter — updated by producer, read by live state.
+    let files_discovered = Arc::new(AtomicU64::new(0));
+
+    // Create live state immediately (before collection starts).
     let live = if let Some(existing) = existing_live {
-        // Orchestrated: reuse caller's live state, update files_total.
-        existing.files_total.store(total_files, Ordering::Relaxed);
+        existing.files_total.store(0, Ordering::Relaxed);
         existing.set_status(ScanJobStatus::Running);
         existing
     } else {
-        // Legacy: create fresh live state.
         let live = Arc::new(ScanLiveState {
             id: job_id.to_string(),
             kind: scan_type.clone(),
             started_at: chrono::Utc::now().timestamp(),
-            files_total: AtomicU64::new(total_files),
+            files_total: AtomicU64::new(0),
             files_scanned: AtomicU64::new(0),
             threats_found: AtomicU64::new(0),
             cancel_flag: Arc::clone(&cancel),
-            status: std::sync::atomic::AtomicU8::new(1), // Running
-            current_path: Mutex::new("Starting...".into()),
+            status: std::sync::atomic::AtomicU8::new(1),
+            current_path: Mutex::new("Scanning...".into()),
         });
         *state.scan_live.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&live));
         live
     };
 
-    // Set total in the job for progress tracking.
     {
         let mut inner = state.lock_inner();
         if let Some(ref mut job) = inner.active_scan {
-            job.files_total = total_files;
             job.live = Some(Arc::clone(&live));
         }
     }
 
-    // ── Multi-threaded scan pipeline ──────────────────────────
-    // ClamAV's compiled engine is thread-safe (read-only after compile).
-    // ARGUS engine is also thread-safe (stateless + atomic counters).
-    // We use a channel to collect results from worker threads.
+    // Producer thread: walks directories, sends paths into bounded channel.
+    let producer_cancel = Arc::clone(&cancel);
+    let producer_discovered = Arc::clone(&files_discovered);
+    let producer_live = Arc::clone(&live);
+    let excluded_paths = config.excluded_paths.clone();
+    let excluded_extensions = config.excluded_extensions.clone();
+    let producer = std::thread::spawn(move || {
+        for dir in &targets {
+            if producer_cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            collect_files_streaming(
+                dir,
+                &file_tx,
+                max_depth,
+                &producer_cancel,
+                is_quick,
+                &excluded_paths,
+                &excluded_extensions,
+                &producer_discovered,
+                &producer_live,
+            );
+        }
+        // file_tx dropped here → workers see channel closed.
+    });
 
+    // ── Multi-threaded scan pipeline ──────────────────────────
     use std::sync::mpsc;
 
-    // Result messages from scan workers.
     enum ScanMsg {
-        Progress(String), // current file path
+        Progress(String),
         Threat(Detection, argus::ArgusVerdict),
-        ArgusOnly(argus::ArgusVerdict), // findings but not a threat
+        ArgusOnly(argus::ArgusVerdict),
         Error(String),
         Done,
     }
 
     let (tx, rx) = mpsc::channel::<ScanMsg>();
-    let num_threads = SCAN_THREADS.min(files.len());
-    let files = Arc::new(files);
-    let next_file = Arc::new(AtomicUsize::new(0));
+    let num_threads = SCAN_THREADS;
 
-    // Spawn scan workers.
     let mut handles = Vec::new();
     for _ in 0..num_threads {
         let eng = Arc::clone(&engine);
@@ -3878,8 +4178,7 @@ fn folder_scan_worker_inner(
         let cancel_ref = Arc::clone(&cancel);
         let live_w = Arc::clone(&live);
         let tx_ref = tx.clone();
-        let files_ref = Arc::clone(&files);
-        let next_ref = Arc::clone(&next_file);
+        let file_rx_ref = Arc::clone(&file_rx);
         let scan_type_w = scan_type.clone();
 
         handles.push(std::thread::spawn(move || {
@@ -3887,11 +4186,15 @@ fn folder_scan_worker_inner(
                 if cancel_ref.load(Ordering::Relaxed) {
                     break;
                 }
-                let idx = next_ref.fetch_add(1, Ordering::Relaxed);
-                if idx >= files_ref.len() {
-                    break;
-                }
-                let file = &files_ref[idx];
+                // Pull next file from the streaming channel.
+                let file = {
+                    let rx = file_rx_ref.lock().unwrap_or_else(|e| e.into_inner());
+                    match rx.recv() {
+                        Ok(f) => f,
+                        Err(_) => break, // Channel closed — producer done.
+                    }
+                };
+                let file = &file;
 
                 let _ = tx_ref.send(ScanMsg::Progress(file.to_string_lossy().to_string()));
 
@@ -4008,6 +4311,11 @@ fn folder_scan_worker_inner(
                     }
                 }
 
+                // ── ConvergenceLedger: single source of truth for post-ARGUS scoring ──
+                // ARCH-1 fix: all post-ARGUS additions go through the ledger.
+                // ARCH-2 fix: explanation recomputed from final state.
+                let mut ledger = crate::convergence::ConvergenceLedger::new(&argus_verdict, result.infected);
+
                 // ── ADS content scan (ASTRA, profile-aware) ───
                 if !tracker.is_expired() {
                     let ads_policy = crate::scan::ads::ads_policy_for_profile(&scan_profile);
@@ -4015,77 +4323,89 @@ fn folder_scan_worker_inner(
                     let filtered = crate::scan::ads::filter_streams(streams, ads_policy);
                     for stream in &filtered {
                         if tracker.is_expired() { break; }
-                        // Real content scan — feed ADS content to ARGUS.
                         let ads_result = crate::scan::ads::scan_ads_content(stream, state_ref.argus());
                         for finding in ads_result.content_findings {
-                            argus_verdict.score = argus_verdict.score.saturating_add(finding.weight).min(100);
-                            argus_verdict.findings.push(finding);
+                            ledger.add_evidence("ADS", finding);
                         }
-                    }
-                    if !filtered.is_empty() {
-                        argus_verdict.verdict = argus::verdict::Verdict::from_score(argus_verdict.score);
                     }
                 }
 
                 // ── Persistence intelligence ───────────────
                 if let Some(ptype) = crate::persistence::check_persistence_context(file) {
                     let finding = crate::persistence::persistence_finding(ptype, file, false);
-                    argus_verdict.score = argus_verdict.score.saturating_add(finding.weight).min(100);
-                    argus_verdict.findings.push(finding);
-                    argus_verdict.verdict = argus::verdict::Verdict::from_score(argus_verdict.score);
+                    ledger.add_evidence("Persistence", finding);
                 }
 
                 // ── PLM lineage correlation ──────────────
                 if let Some(ref plm) = state_ref.plm {
                     if let Some(chain) = plm.query_by_image_path(file) {
                         if let Some(finding) = crate::plm::lineage_finding(&chain) {
-                            argus_verdict.score = argus_verdict.score.saturating_add(finding.weight).min(100);
-                            argus_verdict.findings.push(finding);
-                            argus_verdict.verdict = argus::verdict::Verdict::from_score(argus_verdict.score);
+                            ledger.add_evidence("PLM", finding);
                         }
                     }
                 }
 
-                // ── Trust graph: observe + confidence shaping ──
+                // ── Trust graph: query discount (H7 fix: observe deferred to clean only) ──
+                let mut drift_esc: u32 = 0;
                 if let Some(ref tg) = state_ref.trust_graph {
                     let file_key = file.to_string_lossy().to_lowercase();
-                    // Observe this file (builds familiarity over time).
-                    tg.observe(&file_key, crate::trust_graph::TrustNodeKind::Executable, None);
-                    // Query trust level for confidence adjustment.
+                    // Query existing trust for discount — do NOT observe yet.
                     let trust_q = tg.query(&file_key);
-                    if trust_q.confidence_discount > 0 && argus_verdict.score > 0 {
-                        // Trust discount: reduce score for familiar entities.
-                        // NEVER below 0, NEVER suppresses ClamAV positives.
-                        if !result.infected {
-                            argus_verdict.score = argus_verdict.score.saturating_sub(trust_q.confidence_discount);
-                            argus_verdict.verdict = argus::verdict::Verdict::from_score(argus_verdict.score);
-                        }
-                        if let Some(finding) = crate::trust_graph::trust_finding(&trust_q) {
-                            argus_verdict.findings.push(finding);
+                    if trust_q.confidence_discount > 0 {
+                        let trust_finding = crate::trust_graph::trust_finding(&trust_q);
+                        ledger.apply_trust_discount(trust_q.confidence_discount, trust_finding);
+                    }
+                    for f in &ledger.findings {
+                        if f.description.to_lowercase().contains("drift") {
+                            drift_esc += f.weight;
                         }
                     }
                 }
 
                 // ── Ecosystem convergence ─────────────────
-                // Feed evidence from all sources into ecosystem tracker.
-                if argus_verdict.score > 0 {
+                let mut eco_esc: u32 = 0;
+                let mut recurrence_bonus: u32 = 0;
+                if ledger.base_score > 0 {
                     let file_key = file.to_string_lossy().to_string();
-                    // ARGUS findings.
-                    if !argus_verdict.findings.is_empty() {
+                    if !ledger.findings.is_empty() {
                         state_ref.ecosystem.add_evidence(&file_key, crate::ecosystem::EcosystemEvidence {
                             source: crate::ecosystem::EvidenceSource::Argus,
                             timestamp: chrono::Utc::now().timestamp(),
-                            description: format!("{} findings, score {}", argus_verdict.findings.len(), argus_verdict.score),
-                            weight: (argus_verdict.score / 10).min(10),
+                            description: format!("{} findings, score {}", ledger.findings.len(), ledger.base_score),
+                            weight: (ledger.base_score / 10).min(10),
                         });
                     }
-                    // Check if ecosystem has reached escalation threshold.
                     if let Some(eco) = state_ref.ecosystem.get(&file_key) {
+                        eco_esc = eco.escalation;
+                        recurrence_bonus = eco.recurrence_count.min(4) * 2;
                         if let Some(finding) = crate::ecosystem::ecosystem_finding(&eco) {
-                            argus_verdict.score = argus_verdict.score.saturating_add(finding.weight).min(100);
-                            argus_verdict.findings.push(finding);
-                            argus_verdict.verdict = argus::verdict::Verdict::from_score(argus_verdict.score);
+                            ledger.add_evidence("Ecosystem", finding);
                         }
+                    }
+                }
+
+                // ── Finalize convergence: apply caps, recompute explanation ──
+                let (final_score, final_verdict, _) = ledger.finalize();
+                argus_verdict.score = final_score;
+                argus_verdict.verdict = final_verdict;
+                argus_verdict.findings = ledger.findings.clone();
+                // ARCH-H3 fix: patch explanation to reflect post-ARGUS adjustments.
+                ledger.patch_explanation(&mut argus_verdict.explanation, final_score);
+
+                // Store convergence attribution.
+                if ledger.base_score > 0 {
+                    let file_key = file.to_string_lossy().to_string();
+                    state_ref.ecosystem.set_attribution(
+                        &file_key,
+                        ledger.attribution(final_score, drift_esc, eco_esc, recurrence_bonus),
+                    );
+                }
+
+                // H7 fix: deferred trust observation — only clean files build familiarity.
+                if final_score == 0 && !result.infected {
+                    if let Some(ref tg) = state_ref.trust_graph {
+                        let file_key = file.to_string_lossy().to_lowercase();
+                        tg.observe(&file_key, crate::trust_graph::TrustNodeKind::Executable, None);
                     }
                 }
 
@@ -4181,6 +4501,18 @@ fn folder_scan_worker_inner(
     for h in handles {
         let _ = h.join();
     }
+    // Wait for producer to finish.
+    let _ = producer.join();
+
+    // Set final file total from producer's count.
+    let total_discovered = files_discovered.load(Ordering::Relaxed);
+    live.files_total.store(total_discovered, Ordering::Relaxed);
+    {
+        let mut inner = state.lock_inner();
+        if let Some(ref mut job) = inner.active_scan {
+            job.files_total = total_discovered;
+        }
+    }
 
     let scanned = live.files_scanned.load(Ordering::Relaxed);
     let threats = live.threats_found.load(Ordering::Relaxed);
@@ -4190,6 +4522,9 @@ fn folder_scan_worker_inner(
     } else {
         ScanJobStatus::Completed
     });
+    if let Ok(mut path) = live.current_path.lock() {
+        path.clear();
+    }
 
     // Finalize.
     let finished = chrono::Utc::now().timestamp();
@@ -4202,6 +4537,44 @@ fn folder_scan_worker_inner(
     } else {
         "clean"
     };
+
+    if orchestrated_scan {
+        if cancelled {
+            state
+                .orchestrated_cancelled_jobs
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            match scan_type.as_str() {
+                "full" => {
+                    state
+                        .orchestrated_completed_full
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                "folder" => {
+                    state
+                        .orchestrated_completed_folder
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                "quick" => {
+                    state
+                        .orchestrated_completed_quick
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                _ => {}
+            }
+        }
+        *state
+            .last_orchestrated_job
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(OrchestratedJobResult {
+            id: scan_id_str.clone(),
+            path: target_summary,
+            verdict: Some(status_str.to_string()),
+            status: status_str.to_string(),
+            duration_ms: ((finished - live.started_at).max(0) as u64) * 1000,
+            error: None,
+        });
+    }
 
     // Log performance summary.
     {
@@ -4326,6 +4699,7 @@ fn folder_scan_worker_inner(
 }
 
 /// Recursively collect files from a directory, respecting depth limit.
+#[allow(dead_code)]
 fn collect_files(
     dir: &Path,
     out: &mut Vec<PathBuf>,
@@ -4386,6 +4760,93 @@ fn collect_files(
                 continue;
             }
             out.push(path);
+        }
+    }
+}
+
+/// Streaming variant of collect_files: sends paths into a bounded channel
+/// instead of accumulating in a Vec. This keeps memory bounded for full-disk scans.
+fn collect_files_streaming(
+    dir: &Path,
+    tx: &std::sync::mpsc::SyncSender<PathBuf>,
+    max_depth: u32,
+    cancel: &AtomicBool,
+    quick_mode: bool,
+    excluded_paths: &[String],
+    excluded_extensions: &[String],
+    discovered: &AtomicU64,
+    live: &ScanLiveState,
+) {
+    if max_depth == 0 || cancel.load(Ordering::Relaxed) {
+        return;
+    }
+
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    for entry in entries {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+
+        if path.is_symlink() {
+            continue;
+        }
+        if crate::scan::is_excluded(&path, excluded_paths, excluded_extensions) {
+            continue;
+        }
+
+        if path.is_dir() {
+            if crate::scan::should_skip_dir(&path, quick_mode) {
+                continue;
+            }
+            if crate::scan::is_sentinella_path(&path) {
+                continue;
+            }
+            collect_files_streaming(
+                &path,
+                tx,
+                max_depth - 1,
+                cancel,
+                quick_mode,
+                excluded_paths,
+                excluded_extensions,
+                discovered,
+                live,
+            );
+        } else if path.is_file() {
+            if crate::scan::should_skip_file(&path) {
+                continue;
+            }
+            if crate::scan::is_sentinella_path(&path) {
+                continue;
+            }
+            let count = discovered.fetch_add(1, Ordering::Relaxed) + 1;
+            // Update live total periodically (every 1000 files) to show progress.
+            if count % 1000 == 0 {
+                live.files_total.store(count, Ordering::Relaxed);
+            }
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                match tx.try_send(path.clone()) {
+                    Ok(()) => break,
+                    Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                        return; // Workers gone — stop traversal.
+                    }
+                }
+            }
         }
     }
 }
@@ -4919,6 +5380,8 @@ mod tests {
 
     #[test]
     fn max_file_size_returns_config_not_hardcoded() {
+        // PathManager must be initialized for Config::load(None).
+        crate::paths::init_auto();
         // Without a config file present in test environment, max_file_size()
         // should fall back to DEFAULT_MAX_FILE_SIZE (512 MB).
         let size = max_file_size();

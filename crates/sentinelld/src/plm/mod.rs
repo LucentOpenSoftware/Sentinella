@@ -82,10 +82,19 @@ impl LineageGraph {
     pub fn record_process(&self, node: ProcessNode) {
         let mut map = self.nodes.lock().unwrap_or_else(|e| e.into_inner());
 
-        // Evict expired entries if at capacity.
+        // ARCH-6 fix: strict cap. Evict expired first, then oldest if still full.
         if map.len() >= MAX_NODES {
             let now = Instant::now();
             map.retain(|_, n| now.duration_since(n.created_at) < NODE_TTL);
+
+            // If still at capacity after TTL eviction (all nodes fresh), remove oldest.
+            while map.len() >= MAX_NODES {
+                if let Some(oldest_pid) = map.values().min_by_key(|n| n.timestamp).map(|n| n.pid) {
+                    map.remove(&oldest_pid);
+                } else {
+                    break;
+                }
+            }
         }
 
         map.insert(node.pid, node);
@@ -196,11 +205,17 @@ fn transition_weight(parent: &str, child: &str) -> u32 {
 }
 
 fn is_office_app(name: &str) -> bool {
-    matches!(name, "winword.exe" | "excel.exe" | "powerpnt.exe" | "outlook.exe" | "msaccess.exe")
+    matches!(
+        name,
+        "winword.exe" | "excel.exe" | "powerpnt.exe" | "outlook.exe" | "msaccess.exe"
+    )
 }
 
 fn is_script_engine(name: &str) -> bool {
-    matches!(name, "powershell.exe" | "pwsh.exe" | "cscript.exe" | "wscript.exe" | "mshta.exe" | "cmd.exe")
+    matches!(
+        name,
+        "powershell.exe" | "pwsh.exe" | "cscript.exe" | "wscript.exe" | "mshta.exe" | "cmd.exe"
+    )
 }
 
 fn is_shell(name: &str) -> bool {
@@ -208,18 +223,36 @@ fn is_shell(name: &str) -> bool {
 }
 
 fn is_lolbin(name: &str) -> bool {
-    matches!(name,
-        "rundll32.exe" | "regsvr32.exe" | "mshta.exe" | "certutil.exe"
-        | "bitsadmin.exe" | "msiexec.exe" | "wmic.exe" | "cmstp.exe"
-        | "installutil.exe" | "msbuild.exe" | "forfiles.exe"
+    matches!(
+        name,
+        "rundll32.exe"
+            | "regsvr32.exe"
+            | "mshta.exe"
+            | "certutil.exe"
+            | "bitsadmin.exe"
+            | "msiexec.exe"
+            | "wmic.exe"
+            | "cmstp.exe"
+            | "installutil.exe"
+            | "msbuild.exe"
+            | "forfiles.exe"
     )
 }
 
 fn is_system_binary(name: &str) -> bool {
-    matches!(name,
-        "svchost.exe" | "csrss.exe" | "lsass.exe" | "services.exe"
-        | "winlogon.exe" | "explorer.exe" | "dwm.exe" | "taskhost.exe"
-        | "conhost.exe" | "sihost.exe" | "fontdrvhost.exe"
+    matches!(
+        name,
+        "svchost.exe"
+            | "csrss.exe"
+            | "lsass.exe"
+            | "services.exe"
+            | "winlogon.exe"
+            | "explorer.exe"
+            | "dwm.exe"
+            | "taskhost.exe"
+            | "conhost.exe"
+            | "sihost.exe"
+            | "fontdrvhost.exe"
     )
 }
 
@@ -265,8 +298,8 @@ pub fn lineage_finding(chain: &ProcessChain) -> Option<argus::Finding> {
 //  Live PLM Monitor — background process snapshot intake
 // ═══════════════════════════════════════════════════════════════
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// PLM diagnostics — atomic counters.
 pub struct PlmDiagnostics {
@@ -351,18 +384,55 @@ impl PlmMonitor {
         #[cfg(not(target_os = "windows"))]
         let mode = PlmMode::Snapshot;
 
+        // Snapshot interval: if ETW thread is alive, snapshot is supplemental (6x slower).
+        // A background monitor checks if ETW gave up and boosts snapshot frequency.
+        let snapshot_interval = Arc::new(AtomicU64::new(if mode == PlmMode::Etw {
+            interval_secs * 6
+        } else {
+            interval_secs
+        }));
+
         // Always run snapshot thread (as primary or supplemental cleanup).
         let g = Arc::clone(&graph);
         let d = Arc::clone(&diagnostics);
         let r = Arc::clone(&running);
-        let snapshot_interval = if mode == PlmMode::Etw { interval_secs * 6 } else { interval_secs };
+        let si = Arc::clone(&snapshot_interval);
 
         let snapshot_thread = std::thread::Builder::new()
             .name("plm-snapshot".into())
             .spawn(move || {
-                plm_loop(g, d, r, snapshot_interval);
+                plm_loop(g, d, r, si);
             })
             .ok();
+
+        // If ETW was attempted, spawn a tiny monitor that detects ETW giving up
+        // and boosts snapshot interval to primary frequency.
+        #[cfg(target_os = "windows")]
+        if mode == PlmMode::Etw {
+            let etw_d2 = etw_diag.clone();
+            let si2 = Arc::clone(&snapshot_interval);
+            let r2 = Arc::clone(&running);
+            let primary_interval = interval_secs;
+            std::thread::Builder::new()
+                .name("plm-etw-watchdog".into())
+                .spawn(move || {
+                    // Check every 5s if ETW gave up.
+                    while r2.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_secs(5));
+                        if let Some(ref ed) = etw_d2 {
+                            if ed.etw_gave_up.load(Ordering::Relaxed) {
+                                tracing::info!(
+                                    interval_secs = primary_interval,
+                                    "PLM: ETW gave up, boosting snapshot to primary frequency"
+                                );
+                                si2.store(primary_interval, Ordering::Relaxed);
+                                break;
+                            }
+                        }
+                    }
+                })
+                .ok();
+        }
 
         Self {
             graph,
@@ -383,17 +453,22 @@ impl PlmMonitor {
         let map = self.graph.nodes.lock().unwrap_or_else(|e| e.into_inner());
 
         // Find most recent process with matching image path.
-        let target_pid = map.values()
+        let target_pid = map
+            .values()
             .filter(|n| n.image_path.to_lowercase() == p)
             .max_by_key(|n| n.timestamp)
             .map(|n| n.pid);
         drop(map);
 
         if let Some(pid) = target_pid {
-            self.diagnostics.chains_scored.fetch_add(1, Ordering::Relaxed);
+            self.diagnostics
+                .chains_scored
+                .fetch_add(1, Ordering::Relaxed);
             let chain = self.graph.get_chain(pid);
             if chain.chain_suspicion > 0 {
-                self.diagnostics.suspicious_chains.fetch_add(1, Ordering::Relaxed);
+                self.diagnostics
+                    .suspicious_chains
+                    .fetch_add(1, Ordering::Relaxed);
             }
             Some(chain)
         } else {
@@ -417,16 +492,20 @@ fn plm_loop(
     graph: Arc<LineageGraph>,
     diagnostics: Arc<PlmDiagnostics>,
     running: Arc<AtomicBool>,
-    interval_secs: u64,
+    interval: Arc<AtomicU64>,
 ) {
-    tracing::info!("PLM monitor started (interval={}s)", interval_secs);
+    let initial = interval.load(Ordering::Relaxed);
+    tracing::info!("PLM monitor started (interval={}s)", initial);
 
     // Initial snapshot.
     snapshot_processes(&graph, &diagnostics);
 
     while running.load(Ordering::Relaxed) {
-        std::thread::sleep(Duration::from_secs(interval_secs));
-        if !running.load(Ordering::Relaxed) { break; }
+        let secs = interval.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_secs(secs));
+        if !running.load(Ordering::Relaxed) {
+            break;
+        }
 
         snapshot_processes(&graph, &diagnostics);
 
@@ -441,8 +520,8 @@ fn plm_loop(
 #[cfg(target_os = "windows")]
 fn snapshot_processes(graph: &LineageGraph, diagnostics: &PlmDiagnostics) {
     use windows::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW,
-        PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
     };
 
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
@@ -459,7 +538,9 @@ fn snapshot_processes(graph: &LineageGraph, diagnostics: &PlmDiagnostics) {
 
     let ok = unsafe { Process32FirstW(snapshot, &mut entry) };
     if ok.is_err() {
-        unsafe { let _ = windows::Win32::Foundation::CloseHandle(snapshot); }
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(snapshot);
+        }
         return;
     }
 
@@ -483,7 +564,11 @@ fn snapshot_processes(graph: &LineageGraph, diagnostics: &PlmDiagnostics) {
                     pid,
                     parent_pid: ppid,
                     image_path: exe_name.clone(),
-                    image_name: exe_name.rsplit('\\').next().unwrap_or(&exe_name).to_string(),
+                    image_name: exe_name
+                        .rsplit('\\')
+                        .next()
+                        .unwrap_or(&exe_name)
+                        .to_string(),
                     command_line: None, // ToolHelp32 doesn't provide cmdline.
                     is_signed: None,
                     integrity_level: None,
@@ -495,10 +580,14 @@ fn snapshot_processes(graph: &LineageGraph, diagnostics: &PlmDiagnostics) {
         }
 
         let ok = unsafe { Process32NextW(snapshot, &mut entry) };
-        if ok.is_err() { break; }
+        if ok.is_err() {
+            break;
+        }
     }
 
-    unsafe { let _ = windows::Win32::Foundation::CloseHandle(snapshot); }
+    unsafe {
+        let _ = windows::Win32::Foundation::CloseHandle(snapshot);
+    }
     diagnostics.events_seen.fetch_add(count, Ordering::Relaxed);
 }
 
@@ -519,7 +608,8 @@ mod tests {
 
     fn make_node(pid: u32, ppid: u32, name: &str) -> ProcessNode {
         ProcessNode {
-            pid, parent_pid: ppid,
+            pid,
+            parent_pid: ppid,
             image_path: format!("C:\\Windows\\System32\\{name}"),
             image_name: name.to_string(),
             command_line: None,
@@ -574,7 +664,10 @@ mod tests {
         graph.record_process(make_node(3, 2, "rundll32.exe"));
 
         let chain = graph.get_chain(3);
-        assert_eq!(chain.description, "winword.exe → powershell.exe → rundll32.exe");
+        assert_eq!(
+            chain.description,
+            "winword.exe → powershell.exe → rundll32.exe"
+        );
     }
 
     #[test]

@@ -103,6 +103,25 @@ pub type FnClEngineSetStr = unsafe extern "C" fn(
 pub type FnClEngineSetNum =
     unsafe extern "C" fn(engine: *mut cl_engine, field: cl_engine_field, val: i64) -> cl_error_t;
 
+/// cl_set_clcb_msg — set ClamAV message callback to intercept log output.
+/// ClamAV signature: `void cl_set_clcb_msg(clcb_msg callback)`
+/// where `clcb_msg = void (*)(enum cl_msg severity, const char *fullmsg, const char *msg, void *context)`
+pub type FnClSetClcbMsg = unsafe extern "C" fn(
+    callback: Option<
+        unsafe extern "C" fn(
+            severity: c_uint,
+            fullmsg: *const c_char,
+            msg: *const c_char,
+            context: *mut std::ffi::c_void,
+        ),
+    >,
+);
+
+/// ClamAV message severity levels.
+pub const CL_MSG_INFO_VERBOSE: c_uint = 0; // LOG_DEBUG2/LOG_INFO
+pub const CL_MSG_WARN: c_uint = 1;
+pub const CL_MSG_ERROR: c_uint = 2;
+
 /// Engine configuration fields (from clamav.h enum cl_engine_field).
 pub type cl_engine_field = c_uint;
 
@@ -128,3 +147,15 @@ pub const CL_ENGINE_MAXFILES: cl_engine_field = 3;
 
 /// CL_ENGINE_TMPDIR — override temp directory for compound file extraction.
 pub const CL_ENGINE_TMPDIR: cl_engine_field = 13;
+
+/// mpool_getstats — get memory pool statistics.
+/// ClamAV signature: `int mpool_getstats(const struct cl_engine *, size_t *used, size_t *total)`
+pub type FnMpoolGetstats =
+    unsafe extern "C" fn(engine: *const cl_engine, used: *mut usize, total: *mut usize) -> c_int;
+
+/// sentinella_mpool_set_cache_path — set file-backed mpool cache path.
+/// Only available in ClamAV builds with SENTINELLA_FILEBACKED_MPOOL.
+/// Must be called BEFORE cl_engine_new() / mpool_create().
+pub type FnSentinellaMpoolSetCachePath = unsafe extern "C" fn(
+    path: *const u16, // wchar_t* on Windows
+);

@@ -227,7 +227,7 @@ rule lsass_dump_comsvcs {
     condition:
         (($csv1 or $csv2) and any of ($mini*) and any of ($rundll*)) or
         (any of ($lsass*) and any of ($mini*) and any of ($rundll*)) or
-        (any of ($ps2, $ps3, $ps4) and any of ($lsass*)) or
+        (any of ($ps1, $ps2, $ps3, $ps4) and any of ($lsass*)) or
         (any of ($alt1, $alt2) and $alt3) or
         ($alt4 and any of ($lsass*)) or
         ($alt5 and any of ($lsass*))

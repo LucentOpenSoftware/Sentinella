@@ -17,6 +17,42 @@ use std::time::SystemTime;
 const MAX_MEMORY_ENTRIES: usize = 50_000;
 const DB_WRITE_QUEUE_CAP: usize = 4096;
 
+/// Cache integrity seed — keyed hash (not cryptographic HMAC) to detect
+/// externally injected/modified cache entries. Uses DefaultHasher (SipHash).
+/// An attacker who runs `sqlite3 scan_cache.db "UPDATE scan_cache SET clean=1"`
+/// will have entries with invalid hashes → cache miss → file rescanned.
+///
+/// Not a security boundary against adversaries with vault key access.
+/// Detects casual tampering and accidental corruption.
+static CACHE_INTEGRITY_SECRET: std::sync::OnceLock<[u8; 16]> = std::sync::OnceLock::new();
+
+/// Set the cache integrity secret (called during daemon startup).
+pub fn set_cache_integrity_secret(secret: &[u8]) {
+    let mut key = [0u8; 16];
+    for (i, byte) in secret.iter().take(16).enumerate() {
+        key[i] = *byte;
+    }
+    let _ = CACHE_INTEGRITY_SECRET.set(key);
+}
+
+/// Compute integrity hash for a cache entry.
+/// Returns a u64 hash that must match for the entry to be trusted.
+fn cache_entry_hash(path: &std::path::Path, size: u64, mtime: u64, clean: bool) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let secret = CACHE_INTEGRITY_SECRET.get().copied().unwrap_or([0u8; 16]);
+
+    let mut hasher = DefaultHasher::new();
+    secret.hash(&mut hasher);
+    path.to_string_lossy().as_ref().hash(&mut hasher);
+    size.hash(&mut hasher);
+    mtime.hash(&mut hasher);
+    clean.hash(&mut hasher);
+    secret.hash(&mut hasher); // Double-keyed.
+    hasher.finish()
+}
+
 #[derive(Debug, Clone)]
 struct CacheEntry {
     size: u64,
@@ -301,7 +337,8 @@ fn open_cache_db(path: &Path) -> Result<rusqlite::Connection, String> {
             mtime INTEGER NOT NULL,
             clean INTEGER NOT NULL,
             sig_generation INTEGER NOT NULL,
-            updated_at INTEGER NOT NULL
+            updated_at INTEGER NOT NULL,
+            integrity_hash INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS cache_meta (
             key TEXT PRIMARY KEY,
@@ -310,6 +347,12 @@ fn open_cache_db(path: &Path) -> Result<rusqlite::Connection, String> {
         CREATE INDEX IF NOT EXISTS idx_cache_gen ON scan_cache(sig_generation);",
     )
     .map_err(|e| format!("schema: {e}"))?;
+
+    // D-3 fix: add integrity_hash column if upgrading from older schema.
+    let _ = conn.execute(
+        "ALTER TABLE scan_cache ADD COLUMN integrity_hash INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
 
     Ok(conn)
 }
@@ -326,10 +369,11 @@ fn load_from_db(
         )
         .unwrap_or(1) as u64;
 
-    // Load entries for current generation (limit to MAX to prevent OOM).
+    // Load entries for current generation with integrity verification.
+    // D-3 fix: entries with invalid integrity_hash are REJECTED (cache miss).
     let mut stmt = conn
         .prepare(
-            "SELECT path, size, mtime, clean FROM scan_cache WHERE sig_generation = ?1 LIMIT ?2",
+            "SELECT path, size, mtime, clean, integrity_hash FROM scan_cache WHERE sig_generation = ?1 LIMIT ?2",
         )
         .map_err(|e| format!("prepare: {e}"))?;
 
@@ -342,6 +386,7 @@ fn load_from_db(
                     row.get::<_, i64>(1)? as u64,
                     row.get::<_, i64>(2)? as u64,
                     row.get::<_, i64>(3)? != 0,
+                    row.get::<_, i64>(4).unwrap_or(0) as u64,
                 ))
             },
         )
@@ -349,11 +394,26 @@ fn load_from_db(
 
     let mut entries = HashMap::new();
     let mut counter = 0u64;
+    let mut rejected = 0u64;
     for row in rows {
-        if let Ok((path, size, mtime, clean)) = row {
+        if let Ok((path_str, size, mtime, clean, stored_hash)) = row {
+            let path = PathBuf::from(&path_str);
+
+            // D-3 fix: verify integrity hash before trusting cache entry.
+            let expected_hash = cache_entry_hash(&path, size, mtime, clean);
+            if stored_hash != 0 && stored_hash != expected_hash {
+                // Hash mismatch → externally tampered entry → reject.
+                rejected += 1;
+                tracing::warn!(
+                    path = path_str,
+                    "scan cache: INTEGRITY MISMATCH — entry rejected (possible tampering)"
+                );
+                continue;
+            }
+
             counter += 1;
             entries.insert(
-                PathBuf::from(path),
+                path,
                 CacheEntry {
                     size,
                     mtime,
@@ -363,6 +423,13 @@ fn load_from_db(
                 },
             );
         }
+    }
+    if rejected > 0 {
+        tracing::warn!(
+            rejected,
+            "scan cache: {} entries rejected due to integrity mismatch",
+            rejected
+        );
     }
 
     Ok((entries, sgen))
@@ -390,9 +457,13 @@ fn write_to_db(
         .unwrap_or_default()
         .as_secs() as i64;
 
+    // D-3 fix: include integrity hash — externally inserted/modified entries
+    // won't have a valid hash and will be treated as cache misses.
+    let ihash = cache_entry_hash(path, size, mtime, clean) as i64;
+
     conn.execute(
-        "INSERT OR REPLACE INTO scan_cache (path, size, mtime, clean, sig_generation, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT OR REPLACE INTO scan_cache (path, size, mtime, clean, sig_generation, updated_at, integrity_hash)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         rusqlite::params![
             path.to_string_lossy().as_ref(),
             size as i64,
@@ -400,6 +471,7 @@ fn write_to_db(
             clean as i64,
             sig_generation as i64,
             now,
+            ihash,
         ],
     )
     .map_err(|e| format!("insert: {e}"))?;

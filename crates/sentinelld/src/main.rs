@@ -10,6 +10,9 @@ pub mod calibration;
 #[allow(dead_code)]
 mod clamav_worker;
 mod config;
+pub mod convergence;
+pub mod paths;
+pub mod runtime_integrity;
 // Sandbox worker is called from scan flow when config.sandbox.enabled = true.
 pub mod db;
 pub mod ecosystem;
@@ -65,6 +68,11 @@ struct Args {
     #[arg(long)]
     state_db: Option<String>,
 
+    /// Override runtime root directory (PathManager).
+    /// Default: auto-detect (dev → ./runtime, installed → ProgramData/Sentinella).
+    #[arg(long)]
+    runtime_root: Option<String>,
+
     /// Audit mode: reduced features for stability after repeated crashes.
     /// Disables idle scanner, forces external ARGUS, reduces worker count.
     #[arg(long)]
@@ -75,23 +83,20 @@ struct Args {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    // Bootstrap runtime directories — daemon creates them if missing.
-    for dir in &[
-        "runtime/logs",
-        "runtime/config",
-        "runtime/state",
-        "runtime/signatures",
-        "runtime/quarantine",
-        "runtime/rules",
-        "runtime/argus/rules/yara",
-        "runtime/argus/compiled",
-        "runtime/argus/manifests",
-    ] {
-        let _ = std::fs::create_dir_all(dir);
+    // Initialize PathManager — centralized path resolution.
+    if let Some(ref root) = args.runtime_root {
+        paths::init(std::path::PathBuf::from(root));
+    } else {
+        paths::init_auto();
+    }
+    let p = paths::paths();
+    if let Err(e) = p.ensure_dirs() {
+        eprintln!("FATAL: {e}");
+        std::process::exit(1);
     }
 
     // Initialize tracing with file + stdout output.
-    let log_dir = std::path::PathBuf::from("runtime/logs");
+    let log_dir = p.logs_dir();
 
     // Log rotation: if current log > 10 MB, rotate.
     let log_path = log_dir.join("sentinelld.log");
@@ -179,7 +184,7 @@ async fn main() -> anyhow::Result<()> {
 
     let db_dir = args.db_dir.map(PathBuf::from).or_else(|| {
         let candidates = [
-            Some(PathBuf::from("runtime/signatures")),
+            Some(p.signatures_dir()),
             exe_dir.as_ref().map(|d| d.join("signatures")),
         ];
         for c in candidates.iter().flatten() {
@@ -202,7 +207,7 @@ async fn main() -> anyhow::Result<()> {
     let state_db_path = args
         .state_db
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("runtime/state/sentinella.db"));
+        .unwrap_or_else(|| p.state_db());
     let database = match db::Database::open(&state_db_path) {
         Ok(d) => {
             info!(path = %state_db_path.display(), "state database opened");
@@ -295,7 +300,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Start PowerShell Script Block Logging bridge (config-gated).
     if !args.audit_mode && config.powershell_bridge_enabled {
-        server.state().start_ps_bridge(config.powershell_poll_seconds);
+        server
+            .state()
+            .start_ps_bridge(config.powershell_poll_seconds);
     } else if !config.powershell_bridge_enabled {
         info!("PowerShell bridge disabled by config");
     }

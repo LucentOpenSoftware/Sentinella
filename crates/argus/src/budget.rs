@@ -4,8 +4,8 @@
 //! it's evidence. Timeouts feed back into the convergence model.
 
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// Execution budget for a single file scan.
@@ -186,18 +186,12 @@ impl BudgetTracker {
 
     /// Get all recorded timeouts.
     pub fn timeouts(&self) -> Vec<TimeoutReason> {
-        self.timeouts
-            .lock()
-            .map(|t| t.clone())
-            .unwrap_or_default()
+        self.timeouts.lock().map(|t| t.clone()).unwrap_or_default()
     }
 
     /// Total suspicion weight from all timeouts.
     pub fn timeout_suspicion(&self) -> u32 {
-        self.timeouts()
-            .iter()
-            .map(|r| r.suspicion_weight())
-            .sum()
+        self.timeouts().iter().map(|r| r.suspicion_weight()).sum()
     }
 
     /// Elapsed time since scan started.
@@ -411,7 +405,10 @@ mod tests {
     #[test]
     fn budget_outcome_labels() {
         assert_eq!(BudgetOutcome::Clean.label(), "Completed");
-        assert_eq!(BudgetOutcome::Suspicious.label(), "Completed with execution limits");
+        assert_eq!(
+            BudgetOutcome::Suspicious.label(),
+            "Completed with execution limits"
+        );
         assert_eq!(BudgetOutcome::Exhausted.label(), "Budget exhausted");
         assert_eq!(BudgetOutcome::Aborted.label(), "Cancelled");
         assert_eq!(BudgetOutcome::Partial.label(), "Partially analyzed");

@@ -108,7 +108,11 @@ pub fn persistence_finding(
 ) -> argus::Finding {
     let base_weight = persistence_type.context_weight();
     // Unsigned files at persistence locations are more suspicious.
-    let weight = if is_unsigned { base_weight + 5 } else { base_weight };
+    let weight = if is_unsigned {
+        base_weight + 5
+    } else {
+        base_weight
+    };
 
     let severity = if weight >= 15 {
         argus::verdict::Severity::High
@@ -150,8 +154,13 @@ mod tests {
 
     #[test]
     fn startup_folder_detected() {
-        let path = PathBuf::from(r"C:\Users\test\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\evil.exe");
-        assert_eq!(check_persistence_context(&path), Some(PersistenceType::StartupFolder));
+        let path = PathBuf::from(
+            r"C:\Users\test\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\evil.exe",
+        );
+        assert_eq!(
+            check_persistence_context(&path),
+            Some(PersistenceType::StartupFolder)
+        );
     }
 
     #[test]
@@ -163,18 +172,26 @@ mod tests {
     #[test]
     fn scheduled_task_detected() {
         let path = PathBuf::from(r"C:\Windows\System32\Tasks\MyUpdate");
-        assert_eq!(check_persistence_context(&path), Some(PersistenceType::ScheduledTask));
+        assert_eq!(
+            check_persistence_context(&path),
+            Some(PersistenceType::ScheduledTask)
+        );
     }
 
     #[test]
     fn persistence_weight_ordering() {
         assert!(PersistenceType::Ifeo.context_weight() > PersistenceType::RunKey.context_weight());
-        assert!(PersistenceType::Service.context_weight() > PersistenceType::StartupFolder.context_weight());
+        assert!(
+            PersistenceType::Service.context_weight()
+                > PersistenceType::StartupFolder.context_weight()
+        );
     }
 
     #[test]
     fn unsigned_boost() {
-        let path = PathBuf::from(r"C:\Users\test\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\app.exe");
+        let path = PathBuf::from(
+            r"C:\Users\test\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\app.exe",
+        );
         let signed = persistence_finding(PersistenceType::StartupFolder, &path, false);
         let unsigned = persistence_finding(PersistenceType::StartupFolder, &path, true);
         assert!(unsigned.weight > signed.weight);

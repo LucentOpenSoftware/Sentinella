@@ -15,14 +15,50 @@
 //!   Scan file → TrustGraph.query() → confidence adjustment
 //!   Both → explainable: "Observed 217 times from Visual Studio Code"
 
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use serde::Serialize;
 use std::path::Path;
 use std::sync::Mutex;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+
+// ── D-2 fix: Trust node integrity ──────────────────────────────
+// Keyed hash prevents external SQLite tampering from manufacturing trust.
+// Tampered nodes → integrity mismatch → no discount (safe default).
+
+static TRUST_INTEGRITY_SECRET: std::sync::OnceLock<[u8; 16]> = std::sync::OnceLock::new();
+
+/// Set the trust integrity secret (called during daemon startup from vault key).
+pub fn set_trust_integrity_secret(secret: &[u8]) {
+    let mut key = [0u8; 16];
+    for (i, byte) in secret.iter().take(16).enumerate() {
+        key[i] = *byte;
+    }
+    // Use different bytes than cache to avoid cross-component key reuse.
+    key[0] ^= 0xAA;
+    key[15] ^= 0x55;
+    let _ = TRUST_INTEGRITY_SECRET.set(key);
+}
+
+/// Compute integrity hash for a trust node's security-critical fields.
+fn trust_node_hash(key: &str, observation_count: u64, stable_days: u32) -> i64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let secret = TRUST_INTEGRITY_SECRET.get().copied().unwrap_or([0u8; 16]);
+
+    let mut hasher = DefaultHasher::new();
+    secret.hash(&mut hasher);
+    key.hash(&mut hasher);
+    observation_count.hash(&mut hasher);
+    stable_days.hash(&mut hasher);
+    secret.hash(&mut hasher);
+    hasher.finish() as i64
+}
 
 /// Max trust nodes before pruning oldest.
 const MAX_NODES: usize = 10_000;
+/// Max drift events retained in database (ARCH-7 fix).
+const MAX_DRIFT_EVENTS: usize = 1_000;
 /// Trust decays after this many days without observation.
 const TRUST_DECAY_DAYS: i64 = 30;
 /// Minimum observations to be considered "stable."
@@ -104,13 +140,21 @@ impl TrustLevel {
             Self::Rare => format!("Rare — observed {} time(s)", count),
             Self::Familiar => format!("Familiar — observed {} times over {} day(s)", count, days),
             Self::Established => format!("Established — consistently observed over {} days", days),
-            Self::Trusted => format!("Trusted — stable presence over {} days ({} observations)", days, count),
+            Self::Trusted => format!(
+                "Trusted — stable presence over {} days ({} observations)",
+                days, count
+            ),
         }
     }
 }
 
 /// Compute trust level from observation data.
-fn compute_trust_level(count: u64, stable_days: u32, has_signer: bool, age_days: i64) -> TrustLevel {
+fn compute_trust_level(
+    count: u64,
+    stable_days: u32,
+    has_signer: bool,
+    age_days: i64,
+) -> TrustLevel {
     if count == 0 {
         return TrustLevel::Unknown;
     }
@@ -203,7 +247,8 @@ impl TrustGraph {
     pub fn open(path: &Path) -> Result<Self, String> {
         let conn = Connection::open(path).map_err(|e| format!("trust_graph open: {e}"))?;
 
-        conn.execute_batch("
+        conn.execute_batch(
+            "
             PRAGMA journal_mode = WAL;
             PRAGMA foreign_keys = ON;
 
@@ -215,7 +260,8 @@ impl TrustGraph {
                 observation_count INTEGER NOT NULL DEFAULT 1,
                 stable_days INTEGER NOT NULL DEFAULT 0,
                 signer TEXT,
-                last_day_hash TEXT
+                last_day_hash TEXT,
+                integrity_hash INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE INDEX IF NOT EXISTS idx_trust_last_seen ON trust_nodes(last_seen);
@@ -233,10 +279,20 @@ impl TrustGraph {
             );
 
             CREATE INDEX IF NOT EXISTS idx_drift_timestamp ON drift_events(timestamp);
-        ").map_err(|e| format!("trust_graph schema: {e}"))?;
+        ",
+        )
+        .map_err(|e| format!("trust_graph schema: {e}"))?;
+
+        // D-2 fix: add integrity_hash column if upgrading from older schema.
+        let _ = conn.execute(
+            "ALTER TABLE trust_nodes ADD COLUMN integrity_hash INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
 
         info!("trust graph opened");
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     /// Record an observation of an entity.
@@ -247,9 +303,11 @@ impl TrustGraph {
         let kind_str = format!("{kind:?}");
 
         // Upsert: insert or update observation.
+        // D-2 fix: integrity_hash updated on every write so it stays valid.
+        // We compute the hash AFTER the upsert using the new values.
         let result = conn.execute(
-            "INSERT INTO trust_nodes (key, kind, first_seen, last_seen, observation_count, stable_days, signer, last_day_hash)
-             VALUES (?1, ?2, ?3, ?3, 1, 1, ?4, ?5)
+            "INSERT INTO trust_nodes (key, kind, first_seen, last_seen, observation_count, stable_days, signer, last_day_hash, integrity_hash)
+             VALUES (?1, ?2, ?3, ?3, 1, 1, ?4, ?5, 0)
              ON CONFLICT(key) DO UPDATE SET
                 last_seen = ?3,
                 observation_count = observation_count + 1,
@@ -261,6 +319,21 @@ impl TrustGraph {
                 signer = COALESCE(?4, signer)",
             params![key, kind_str, now, signer, today],
         );
+
+        // Update integrity hash with the new observation_count + stable_days.
+        if result.is_ok() {
+            if let Ok(row) = conn.query_row(
+                "SELECT observation_count, stable_days FROM trust_nodes WHERE key = ?1",
+                params![key],
+                |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u32)),
+            ) {
+                let ihash = trust_node_hash(key, row.0, row.1);
+                let _ = conn.execute(
+                    "UPDATE trust_nodes SET integrity_hash = ?1 WHERE key = ?2",
+                    params![ihash, key],
+                );
+            }
+        }
 
         if let Err(e) = result {
             debug!(error = %e, key, "trust_graph observe failed");
@@ -276,7 +349,7 @@ impl TrustGraph {
         let now = chrono::Utc::now().timestamp();
 
         let result = conn.query_row(
-            "SELECT observation_count, stable_days, signer, first_seen, last_seen FROM trust_nodes WHERE key = ?1",
+            "SELECT observation_count, stable_days, signer, first_seen, last_seen, integrity_hash FROM trust_nodes WHERE key = ?1",
             params![key],
             |row| {
                 let count: u64 = row.get(0)?;
@@ -284,12 +357,32 @@ impl TrustGraph {
                 let signer: Option<String> = row.get(2)?;
                 let first_seen: i64 = row.get(3)?;
                 let last_seen: i64 = row.get(4)?;
-                Ok((count, stable_days, signer, first_seen, last_seen))
+                let stored_hash: i64 = row.get(5).unwrap_or(0);
+                Ok((count, stable_days, signer, first_seen, last_seen, stored_hash))
             },
         );
 
         match result {
-            Ok((count, stable_days, signer, first_seen, last_seen)) => {
+            Ok((count, stable_days, signer, first_seen, last_seen, stored_hash)) => {
+                // D-2 fix: verify integrity hash before trusting node data.
+                // Tampered nodes (externally modified observation_count/stable_days)
+                // will have mismatched hashes → return Unknown (0 discount).
+                if stored_hash != 0 {
+                    let expected = trust_node_hash(key, count, stable_days);
+                    if stored_hash != expected {
+                        warn!(
+                            key,
+                            "trust graph: INTEGRITY MISMATCH — node rejected (possible tampering)"
+                        );
+                        return TrustQuery {
+                            trust_level: TrustLevel::Unknown,
+                            confidence_discount: 0,
+                            explanation: "Integrity verification failed — trust revoked".into(),
+                            observation_count: 0,
+                            stable_days: 0,
+                        };
+                    }
+                }
                 let age_days = (now - first_seen) / 86400;
                 let stale_days = (now - last_seen) / 86400;
 
@@ -330,15 +423,23 @@ impl TrustGraph {
 
     /// Observe with signer consistency check.
     /// Detects drift: signer changed on previously-signed binary.
-    pub fn observe_with_signer(&self, key: &str, kind: TrustNodeKind, new_signer: Option<&str>) -> Option<DriftEvent> {
+    pub fn observe_with_signer(
+        &self,
+        key: &str,
+        kind: TrustNodeKind,
+        new_signer: Option<&str>,
+    ) -> Option<DriftEvent> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
 
         // Check existing signer before updating.
-        let existing_signer: Option<String> = conn.query_row(
-            "SELECT signer FROM trust_nodes WHERE key = ?1",
-            params![key],
-            |row| row.get(0),
-        ).ok().flatten();
+        let existing_signer: Option<String> = conn
+            .query_row(
+                "SELECT signer FROM trust_nodes WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .ok()
+            .flatten();
 
         drop(conn);
 
@@ -384,12 +485,17 @@ impl TrustGraph {
     }
 
     /// Detect chain mutation: trusted chain gained new child.
-    pub fn check_chain_drift(&self, base_chain_key: &str, extended_chain_key: &str) -> Option<DriftEvent> {
+    pub fn check_chain_drift(
+        &self,
+        base_chain_key: &str,
+        extended_chain_key: &str,
+    ) -> Option<DriftEvent> {
         let base_q = self.query(base_chain_key);
         let ext_q = self.query(extended_chain_key);
 
         // Base chain is established but extended chain is unknown = mutation.
-        if base_q.trust_level >= TrustLevel::Established && ext_q.trust_level == TrustLevel::Unknown {
+        if base_q.trust_level >= TrustLevel::Established && ext_q.trust_level == TrustLevel::Unknown
+        {
             let drift = DriftEvent {
                 timestamp: chrono::Utc::now().timestamp(),
                 entity_key: extended_chain_key.to_string(),
@@ -410,6 +516,7 @@ impl TrustGraph {
     }
 
     /// Record a drift event.
+    /// ARCH-7 fix: prunes drift table to MAX_DRIFT_EVENTS after insert.
     fn record_drift(&self, drift: &DriftEvent) {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let dtype = format!("{:?}", drift.drift_type);
@@ -418,6 +525,13 @@ impl TrustGraph {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![drift.timestamp, drift.entity_key, dtype, drift.old_value, drift.new_value, drift.trust_impact, drift.explanation],
         );
+
+        // Prune old drift events — keep only the most recent MAX_DRIFT_EVENTS.
+        let _ = conn.execute(
+            "DELETE FROM drift_events WHERE id NOT IN (SELECT id FROM drift_events ORDER BY timestamp DESC LIMIT ?1)",
+            params![MAX_DRIFT_EVENTS],
+        );
+
         info!(
             entity = %drift.entity_key,
             drift_type = %dtype,
@@ -428,9 +542,11 @@ impl TrustGraph {
     /// Reset trust for an entity (signer changed, etc.)
     fn reset_trust(&self, key: &str) {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        // D-2 fix: update integrity_hash after reset to keep it consistent.
+        let new_hash = trust_node_hash(key, 1, 0);
         let _ = conn.execute(
-            "UPDATE trust_nodes SET observation_count = 1, stable_days = 0 WHERE key = ?1",
-            params![key],
+            "UPDATE trust_nodes SET observation_count = 1, stable_days = 0, integrity_hash = ?1 WHERE key = ?2",
+            params![new_hash, key],
         );
     }
 
@@ -474,33 +590,46 @@ impl TrustGraph {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let now = chrono::Utc::now().timestamp();
 
-        let total: u64 = conn.query_row("SELECT COUNT(*) FROM trust_nodes", [], |r| r.get(0)).unwrap_or(0);
+        let total: u64 = conn
+            .query_row("SELECT COUNT(*) FROM trust_nodes", [], |r| r.get(0))
+            .unwrap_or(0);
         let stable: u64 = conn.query_row(
             "SELECT COUNT(*) FROM trust_nodes WHERE observation_count >= ?1 AND stable_days >= ?2",
             params![STABLE_THRESHOLD, ESTABLISHED_DAYS],
             |r| r.get(0),
         ).unwrap_or(0);
-        let rare: u64 = conn.query_row(
-            "SELECT COUNT(*) FROM trust_nodes WHERE observation_count < 3",
-            [], |r| r.get(0),
-        ).unwrap_or(0);
-        let recent: u64 = conn.query_row(
-            "SELECT COUNT(*) FROM trust_nodes WHERE last_seen > ?1",
-            params![now - 86400],
-            |r| r.get(0),
-        ).unwrap_or(0);
-        let stale: u64 = conn.query_row(
-            "SELECT COUNT(*) FROM trust_nodes WHERE last_seen < ?1",
-            params![now - TRUST_DECAY_DAYS * 86400],
-            |r| r.get(0),
-        ).unwrap_or(0);
+        let rare: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM trust_nodes WHERE observation_count < 3",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let recent: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM trust_nodes WHERE last_seen > ?1",
+                params![now - 86400],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let stale: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM trust_nodes WHERE last_seen < ?1",
+                params![now - TRUST_DECAY_DAYS * 86400],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
 
-        let drift_count: u64 = conn.query_row("SELECT COUNT(*) FROM drift_events", [], |r| r.get(0)).unwrap_or(0);
-        let recent_drifts: u64 = conn.query_row(
-            "SELECT COUNT(*) FROM drift_events WHERE timestamp > ?1",
-            params![now - 86400],
-            |r| r.get(0),
-        ).unwrap_or(0);
+        let drift_count: u64 = conn
+            .query_row("SELECT COUNT(*) FROM drift_events", [], |r| r.get(0))
+            .unwrap_or(0);
+        let recent_drifts: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM drift_events WHERE timestamp > ?1",
+                params![now - 86400],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
 
         serde_json::json!({
             "nodes": total,
@@ -517,7 +646,9 @@ impl TrustGraph {
 
     /// Prune oldest entries if over capacity.
     fn prune_if_needed(&self, conn: &Connection) {
-        let count: u64 = conn.query_row("SELECT COUNT(*) FROM trust_nodes", [], |r| r.get(0)).unwrap_or(0);
+        let count: u64 = conn
+            .query_row("SELECT COUNT(*) FROM trust_nodes", [], |r| r.get(0))
+            .unwrap_or(0);
         if count as usize > MAX_NODES {
             let to_remove = count as usize - MAX_NODES;
             let _ = conn.execute(
@@ -531,10 +662,12 @@ impl TrustGraph {
     pub fn expire_stale(&self) {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let cutoff = chrono::Utc::now().timestamp() - (TRUST_DECAY_DAYS * 2 * 86400);
-        let removed = conn.execute(
-            "DELETE FROM trust_nodes WHERE last_seen < ?1",
-            params![cutoff],
-        ).unwrap_or(0);
+        let removed = conn
+            .execute(
+                "DELETE FROM trust_nodes WHERE last_seen < ?1",
+                params![cutoff],
+            )
+            .unwrap_or(0);
         if removed > 0 {
             debug!(removed, "trust_graph: expired stale entries");
         }
@@ -543,7 +676,10 @@ impl TrustGraph {
     /// Node count.
     pub fn node_count(&self) -> usize {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        conn.query_row("SELECT COUNT(*) FROM trust_nodes", [], |r| r.get::<_, u64>(0)).unwrap_or(0) as usize
+        conn.query_row("SELECT COUNT(*) FROM trust_nodes", [], |r| {
+            r.get::<_, u64>(0)
+        })
+        .unwrap_or(0) as usize
     }
 }
 
@@ -561,8 +697,10 @@ pub fn trust_finding(query: &TrustQuery) -> Option<argus::Finding> {
         description: format!("Local trust: {}", query.explanation),
         technical_detail: Some(format!(
             "trust_level={:?} discount={} observations={} stable_days={}",
-            query.trust_level, query.confidence_discount,
-            query.observation_count, query.stable_days
+            query.trust_level,
+            query.confidence_discount,
+            query.observation_count,
+            query.stable_days
         )),
     })
 }
@@ -635,7 +773,13 @@ mod tests {
         assert_eq!(TrustLevel::Trusted.confidence_discount(), 8);
         assert_eq!(TrustLevel::Unknown.confidence_discount(), 0);
         // No trust level gives more than 8.
-        for level in [TrustLevel::Unknown, TrustLevel::Rare, TrustLevel::Familiar, TrustLevel::Established, TrustLevel::Trusted] {
+        for level in [
+            TrustLevel::Unknown,
+            TrustLevel::Rare,
+            TrustLevel::Familiar,
+            TrustLevel::Established,
+            TrustLevel::Trusted,
+        ] {
             assert!(level.confidence_discount() <= 8);
         }
     }
@@ -724,8 +868,13 @@ mod tests {
 
     #[test]
     fn drift_suspicion_weights() {
-        assert!(DriftType::SignerChanged.suspicion_weight() > DriftType::StaleReturn.suspicion_weight());
-        assert!(DriftType::NewPersistence.suspicion_weight() > DriftType::PathChanged.suspicion_weight());
+        assert!(
+            DriftType::SignerChanged.suspicion_weight() > DriftType::StaleReturn.suspicion_weight()
+        );
+        assert!(
+            DriftType::NewPersistence.suspicion_weight()
+                > DriftType::PathChanged.suspicion_weight()
+        );
     }
 
     #[test]

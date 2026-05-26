@@ -674,7 +674,7 @@ function FileResult({ r, argus, onDismiss, onQuarantine }: {
                 {argus.explanation.trust_reasons.length > 0 && (
                   <div>
                     <p className="text-[10px] font-semibold uppercase tracking-wider text-[rgb(var(--green))] mb-2">
-                      {t("scan.trust_applied")} (−{argus.explanation.reputation_discount + argus.explanation.authenticode_discount})
+                      {t("scan.trust_applied")}
                     </p>
                     <ul className="space-y-1.5">
                       {argus.explanation.trust_reasons.map((r, i) => (

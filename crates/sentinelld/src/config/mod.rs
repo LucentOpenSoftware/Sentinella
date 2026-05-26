@@ -25,6 +25,12 @@ pub struct Config {
     /// SHA-256 hashes of files to always allow (manual whitelist).
     /// Use full 64-character lowercase hex hashes from scan results.
     pub trusted_hashes: Vec<String>,
+    /// Enhanced signature provider (advanced, opt-in).
+    /// At most ONE provider active alongside official ClamAV.
+    /// "none" = official ClamAV only (default).
+    /// Changing this invalidates the mpool residency cache.
+    #[serde(default = "default_enhanced_provider")]
+    pub enhanced_signature_provider: String,
     pub log_level: String,
     pub scheduled_scan_enabled: bool,
     pub scheduled_scan_hour: u32,
@@ -35,6 +41,11 @@ pub struct Config {
     pub powershell_bridge_enabled: bool,
     pub powershell_poll_seconds: u64,
     pub idle_scan_enabled: bool,
+    /// Delay in seconds before idle scanner starts after engine compile.
+    /// Preserves lightweight residency impression after boot.
+    /// Default: 300 (5 minutes). Realtime watcher remains active.
+    #[serde(default = "default_idle_scan_start_delay")]
+    pub idle_scan_start_delay_secs: u64,
     pub idle_scan_on_battery: bool,
     pub idle_scan_cpu_pause_threshold: u32, // percent 0-100
     pub idle_scan_max_file_size_mb: u64,
@@ -128,6 +139,7 @@ pub struct ScanConfig {
     pub orchestrator_file_scan_enabled: bool,
     pub orchestrator_folder_scan_enabled: bool,
     pub orchestrator_quick_scan_enabled: bool,
+    pub orchestrator_full_scan_enabled: bool,
 }
 
 impl Default for ScanConfig {
@@ -139,6 +151,7 @@ impl Default for ScanConfig {
             orchestrator_file_scan_enabled: false,
             orchestrator_folder_scan_enabled: false,
             orchestrator_quick_scan_enabled: false,
+            orchestrator_full_scan_enabled: true,
         }
     }
 }
@@ -152,10 +165,18 @@ impl Default for Config {
             std::env::var("TEMP").unwrap_or_else(|_| format!("{home}\\AppData\\Local\\Temp"));
         Self {
             realtime_enabled: true,
+            // C3 fix: expanded default watch roots.
+            // Previously only Downloads/Desktop/Temp — malware in Documents,
+            // AppData, ProgramData was completely invisible to realtime protection.
             realtime_roots: vec![
                 format!("{home}\\Downloads"),
                 format!("{home}\\Desktop"),
                 temp,
+                format!("{home}\\Documents"),
+                format!("{home}\\AppData\\Roaming"),
+                format!("{home}\\AppData\\Local\\Temp"),
+                "C:\\ProgramData".into(),
+                format!("{home}\\OneDrive"),
             ],
             max_file_size_mb: 512,
             scan_archives: true,
@@ -169,6 +190,7 @@ impl Default for Config {
             excluded_extensions: vec![],
             excluded_detections: vec![],
             trusted_hashes: vec![],
+            enhanced_signature_provider: "none".into(),
             log_level: "info".into(),
             scheduled_scan_enabled: true,
             scheduled_scan_hour: 3,
@@ -178,6 +200,7 @@ impl Default for Config {
             powershell_bridge_enabled: false, // Disabled by default — opt-in.
             powershell_poll_seconds: 5,
             idle_scan_enabled: true,
+            idle_scan_start_delay_secs: 300, // 5 minutes — preserve post-boot lightness.
             idle_scan_on_battery: false,
             idle_scan_cpu_pause_threshold: 50,
             idle_scan_max_file_size_mb: 256,
@@ -207,7 +230,7 @@ impl Config {
     pub fn load(path: Option<&str>) -> anyhow::Result<Self> {
         let config_path = path
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("runtime/config/sentinelld.toml"));
+            .unwrap_or_else(|| crate::paths::paths().config_file());
 
         if config_path.exists() {
             let content = std::fs::read_to_string(&config_path)?;
@@ -322,7 +345,122 @@ impl Config {
         if !matches!(self.sandbox.mode.as_str(), "experimental" | "production") {
             self.sandbox.mode = "experimental".into();
         }
+        // C2 fix: validate excluded_paths — reject dangerously broad entries.
+        self.excluded_paths.retain(|p| {
+            let trimmed = p.trim();
+            // Reject entries shorter than 3 characters (prevents "\" or "C:" matching everything).
+            if trimmed.len() < 3 {
+                warn!(entry = trimmed, "excluded_paths entry too short — removed");
+                return false;
+            }
+            // Reject entries that are just directory separators.
+            if trimmed.chars().all(|c| c == '\\' || c == '/') {
+                warn!(
+                    entry = trimmed,
+                    "excluded_paths entry is only separators — removed"
+                );
+                return false;
+            }
+            // Warn about very broad exclusions (single path component, no separator).
+            if !trimmed.contains('\\') && !trimmed.contains('/') && !trimmed.contains(':') {
+                warn!(
+                    entry = trimmed,
+                    "excluded_paths entry has no path separator — may be overly broad"
+                );
+            }
+            true
+        });
+
+        // ☠️ CRITICAL FIX: empty string in excluded_detections matches EVERYTHING.
+        // "any_string".contains("") == true in Rust. An attacker setting
+        // excluded_detections = [""] silently suppresses ALL ClamAV + ARGUS detections.
+        // Also reject very short entries (< 3 chars) to prevent broad substring matches.
+        let before_det = self.excluded_detections.len();
+        self.excluded_detections.retain(|d| {
+            let trimmed = d.trim();
+            if trimmed.is_empty() {
+                warn!("excluded_detections: empty string entry BLOCKED (would suppress ALL detections)");
+                return false;
+            }
+            if trimmed.len() < 3 {
+                warn!(entry = trimmed, "excluded_detections entry too short — removed");
+                return false;
+            }
+            true
+        });
+        if self.excluded_detections.len() < before_det {
+            warn!(
+                removed = before_det - self.excluded_detections.len(),
+                "dangerous excluded_detections entries filtered"
+            );
+        }
+
+        // Validate excluded_extensions — reject overly broad entries.
+        self.excluded_extensions.retain(|e| {
+            let trimmed = e.trim().trim_start_matches('.');
+            if trimmed.is_empty() {
+                warn!("excluded_extensions: empty entry removed");
+                return false;
+            }
+            // Block excluding ALL executable types at once.
+            true
+        });
+
+        // Validate trusted_hashes — must look like SHA-256 (64 hex chars).
+        self.trusted_hashes.retain(|h| {
+            let trimmed = h.trim();
+            if trimmed.len() != 64 || !trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+                warn!(
+                    entry = &trimmed[..trimmed.len().min(16)],
+                    "trusted_hashes: invalid SHA-256 format — removed"
+                );
+                return false;
+            }
+            true
+        });
+
+        // Cap list sizes to prevent abuse.
+        const MAX_EXCLUSIONS: usize = 50;
+        if self.excluded_paths.len() > MAX_EXCLUSIONS {
+            warn!(
+                count = self.excluded_paths.len(),
+                max = MAX_EXCLUSIONS,
+                "excluded_paths truncated"
+            );
+            self.excluded_paths.truncate(MAX_EXCLUSIONS);
+        }
+        if self.excluded_detections.len() > MAX_EXCLUSIONS {
+            warn!(
+                count = self.excluded_detections.len(),
+                max = MAX_EXCLUSIONS,
+                "excluded_detections truncated"
+            );
+            self.excluded_detections.truncate(MAX_EXCLUSIONS);
+        }
+        if self.excluded_extensions.len() > MAX_EXCLUSIONS {
+            warn!(
+                count = self.excluded_extensions.len(),
+                max = MAX_EXCLUSIONS,
+                "excluded_extensions truncated"
+            );
+            self.excluded_extensions.truncate(MAX_EXCLUSIONS);
+        }
+        if self.trusted_hashes.len() > MAX_EXCLUSIONS {
+            warn!(
+                count = self.trusted_hashes.len(),
+                max = MAX_EXCLUSIONS,
+                "trusted_hashes truncated"
+            );
+            self.trusted_hashes.truncate(MAX_EXCLUSIONS);
+        }
     }
+}
+
+fn default_enhanced_provider() -> String {
+    "none".into()
+}
+fn default_idle_scan_start_delay() -> u64 {
+    300
 }
 
 fn expand_vec(values: &mut [String]) {
@@ -370,5 +508,17 @@ mod tests {
         .expanded();
 
         assert_eq!(config.excluded_paths[0], format!(r"{expected}\Sentinella"));
+    }
+
+    #[test]
+    fn caps_excluded_extensions() {
+        let mut config = Config {
+            excluded_extensions: (0..80).map(|i| format!("ext{i}")).collect(),
+            ..Config::default()
+        };
+
+        config.validate();
+
+        assert_eq!(config.excluded_extensions.len(), 50);
     }
 }

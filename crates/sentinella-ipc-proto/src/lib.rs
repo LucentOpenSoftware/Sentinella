@@ -27,7 +27,9 @@ use serde_json::Value;
 // ─── JSON-RPC 2.0 envelope ──────────────────────────────────────
 
 pub const JSONRPC_VERSION: &str = "2.0";
-pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
+// K2 fix: reduced from 16 MiB to 1 MiB. JSON-RPC messages are typically <100 KB.
+// 16 MiB allowed OOM via 100 concurrent connections × 16 MB each = 1.6 GB heap.
+pub const MAX_FRAME_SIZE: usize = 1024 * 1024; // 1 MiB
 
 /// A JSON-RPC 2.0 request (client → server).
 #[derive(Debug, Clone, Serialize, Deserialize)]

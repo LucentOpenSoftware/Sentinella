@@ -1,8 +1,9 @@
 import { useState, useEffect, useCallback } from "react";
-import { RotateCcw, Trash2, FileWarning, ChevronDown, ChevronUp, Loader2, WifiOff, AlertTriangle, CheckCircle2, XCircle } from "lucide-react";
+import { RotateCcw, Trash2, FileWarning, ChevronDown, ChevronUp, Loader2, WifiOff, AlertTriangle, CheckCircle2, XCircle, FolderOpen } from "lucide-react";
 import { ShieldIcon } from "../components/ShieldIcon";
 import { Card } from "../components/Card";
-import { getQuarantineItems, restoreQuarantine, deleteQuarantine, reportSafe } from "../api/sentinella";
+import { getQuarantineItems, restoreQuarantine, deleteQuarantine, reportSafe, restoreQuarantineAs } from "../api/sentinella";
+import { save } from "@tauri-apps/plugin-dialog";
 import type { QuarantineEntry } from "../types/sentinella";
 import { t } from "../i18n";
 import { ShieldCheck } from "lucide-react";
@@ -87,6 +88,29 @@ export function QuarantinePage() {
     }
     setBusy(null);
     setExpanded(null);
+    setConfirm(null);
+    refresh();
+  };
+
+  const handleRestoreAs = async (item: QuarantineEntry) => {
+    const fileName = item.original_path.split('\\').pop() || "restored_file";
+    const dest = await save({
+      defaultPath: fileName,
+      title: "Restore quarantined file to...",
+    });
+    if (!dest) return;
+    setBusy(item.id);
+    try {
+      const result = await restoreQuarantineAs(item.id, dest);
+      if (result.ok) {
+        setToast({ type: "success", message: `Restored to ${result.restored_to || dest}` });
+      } else {
+        setToast({ type: "error", message: result.error || "Restore failed" });
+      }
+    } catch (e) {
+      setToast({ type: "error", message: String(e) });
+    }
+    setBusy(null);
     setConfirm(null);
     refresh();
   };
@@ -212,6 +236,15 @@ export function QuarantinePage() {
                       >
                         {isBusy ? <Loader2 size={12} className="animate-spin"/> : <RotateCcw size={12}/>}
                         {t("quar.restore")}
+                      </button>
+                      <button
+                        disabled={!item.restorable || isBusy}
+                        onClick={() => handleRestoreAs(item)}
+                        className="text-[11px] font-medium px-4 py-2 rounded-xl bg-[rgb(var(--raised))]/25 text-[rgb(var(--t2))] flex items-center gap-1.5 cursor-pointer disabled:opacity-30"
+                        title="Restore to a different location"
+                      >
+                        {isBusy ? <Loader2 size={12} className="animate-spin"/> : <FolderOpen size={12}/>}
+                        Restore as...
                       </button>
                       <button
                         disabled={!item.restorable || isBusy}

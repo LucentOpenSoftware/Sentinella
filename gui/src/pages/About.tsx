@@ -4,9 +4,11 @@ import {
   ChevronLeft, Cpu, ShieldCheck, Eye, Lock,
   Gauge, GitBranch, EyeOff, BookOpen,
   Layers, Microscope, Box, Zap, Server,
+  Download, Loader2, CheckCircle2, AlertTriangle,
 } from "lucide-react";
 import { Card } from "../components/Card";
 import { ShieldIcon } from "../components/ShieldIcon";
+import { check } from "@tauri-apps/plugin-updater";
 import aboutBanner from "../../../assets/about1.png";
 
 // ── Sub-page type ────────────────────────────────────────
@@ -65,6 +67,9 @@ export function AboutPage() {
           </div>
         </div>
       </Card>
+
+      {/* Update checker */}
+      <UpdateChecker />
 
       {/* Technology + License */}
       <div className="card-grid-2">
@@ -140,6 +145,118 @@ export function AboutPage() {
         Made with <Heart size={10} className="text-[rgb(var(--red))]" /> by the Sentinella community
       </p>
     </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════
+//  Update checker
+// ══════════════════════════════════════════════════════════
+
+type UpdateState = "idle" | "checking" | "available" | "downloading" | "ready" | "up-to-date" | "error";
+
+function UpdateChecker() {
+  const [state, setState] = useState<UpdateState>("idle");
+  const [version, setVersion] = useState<string | null>(null);
+  const [progress, setProgress] = useState(0);
+  const [error, setError] = useState<string | null>(null);
+
+  const handleCheck = async () => {
+    setState("checking");
+    setError(null);
+    try {
+      const update = await check();
+      if (update) {
+        setVersion(update.version);
+        setState("available");
+      } else {
+        setState("up-to-date");
+      }
+    } catch (e) {
+      setError(String(e));
+      setState("error");
+    }
+  };
+
+  const handleDownloadAndInstall = async () => {
+    setState("downloading");
+    try {
+      const update = await check();
+      if (!update) { setState("up-to-date"); return; }
+      let downloaded = 0;
+      let total = 0;
+      await update.downloadAndInstall((ev) => {
+        if (ev.event === "Started" && ev.data.contentLength) {
+          total = ev.data.contentLength;
+        } else if (ev.event === "Progress") {
+          downloaded += ev.data.chunkLength;
+          if (total > 0) setProgress(Math.round((downloaded / total) * 100));
+        } else if (ev.event === "Finished") {
+          setState("ready");
+        }
+      });
+      setState("ready");
+    } catch (e) {
+      setError(String(e));
+      setState("error");
+    }
+  };
+
+  return (
+    <Card>
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <div className="w-9 h-9 rounded-xl bg-[rgb(var(--accent))]/8 flex items-center justify-center">
+            <Download size={16} className="text-[rgb(var(--accent))]" />
+          </div>
+          <div>
+            <p className="text-[14px] font-semibold">Software Updates</p>
+            <p className="text-[11px] text-[rgb(var(--t3))]">
+              {state === "up-to-date" ? "You're running the latest version" :
+               state === "available" ? `Version ${version} is available` :
+               state === "downloading" ? `Downloading update... ${progress}%` :
+               state === "ready" ? "Update ready — restart to apply" :
+               state === "error" ? "Update check failed" :
+               state === "checking" ? "Checking for updates..." :
+               "Check for new versions"}
+            </p>
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          {state === "up-to-date" && <CheckCircle2 size={16} className="text-[rgb(var(--green))]" />}
+          {state === "error" && <AlertTriangle size={16} className="text-[rgb(var(--amber))]" />}
+          {state === "checking" || state === "downloading" ? (
+            <Loader2 size={16} className="text-[rgb(var(--accent))] animate-spin" />
+          ) : state === "available" ? (
+            <button
+              onClick={handleDownloadAndInstall}
+              className="text-[11px] font-semibold px-3 py-1.5 rounded-lg bg-[rgb(var(--accent))]/10 text-[rgb(var(--accent))] hover:bg-[rgb(var(--accent))]/20 transition-colors cursor-pointer"
+            >
+              Install Update
+            </button>
+          ) : state === "ready" ? (
+            <button
+              onClick={() => { import("@tauri-apps/plugin-updater").then(() => { /* app will restart via NSIS */ }); }}
+              className="text-[11px] font-semibold px-3 py-1.5 rounded-lg bg-[rgb(var(--green))]/10 text-[rgb(var(--green))] hover:bg-[rgb(var(--green))]/20 transition-colors cursor-pointer"
+            >
+              Restart Now
+            </button>
+          ) : (
+            <button
+              onClick={handleCheck}
+              className="text-[11px] font-semibold px-3 py-1.5 rounded-lg bg-[rgb(var(--raised))]/30 text-[rgb(var(--t2))] hover:bg-[rgb(var(--raised))]/50 transition-colors cursor-pointer"
+            >
+              Check for Updates
+            </button>
+          )}
+        </div>
+      </div>
+      {state === "downloading" && (
+        <div className="mt-3 h-1.5 bg-[rgb(var(--raised))]/20 rounded-full overflow-hidden">
+          <div className="h-full bg-[rgb(var(--accent))] rounded-full transition-all" style={{ width: `${progress}%` }} />
+        </div>
+      )}
+      {error && <p className="mt-2 text-[11px] text-[rgb(var(--amber))]">{error}</p>}
+    </Card>
   );
 }
 

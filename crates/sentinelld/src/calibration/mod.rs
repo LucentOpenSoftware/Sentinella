@@ -8,7 +8,7 @@
 //! The database lives at `runtime/state/calibration.db` — separate from
 //! the main state DB so it can be shipped / wiped independently.
 
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use serde::Serialize;
 use std::path::Path;
 use tracing::{error, info};
@@ -412,20 +412,16 @@ impl CalibrationLog {
     pub fn export_calibration_bundle(&self) -> CalibrationBundle {
         let total_detections: u64 = self
             .conn
-            .query_row(
-                "SELECT COUNT(*) FROM detection_events",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
+            .query_row("SELECT COUNT(*) FROM detection_events", [], |row| {
+                row.get::<_, i64>(0)
+            })
             .unwrap_or(0) as u64;
 
         let total_restores: u64 = self
             .conn
-            .query_row(
-                "SELECT COUNT(*) FROM restore_events",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
+            .query_row("SELECT COUNT(*) FROM restore_events", [], |row| {
+                row.get::<_, i64>(0)
+            })
             .unwrap_or(0) as u64;
 
         let fp_rate = if total_detections > 0 {

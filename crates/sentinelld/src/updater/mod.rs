@@ -245,7 +245,10 @@ fn resolve_freshclam_config(config_path: &Path) -> Option<PathBuf> {
     }
 
     // Write resolved config to temp file.
-    let tmp = cwd.join("runtime").join("config").join("freshclam.resolved.conf");
+    let tmp = cwd
+        .join("runtime")
+        .join("config")
+        .join("freshclam.resolved.conf");
     std::fs::write(&tmp, &rewritten).ok()?;
     info!(path = %tmp.display(), "freshclam config resolved to absolute paths");
     Some(tmp)

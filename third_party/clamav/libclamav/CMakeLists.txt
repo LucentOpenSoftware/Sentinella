@@ -484,6 +484,8 @@ if(ENABLE_SHARED_LIB)
 
     if(WIN32)
         set_target_properties( clamav PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON )
+        # Phase 2A: Enable Sentinella file-backed mpool for lower memory pressure.
+        target_compile_definitions( clamav PRIVATE SENTINELLA_FILEBACKED_MPOOL )
     else()
         target_link_libraries( clamav PUBLIC Iconv::Iconv )
     endif()

@@ -9,6 +9,7 @@ const metaKeys: Record<Page, [string, string]> = {
   quarantine: ["nav.quarantine", "Isolated threats"],
   history: ["nav.history", "Scan records"],
   notifications: ["nav.notifications", "Alert history"],
+  intelligence: ["nav.intelligence", "ASTRA adaptive analysis"],
   update: ["nav.update", "Signature database"],
   settings: ["nav.settings", "Configure Sentinella"],
   about: ["nav.about", "Sentinella v0.1.0"],

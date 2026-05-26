@@ -187,14 +187,18 @@ pub fn read_ads_content(stream: &AlternateStream) -> Result<Vec<u8>, String> {
     use std::io::Read;
 
     if stream.size > MAX_ADS_CONTENT_SIZE {
-        return Err(format!("ADS too large: {} bytes (max {})", stream.size, MAX_ADS_CONTENT_SIZE));
+        return Err(format!(
+            "ADS too large: {} bytes (max {})",
+            stream.size, MAX_ADS_CONTENT_SIZE
+        ));
     }
 
     let file = std::fs::File::open(&stream.full_path)
         .map_err(|e| format!("cannot open ADS '{}': {e}", stream.full_path))?;
 
     let mut buf = Vec::with_capacity(stream.size.min(MAX_ADS_CONTENT_SIZE) as usize);
-    file.take(MAX_ADS_CONTENT_SIZE).read_to_end(&mut buf)
+    file.take(MAX_ADS_CONTENT_SIZE)
+        .read_to_end(&mut buf)
         .map_err(|e| format!("cannot read ADS '{}': {e}", stream.full_path))?;
 
     Ok(buf)
@@ -308,10 +312,26 @@ fn is_suspicious_stream_name(name: &str) -> bool {
     let ext = lower.rsplit('.').next().unwrap_or("");
     matches!(
         ext,
-        "exe" | "dll" | "scr" | "com" | "pif" | "sys"
-            | "bat" | "cmd" | "ps1" | "vbs" | "js" | "wsh" | "wsf"
-            | "hta" | "msi" | "reg"
-            | "lnk" | "inf" | "sct" | "wsc"
+        "exe"
+            | "dll"
+            | "scr"
+            | "com"
+            | "pif"
+            | "sys"
+            | "bat"
+            | "cmd"
+            | "ps1"
+            | "vbs"
+            | "js"
+            | "wsh"
+            | "wsf"
+            | "hta"
+            | "msi"
+            | "reg"
+            | "lnk"
+            | "inf"
+            | "sct"
+            | "wsc"
     )
 }
 
@@ -344,7 +364,10 @@ pub fn ads_policy_for_profile(profile: &argus::profile::ScanProfile) -> AdsScanP
 }
 
 /// Filter streams based on scan policy.
-pub fn filter_streams(streams: Vec<AlternateStream>, policy: AdsScanPolicy) -> Vec<AlternateStream> {
+pub fn filter_streams(
+    streams: Vec<AlternateStream>,
+    policy: AdsScanPolicy,
+) -> Vec<AlternateStream> {
     match policy {
         AdsScanPolicy::Disabled => vec![],
         AdsScanPolicy::All => streams,
@@ -378,8 +401,18 @@ mod tests {
     #[test]
     fn filter_executable_only() {
         let streams = vec![
-            AlternateStream { full_path: "a:b.exe".into(), stream_name: "b.exe".into(), size: 100, suspicious: true },
-            AlternateStream { full_path: "a:c.txt".into(), stream_name: "c.txt".into(), size: 50, suspicious: false },
+            AlternateStream {
+                full_path: "a:b.exe".into(),
+                stream_name: "b.exe".into(),
+                size: 100,
+                suspicious: true,
+            },
+            AlternateStream {
+                full_path: "a:c.txt".into(),
+                stream_name: "c.txt".into(),
+                size: 50,
+                suspicious: false,
+            },
         ];
         let filtered = filter_streams(streams, AdsScanPolicy::ExecutableOnly);
         assert_eq!(filtered.len(), 1);
@@ -388,8 +421,18 @@ mod tests {
     #[test]
     fn filter_all_keeps_everything() {
         let streams = vec![
-            AlternateStream { full_path: "a:b.exe".into(), stream_name: "b.exe".into(), size: 100, suspicious: true },
-            AlternateStream { full_path: "a:c.txt".into(), stream_name: "c.txt".into(), size: 50, suspicious: false },
+            AlternateStream {
+                full_path: "a:b.exe".into(),
+                stream_name: "b.exe".into(),
+                size: 100,
+                suspicious: true,
+            },
+            AlternateStream {
+                full_path: "a:c.txt".into(),
+                stream_name: "c.txt".into(),
+                size: 50,
+                suspicious: false,
+            },
         ];
         let filtered = filter_streams(streams, AdsScanPolicy::All);
         assert_eq!(filtered.len(), 2);
@@ -397,9 +440,12 @@ mod tests {
 
     #[test]
     fn filter_disabled_returns_empty() {
-        let streams = vec![
-            AlternateStream { full_path: "a:b.exe".into(), stream_name: "b.exe".into(), size: 100, suspicious: true },
-        ];
+        let streams = vec![AlternateStream {
+            full_path: "a:b.exe".into(),
+            stream_name: "b.exe".into(),
+            size: 100,
+            suspicious: true,
+        }];
         let filtered = filter_streams(streams, AdsScanPolicy::Disabled);
         assert_eq!(filtered.len(), 0);
     }

@@ -13,6 +13,7 @@ export const es: Record<string, string> = {
   "nav.notifications": "Notificaciones",
   "nav.update": "Actualizar",
   "nav.settings": "Configuracion",
+  "nav.intelligence": "Inteligencia",
   "nav.about": "Acerca de",
   "nav.protection": "PROTECCION",
   "nav.system": "SISTEMA",

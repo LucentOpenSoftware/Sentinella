@@ -53,14 +53,12 @@ pub struct ScanProfile {
     pub budget: ScanExecutionBudget,
 
     // ── YARA behavior ────────────────────────────────────
-
     /// Enable YARA rule matching.
     pub yara_enabled: bool,
     /// Max YARA matches before stopping (prevents rule floods).
     pub yara_max_matches: usize,
 
     // ── Heuristic sensitivity ────────────────────────────
-
     /// Enable PE structural heuristics.
     pub pe_heuristics_enabled: bool,
     /// Enable reputation layer.
@@ -73,7 +71,6 @@ pub struct ScanProfile {
     pub packer_detection_enabled: bool,
 
     // ── Convergence tuning ───────────────────────────────
-
     /// Minimum score to trigger convergence chain analysis.
     /// Lower = more sensitive, higher = fewer false positives.
     pub convergence_threshold: u32,
@@ -81,14 +78,12 @@ pub struct ScanProfile {
     pub quarantine_threshold: u32,
 
     // ── Archive behavior ─────────────────────────────────
-
     /// Max archive nesting depth for this profile.
     pub max_archive_depth: u32,
     /// Max extracted bytes from compound files.
     pub max_extracted_bytes: u64,
 
     // ── Strategy overrides ───────────────────────────────
-
     /// If true, transient/temp artifacts get SignatureOnly instead of FullAnalysis.
     pub downgrade_transient: bool,
     /// If true, files >50MB get SignatureOnly regardless of extension.
@@ -232,7 +227,12 @@ impl ScanProfile {
     }
 
     /// Determine the effective scan strategy for a file under this profile.
-    pub fn effective_strategy(&self, path: &str, file_size: u64, is_transient: bool) -> ScanStrategy {
+    pub fn effective_strategy(
+        &self,
+        path: &str,
+        file_size: u64,
+        is_transient: bool,
+    ) -> ScanStrategy {
         // Transient artifacts → downgrade if profile says so.
         if is_transient && self.downgrade_transient {
             return ScanStrategy::SignatureOnly;
@@ -295,12 +295,21 @@ mod tests {
 
     #[test]
     fn for_context_maps_correctly() {
-        assert_eq!(ScanProfile::for_context("realtime").kind, ProfileKind::Realtime);
-        assert_eq!(ScanProfile::for_context("watcher").kind, ProfileKind::Realtime);
+        assert_eq!(
+            ScanProfile::for_context("realtime").kind,
+            ProfileKind::Realtime
+        );
+        assert_eq!(
+            ScanProfile::for_context("watcher").kind,
+            ProfileKind::Realtime
+        );
         assert_eq!(ScanProfile::for_context("quick").kind, ProfileKind::Startup);
         assert_eq!(ScanProfile::for_context("folder").kind, ProfileKind::Manual);
         assert_eq!(ScanProfile::for_context("idle").kind, ProfileKind::Idle);
-        assert_eq!(ScanProfile::for_context("unknown").kind, ProfileKind::Manual);
+        assert_eq!(
+            ScanProfile::for_context("unknown").kind,
+            ProfileKind::Manual
+        );
     }
 
     #[test]

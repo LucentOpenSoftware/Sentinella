@@ -46,6 +46,236 @@
 #include "str.h"
 #include "readdb.h"
 
+/* ── Sentinella Phase 2A: File-backed mpool ──────────────────────────
+ *
+ * When SENTINELLA_FILEBACKED_MPOOL is defined, mpool regions on Windows
+ * are backed by a cache file instead of anonymous VirtualAlloc pages.
+ *
+ * File-backed pages allow the OS to:
+ *   - Discard pages freely under memory pressure (re-read from file)
+ *   - Share pages across processes if multiple instances run
+ *   - Avoid pagefile thrashing (file IS the backing store)
+ *
+ * This does NOT change:
+ *   - Allocation semantics (same mpool API)
+ *   - Matcher logic (no pointer changes)
+ *   - Compile flow (same cl_engine_compile)
+ *   - Detection behavior (bit-identical results)
+ *
+ * The only change: page residency behavior under memory pressure.
+ */
+#ifdef SENTINELLA_FILEBACKED_MPOOL
+#ifdef _WIN32
+#include <windows.h>
+#include <stdio.h>
+
+/* Dynamic region tracking — grows as needed, never leaks mappings. */
+static struct sentinella_region {
+    void *base;
+    size_t size;
+} *sentinella_regions = NULL;
+static int sentinella_region_count = 0;
+static int sentinella_region_capacity = 0;
+static wchar_t sentinella_cache_path[MAX_PATH] = {0};
+static LARGE_INTEGER sentinella_cache_offset = {0};
+static HANDLE sentinella_cache_file = INVALID_HANDLE_VALUE;
+static HANDLE sentinella_cache_mapping = INVALID_HANDLE_VALUE;
+
+/* Set the cache file path. Call before mpool_create(). */
+__declspec(dllexport) void sentinella_mpool_set_cache_path(const wchar_t *path) {
+    wcsncpy(sentinella_cache_path, path, MAX_PATH - 1);
+}
+
+/* Auto-detect cache path from environment variable on first allocation.
+ * This avoids the DLL export issue — the Rust daemon sets
+ * SENTINELLA_MPOOL_CACHE_PATH before loading the engine. */
+static void sentinella_auto_detect_cache_path(void) {
+    if (sentinella_cache_path[0] != L'\0') return; /* Already set via API. */
+
+    char path_utf8[MAX_PATH] = {0};
+    DWORD len = GetEnvironmentVariableA("SENTINELLA_MPOOL_CACHE_PATH", path_utf8, MAX_PATH);
+    if (len > 0 && len < MAX_PATH) {
+        /* Convert UTF-8 to wide. */
+        MultiByteToWideChar(CP_UTF8, 0, path_utf8, -1, sentinella_cache_path, MAX_PATH);
+        cli_warnmsg("sentinella_mpool: file-backed mode enabled via env: %s\n", path_utf8);
+    }
+}
+
+/* Align offset to Windows allocation granularity (64 KB).
+ * MapViewOfFile requires the offset to be a multiple of this value. */
+static LONGLONG sentinella_align_offset(LONGLONG offset) {
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    LONGLONG granularity = (LONGLONG)si.dwAllocationGranularity; /* typically 64 KB */
+    return (offset + granularity - 1) & ~(granularity - 1);
+}
+
+static int sentinella_filebacked_active = 0;
+static int sentinella_anonymous_fallbacks = 0;
+
+/* Allocate a file-backed region. Falls back to VirtualAlloc on failure.
+ *
+ * Phase 2B: multi-region support.
+ * Uses a single growing backing file. Each region is mapped at an aligned
+ * offset within the file. The file mapping handle is recreated for each
+ * extension to cover the new file size.
+ */
+static void *sentinella_alloc_filebacked(size_t sz) {
+    void *result = NULL;
+
+    /* Try auto-detect from environment on first call. */
+    sentinella_auto_detect_cache_path();
+
+    if (sentinella_cache_path[0] == L'\0') {
+        return VirtualAlloc(NULL, sz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    }
+
+    /* Open the cache file on first call. */
+    if (sentinella_cache_file == INVALID_HANDLE_VALUE) {
+        sentinella_cache_file = CreateFileW(
+            sentinella_cache_path,
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ,
+            NULL,
+            CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS,
+            NULL
+        );
+        if (sentinella_cache_file == INVALID_HANDLE_VALUE) {
+            cli_warnmsg("sentinella_mpool: cache file creation failed (%lu), using anonymous\n",
+                         GetLastError());
+            return VirtualAlloc(NULL, sz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        }
+        sentinella_cache_offset.QuadPart = 0;
+        cli_warnmsg("sentinella_mpool: cache file opened\n");
+    }
+
+    /* Align current offset to allocation granularity for MapViewOfFile. */
+    LONGLONG aligned_offset = sentinella_align_offset(sentinella_cache_offset.QuadPart);
+
+    /* Extend file to accommodate this region (at aligned offset). */
+    LARGE_INTEGER new_file_size;
+    new_file_size.QuadPart = aligned_offset + (LONGLONG)sz;
+
+    if (!SetFilePointerEx(sentinella_cache_file, new_file_size, NULL, FILE_BEGIN) ||
+        !SetEndOfFile(sentinella_cache_file)) {
+        cli_warnmsg("sentinella_mpool: extend to %lld failed (%lu), using anonymous\n",
+                     new_file_size.QuadPart, GetLastError());
+        sentinella_anonymous_fallbacks++;
+        return VirtualAlloc(NULL, sz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    }
+
+    /* Close previous mapping handle (if any) — we need a new one for the larger file. */
+    if (sentinella_cache_mapping != INVALID_HANDLE_VALUE) {
+        CloseHandle(sentinella_cache_mapping);
+        sentinella_cache_mapping = INVALID_HANDLE_VALUE;
+    }
+
+    /* Create mapping for the full extended file. */
+    sentinella_cache_mapping = CreateFileMappingW(
+        sentinella_cache_file,
+        NULL,
+        PAGE_READWRITE,
+        (DWORD)(new_file_size.QuadPart >> 32),
+        (DWORD)(new_file_size.QuadPart & 0xFFFFFFFF),
+        NULL
+    );
+    if (!sentinella_cache_mapping) {
+        cli_warnmsg("sentinella_mpool: CreateFileMapping failed (%lu), using anonymous\n",
+                     GetLastError());
+        sentinella_cache_mapping = INVALID_HANDLE_VALUE;
+        sentinella_anonymous_fallbacks++;
+        return VirtualAlloc(NULL, sz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    }
+
+    /* Map just this region's view at the aligned offset. */
+    result = MapViewOfFile(
+        sentinella_cache_mapping,
+        FILE_MAP_ALL_ACCESS,
+        (DWORD)(aligned_offset >> 32),
+        (DWORD)(aligned_offset & 0xFFFFFFFF),
+        sz
+    );
+
+    if (!result) {
+        cli_warnmsg("sentinella_mpool: MapViewOfFile at offset %lld size %zu failed (%lu), using anonymous\n",
+                     aligned_offset, sz, GetLastError());
+        sentinella_anonymous_fallbacks++;
+        return VirtualAlloc(NULL, sz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    }
+
+    /* Track for cleanup — dynamic growth, never overflow. */
+    if (sentinella_region_count >= sentinella_region_capacity) {
+        int new_cap = sentinella_region_capacity == 0 ? 32 : sentinella_region_capacity * 2;
+        struct sentinella_region *new_arr = (struct sentinella_region *)realloc(
+            sentinella_regions, new_cap * sizeof(struct sentinella_region));
+        if (new_arr) {
+            sentinella_regions = new_arr;
+            sentinella_region_capacity = new_cap;
+        }
+    }
+    if (sentinella_region_count < sentinella_region_capacity) {
+        sentinella_regions[sentinella_region_count].base = result;
+        sentinella_regions[sentinella_region_count].size = sz;
+        sentinella_region_count++;
+    }
+
+    sentinella_filebacked_active++;
+    sentinella_cache_offset.QuadPart = aligned_offset + (LONGLONG)sz;
+
+    return result;
+}
+
+/* Free a file-backed region. Unmaps the view but doesn't close the shared mapping. */
+static void sentinella_free_filebacked(void *ptr) {
+    for (int i = 0; i < sentinella_region_count; i++) {
+        if (sentinella_regions[i].base == ptr) {
+            UnmapViewOfFile(ptr);
+            sentinella_regions[i].base = NULL;
+            return;
+        }
+    }
+    /* Not a file-backed region — use VirtualFree. */
+    VirtualFree(ptr, 0, MEM_RELEASE);
+}
+
+/* Cleanup all file-backed resources. */
+__declspec(dllexport) void sentinella_mpool_cleanup(void) {
+    /* Unmap all views. */
+    for (int i = 0; i < sentinella_region_count; i++) {
+        if (sentinella_regions && sentinella_regions[i].base) {
+            UnmapViewOfFile(sentinella_regions[i].base);
+            sentinella_regions[i].base = NULL;
+        }
+    }
+    sentinella_region_count = 0;
+    sentinella_region_capacity = 0;
+    free(sentinella_regions);
+    sentinella_regions = NULL;
+
+    /* Close the shared mapping handle. */
+    if (sentinella_cache_mapping != INVALID_HANDLE_VALUE) {
+        CloseHandle(sentinella_cache_mapping);
+        sentinella_cache_mapping = INVALID_HANDLE_VALUE;
+    }
+
+    /* Close the backing file. */
+    if (sentinella_cache_file != INVALID_HANDLE_VALUE) {
+        CloseHandle(sentinella_cache_file);
+        sentinella_cache_file = INVALID_HANDLE_VALUE;
+    }
+
+    cli_warnmsg("sentinella_mpool: cleanup — %d file-backed regions, %d anonymous fallbacks\n",
+                sentinella_filebacked_active, sentinella_anonymous_fallbacks);
+
+    sentinella_cache_offset.QuadPart = 0;
+    sentinella_filebacked_active = 0;
+    sentinella_anonymous_fallbacks = 0;
+}
+
+#endif /* _WIN32 */
+#endif /* SENTINELLA_FILEBACKED_MPOOL */
+
 /*#define CL_DEBUG*/
 #ifdef CL_DEBUG
 #include <assert.h>
@@ -472,6 +702,8 @@ struct MP *mpool_create()
     }
 #ifndef _WIN32
     if ((mpool_p = (struct MP *)mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | ANONYMOUS_MAP, -1, 0)) == MAP_FAILED)
+#elif defined(SENTINELLA_FILEBACKED_MPOOL)
+    if (!(mpool_p = (struct MP *)sentinella_alloc_filebacked(sz)))
 #else
     if (!(mpool_p = (struct MP *)VirtualAlloc(NULL, sz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)))
 #endif
@@ -498,6 +730,8 @@ void mpool_destroy(struct MP *mp)
 #endif
 #ifndef _WIN32
         munmap((void *)mpm, mpmsize);
+#elif defined(SENTINELLA_FILEBACKED_MPOOL)
+        sentinella_free_filebacked((void *)mpm);
 #else
         VirtualFree(mpm, 0, MEM_RELEASE);
 #endif
@@ -508,6 +742,9 @@ void mpool_destroy(struct MP *mp)
 #endif
 #ifndef _WIN32
     munmap((void *)mp, mpmsize + sizeof(*mp));
+#elif defined(SENTINELLA_FILEBACKED_MPOOL)
+    sentinella_free_filebacked((void *)mp);
+    sentinella_mpool_cleanup();
 #else
     VirtualFree(mp, 0, MEM_RELEASE);
 #endif
@@ -531,6 +768,12 @@ void mpool_flush(struct MP *mp)
 #endif
 #ifndef _WIN32
             munmap((char *)mpm + mused, mpm->size - mused);
+#elif defined(SENTINELLA_FILEBACKED_MPOOL)
+            /* File-backed views: neither MEM_DECOMMIT nor MEM_RESET are valid
+             * on MapViewOfFile regions. Skip trim entirely — unused file-backed
+             * pages are already cheaply reclaimable by the OS page manager.
+             * No commit charge saved by trimming (pages are not anonymous). */
+            (void)0; /* intentional no-op */
 #else
             VirtualFree((char *)mpm + mused, mpm->size - mused, MEM_DECOMMIT);
 #endif
@@ -546,6 +789,8 @@ void mpool_flush(struct MP *mp)
 #endif
 #ifndef _WIN32
         munmap((char *)mp + mused, mp->u.mpm.size + sizeof(*mp) - mused);
+#elif defined(SENTINELLA_FILEBACKED_MPOOL)
+        (void)0; /* no-op: file-backed pages need no decommit */
 #else
         VirtualFree((char *)mp + mused, mp->u.mpm.size + sizeof(*mp) - mused, MEM_DECOMMIT);
 #endif
@@ -670,6 +915,8 @@ void *mpool_malloc(struct MP *mp, size_t size)
 
 #ifndef _WIN32
     if ((mpm = (struct MPMAP *)mmap(NULL, i, PROT_READ | PROT_WRITE, MAP_PRIVATE | ANONYMOUS_MAP, -1, 0)) == MAP_FAILED) {
+#elif defined(SENTINELLA_FILEBACKED_MPOOL)
+    if (!(mpm = (struct MPMAP *)sentinella_alloc_filebacked(i))) {
 #else
     if (!(mpm = (struct MPMAP *)VirtualAlloc(NULL, i, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE))) {
 #endif

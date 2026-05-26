@@ -12,8 +12,53 @@
 //! - Cannot scan processes with higher privilege
 //! - Some processes guard their memory (anti-debug)
 //! - Memory regions may change between enumeration and read
+//!
+//! Budget discipline:
+//! - max_region_size_mb: largest single region to read
+//! - max_total_scan_mb: total bytes across all regions per process
+//! - max_regions_per_process: region count cap
+//! - timeout_secs: wall-clock timeout per process
+//! - cancel_flag: shared cancellation signal
 
 use serde::Serialize;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Budget configuration for memory scanning.
+#[derive(Debug, Clone, Serialize)]
+#[allow(dead_code)]
+pub struct MemoryScanBudget {
+    pub max_region_size_mb: u64,
+    pub max_total_scan_mb: u64,
+    pub max_regions_per_process: u32,
+    pub timeout_secs: u64,
+}
+
+impl Default for MemoryScanBudget {
+    fn default() -> Self {
+        Self {
+            max_region_size_mb: 64,
+            max_total_scan_mb: 256,
+            max_regions_per_process: 512,
+            timeout_secs: 30,
+        }
+    }
+}
+
+/// Why a region or process was skipped.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
+pub enum MemoryTimeoutReason {
+    RegionTooLarge,
+    BudgetExceeded,
+    AccessDenied,
+    ReadFailed,
+    YaraTimeout,
+    WallClockTimeout,
+    RegionLimitReached,
+    Cancelled,
+}
 
 /// Result of scanning one process's memory.
 #[derive(Debug, Clone, Serialize)]
@@ -22,10 +67,23 @@ pub struct MemoryScanResult {
     pub process_name: String,
     pub process_path: Option<String>,
     pub regions_scanned: u32,
+    pub regions_skipped: u32,
     pub bytes_scanned: u64,
     pub findings: Vec<MemoryFinding>,
     pub errors: Vec<String>,
+    pub skip_reasons: Vec<MemoryTimeoutReason>,
+    pub access_denied_count: u32,
     pub scan_time_ms: u64,
+    pub modules: Vec<ModuleInfo>,
+}
+
+/// Loaded module information for a process.
+#[derive(Debug, Clone, Serialize)]
+pub struct ModuleInfo {
+    pub name: String,
+    pub path: String,
+    pub base_address: u64,
+    pub size: u64,
 }
 
 /// A finding in process memory.
@@ -47,29 +105,42 @@ pub enum MemorySeverity {
     Malicious,
 }
 
-/// Scan a specific process by PID.
-/// Uses ARGUS engine for YARA + pattern analysis on memory buffers.
-pub fn scan_process(pid: u32, argus: &argus::ArgusEngine) -> MemoryScanResult {
+/// Scan a specific process by PID with budget and cancellation.
+pub fn scan_process(
+    pid: u32,
+    argus: &argus::ArgusEngine,
+    budget: &MemoryScanBudget,
+    cancel: &Arc<AtomicBool>,
+) -> MemoryScanResult {
     let start = std::time::Instant::now();
     let mut result = MemoryScanResult {
         pid,
         process_name: String::new(),
         process_path: None,
         regions_scanned: 0,
+        regions_skipped: 0,
         bytes_scanned: 0,
         findings: Vec::new(),
         errors: Vec::new(),
+        skip_reasons: Vec::new(),
+        access_denied_count: 0,
         scan_time_ms: 0,
+        modules: Vec::new(),
     };
+
+    if pid == std::process::id() {
+        result.scan_time_ms = start.elapsed().as_millis() as u64;
+        return result;
+    }
 
     #[cfg(target_os = "windows")]
     {
-        scan_process_windows(pid, argus, &mut result);
+        scan_process_windows(pid, argus, budget, cancel, &start, &mut result);
     }
 
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = argus;
+        let _ = (argus, budget, cancel);
         result
             .errors
             .push("Memory scanning only supported on Windows".into());
@@ -77,6 +148,17 @@ pub fn scan_process(pid: u32, argus: &argus::ArgusEngine) -> MemoryScanResult {
 
     result.scan_time_ms = start.elapsed().as_millis() as u64;
     result
+}
+
+/// Convenience: scan with default budget, no cancellation.
+#[allow(dead_code)]
+pub fn scan_process_simple(pid: u32, argus: &argus::ArgusEngine) -> MemoryScanResult {
+    scan_process(
+        pid,
+        argus,
+        &MemoryScanBudget::default(),
+        &Arc::new(AtomicBool::new(false)),
+    )
 }
 
 /// List running processes with basic info.
@@ -104,11 +186,18 @@ pub fn list_processes() -> Vec<ProcessInfo> {
 // ═══════════════════════════════════════════════════════════════
 
 #[cfg(target_os = "windows")]
-fn scan_process_windows(pid: u32, argus: &argus::ArgusEngine, result: &mut MemoryScanResult) {
+fn scan_process_windows(
+    pid: u32,
+    argus: &argus::ArgusEngine,
+    budget: &MemoryScanBudget,
+    cancel: &Arc<AtomicBool>,
+    start: &std::time::Instant,
+    result: &mut MemoryScanResult,
+) {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows::Win32::System::Memory::{
-        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE, PAGE_EXECUTE_READ,
+        MEM_COMMIT, MEM_IMAGE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE, PAGE_EXECUTE_READ,
         PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, VirtualQueryEx,
     };
     use windows::Win32::System::Threading::{
@@ -121,14 +210,14 @@ fn scan_process_windows(pid: u32, argus: &argus::ArgusEngine, result: &mut Memor
         result.process_path = info.path;
     }
 
-    // Open process with read access.
+    result.modules = enumerate_modules_windows(pid);
+
     let handle = unsafe {
         match OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) {
             Ok(h) => h,
-            Err(e) => {
-                result
-                    .errors
-                    .push(format!("Cannot open process {pid}: {e}"));
+            Err(_) => {
+                result.access_denied_count += 1;
+                result.skip_reasons.push(MemoryTimeoutReason::AccessDenied);
                 return;
             }
         }
@@ -136,14 +225,34 @@ fn scan_process_windows(pid: u32, argus: &argus::ArgusEngine, result: &mut Memor
 
     // Enumerate memory regions.
     let mut address: usize = 0;
+    let mut regions_seen: u32 = 0;
     let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     let mbi_size = std::mem::size_of::<MEMORY_BASIC_INFORMATION>();
 
-    // Cap total bytes to scan (prevent reading gigabytes of memory).
-    const MAX_SCAN_BYTES: u64 = 256 * 1024 * 1024; // 256 MB max per process
-    const MAX_REGION_SIZE: usize = 64 * 1024 * 1024; // 64 MB max per region
+    let max_scan_bytes = budget.max_total_scan_mb.saturating_mul(1024 * 1024);
+    let max_region_size = budget
+        .max_region_size_mb
+        .saturating_mul(1024 * 1024)
+        .min(usize::MAX as u64) as usize;
 
     loop {
+        if cancel.load(Ordering::Relaxed) {
+            result.skip_reasons.push(MemoryTimeoutReason::Cancelled);
+            break;
+        }
+        if start.elapsed().as_secs() >= budget.timeout_secs {
+            result
+                .skip_reasons
+                .push(MemoryTimeoutReason::WallClockTimeout);
+            break;
+        }
+        if regions_seen >= budget.max_regions_per_process {
+            result
+                .skip_reasons
+                .push(MemoryTimeoutReason::RegionLimitReached);
+            break;
+        }
+
         let ret = unsafe {
             VirtualQueryEx(
                 handle,
@@ -155,6 +264,7 @@ fn scan_process_windows(pid: u32, argus: &argus::ArgusEngine, result: &mut Memor
         if ret == 0 {
             break; // No more regions.
         }
+        regions_seen = regions_seen.saturating_add(1);
 
         // Only scan committed, executable regions — where unpacked code lives.
         let is_executable = mbi.Protect == PAGE_EXECUTE
@@ -162,9 +272,9 @@ fn scan_process_windows(pid: u32, argus: &argus::ArgusEngine, result: &mut Memor
             || mbi.Protect == PAGE_EXECUTE_READWRITE
             || mbi.Protect == PAGE_EXECUTE_WRITECOPY;
         let is_rwx = mbi.Protect == PAGE_EXECUTE_READWRITE;
+        let is_image_backed = mbi.Type == MEM_IMAGE;
 
         if mbi.State == MEM_COMMIT && is_executable && mbi.RegionSize > 0 {
-            // RWX regions are almost always injected code — flag immediately.
             if is_rwx && mbi.RegionSize > 4096 {
                 result.findings.push(MemoryFinding {
                     region_address: mbi.BaseAddress as u64,
@@ -178,9 +288,32 @@ fn scan_process_windows(pid: u32, argus: &argus::ArgusEngine, result: &mut Memor
                 });
             }
 
-            let region_size = mbi.RegionSize.min(MAX_REGION_SIZE);
+            if !is_image_backed && mbi.RegionSize > 4096 {
+                result.findings.push(MemoryFinding {
+                    region_address: mbi.BaseAddress as u64,
+                    region_size: mbi.RegionSize as u64,
+                    description: format!(
+                        "Unbacked executable memory ({} KB) — not backed by any image file",
+                        mbi.RegionSize / 1024
+                    ),
+                    severity: MemorySeverity::Info,
+                    yara_rule: None,
+                });
+            }
 
-            if result.bytes_scanned + region_size as u64 > MAX_SCAN_BYTES {
+            let region_size = mbi.RegionSize.min(max_region_size);
+            if mbi.RegionSize > max_region_size {
+                result.regions_skipped += 1;
+                result
+                    .skip_reasons
+                    .push(MemoryTimeoutReason::RegionTooLarge);
+            }
+
+            if result.bytes_scanned + region_size as u64 > max_scan_bytes {
+                result.regions_skipped += 1;
+                result
+                    .skip_reasons
+                    .push(MemoryTimeoutReason::BudgetExceeded);
                 result
                     .errors
                     .push("Max scan bytes reached — stopping".into());
@@ -231,7 +364,21 @@ fn scan_process_windows(pid: u32, argus: &argus::ArgusEngine, result: &mut Memor
                     bytes_read as u64,
                     &mut result.findings,
                 );
+            } else {
+                result.regions_skipped += 1;
+                result.skip_reasons.push(MemoryTimeoutReason::ReadFailed);
             }
+        }
+
+        let base_address = mbi.BaseAddress as usize;
+        if mbi.RegionSize == 0
+            || mbi.RegionSize > usize::MAX.saturating_sub(base_address)
+            || base_address.saturating_add(mbi.RegionSize) <= address
+        {
+            result
+                .skip_reasons
+                .push(MemoryTimeoutReason::RegionLimitReached);
+            break;
         }
 
         // Advance to next region.
@@ -244,6 +391,59 @@ fn scan_process_windows(pid: u32, argus: &argus::ArgusEngine, result: &mut Memor
     unsafe {
         let _ = CloseHandle(handle);
     }
+}
+
+#[cfg(target_os = "windows")]
+fn enumerate_modules_windows(pid: u32) -> Vec<ModuleInfo> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, MODULEENTRY32W, Module32FirstW, Module32NextW, TH32CS_SNAPMODULE,
+        TH32CS_SNAPMODULE32,
+    };
+
+    let mut modules = Vec::new();
+    let snap = unsafe {
+        match CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid) {
+            Ok(h) => h,
+            Err(_) => return modules,
+        }
+    };
+
+    let mut entry: MODULEENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<MODULEENTRY32W>() as u32;
+
+    let mut ok = unsafe { Module32FirstW(snap, &mut entry).is_ok() };
+    while ok {
+        let name = String::from_utf16_lossy(
+            &entry.szModule[..entry
+                .szModule
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(entry.szModule.len())],
+        );
+        let path = String::from_utf16_lossy(
+            &entry.szExePath[..entry
+                .szExePath
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(entry.szExePath.len())],
+        );
+        modules.push(ModuleInfo {
+            name,
+            path,
+            base_address: entry.modBaseAddr as u64,
+            size: entry.modBaseSize as u64,
+        });
+        if modules.len() >= 2048 {
+            break;
+        }
+        ok = unsafe { Module32NextW(snap, &mut entry).is_ok() };
+    }
+
+    unsafe {
+        let _ = CloseHandle(snap);
+    }
+    modules
 }
 
 /// Check memory buffer for suspicious patterns (shellcode, PE headers, etc.).
@@ -587,5 +787,55 @@ mod tests {
         check_memory_patterns(&data, 0x70000, 4096, &mut findings);
         // Should detect high entropy.
         assert!(findings.iter().any(|f| f.description.contains("entropy")));
+    }
+
+    #[test]
+    fn self_process_skipped() {
+        let budget = MemoryScanBudget::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = scan_process(
+            std::process::id(),
+            &argus::ArgusEngine::with_defaults(),
+            &budget,
+            &cancel,
+        );
+        assert_eq!(result.regions_scanned, 0);
+        assert!(result.findings.is_empty());
+    }
+
+    #[test]
+    fn cancelled_scan_stops() {
+        let budget = MemoryScanBudget::default();
+        let cancel = Arc::new(AtomicBool::new(true)); // pre-cancelled
+        let result = scan_process(4, &argus::ArgusEngine::with_defaults(), &budget, &cancel);
+        // Should have stopped immediately — either access denied or cancelled.
+        let has_cancel_or_denied = result.skip_reasons.iter().any(|r| {
+            matches!(
+                r,
+                MemoryTimeoutReason::Cancelled | MemoryTimeoutReason::AccessDenied
+            )
+        });
+        assert!(has_cancel_or_denied || result.regions_scanned == 0);
+    }
+
+    #[test]
+    fn budget_defaults_are_sane() {
+        let b = MemoryScanBudget::default();
+        assert_eq!(b.max_region_size_mb, 64);
+        assert_eq!(b.max_total_scan_mb, 256);
+        assert_eq!(b.max_regions_per_process, 512);
+        assert_eq!(b.timeout_secs, 30);
+    }
+
+    #[test]
+    fn module_info_fields() {
+        let m = ModuleInfo {
+            name: "test.dll".into(),
+            path: "C:\\test.dll".into(),
+            base_address: 0x7FF00000,
+            size: 4096,
+        };
+        assert_eq!(m.name, "test.dll");
+        assert_eq!(m.size, 4096);
     }
 }

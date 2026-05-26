@@ -72,9 +72,6 @@ rule evasion_etw_patching {
         $patch3 = "GetProcAddress" ascii
         $patch4 = "GetModuleHandleA" ascii
 
-        // Known ETW patch: ret (0xC3) written to EtwEventWrite
-        $ret_patch = { C3 } // single ret opcode (matched contextually)
-
         // .NET ETW bypass
         $dotnet1 = "Reflection.Assembly" ascii
         $dotnet2 = "System.Diagnostics.Tracing" ascii
@@ -309,7 +306,8 @@ rule evasion_api_unhooking_ntdll_reload {
         uint16(0) == 0x5A4D and
         any of ($ntdll*) and
         2 of ($map*) and
-        any of ($overwrite*)
+        any of ($overwrite*) and
+        any of ($enum*)
 }
 
 rule evasion_smart_applocker_bypass {

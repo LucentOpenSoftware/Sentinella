@@ -5,5 +5,8 @@
 
 pub mod bindings;
 pub mod clamav;
+pub mod residency;
+pub mod sources;
+pub mod update_pipeline;
 
 pub use clamav::ClamEngine;

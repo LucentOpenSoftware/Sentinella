@@ -3,6 +3,8 @@
 //! Uses the `notify` crate (ReadDirectoryChangesW on Windows, inotify on Linux).
 //! Debounces rapid events and feeds new/modified files into the scan queue.
 
+pub mod file_identity;
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{
@@ -159,6 +161,11 @@ fn watcher_loop(
     // the same path in rapid succession.
     let mut sandbox_dedup: HashMap<PathBuf, Instant> = HashMap::new();
 
+    // TOCTOU race prevention diagnostics.
+    let race_diag = file_identity::RaceDiagnostics::new();
+    // Snapshot of watched roots for identity revalidation (TOCTOU).
+    let watched_roots_vec: Vec<PathBuf> = roots.clone();
+
     // FISH — observe-only ransomware detection via AppState's shared MutationWindow.
 
     while running.load(Ordering::Relaxed) {
@@ -294,14 +301,36 @@ fn watcher_loop(
                     }
                 }
 
-                // Skip symlinks (SEV-MEDIUM: prevent scanning through symlinks).
-                if path.is_symlink() {
-                    continue;
-                }
+                // TOCTOU fix: capture file identity snapshot BEFORE scan.
+                // Replaces old is_symlink() check — now detects ALL reparse
+                // points (junctions, mount points) and captures canonical path +
+                // metadata for revalidation before scan and quarantine.
+                let file_id = match file_identity::FileIdentity::capture(&path) {
+                    Some(id) => id,
+                    None => {
+                        // Reparse point or unresolvable → reject.
+                        race_diag.reparse_rejected.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                };
 
                 // Check scan cache — skip if recently scanned and clean.
                 if let Some(true) = cache.check_with_metadata(&path, &path_meta) {
                     debug!(file = %path.display(), "cache hit: clean");
+                    continue;
+                }
+
+                // TOCTOU Phase 2: revalidate identity before scan.
+                // Between debounce buffer flush and now, the file may have been
+                // replaced by a symlink/junction. Reject if identity changed.
+                if let Err(mismatch) = file_id.revalidate(&watched_roots_vec) {
+                    debug!(
+                        file = %path.display(),
+                        reason = %mismatch,
+                        "TOCTOU: identity changed before scan, skipping"
+                    );
+                    race_diag.race_skipped.fetch_add(1, Ordering::Relaxed);
+                    race_diag.identity_changed.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
 
@@ -322,6 +351,9 @@ fn watcher_loop(
                     std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 );
 
+                // Record realtime scan activity for residency management.
+                state.activity_tracker.record_realtime_scan();
+
                 // Layer 0: ClamAV signature scan (with budget check).
                 let clamav_start = std::time::Instant::now();
                 let result = state.scan_file_clamav(&engine, &path, &rt_cancel);
@@ -337,8 +369,13 @@ fn watcher_loop(
                 let mut argus_verdict = if rt_tracker.is_expired() {
                     rt_tracker.record_timeout(argus::budget::TimeoutReason::TotalTimeout);
                     debug!(file = %path.display(), "realtime budget exhausted, skipping ARGUS");
-                    // Partial result: ClamAV ran, ARGUS skipped.
-                    cache.record_with_metadata(&path, &path_meta, !result.infected);
+                    // H4 fix: partial analysis (ARGUS skipped) → NEVER cache as clean.
+                    // Budget exhaustion means incomplete analysis. Only cache ClamAV positives.
+                    // Clean-looking files remain uncached → will be re-scanned next encounter.
+                    if result.infected {
+                        cache.record_with_metadata(&path, &path_meta, false);
+                    }
+                    // else: deliberately NOT cached — next scan attempt will retry.
                     if result.infected {
                         // ClamAV positive — still report threat even without ARGUS.
                         let threat_name = result.virus_name.clone().unwrap_or("Unknown".into());
@@ -346,7 +383,9 @@ fn watcher_loop(
                         detections_count.fetch_add(1, Ordering::Relaxed);
                         let path_str = path.to_string_lossy().to_string();
                         match state.quarantine_file(&path_str, &threat_name, "realtime") {
-                            Ok(q) => info!(id = %q.quarantine_id, "auto-quarantined (budget-partial)"),
+                            Ok(q) => {
+                                info!(id = %q.quarantine_id, "auto-quarantined (budget-partial)")
+                            }
                             Err(e) => warn!(%e, "auto-quarantine failed"),
                         }
                     }
@@ -354,7 +393,8 @@ fn watcher_loop(
                 } else if config.heuristic_alerts {
                     let argus_start = std::time::Instant::now();
                     let v = state.argus().analyze_file(&path);
-                    if rt_tracker.phase_expired(argus_start, rt_tracker.budget().max_yara_duration) {
+                    if rt_tracker.phase_expired(argus_start, rt_tracker.budget().max_yara_duration)
+                    {
                         rt_tracker.record_timeout(argus::budget::TimeoutReason::YaraTimeout);
                     }
                     v
@@ -375,21 +415,96 @@ fn watcher_loop(
                     }
                 };
 
+                // ── ConvergenceLedger (ARCH-H1 fix: realtime uses same path as manual) ──
+                let mut ledger =
+                    crate::convergence::ConvergenceLedger::new(&argus_verdict, result.infected);
+
                 // ── ADS content scan (ASTRA, realtime: exe streams only) ──
                 if !rt_tracker.is_expired() {
                     let ads_policy = crate::scan::ads::ads_policy_for_profile(&rt_profile);
                     let streams = crate::scan::ads::enumerate_ads(&path);
                     let filtered = crate::scan::ads::filter_streams(streams, ads_policy);
                     for stream in &filtered {
-                        if rt_tracker.is_expired() { break; }
+                        if rt_tracker.is_expired() {
+                            break;
+                        }
                         let ads_result = crate::scan::ads::scan_ads_content(stream, state.argus());
                         for finding in ads_result.content_findings {
-                            argus_verdict.score = argus_verdict.score.saturating_add(finding.weight).min(100);
-                            argus_verdict.findings.push(finding);
+                            ledger.add_evidence("ADS", finding);
                         }
                     }
-                    if !filtered.is_empty() {
-                        argus_verdict.verdict = argus::verdict::Verdict::from_score(argus_verdict.score);
+                }
+
+                // ── Trust graph (realtime: query discount, defer observation) ──
+                // H7 fix: observe() moved AFTER finalize — only clean files build trust.
+                // Previously, malicious files observed BEFORE scoring → slowly earned trust.
+                if let Some(tg) = state.trust_graph() {
+                    let file_key = path.to_string_lossy().to_lowercase();
+                    // Query existing trust level for discount (read-only).
+                    let trust_q = tg.query(&file_key);
+                    if trust_q.confidence_discount > 0 {
+                        let trust_finding = crate::trust_graph::trust_finding(&trust_q);
+                        ledger.apply_trust_discount(trust_q.confidence_discount, trust_finding);
+                    }
+                }
+
+                // ── Persistence intelligence ──
+                if let Some(ptype) = crate::persistence::check_persistence_context(&path) {
+                    let finding = crate::persistence::persistence_finding(ptype, &path, false);
+                    ledger.add_evidence("Persistence", finding);
+                }
+
+                // ── PLM lineage correlation ──
+                if let Some(plm) = state.plm() {
+                    if let Some(chain) = plm.query_by_image_path(&path) {
+                        if let Some(finding) = crate::plm::lineage_finding(&chain) {
+                            ledger.add_evidence("PLM", finding);
+                        }
+                    }
+                }
+
+                // ── Ecosystem convergence ──
+                if ledger.base_score > 0 {
+                    let file_key = path.to_string_lossy().to_string();
+                    if !ledger.findings.is_empty() {
+                        state.ecosystem.add_evidence(
+                            &file_key,
+                            crate::ecosystem::EcosystemEvidence {
+                                source: crate::ecosystem::EvidenceSource::Argus,
+                                timestamp: chrono::Utc::now().timestamp(),
+                                description: format!(
+                                    "{} findings, score {}",
+                                    ledger.findings.len(),
+                                    ledger.base_score
+                                ),
+                                weight: (ledger.base_score / 10).min(10),
+                            },
+                        );
+                    }
+                    if let Some(eco) = state.ecosystem.get(&file_key) {
+                        if let Some(finding) = crate::ecosystem::ecosystem_finding(&eco) {
+                            ledger.add_evidence("Ecosystem", finding);
+                        }
+                    }
+                }
+
+                // ── Finalize convergence ──
+                let (final_score, final_verdict, _) = ledger.finalize();
+                argus_verdict.score = final_score;
+                argus_verdict.verdict = final_verdict;
+                argus_verdict.findings = ledger.findings.clone();
+                ledger.patch_explanation(&mut argus_verdict.explanation, final_score);
+
+                // H7 fix: deferred trust observation — only clean files build familiarity.
+                // Prevents malware from slowly earning trust through repeated execution.
+                if final_score == 0 && !result.infected {
+                    if let Some(tg) = state.trust_graph() {
+                        let file_key = path.to_string_lossy().to_lowercase();
+                        tg.observe(
+                            &file_key,
+                            crate::trust_graph::TrustNodeKind::Executable,
+                            None,
+                        );
                     }
                 }
 
@@ -483,7 +598,32 @@ fn watcher_loop(
                     let path_str_for_mem = path.to_string_lossy().to_string();
                     state.auto_memory_scan_if_running(&path_str_for_mem, argus_verdict.score);
 
-                    // Auto-quarantine.
+                    // TOCTOU Phase 3: revalidate identity BEFORE quarantine.
+                    // Scanning wrong file is bad. Quarantining wrong file is CRITICAL.
+                    if let Err(mismatch) = file_id.revalidate(&watched_roots_vec) {
+                        warn!(
+                            file = %path.display(),
+                            reason = %mismatch,
+                            "TOCTOU: identity changed before quarantine — PREVENTED"
+                        );
+                        race_diag
+                            .quarantine_race_prevented
+                            .fetch_add(1, Ordering::Relaxed);
+                        // Still log the detection, but do NOT quarantine the wrong file.
+                        let path_str = path.to_string_lossy().to_string();
+                        state.log_activity(
+                            "critical",
+                            "watcher",
+                            &format!(
+                                "Threat detected but quarantine blocked (TOCTOU): {threat_name}"
+                            ),
+                            &path_str,
+                            None,
+                        );
+                        continue; // Skip quarantine, move to next file.
+                    }
+
+                    // Auto-quarantine (identity verified).
                     let path_str = path.to_string_lossy().to_string();
                     match state.quarantine_file(&path_str, &threat_name, "realtime") {
                         Ok(q) => {

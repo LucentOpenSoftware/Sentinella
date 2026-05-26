@@ -206,7 +206,7 @@ rule loader_certutil_bitsadmin_abuse {
 
     condition:
         ($cert1 and any of ($cert2, $cert3, $cert4, $cert5) and any of ($url*)) or
-        ($bits1 and any of ($bits2, $bits3) and any of ($url*)) or
+        ($bits1 and any of ($bits2, $bits3, $bits4) and any of ($url*)) or
         ($bits5 and any of ($url*) and $cert6)
 }
 
@@ -227,7 +227,6 @@ rule loader_lolbin_proxy_execution {
 
         // Regsvr32 abuse (Squiblydoo)
         $reg1 = "regsvr32" ascii nocase
-        $reg2 = "/s " ascii nocase
         $reg3 = "/i:" ascii nocase
         $reg4 = "scrobj.dll" ascii nocase
         $reg5 = ".sct" ascii nocase
@@ -251,10 +250,10 @@ rule loader_lolbin_proxy_execution {
         $script4 = "ScriptControl" ascii
 
     condition:
-        ($mshta1 and (any of ($mshta3, $mshta4) or any of ($script*))) or
+        (any of ($mshta1, $mshta2) and (any of ($mshta3, $mshta4) or any of ($script*))) or
         ($reg1 and $reg3 and any of ($reg4, $reg5, $remote1, $remote2)) or
         (any of ($rund1, $rund2) and any of ($remote*) and any of ($script*)) or
-        (any of ($mshta1, $reg1, $rund1) and any of ($remote*) and any of ($script*))
+        (any of ($mshta1, $mshta2, $reg1, $rund1) and any of ($remote*) and any of ($script*))
 }
 
 rule loader_iso_vhd_motw_bypass {

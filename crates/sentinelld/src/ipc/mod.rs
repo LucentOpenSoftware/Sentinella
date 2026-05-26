@@ -14,6 +14,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, error, info, warn};
 
+mod policy;
 mod state;
 pub use state::{AppState, unify_detection_filtered};
 
@@ -314,6 +315,52 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
     debug!(method = %req.method, id = req.id, "dispatch");
     state.record_request();
 
+    // ── Policy enforcement (phases 1-3, 7) ─────────────
+    {
+        use std::collections::HashMap;
+        use std::sync::OnceLock;
+        static REGISTRY: OnceLock<HashMap<&'static str, policy::MethodPolicy>> = OnceLock::new();
+        let reg = REGISTRY.get_or_init(policy::method_registry);
+
+        if let Some(pol) = reg.get(req.method.as_str()) {
+            // Phase 2: per-method payload cap.
+            let payload_size = serde_json::to_vec(&req.params)
+                .map(|v| v.len())
+                .unwrap_or(0);
+            if payload_size > pol.max_payload_bytes {
+                return serde_json::to_vec(&RpcErrorResponse::err(
+                    req.id,
+                    policy::ipc_errors::PAYLOAD_TOO_LARGE,
+                    format!(
+                        "payload {} bytes exceeds limit {} for {}",
+                        payload_size, pol.max_payload_bytes, req.method
+                    ),
+                ))
+                .unwrap_or_default();
+            }
+
+            // Phase 3: rate limiting.
+            if let Err(retry_secs) = state.rate_limiter.check(pol.rate_bucket) {
+                return serde_json::to_vec(&RpcErrorResponse::err(
+                    req.id,
+                    policy::ipc_errors::RATE_LIMITED,
+                    format!("rate limited — retry after {}s", retry_secs),
+                ))
+                .unwrap_or_default();
+            }
+
+            // Phase 7: degraded mode — block mutations if engine is reloading.
+            if !pol.allowed_while_reloading && state.is_engine_reloading() {
+                return serde_json::to_vec(&RpcErrorResponse::err(
+                    req.id,
+                    policy::ipc_errors::ENGINE_RELOADING,
+                    "engine is reloading — try again shortly".to_string(),
+                ))
+                .unwrap_or_default();
+            }
+        }
+    }
+
     let result: Result<Value, (i32, String)> = match req.method.as_str() {
         "engine.status" => ok_json(state.engine_status()),
         "engine.reload" => {
@@ -487,6 +534,33 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
                 }
             }
         }
+        "quarantine.restore_as" => {
+            let token = req
+                .params
+                .get("token")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !state.validate_challenge_token(token) {
+                Ok(
+                    serde_json::json!({"ok": false, "error": "Challenge token required for quarantine restore"}),
+                )
+            } else {
+                let id = req.params.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                let dest = req
+                    .params
+                    .get("dest")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if dest.is_empty() {
+                    Ok(serde_json::json!({"ok": false, "error": "dest path required"}))
+                } else {
+                    match state.quarantine_restore_as(id, dest) {
+                        Ok(path) => Ok(serde_json::json!({"ok": true, "restored_to": path})),
+                        Err(e) => Ok(serde_json::json!({"ok": false, "error": e})),
+                    }
+                }
+            }
+        }
         "quarantine.delete" => {
             // Dangerous — permanently destroys quarantined file. Requires challenge token.
             let token = req
@@ -509,7 +583,11 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
 
         "calibration.report_safe" => {
             // Record a restored file as likely false positive.
-            let auth = req.params.get("auth").and_then(|v| v.as_str()).unwrap_or("");
+            let auth = req
+                .params
+                .get("auth")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if !state.validate_ipc_auth(auth) {
                 return serde_json::to_vec(&RpcErrorResponse::err(
                     req.id,
@@ -518,10 +596,26 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
                 ))
                 .unwrap_or_default();
             }
-            let quarantine_id = req.params.get("quarantine_id").and_then(|v| v.as_str()).unwrap_or("");
-            let sha256 = req.params.get("sha256").and_then(|v| v.as_str()).unwrap_or("");
-            let file_path = req.params.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
-            let detection_name = req.params.get("detection_name").and_then(|v| v.as_str()).unwrap_or("");
+            let quarantine_id = req
+                .params
+                .get("quarantine_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let sha256 = req
+                .params
+                .get("sha256")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let file_path = req
+                .params
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let detection_name = req
+                .params
+                .get("detection_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
 
             if sha256.is_empty() || file_path.is_empty() {
                 Ok(serde_json::json!({"ok": false, "error": "missing sha256 or file_path"}))
@@ -559,18 +653,21 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
             if let Some(tg) = state.trust_graph() {
                 let mut diag = tg.diagnostics();
                 let drifts = tg.recent_drifts(10);
-                let drift_json: Vec<serde_json::Value> = drifts.iter().map(|d| {
-                    serde_json::json!({
-                        "timestamp": d.timestamp,
-                        "entity": d.entity_key,
-                        "type": format!("{:?}", d.drift_type),
-                        "old": d.old_value,
-                        "new": d.new_value,
-                        "impact": d.trust_impact,
-                        "explanation": d.explanation,
-                        "weight": d.drift_type.suspicion_weight(),
+                let drift_json: Vec<serde_json::Value> = drifts
+                    .iter()
+                    .map(|d| {
+                        serde_json::json!({
+                            "timestamp": d.timestamp,
+                            "entity": d.entity_key,
+                            "type": format!("{:?}", d.drift_type),
+                            "old": d.old_value,
+                            "new": d.new_value,
+                            "impact": d.trust_impact,
+                            "explanation": d.explanation,
+                            "weight": d.drift_type.suspicion_weight(),
+                        })
                     })
-                }).collect();
+                    .collect();
                 if let Some(obj) = diag.as_object_mut() {
                     obj.insert("recent_drift_events".into(), serde_json::json!(drift_json));
                 }
@@ -582,18 +679,40 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
 
         "runtime.scan_buffer" => {
             // Dev/test: scan a runtime buffer through ASTRA runtime pipeline.
-            let auth = req.params.get("auth").and_then(|v| v.as_str()).unwrap_or("");
+            let auth = req
+                .params
+                .get("auth")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if !state.validate_ipc_auth(auth) {
                 return serde_json::to_vec(&RpcErrorResponse::err(
-                    req.id, error_codes::INVALID_PARAMS,
+                    req.id,
+                    error_codes::INVALID_PARAMS,
                     "authenticated IPC required".to_string(),
-                )).unwrap_or_default();
+                ))
+                .unwrap_or_default();
             }
 
-            let content_b64 = req.params.get("content").and_then(|v| v.as_str()).unwrap_or("");
-            let language = req.params.get("language").and_then(|v| v.as_str()).unwrap_or("other");
-            let source_app = req.params.get("source_app").and_then(|v| v.as_str()).unwrap_or("dev-inject");
-            let content_name = req.params.get("content_name").and_then(|v| v.as_str()).unwrap_or("manual");
+            let content_b64 = req
+                .params
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let language = req
+                .params
+                .get("language")
+                .and_then(|v| v.as_str())
+                .unwrap_or("other");
+            let source_app = req
+                .params
+                .get("source_app")
+                .and_then(|v| v.as_str())
+                .unwrap_or("dev-inject");
+            let content_name = req
+                .params
+                .get("content_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("manual");
 
             // Decode base64 content or use raw UTF-8.
             let content = if content_b64.is_empty() {
@@ -610,9 +729,9 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
                     source_app: source_app.to_string(),
                     source_pid: 0,
                     content_name: content_name.to_string(),
-                    language: crate::amsi::ScriptLanguage::from_app_name(
-                        &format!("{language}.exe")
-                    ),
+                    language: crate::amsi::ScriptLanguage::from_app_name(&format!(
+                        "{language}.exe"
+                    )),
                     content,
                     original_size: content_b64.len(),
                     timestamp: chrono::Utc::now().timestamp(),
@@ -625,8 +744,12 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
                     if buffer.source_pid > 0 {
                         let chain = plm.graph.get_chain(buffer.source_pid);
                         chain.chain_suspicion
-                    } else { 0 }
-                } else { 0 };
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                };
 
                 let total_score = result.score.saturating_add(plm_boost).min(100);
 
@@ -794,6 +917,225 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
             }))
         }
 
+        // ── Signature Sources ─────────────────────────────
+        // Read-only: no auth required.
+        "sources.status" | "sources.list" => {
+            let sig_dir = crate::paths::paths().signatures_dir();
+            let mut mgr = crate::engine::sources::SignatureSourceManager::new(&sig_dir);
+            let config = crate::config::Config::load(None).unwrap_or_default();
+            let provider = if config.enhanced_signature_provider == "none" {
+                None
+            } else {
+                Some(config.enhanced_signature_provider.clone())
+            };
+            mgr.load_config(provider);
+            Ok(mgr.diagnostics())
+        }
+
+        // Privileged: requires challenge token (changes security posture).
+        "sources.set" => {
+            // Require challenge token — provider change affects detection coverage.
+            let token = req
+                .params
+                .get("challenge_token")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !state.validate_challenge_token(token) {
+                return serde_json::to_vec(&RpcErrorResponse::err(
+                    req.id,
+                    error_codes::INSUFFICIENT_PRIVILEGE,
+                    "challenge token required to change signature sources".to_string(),
+                ))
+                .unwrap_or_default();
+            }
+
+            let provider_id = req
+                .params
+                .get("provider")
+                .and_then(|v| v.as_str())
+                .unwrap_or("none");
+
+            // Validate provider exists.
+            let sig_dir = crate::paths::paths().signatures_dir();
+            let mut mgr = crate::engine::sources::SignatureSourceManager::new(&sig_dir);
+            let new_provider = if provider_id == "none" {
+                None
+            } else {
+                Some(provider_id)
+            };
+            if !mgr.set_enhanced(new_provider) && new_provider.is_some() {
+                return serde_json::to_vec(&RpcErrorResponse::err(
+                    req.id,
+                    error_codes::INVALID_PARAMS,
+                    format!("unknown provider: {provider_id}"),
+                ))
+                .unwrap_or_default();
+            }
+
+            // Save to config.
+            let mut config = crate::config::Config::load(None).unwrap_or_default();
+            config.enhanced_signature_provider = provider_id.to_string();
+            let config_path = crate::paths::paths().config_file();
+            let _ = config.save(&config_path);
+
+            // Invalidate mpool cache — force rebuild with new provider.
+            let cache_path = crate::paths::paths().mpool_cache();
+            if cache_path.exists() {
+                let _ = std::fs::remove_file(&cache_path);
+                info!("sources.set: mpool cache invalidated");
+            }
+            let meta_path = crate::paths::paths().mpool_meta();
+            let _ = std::fs::remove_file(&meta_path);
+
+            // Audit trail.
+            state.log_activity(
+                "critical",
+                "sources",
+                &format!("Enhanced signature provider changed to: {provider_id}"),
+                "",
+                None,
+            );
+
+            info!(
+                provider = provider_id,
+                "signature source changed — restart required for activation"
+            );
+
+            Ok(serde_json::json!({
+                "ok": true,
+                "provider": provider_id,
+                "restart_required": true,
+                "cache_invalidated": true,
+            }))
+        }
+
+        // Update enhanced signature provider files.
+        // Challenge-token protected — modifies detection coverage.
+        "sources.update" => {
+            let token = req
+                .params
+                .get("challenge_token")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !state.validate_challenge_token(token) {
+                return serde_json::to_vec(&RpcErrorResponse::err(
+                    req.id,
+                    error_codes::INSUFFICIENT_PRIVILEGE,
+                    "challenge token required for provider update".to_string(),
+                ))
+                .unwrap_or_default();
+            }
+
+            let config = crate::config::Config::load(None).unwrap_or_default();
+            if config.enhanced_signature_provider == "none" {
+                return serde_json::to_vec(&serde_json::json!({
+                    "ok": false,
+                    "error": "no enhanced provider configured"
+                }))
+                .unwrap_or_default();
+            }
+
+            // Find the active provider.
+            let p = crate::paths::paths();
+            let mut source_mgr =
+                crate::engine::sources::SignatureSourceManager::new(&p.signatures_dir());
+            source_mgr.load_config(Some(config.enhanced_signature_provider.clone()));
+
+            let provider = match source_mgr.active_enhanced() {
+                Some(prov) => prov.clone(),
+                None => {
+                    return serde_json::to_vec(&serde_json::json!({
+                        "ok": false,
+                        "error": "configured provider not found in registry"
+                    }))
+                    .unwrap_or_default();
+                }
+            };
+
+            // Run the update pipeline.
+            let mut pipeline = crate::engine::update_pipeline::SignatureUpdateManager::new();
+            let result = pipeline.update_provider(&provider);
+
+            if result.success {
+                // Invalidate mpool cache — force rebuild with new signatures.
+                let cache_path = p.mpool_cache();
+                if cache_path.exists() {
+                    let _ = std::fs::remove_file(&cache_path);
+                }
+                let _ = std::fs::remove_file(p.mpool_meta());
+
+                state.log_activity(
+                    "info",
+                    "sources",
+                    &format!(
+                        "Enhanced signatures updated: {} ({} files)",
+                        provider.name, result.files_activated
+                    ),
+                    "",
+                    None,
+                );
+            } else {
+                state.log_activity(
+                    "critical",
+                    "sources",
+                    &format!(
+                        "Enhanced signature update FAILED: {}",
+                        result.error.as_deref().unwrap_or("unknown")
+                    ),
+                    "",
+                    None,
+                );
+            }
+
+            Ok(serde_json::json!({
+                "ok": result.success,
+                "files_downloaded": result.files_downloaded,
+                "files_activated": result.files_activated,
+                "error": result.error,
+                "restart_required": result.success,
+            }))
+        }
+
+        // Rollback enhanced signatures to official-only.
+        "sources.rollback" => {
+            let token = req
+                .params
+                .get("challenge_token")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !state.validate_challenge_token(token) {
+                return serde_json::to_vec(&RpcErrorResponse::err(
+                    req.id,
+                    error_codes::INSUFFICIENT_PRIVILEGE,
+                    "challenge token required for rollback".to_string(),
+                ))
+                .unwrap_or_default();
+            }
+
+            let mut pipeline = crate::engine::update_pipeline::SignatureUpdateManager::new();
+            pipeline.rollback();
+            pipeline.cleanup_all_staging();
+
+            // Invalidate cache.
+            let p = crate::paths::paths();
+            let _ = std::fs::remove_file(p.mpool_cache());
+            let _ = std::fs::remove_file(p.mpool_meta());
+
+            state.log_activity(
+                "critical",
+                "sources",
+                "Enhanced signatures rolled back — official ClamAV only",
+                "",
+                None,
+            );
+
+            Ok(serde_json::json!({
+                "ok": true,
+                "mode": "official_only",
+                "restart_required": true,
+            }))
+        }
+
         // ARGUS reload — hot-reload YARA rules + IOC hashes.
         "argus.reload" => {
             let auth = req
@@ -809,10 +1151,7 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
                 ))
                 .unwrap_or_default();
             }
-            let yara_dirs = vec![
-                std::path::PathBuf::from("runtime/argus/rules/yara"),
-                std::path::PathBuf::from("runtime/rules"),
-            ];
+            let yara_dirs = crate::paths::paths().yara_rule_dirs();
             let yara_result = state.argus().yara.load_rules_on_large_stack(&yara_dirs);
             let yara_msg = match yara_result {
                 Ok(count) => format!("{count} YARA rules reloaded"),
@@ -820,14 +1159,10 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
             };
 
             // Reload IOC hashes.
-            let ioc_paths = [
-                std::path::PathBuf::from("runtime/rules/ioc_hashes.txt"),
-                std::path::PathBuf::from("runtime/argus/rules/ioc/ioc_hashes.txt"),
-            ];
             let mut ioc_count = 0u64;
-            for p in &ioc_paths {
-                if p.exists() {
-                    if let Ok(c) = state.argus().ioc.load_from_file(p) {
+            for ip in &crate::paths::paths().ioc_hash_paths() {
+                if ip.exists() {
+                    if let Ok(c) = state.argus().ioc.load_from_file(ip) {
                         ioc_count = c;
                         break;
                     }
@@ -851,9 +1186,7 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
 
         // ARGUS intelligence packs — read manifest and return pack info.
         "argus.packs" => {
-            let manifest_paths = [std::path::PathBuf::from(
-                "runtime/argus/manifests/pack_manifest.json",
-            )];
+            let manifest_paths = [crate::paths::paths().pack_manifest()];
             let mut packs = serde_json::json!([]);
             for mp in &manifest_paths {
                 if mp.exists() {
@@ -912,7 +1245,7 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
             if pid == 0 {
                 Ok(serde_json::json!({"error": "pid required"}))
             } else {
-                let result = crate::memory_scanner::scan_process(pid, state.argus());
+                let result = crate::memory_scanner::scan_process_simple(pid, state.argus());
                 state.log_activity(
                     if result.findings.is_empty() {
                         "info"
@@ -971,12 +1304,44 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
             }
             match serde_json::from_value::<crate::config::Config>(req.params.clone()) {
                 Ok(mut config) => {
-                    // Security-critical fields preserved from current config.
-                    // These can only be changed via protection.set_critical (requires
+                    // ── Security-critical fields preserved from current config ──
+                    // These can ONLY be changed via protection.set_critical (requires
                     // challenge token + UAC elevation on GUI side).
+                    //
+                    // APT kill vector: attacker with IPC secret calls settings.set
+                    // to inject exclusions that suppress all detection. Protecting
+                    // these fields forces the attacker to have admin + challenge token.
                     let current = crate::config::Config::load(None).unwrap_or_default();
+
+                    // Protection state (existing).
                     config.realtime_enabled = current.realtime_enabled;
                     config.auto_quarantine = current.auto_quarantine;
+
+                    // Worker path (C2 fix).
+                    config.argus_worker_path = current.argus_worker_path;
+                    config.argus_worker_enabled = current.argus_worker_enabled;
+                    config.scan.argus_worker_path = current.scan.argus_worker_path;
+                    config.scan.argus_worker_enabled = current.scan.argus_worker_enabled;
+
+                    // ☠️ KILL VECTOR FIX: protect all detection-affecting fields.
+                    // An attacker setting excluded_detections=[""] kills ALL detection.
+                    // An attacker setting excluded_paths=["C:\\Users"] blinds the scanner.
+                    // An attacker adding to trusted_hashes whitelists specific malware.
+                    // An attacker emptying realtime_roots disables watcher coverage.
+                    config.excluded_paths = current.excluded_paths;
+                    config.excluded_extensions = current.excluded_extensions;
+                    config.excluded_detections = current.excluded_detections;
+                    config.trusted_hashes = current.trusted_hashes;
+                    config.realtime_roots = current.realtime_roots;
+                    config.heuristic_alerts = current.heuristic_alerts;
+                    config.idle_scan_enabled = current.idle_scan_enabled;
+                    config.scheduled_scan_enabled = current.scheduled_scan_enabled;
+                    config.enhanced_signature_provider = current.enhanced_signature_provider;
+
+                    // Validate the remaining mutable fields.
+                    config.validate();
+
+                    // Load safe (validated) detection exclusions.
                     state.load_detection_exclusions(config.excluded_detections.clone());
 
                     // Log any settings change for audit trail.
@@ -988,7 +1353,7 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
                         None,
                     );
 
-                    let path = std::path::PathBuf::from("runtime/config/sentinelld.toml");
+                    let path = crate::paths::paths().config_file();
                     match config.save(&path) {
                         Ok(()) => Ok(serde_json::json!({"ok": true})),
                         Err(e) => Ok(serde_json::json!({"ok": false, "error": e})),
@@ -1008,6 +1373,7 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
             "daemon_mode": state.daemon_mode(),
             "audit_mode": state.is_audit_mode(),
             "memory_pressure": state.pressure_state(),
+            "working_set": state.residency_diagnostics(),
         })),
 
         // ── Protection critical settings (requires challenge token) ──
@@ -1046,7 +1412,7 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
                 changes.push(format!("auto_quarantine={v}"));
             }
 
-            let path = std::path::PathBuf::from("runtime/config/sentinelld.toml");
+            let path = crate::paths::paths().config_file();
             match config.save(&path) {
                 Ok(()) => {
                     state.log_activity(
@@ -1205,6 +1571,7 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
                 "fish": state.fish_diagnostics(),
                 "resilience": state.resilience_diagnostics(),
                 "memory_pressure": state.pressure_policy(),
+                "residency": state.residency_diagnostics(),
                 "generated_at": chrono::Utc::now().to_rfc3339(),
             }))
         }

@@ -541,6 +541,49 @@ async fn get_trust_status() -> Result<Value, String> {
     daemon_client::call_simple("trust.status").await.map_err(Into::into)
 }
 
+#[tauri::command]
+async fn get_signature_sources() -> Result<Value, String> {
+    daemon_client::call_simple("sources.status").await.map_err(Into::into)
+}
+
+#[tauri::command]
+async fn set_signature_source(provider_id: String) -> Result<Value, String> {
+    // Provider change is security-sensitive — requires challenge token.
+    let token_resp = daemon_client::call_auth("security.challenge", serde_json::json!({})).await.map_err(|e| e.to_string())?;
+    let token = token_resp.get("token").and_then(|v| v.as_str()).unwrap_or("");
+    daemon_client::call("sources.set", serde_json::json!({
+        "provider": provider_id,
+        "challenge_token": token,
+    })).await.map_err(Into::into)
+}
+
+#[tauri::command]
+async fn rollback_signature_source() -> Result<Value, String> {
+    let token_resp = daemon_client::call_auth("security.challenge", serde_json::json!({})).await.map_err(|e| e.to_string())?;
+    let token = token_resp.get("token").and_then(|v| v.as_str()).unwrap_or("");
+    daemon_client::call("sources.rollback", serde_json::json!({
+        "challenge_token": token,
+    })).await.map_err(Into::into)
+}
+
+#[tauri::command]
+async fn update_signature_source() -> Result<Value, String> {
+    let token_resp = daemon_client::call_auth("security.challenge", serde_json::json!({})).await.map_err(|e| e.to_string())?;
+    let token = token_resp.get("token").and_then(|v| v.as_str()).unwrap_or("");
+    daemon_client::call("sources.update", serde_json::json!({
+        "challenge_token": token,
+    })).await.map_err(Into::into)
+}
+
+#[tauri::command]
+async fn quarantine_restore_as(id: String, dest: String) -> Result<Value, String> {
+    let token_resp = daemon_client::call_auth("security.challenge", serde_json::json!({})).await.map_err(|e| e.to_string())?;
+    let token = token_resp.get("token").and_then(|v| v.as_str()).unwrap_or("");
+    daemon_client::call("quarantine.restore_as", serde_json::json!({
+        "id": id, "dest": dest, "token": token,
+    })).await.map_err(Into::into)
+}
+
 // ── App entry with system tray ───────────────────────────────────
 
 use tauri::{
@@ -555,6 +598,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             // ── Daemon supervisor ────────────────────────────
             let supervisor_state = std::sync::Arc::new(supervisor::SupervisorState::new());
@@ -750,6 +794,11 @@ pub fn run() {
             get_connection_state,
             get_runtime_intelligence,
             get_trust_status,
+            get_signature_sources,
+            set_signature_source,
+            rollback_signature_source,
+            update_signature_source,
+            quarantine_restore_as,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

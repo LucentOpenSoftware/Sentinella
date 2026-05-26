@@ -421,9 +421,16 @@ fn idle_scanner_loop(
     let _ = resources::cpu_usage_percent();
     std::thread::sleep(Duration::from_secs(2));
 
-    // Wait 30s after daemon start before beginning idle scan.
-    info!("idle scanner: waiting 30s before first scan cycle");
-    for _ in 0..30 {
+    // Wait before beginning idle scan.
+    // After engine compile + WS trim, delaying the idle scanner preserves
+    // the initial lightweight residency impression. Realtime watcher and
+    // startup critical scan remain active during this delay.
+    let idle_delay_secs = config.idle_scan_start_delay_secs.max(30);
+    info!(
+        delay_secs = idle_delay_secs,
+        "idle scanner: waiting before first scan cycle"
+    );
+    for _ in 0..idle_delay_secs {
         if !running.load(Ordering::Relaxed) {
             return;
         }
@@ -516,6 +523,7 @@ fn idle_scanner_loop(
                 .unwrap_or_default();
 
             *current_target_ref.lock().unwrap_or_else(|e| e.into_inner()) = dir_name.clone();
+            app_state.activity_tracker.record_idle_scan();
             info!(dir = %target_dir.display(), "idle scanner: scanning directory");
 
             let files = collect_scannable_files(
@@ -607,12 +615,14 @@ fn idle_scanner_loop(
                 let idle_cancel = std::sync::atomic::AtomicBool::new(false);
                 let clamav_start = std::time::Instant::now();
                 let clam_result = app_state.scan_file_clamav(&engine, file_path, &idle_cancel);
-                if idle_tracker.phase_expired(clamav_start, idle_tracker.budget().max_clamav_duration) {
+                if idle_tracker
+                    .phase_expired(clamav_start, idle_tracker.budget().max_clamav_duration)
+                {
                     idle_tracker.record_timeout(argus::budget::TimeoutReason::ClamAvTimeout);
                 }
 
                 // ARGUS analysis (skip if total budget exhausted).
-                let argus_verdict = if idle_tracker.is_expired() {
+                let mut argus_verdict = if idle_tracker.is_expired() {
                     idle_tracker.record_timeout(argus::budget::TimeoutReason::TotalTimeout);
                     debug!(file = %file_path.display(), "idle budget exhausted, skipping ARGUS");
                     argus::ArgusVerdict {
@@ -632,11 +642,105 @@ fn idle_scanner_loop(
                 } else {
                     let argus_start = std::time::Instant::now();
                     let v = app_state.argus().analyze_file(file_path);
-                    if idle_tracker.phase_expired(argus_start, idle_tracker.budget().max_yara_duration) {
+                    if idle_tracker
+                        .phase_expired(argus_start, idle_tracker.budget().max_yara_duration)
+                    {
                         idle_tracker.record_timeout(argus::budget::TimeoutReason::YaraTimeout);
                     }
                     v
                 };
+
+                // ── ConvergenceLedger (ARCH-M1 fix: idle uses same path as manual) ──
+                let mut ledger = crate::convergence::ConvergenceLedger::new(
+                    &argus_verdict,
+                    clam_result.infected,
+                );
+
+                // ADS content scan (idle profile).
+                if !idle_tracker.is_expired() {
+                    let ads_policy = crate::scan::ads::ads_policy_for_profile(&idle_profile);
+                    let streams = crate::scan::ads::enumerate_ads(file_path);
+                    let filtered = crate::scan::ads::filter_streams(streams, ads_policy);
+                    for stream in &filtered {
+                        if idle_tracker.is_expired() {
+                            break;
+                        }
+                        let ads_result =
+                            crate::scan::ads::scan_ads_content(stream, app_state.argus());
+                        for finding in ads_result.content_findings {
+                            ledger.add_evidence("ADS", finding);
+                        }
+                    }
+                }
+
+                // Trust graph: query discount (H7 fix: observe deferred to after finalize).
+                if let Some(tg) = app_state.trust_graph() {
+                    let file_key = file_path.to_string_lossy().to_lowercase();
+                    let trust_q = tg.query(&file_key);
+                    if trust_q.confidence_discount > 0 {
+                        let trust_finding = crate::trust_graph::trust_finding(&trust_q);
+                        ledger.apply_trust_discount(trust_q.confidence_discount, trust_finding);
+                    }
+                }
+
+                // Persistence intelligence.
+                if let Some(ptype) = crate::persistence::check_persistence_context(file_path) {
+                    let finding = crate::persistence::persistence_finding(ptype, file_path, false);
+                    ledger.add_evidence("Persistence", finding);
+                }
+
+                // PLM lineage.
+                if let Some(plm) = app_state.plm() {
+                    if let Some(chain) = plm.query_by_image_path(file_path) {
+                        if let Some(finding) = crate::plm::lineage_finding(&chain) {
+                            ledger.add_evidence("PLM", finding);
+                        }
+                    }
+                }
+
+                // Ecosystem convergence.
+                if ledger.base_score > 0 {
+                    let file_key = file_path.to_string_lossy().to_string();
+                    if !ledger.findings.is_empty() {
+                        app_state.ecosystem.add_evidence(
+                            &file_key,
+                            crate::ecosystem::EcosystemEvidence {
+                                source: crate::ecosystem::EvidenceSource::Argus,
+                                timestamp: chrono::Utc::now().timestamp(),
+                                description: format!(
+                                    "{} findings, score {}",
+                                    ledger.findings.len(),
+                                    ledger.base_score
+                                ),
+                                weight: (ledger.base_score / 10).min(10),
+                            },
+                        );
+                    }
+                    if let Some(eco) = app_state.ecosystem.get(&file_key) {
+                        if let Some(finding) = crate::ecosystem::ecosystem_finding(&eco) {
+                            ledger.add_evidence("Ecosystem", finding);
+                        }
+                    }
+                }
+
+                // Finalize convergence.
+                let (final_score, final_verdict, _) = ledger.finalize();
+                argus_verdict.score = final_score;
+                argus_verdict.verdict = final_verdict;
+                argus_verdict.findings = ledger.findings.clone();
+                ledger.patch_explanation(&mut argus_verdict.explanation, final_score);
+
+                // H7 fix: only clean files build trust.
+                if final_score == 0 && !clam_result.infected {
+                    if let Some(tg) = app_state.trust_graph() {
+                        let file_key = file_path.to_string_lossy().to_lowercase();
+                        tg.observe(
+                            &file_key,
+                            crate::trust_graph::TrustNodeKind::Executable,
+                            None,
+                        );
+                    }
+                }
 
                 let (is_threat, threat_name_opt) = crate::ipc::unify_detection_filtered(
                     clam_result.infected,
@@ -704,6 +808,42 @@ fn idle_scanner_loop(
             "",
             None,
         );
+
+        // Re-trim working set after idle scan cycle.
+        // Idle scanning faults many ClamAV signature pages into the WS.
+        // Trimming after the cycle moves them back to standby, keeping
+        // the idle residency low between scan cycles.
+        #[cfg(target_os = "windows")]
+        {
+            use windows::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
+            let ws_before = {
+                use windows::Win32::System::ProcessStatus::GetProcessMemoryInfo;
+                let mut c: windows::Win32::System::ProcessStatus::PROCESS_MEMORY_COUNTERS =
+                    unsafe { std::mem::zeroed() };
+                c.cb = std::mem::size_of_val(&c) as u32;
+                unsafe {
+                    let _ = GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb);
+                }
+                c.WorkingSetSize as u64 / (1024 * 1024)
+            };
+            let _ =
+                unsafe { SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX) };
+            let ws_after = {
+                use windows::Win32::System::ProcessStatus::GetProcessMemoryInfo;
+                let mut c: windows::Win32::System::ProcessStatus::PROCESS_MEMORY_COUNTERS =
+                    unsafe { std::mem::zeroed() };
+                c.cb = std::mem::size_of_val(&c) as u32;
+                unsafe {
+                    let _ = GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb);
+                }
+                c.WorkingSetSize as u64 / (1024 * 1024)
+            };
+            info!(
+                ws_before_mb = ws_before,
+                ws_after_mb = ws_after,
+                "idle scanner: post-cycle working set trim"
+            );
+        }
 
         // Wait before next cycle — long pause (30-60 min).
         let wait_secs = rand::thread_rng().gen_range(1800..=3600);

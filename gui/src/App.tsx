@@ -15,6 +15,7 @@ import { UpdatePage } from "./pages/Update";
 import { SettingsPage } from "./pages/Settings";
 import { AboutPage } from "./pages/About";
 import { NotificationsPage } from "./pages/Notifications";
+import { IntelligencePage } from "./pages/Intelligence";
 import { FirstRunWizard, isFirstRunComplete } from "./pages/FirstRun";
 import { useDaemon } from "./hooks/useDaemon";
 import "./App.css";
@@ -251,6 +252,7 @@ function App() {
           {page === "settings" && <SettingsPage />}
 
           {page === "notifications" && <NotificationsPage />}
+          {page === "intelligence" && <IntelligencePage />}
           {page === "about" && <AboutPage />}
         </AppShell>
       </DaemonProvider>

@@ -10,8 +10,8 @@
 
 #![cfg(target_os = "windows")]
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use super::{LineageGraph, ProcessNode};
@@ -24,6 +24,9 @@ pub struct EtwIntakeDiagnostics {
     pub reconnects: AtomicU64,
     pub etw_running: AtomicBool,
     pub last_event_ts: AtomicU64,
+    /// Set to true when ETW gives up retrying (e.g. access denied, not admin).
+    /// PlmMonitor can check this to switch to full snapshot mode.
+    pub etw_gave_up: AtomicBool,
 }
 
 impl EtwIntakeDiagnostics {
@@ -34,6 +37,7 @@ impl EtwIntakeDiagnostics {
             reconnects: AtomicU64::new(0),
             etw_running: AtomicBool::new(false),
             last_event_ts: AtomicU64::new(0),
+            etw_gave_up: AtomicBool::new(false),
         }
     }
 }
@@ -69,17 +73,23 @@ pub fn start_etw_intake(
     Ok(thread)
 }
 
+/// Maximum retry attempts for access-denied (error 5) before giving up.
+/// After this many failures, ETW intake stops retrying and signals
+/// the PLM monitor to rely on snapshot mode exclusively.
+const MAX_ACCESS_DENIED_RETRIES: u32 = 5;
+
 /// Main ETW processing loop. Retries on failure with backoff.
+/// Gives up after `MAX_ACCESS_DENIED_RETRIES` access-denied failures.
 fn etw_process_loop(
     graph: Arc<LineageGraph>,
     diag: Arc<EtwIntakeDiagnostics>,
     running: Arc<AtomicBool>,
 ) {
-
     tracing::info!("PLM ETW intake starting");
 
     let session_name = "SentinellaPLM";
     let mut backoff_secs = 1u64;
+    let mut access_denied_count = 0u32;
 
     while running.load(Ordering::Relaxed) {
         match run_etw_session(session_name, &graph, &diag, &running) {
@@ -95,9 +105,24 @@ fn etw_process_loop(
                     break;
                 }
 
+                let is_access_denied = e.contains("failed: 5");
+                if is_access_denied {
+                    access_denied_count += 1;
+                }
+
+                if is_access_denied && access_denied_count >= MAX_ACCESS_DENIED_RETRIES {
+                    tracing::info!(
+                        attempts = access_denied_count,
+                        "PLM ETW: access denied (not admin), switching to snapshot-only mode"
+                    );
+                    diag.etw_gave_up.store(true, Ordering::Relaxed);
+                    break;
+                }
+
                 tracing::warn!(
                     error = %e,
                     backoff_secs,
+                    attempt = access_denied_count,
                     "PLM ETW session failed, will retry"
                 );
 
@@ -162,7 +187,8 @@ fn run_etw_session(
         if start_result.0 == 183 {
             // Stale session — stop and retry.
             let mut stop_buf = vec![0u8; props_size];
-            let stop_props = unsafe { &mut *(stop_buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES) };
+            let stop_props =
+                unsafe { &mut *(stop_buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES) };
             stop_props.Wnode.BufferSize = props_size as u32;
             stop_props.LoggerNameOffset = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
             unsafe {
@@ -175,7 +201,10 @@ fn run_etw_session(
             }
             return Err("stale session cleaned, will retry".into());
         }
-        return Err(format!("StartTraceW failed: {} (need admin?)", start_result.0));
+        return Err(format!(
+            "StartTraceW failed: {} (need admin?)",
+            start_result.0
+        ));
     }
 
     tracing::info!("PLM ETW kernel trace session started");
@@ -201,15 +230,23 @@ fn run_etw_session(
     }
 
     // ProcessTrace blocks until session stops.
+    // ARCH-3 fix: use a separate flag for the stop thread so that if
+    // ProcessTrace returns early (error/OS killed session), the stop
+    // thread exits its polling loop and join() doesn't deadlock.
+    // The `running` flag is shared with the main PLM loop and must NOT
+    // be set to false here — that would kill the entire PLM monitor.
+    let trace_done = Arc::new(AtomicBool::new(false));
+    let trace_done_clone = Arc::clone(&trace_done);
+
     let handles = [trace_handle];
     let running_clone = Arc::clone(running);
     let session_name_stop = session_name_wide.clone();
     let stop_thread = std::thread::spawn(move || {
-        // Wait for running=false, then stop the session.
-        while running_clone.load(Ordering::Relaxed) {
+        // Wait for either: shutdown requested OR ProcessTrace returned.
+        while running_clone.load(Ordering::Relaxed) && !trace_done_clone.load(Ordering::Relaxed) {
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
-        // Stop session to unblock ProcessTrace.
+        // Stop session to unblock ProcessTrace (idempotent if already stopped).
         let stop_size = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + 512;
         let mut stop_buf = vec![0u8; stop_size];
         let stop_props = unsafe { &mut *(stop_buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES) };
@@ -227,6 +264,8 @@ fn run_etw_session(
 
     let _ = unsafe { ProcessTrace(&handles, None, None) };
 
+    // Signal stop thread that ProcessTrace has returned.
+    trace_done.store(true, Ordering::Relaxed);
     let _ = stop_thread.join();
     diag.etw_running.store(false, Ordering::Relaxed);
 
@@ -240,78 +279,94 @@ static CALLBACK_DIAG: AtomicU64 = AtomicU64::new(0);
 
 /// Process GUID for ETW kernel process events.
 const PROCESS_GUID: windows::core::GUID = windows::core::GUID::from_values(
-    0x3d6fa8d0, 0xfe05, 0x11d0,
+    0x3d6fa8d0,
+    0xfe05,
+    0x11d0,
     [0x9d, 0xda, 0x00, 0xc0, 0x4f, 0xd7, 0xba, 0x7c],
 );
 
 /// ETW event callback — receives every kernel event.
 unsafe extern "system" fn etw_event_callback(record: *mut EVENT_RECORD) {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { unsafe {
-        if record.is_null() { return; }
-        let event = &*record;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        unsafe {
+            if record.is_null() {
+                return;
+            }
+            let event = &*record;
 
-        let provider = event.EventHeader.ProviderId;
-        let opcode = event.EventHeader.EventDescriptor.Opcode;
+            let provider = event.EventHeader.ProviderId;
+            let opcode = event.EventHeader.EventDescriptor.Opcode;
 
-        // Only process start events (opcode 1).
-        if provider != PROCESS_GUID || opcode != 1 {
-            return;
+            // Only process start events (opcode 1).
+            if provider != PROCESS_GUID || opcode != 1 {
+                return;
+            }
+
+            let graph_ptr = CALLBACK_GRAPH.load(Ordering::SeqCst);
+            let diag_ptr = CALLBACK_DIAG.load(Ordering::SeqCst);
+            if graph_ptr == 0 || diag_ptr == 0 {
+                return;
+            }
+
+            let diag = &*(diag_ptr as *const EtwIntakeDiagnostics);
+            diag.events_seen.fetch_add(1, Ordering::Relaxed);
+            diag.last_event_ts.store(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                Ordering::Relaxed,
+            );
+
+            // Parse process start event data.
+            let data = std::slice::from_raw_parts(
+                event.UserData as *const u8,
+                event.UserDataLength as usize,
+            );
+
+            if data.len() < 8 {
+                return;
+            }
+
+            // Process start event layout (varies by OS version):
+            // Offset 0: ProcessId (u32) — but this is in the header.
+            let pid = event.EventHeader.ProcessId;
+            let ppid = if data.len() >= 8 {
+                u32::from_le_bytes([data[4], data[5], data[6], data[7]])
+            } else {
+                0
+            };
+
+            // Image name resolution for process START events.
+            // ETW event data (authoritative, free) → ToolHelp fallback (expensive).
+            let image_name = extract_image_from_event(data)
+                .or_else(|| get_process_image(pid))
+                .unwrap_or_else(|| format!("pid:{pid}"));
+            let exe_name = image_name
+                .rsplit('\\')
+                .next()
+                .unwrap_or(&image_name)
+                .to_string();
+
+            let graph = &*(graph_ptr as *const LineageGraph);
+            graph.record_process(ProcessNode {
+                pid,
+                parent_pid: ppid,
+                image_path: image_name,
+                image_name: exe_name,
+                command_line: None,
+                is_signed: None,
+                integrity_level: None,
+                created_at: Instant::now(),
+                timestamp: chrono::Utc::now().timestamp(),
+            });
         }
-
-        let graph_ptr = CALLBACK_GRAPH.load(Ordering::SeqCst);
-        let diag_ptr = CALLBACK_DIAG.load(Ordering::SeqCst);
-        if graph_ptr == 0 || diag_ptr == 0 { return; }
-
-        let diag = &*(diag_ptr as *const EtwIntakeDiagnostics);
-        diag.events_seen.fetch_add(1, Ordering::Relaxed);
-        diag.last_event_ts.store(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-            Ordering::Relaxed,
-        );
-
-        // Parse process start event data.
-        let data = std::slice::from_raw_parts(
-            event.UserData as *const u8,
-            event.UserDataLength as usize,
-        );
-
-        if data.len() < 8 { return; }
-
-        // Process start event layout (varies by OS version):
-        // Offset 0: ProcessId (u32) — but this is in the header.
-        let pid = event.EventHeader.ProcessId;
-        let ppid = if data.len() >= 8 {
-            u32::from_le_bytes([data[4], data[5], data[6], data[7]])
-        } else {
-            0
-        };
-
-        // Image name: try to extract from event data (after fixed fields).
-        // The image name is a null-terminated wide string at variable offset.
-        // Simplified: use PID to look up image name via ToolHelp32.
-        let image_name = get_process_image(pid).unwrap_or_else(|| format!("pid:{pid}"));
-        let exe_name = image_name.rsplit('\\').next().unwrap_or(&image_name).to_string();
-
-        let graph = &*(graph_ptr as *const LineageGraph);
-        graph.record_process(ProcessNode {
-            pid,
-            parent_pid: ppid,
-            image_path: image_name,
-            image_name: exe_name,
-            command_line: None,
-            is_signed: None,
-            integrity_level: None,
-            created_at: Instant::now(),
-            timestamp: chrono::Utc::now().timestamp(),
-        });
-    }}));
+    }));
 
     if result.is_err() {
         // Callback panicked — increment dropped counter.
-        let diag_ptr = CALLBACK_GRAPH.load(Ordering::SeqCst);
+        // ARCH-4 fix: was using CALLBACK_GRAPH (LineageGraph*) as EtwIntakeDiagnostics*.
+        let diag_ptr = CALLBACK_DIAG.load(Ordering::SeqCst);
         if diag_ptr != 0 {
             unsafe {
                 let diag = &*(diag_ptr as *const EtwIntakeDiagnostics);
@@ -321,10 +376,66 @@ unsafe extern "system" fn etw_event_callback(record: *mut EVENT_RECORD) {
     }
 }
 
+/// Try to extract image path from ETW process start event data.
+///
+/// Process start event layout (kernel provider, opcode 1):
+///   Offset 0:   UniqueProcessKey (u64 on x64, u32 on x86)
+///   Offset 4/8: ProcessId (u32)  — but we use the header PID
+///   Offset 8:   ParentId (u32)   — already parsed
+///   Variable:   ImageFileName as null-terminated wide string after fixed fields
+///
+/// The image path is typically at offset 52+ (x64) after SessionId, ExitStatus, etc.
+/// We scan for a plausible wide-string path starting with drive letter.
+fn extract_image_from_event(data: &[u8]) -> Option<String> {
+    // Minimum: need at least 60 bytes for fixed fields + some path data.
+    if data.len() < 60 {
+        return None;
+    }
+
+    // Scan for a wide-string path pattern: drive letter (C-Z) followed by ':'
+    // as UTF-16LE: [0x43-0x5A, 0x00, 0x3A, 0x00]
+    for offset in (40..data.len().saturating_sub(8)).step_by(2) {
+        if offset + 4 > data.len() {
+            break;
+        }
+        let ch = data[offset];
+        let ch_hi = data[offset + 1];
+        let colon = data[offset + 2];
+        let colon_hi = data[offset + 3];
+
+        if ch_hi == 0 && colon == 0x3A && colon_hi == 0 && ch.is_ascii_alphabetic() && ch >= b'C' {
+            // Found potential path start. Read until null terminator or end.
+            let path_start = offset;
+            let mut path_end = path_start;
+            while path_end + 1 < data.len() {
+                let lo = data[path_end];
+                let hi = data[path_end + 1];
+                if lo == 0 && hi == 0 {
+                    break;
+                }
+                path_end += 2;
+            }
+            if path_end > path_start + 4 {
+                let wide: Vec<u16> = data[path_start..path_end]
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect();
+                let s = String::from_utf16_lossy(&wide);
+                // Validate: must contain backslash and look like a path.
+                if s.contains('\\') && s.len() > 3 {
+                    return Some(s);
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Look up process image path by PID via ToolHelp32 snapshot.
 fn get_process_image(pid: u32) -> Option<String> {
-    use windows::Win32::System::Diagnostics::ToolHelp::*;
     use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::*;
 
     unsafe {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
@@ -339,10 +450,16 @@ fn get_process_image(pid: u32) -> Option<String> {
         loop {
             if entry.th32ProcessID == pid {
                 let _ = CloseHandle(snapshot);
-                let len = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
+                let len = entry
+                    .szExeFile
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(entry.szExeFile.len());
                 return Some(String::from_utf16_lossy(&entry.szExeFile[..len]));
             }
-            if Process32NextW(snapshot, &mut entry).is_err() { break; }
+            if Process32NextW(snapshot, &mut entry).is_err() {
+                break;
+            }
         }
 
         let _ = CloseHandle(snapshot);

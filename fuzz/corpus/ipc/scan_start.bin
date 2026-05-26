@@ -1,0 +1,1 @@
+{"method":"scan.start","id":3,"params":{"type":"file","target":"C:\\test.exe"},"auth":"secret"}

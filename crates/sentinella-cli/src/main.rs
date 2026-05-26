@@ -323,68 +323,131 @@ async fn main() -> Result<()> {
         }
         Commands::DisableRealtime => {
             let token = request_challenge_token().await?;
-            let resp = send_request("protection.set_critical", serde_json::json!({
-                "token": token, "realtime_enabled": false
-            })).await?;
-            if resp.get("result").and_then(|r| r.get("ok")).and_then(|v| v.as_bool()) == Some(true) {
+            let resp = send_request(
+                "protection.set_critical",
+                serde_json::json!({
+                    "token": token, "realtime_enabled": false
+                }),
+            )
+            .await?;
+            if resp
+                .get("result")
+                .and_then(|r| r.get("ok"))
+                .and_then(|v| v.as_bool())
+                == Some(true)
+            {
                 println!("  Real-time protection disabled.");
             } else {
-                let err = resp.get("result").and_then(|r| r.get("error")).and_then(|v| v.as_str()).unwrap_or("unknown");
+                let err = resp
+                    .get("result")
+                    .and_then(|r| r.get("error"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
                 eprintln!("  Failed: {err}");
             }
         }
         Commands::EnableRealtime => {
             let token = request_challenge_token().await?;
-            let resp = send_request("protection.set_critical", serde_json::json!({
-                "token": token, "realtime_enabled": true
-            })).await?;
-            if resp.get("result").and_then(|r| r.get("ok")).and_then(|v| v.as_bool()) == Some(true) {
+            let resp = send_request(
+                "protection.set_critical",
+                serde_json::json!({
+                    "token": token, "realtime_enabled": true
+                }),
+            )
+            .await?;
+            if resp
+                .get("result")
+                .and_then(|r| r.get("ok"))
+                .and_then(|v| v.as_bool())
+                == Some(true)
+            {
                 println!("  Real-time protection enabled.");
             } else {
-                let err = resp.get("result").and_then(|r| r.get("error")).and_then(|v| v.as_str()).unwrap_or("unknown");
+                let err = resp
+                    .get("result")
+                    .and_then(|r| r.get("error"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
                 eprintln!("  Failed: {err}");
             }
         }
         Commands::PauseProtection => {
             let token = request_challenge_token().await?;
-            let resp = send_request("protection.disable", serde_json::json!({"token": token})).await?;
-            if resp.get("result").and_then(|r| r.get("ok")).and_then(|v| v.as_bool()) == Some(true) {
+            let resp =
+                send_request("protection.disable", serde_json::json!({"token": token})).await?;
+            if resp
+                .get("result")
+                .and_then(|r| r.get("ok"))
+                .and_then(|v| v.as_bool())
+                == Some(true)
+            {
                 println!("  Protection paused.");
             } else {
-                let err = resp.get("result").and_then(|r| r.get("error")).and_then(|v| v.as_str()).unwrap_or("unknown");
+                let err = resp
+                    .get("result")
+                    .and_then(|r| r.get("error"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
                 eprintln!("  Failed: {err}");
             }
         }
         Commands::ResumeProtection => {
             let token = request_challenge_token().await?;
-            let resp = send_request("protection.enable", serde_json::json!({"token": token})).await?;
-            if resp.get("result").and_then(|r| r.get("ok")).and_then(|v| v.as_bool()) == Some(true) {
+            let resp =
+                send_request("protection.enable", serde_json::json!({"token": token})).await?;
+            if resp
+                .get("result")
+                .and_then(|r| r.get("ok"))
+                .and_then(|v| v.as_bool())
+                == Some(true)
+            {
                 println!("  Protection resumed.");
             } else {
-                let err = resp.get("result").and_then(|r| r.get("error")).and_then(|v| v.as_str()).unwrap_or("unknown");
+                let err = resp
+                    .get("result")
+                    .and_then(|r| r.get("error"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
                 eprintln!("  Failed: {err}");
             }
         }
-        Commands::RuntimeScan { path, language, json } => {
+        Commands::RuntimeScan {
+            path,
+            language,
+            json,
+        } => {
             let content = std::fs::read_to_string(&path)
                 .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
             let auth_params = ipc_auth_params()?;
-            let auth_val = auth_params.get("auth").cloned().unwrap_or(serde_json::Value::Null);
-            let resp = send_request("runtime.scan_buffer", serde_json::json!({
-                "auth": auth_val,
-                "content": content,
-                "language": language,
-                "source_app": "sentinella-cli",
-                "content_name": path.file_name().unwrap_or_default().to_string_lossy(),
-            })).await?;
+            let auth_val = auth_params
+                .get("auth")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let resp = send_request(
+                "runtime.scan_buffer",
+                serde_json::json!({
+                    "auth": auth_val,
+                    "content": content,
+                    "language": language,
+                    "source_app": "sentinella-cli",
+                    "content_name": path.file_name().unwrap_or_default().to_string_lossy(),
+                }),
+            )
+            .await?;
 
             if let Some(r) = resp.get("result") {
                 if json {
                     println!("{}", serde_json::to_string_pretty(r)?);
                 } else {
                     let score = r.get("score").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let findings = r.get("findings_count").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let duration = r.get("scan_duration_us").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let findings = r
+                        .get("findings_count")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let duration = r
+                        .get("scan_duration_us")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
                     let lang = r.get("language").and_then(|v| v.as_str()).unwrap_or("?");
                     println!("  ASTRA Runtime Analysis");
                     println!("  ======================");
@@ -394,8 +457,11 @@ async fn main() -> Result<()> {
                     println!("  Findings:  {findings}");
                     println!("  Duration:  {duration}us");
                     if let Some(block) = r.get("should_block").and_then(|v| v.as_bool()) {
-                        if block { println!("  VERDICT:   BLOCK (high confidence malicious)"); }
-                        else { println!("  VERDICT:   OBSERVE"); }
+                        if block {
+                            println!("  VERDICT:   BLOCK (high confidence malicious)");
+                        } else {
+                            println!("  VERDICT:   OBSERVE");
+                        }
                     }
                 }
             }

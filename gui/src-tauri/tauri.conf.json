@@ -53,10 +53,39 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "resources": {
+      "../../release/staging/windows/sentinelld.exe": "daemon/sentinelld.exe",
+      "../../release/staging/windows/argusd.exe": "daemon/argusd.exe",
+      "../../release/staging/windows/sentinella.exe": "daemon/sentinella-cli.exe",
+      "../../release/staging/windows/freshclam.exe": "daemon/freshclam.exe",
+      "../../release/staging/windows/libclamav.dll": "daemon/libclamav.dll",
+      "../../release/staging/windows/libclammspack.dll": "daemon/libclammspack.dll",
+      "../../release/staging/windows/libfreshclam.dll": "daemon/libfreshclam.dll",
+      "../../release/staging/windows/certs": "daemon/certs",
+      "../../release/staging/windows/runtime/config": "daemon/runtime/config",
+      "../../release/staging/windows/runtime/argus/rules/yara": "daemon/runtime/argus/rules/yara",
+      "../../release/staging/windows/runtime/argus/manifests": "daemon/runtime/argus/manifests",
+      "../../release/staging/windows/runtime/rules": "daemon/runtime/rules",
+      "../../release/staging/windows/LICENSE": "daemon/LICENSE",
+      "../../release/staging/windows/NOTICE.md": "daemon/NOTICE.md"
+    },
     "windows": {
       "certificateThumbprint": null,
       "digestAlgorithm": "sha256",
       "timestampUrl": ""
+    },
+    "nsis": {
+      "installMode": "both",
+      "displayLanguageSelector": false,
+      "installerIcon": "icons/icon.ico"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/LucentOpenSoftware/Sentinella/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDY5RUQ3RDhCQTNBNUI4NjYKUldSbXVLV2ppMzN0YVlteFJZVy9tYmpwQ1hNRHNrRE5ZekdURVp1cEM2WTcxa2c2dnIrVG5nbi8K"
     }
   }
 }

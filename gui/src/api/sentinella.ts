@@ -182,6 +182,23 @@ export const getRuntimeIntelligence = () =>
 export const getTrustStatus = () =>
   invoke<import("../types/sentinella").TrustGraphStatus>("get_trust_status");
 
+// ── Signature Sources ───────────────────────────────────────
+
+export const getSignatureSources = () =>
+  invoke<import("../types/sentinella").SignatureSourcesStatus>("get_signature_sources");
+
+export const setSignatureSource = (providerId: string) =>
+  invoke<{ ok: boolean; error?: string }>("set_signature_source", { providerId });
+
+export const rollbackSignatureSource = () =>
+  invoke<{ ok: boolean; error?: string }>("rollback_signature_source");
+
+export const updateSignatureSource = () =>
+  invoke<{ ok: boolean; files_downloaded?: number; files_activated?: number; restart_required?: boolean; error?: string }>("update_signature_source");
+
+export const restoreQuarantineAs = (id: string, dest: string) =>
+  invoke<{ ok: boolean; restored_to?: string; error?: string }>("quarantine_restore_as", { id, dest });
+
 // ── Memory Scanner ──────────────────────────────────────────
 
 export interface ProcessInfo {

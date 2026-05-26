@@ -318,3 +318,88 @@ export interface TrustDriftEvent {
   explanation: string;
   weight: number;
 }
+
+// ── Ecosystem ─────────────────────────────────────────────
+
+export interface EcosystemDiagnostics {
+  active_ecosystems: number;
+  active: number;
+  cooling: number;
+  suspicious: number;
+  high_severity: number;
+  critical: number;
+  recurring: number;
+  pruned: number;
+  average_lifetime_minutes: number;
+  recurrence_escalations: number;
+  recent_suspicious: EcosystemSummary[];
+}
+
+export interface EcosystemSummary {
+  root: string;
+  severity: string;
+  state: string;
+  escalation: number;
+  escalation_count: number;
+  recurrence_count: number;
+  evidence_count: number;
+  narrative: string;
+  attribution: ConvergenceAttribution | null;
+  timeline: EcosystemTimelineEvent[];
+}
+
+export interface ConvergenceAttribution {
+  base_argus: number;
+  trust_adjustment: number;
+  drift_escalation: number;
+  ecosystem_escalation: number;
+  recurrence_bonus: number;
+  final_convergence: number;
+}
+
+// ── Signature Sources ─────────────────────────────────────
+
+export interface SignatureSourcesStatus {
+  core: {
+    name: string;
+    status: string;
+    always_enabled: boolean;
+  };
+  enhanced: {
+    active_provider: string | null;
+    active_name: string | null;
+    active_focus: string | null;
+    active_signatures: number;
+    active_footprint_mb: number;
+    active_fp_risk: string | null;
+  };
+  available_providers: SignatureProviderInfo[];
+  provider_fingerprint: string;
+}
+
+export interface SignatureProviderInfo {
+  id: string;
+  name: string;
+  description: string;
+  focus: string;
+  estimated_signatures: number;
+  estimated_footprint_mb: number;
+  fp_risk: string;
+  fp_explanation: string;
+  stability: string;
+  recommendation: string;
+  use_case: string;
+  update_frequency: string;
+  license: string;
+  homepage: string;
+  attribution: string;
+  active: boolean;
+  files_present: boolean;
+}
+
+export interface EcosystemTimelineEvent {
+  timestamp: number;
+  description: string;
+  source: string;
+  weight: number;
+}

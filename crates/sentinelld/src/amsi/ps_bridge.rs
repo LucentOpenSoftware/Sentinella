@@ -11,8 +11,8 @@
 
 #![allow(dead_code)]
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use super::{RuntimeBuffer, ScriptLanguage};
@@ -73,7 +73,9 @@ impl PsBridgeDiagnostics {
     }
 
     pub fn to_json(&self) -> serde_json::Value {
-        let recent = self.recent_events.lock()
+        let recent = self
+            .recent_events
+            .lock()
             .map(|e| serde_json::to_value(&*e).unwrap_or_default())
             .unwrap_or(serde_json::json!([]));
         serde_json::json!({
@@ -177,7 +179,9 @@ fn ps_bridge_loop(
                     let buffer = RuntimeBuffer {
                         source_app: "powershell.exe".into(),
                         source_pid: evt.pid,
-                        content_name: evt.script_name.unwrap_or_else(|| format!("block-{}", evt.record_id)),
+                        content_name: evt
+                            .script_name
+                            .unwrap_or_else(|| format!("block-{}", evt.record_id)),
                         language: ScriptLanguage::PowerShell,
                         content: evt.script_text.into_bytes(),
                         original_size: evt.script_text_len,
@@ -187,15 +191,20 @@ fn ps_bridge_loop(
                     // Scan through ASTRA runtime pipeline.
                     let result = super::scan_runtime_buffer(&buffer, &engine);
                     diag.events_scanned.fetch_add(1, Ordering::Relaxed);
-                    diag.last_score.store(result.score as u64, Ordering::Relaxed);
+                    diag.last_score
+                        .store(result.score as u64, Ordering::Relaxed);
 
                     // PLM correlation.
                     let plm_boost = if let Some(ref graph) = plm {
                         if buffer.source_pid > 0 {
                             let chain = graph.get_chain(buffer.source_pid);
                             chain.chain_suspicion
-                        } else { 0 }
-                    } else { 0 };
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    };
 
                     let total = result.score.saturating_add(plm_boost).min(100);
 
@@ -203,9 +212,17 @@ fn ps_bridge_loop(
                     let lineage_desc = if let Some(ref graph) = plm {
                         if buffer.source_pid > 0 {
                             let chain = graph.get_chain(buffer.source_pid);
-                            if chain.depth > 1 { Some(chain.description.clone()) } else { None }
-                        } else { None }
-                    } else { None };
+                            if chain.depth > 1 {
+                                Some(chain.description.clone())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
 
                     diag.record_event(RuntimeEventSummary {
                         timestamp: buffer.timestamp,
@@ -243,7 +260,8 @@ fn ps_bridge_loop(
             }
             Err(e) => {
                 // SBL may not be enabled — not an error, just log once.
-                static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                static LOGGED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
                 if !LOGGED.swap(true, Ordering::Relaxed) {
                     tracing::debug!(error = %e, "PowerShell SBL not available (Script Block Logging may be disabled)");
                 }
@@ -303,7 +321,10 @@ fn read_new_script_blocks(_after_record_id: u64) -> Result<Vec<ScriptBlockEvent>
 
 /// Parse wevtutil text output into ScriptBlockEvents.
 #[cfg(target_os = "windows")]
-fn parse_wevtutil_output(text: &str, after_record_id: u64) -> Result<Vec<ScriptBlockEvent>, String> {
+fn parse_wevtutil_output(
+    text: &str,
+    after_record_id: u64,
+) -> Result<Vec<ScriptBlockEvent>, String> {
     let mut events = Vec::new();
     let mut current_record_id: u64 = 0;
     let mut current_pid: u32 = 0;
@@ -352,10 +373,15 @@ fn parse_wevtutil_output(text: &str, after_record_id: u64) -> Result<Vec<ScriptB
 
         // ScriptBlock text content — appears after "ScriptBlockText=" or as event data.
         if trimmed.starts_with("ScriptBlockText=") || trimmed.starts_with("ScriptBlockText:") {
-            let content = trimmed.splitn(2, |c| c == '=' || c == ':').nth(1).unwrap_or("").trim();
+            let content = trimmed
+                .splitn(2, |c| c == '=' || c == ':')
+                .nth(1)
+                .unwrap_or("")
+                .trim();
             current_script.push_str(content);
             in_script_block = true;
-        } else if in_script_block && !trimmed.is_empty()
+        } else if in_script_block
+            && !trimmed.is_empty()
             && !trimmed.starts_with("ScriptBlockId")
             && !trimmed.starts_with("Path")
             && !trimmed.starts_with("RecordId")
@@ -431,6 +457,9 @@ mod tests {
     fn duplicate_suppression() {
         // Events with record_id <= after_record_id should be skipped.
         let result = parse_wevtutil_output("RecordId: 5\nScriptBlockText=test\n", 10).unwrap();
-        assert!(result.is_empty(), "record_id 5 should be skipped when after=10");
+        assert!(
+            result.is_empty(),
+            "record_id 5 should be skipped when after=10"
+        );
     }
 }

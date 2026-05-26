@@ -122,9 +122,7 @@ fn collect_run_key_targets(targets: &mut Vec<PathBuf>) {
     ];
 
     for key in &keys {
-        let output = Command::new("reg")
-            .args(["query", key])
-            .output();
+        let output = Command::new("reg").args(["query", key]).output();
 
         if let Ok(out) = output {
             let text = String::from_utf8_lossy(&out.stdout);
@@ -156,7 +154,9 @@ fn parse_reg_output(text: &str, targets: &mut Vec<PathBuf>) {
             continue;
         };
         let value = value_part.trim();
-        if value.is_empty() { continue; }
+        if value.is_empty() {
+            continue;
+        }
 
         // Extract path: handle quoted paths and paths with arguments.
         let path_str = if value.starts_with('"') {
@@ -167,7 +167,9 @@ fn parse_reg_output(text: &str, targets: &mut Vec<PathBuf>) {
             value.split_whitespace().next().unwrap_or("").trim()
         };
 
-        if path_str.is_empty() || path_str.len() < 3 { continue; }
+        if path_str.is_empty() || path_str.len() < 3 {
+            continue;
+        }
 
         let p = PathBuf::from(path_str);
         if p.exists() && p.is_file() {

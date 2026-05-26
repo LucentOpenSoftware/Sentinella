@@ -38,15 +38,11 @@
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="Sentinella">
         <Directory Id="CERTSDIR" Name="certs" />
-        <Directory Id="RULESDIR" Name="rules">
-          <Directory Id="YARASUBDIR" Name="yara" />
-        </Directory>
-        <Directory Id="MANIFESTDIR" Name="manifests" />
         <Directory Id="SCRIPTSDIR" Name="scripts" />
       </Directory>
     </StandardDirectory>
 
-    <!-- ProgramData\Sentinella\ (runtime data — created, not populated) -->
+    <!-- ProgramData\Sentinella\ (runtime data — PathManager root in installed mode) -->
     <StandardDirectory Id="CommonAppDataFolder">
       <Directory Id="DATADIRPARENT" Name="Sentinella">
         <Directory Id="SIGDIR" Name="signatures" />
@@ -54,6 +50,13 @@
         <Directory Id="LOGDIR" Name="logs" />
         <Directory Id="QUARANTINEDIR" Name="quarantine" />
         <Directory Id="CONFIGDIR" Name="config" />
+        <Directory Id="DATARULESDIR" Name="rules" />
+        <Directory Id="DATAARGUSDIR" Name="argus">
+          <Directory Id="DATAARGUSRULESDIR" Name="rules">
+            <Directory Id="DATAYARADIR" Name="yara" />
+          </Directory>
+          <Directory Id="DATAMANIFESTDIR" Name="manifests" />
+        </Directory>
       </Directory>
     </StandardDirectory>
 
@@ -87,7 +90,7 @@
           Start="delayed"
           Account="LocalSystem"
           ErrorControl="normal"
-          Arguments="--foreground --log-level info --dll-dir &quot;[INSTALLFOLDER]&quot; --db-dir &quot;[SIGDIR]&quot; --state-db &quot;[STATEDIR]\sentinella.db&quot;" />
+          Arguments="--foreground --log-level info --runtime-root &quot;[DATADIRPARENT]&quot; --dll-dir &quot;[INSTALLFOLDER]&quot; --db-dir &quot;[SIGDIR]&quot; --state-db &quot;[STATEDIR]\sentinella.db&quot;" />
         <ServiceControl
           Id="SentinelldControl"
           Name="SentinellaDaemon"
@@ -141,20 +144,18 @@
          ARGUS INTELLIGENCE
          ═══════════════════════════════════════════════════════════ -->
 
-    <ComponentGroup Id="IntelligenceComponents" Directory="INSTALLFOLDER">
-      <!-- Pack manifest -->
-      <Component Id="PackManifest" Directory="MANIFESTDIR">
+    <ComponentGroup Id="IntelligenceComponents" Directory="DATADIRPARENT">
+      <!-- Pack manifest → ProgramData\Sentinella\argus\manifests\ -->
+      <Component Id="PackManifest" Directory="DATAMANIFESTDIR">
         <File Source="..\..\runtime\argus\manifests\pack_manifest.json" />
       </Component>
-      <!-- IOC hashes -->
-      <Component Id="IOCHashes" Directory="RULESDIR">
+      <!-- IOC hashes → ProgramData\Sentinella\rules\ -->
+      <Component Id="IOCHashes" Directory="DATARULESDIR">
         <File Source="..\..\runtime\rules\ioc_hashes.txt" />
       </Component>
       <!--
-        YARA rule files — use WiX heat to harvest the directory:
-        wix heat dir runtime\argus\rules\yara -cg YaraRules -dr YARASUBDIR -srd
-        Then add: <ComponentGroupRef Id="YaraRules" />
-        For now, rules are bundled via staging script.
+        YARA rule files → ProgramData\Sentinella\argus\rules\yara\
+        Use WiX heat to harvest: wix heat dir runtime\argus\rules\yara -cg YaraRules -dr DATAYARADIR -srd
       -->
     </ComponentGroup>
 

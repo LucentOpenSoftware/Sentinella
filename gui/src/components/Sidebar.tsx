@@ -1,8 +1,8 @@
-import { Shield, Search, Archive, Clock, Settings, Info, RefreshCw, Bell } from "lucide-react";
+import { Shield, Search, Archive, Clock, Settings, Info, RefreshCw, Bell, Activity } from "lucide-react";
 import { ShieldIcon } from "./ShieldIcon";
 import { t } from "../i18n";
 
-export type Page = "dashboard" | "scan" | "quarantine" | "history" | "notifications" | "update" | "settings" | "about";
+export type Page = "dashboard" | "scan" | "quarantine" | "history" | "notifications" | "intelligence" | "update" | "settings" | "about";
 
 const groups = [
   { labelKey: "nav.protection", items: [
@@ -11,6 +11,7 @@ const groups = [
     { page: "quarantine" as Page, labelKey: "nav.quarantine", Icon: Archive },
     { page: "history" as Page, labelKey: "nav.history", Icon: Clock },
     { page: "notifications" as Page, labelKey: "nav.notifications", Icon: Bell },
+    { page: "intelligence" as Page, labelKey: "nav.intelligence", Icon: Activity },
   ]},
   { labelKey: "nav.system", items: [
     { page: "update" as Page, labelKey: "nav.update", Icon: RefreshCw },
