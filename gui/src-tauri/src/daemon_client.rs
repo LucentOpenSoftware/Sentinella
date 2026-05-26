@@ -147,16 +147,37 @@ pub async fn call_simple(method: &str) -> Result<Value, DaemonError> {
 }
 
 /// Send an authenticated request for dangerous local-only operations.
-pub async fn call_auth(method: &str, mut params: Value) -> Result<Value, DaemonError> {
+/// If the secret hasn't loaded yet (daemon still starting up), waits up to
+/// 5 seconds polling for the secret file to appear before giving up.
+pub async fn call_auth(method: &str, params: Value) -> Result<Value, DaemonError> {
+    // Try up to 10 times (5 seconds total) to get a non-empty secret.
+    // The daemon may not have written it yet on first boot.
+    let mut attempts = 0;
+    loop {
+        let secret = crate::ipc_auth::secret();
+        if !secret.is_empty() {
+            return call_auth_inner(method, params, secret).await;
+        }
+        attempts += 1;
+        if attempts >= 10 {
+            return Err(DaemonError::Rpc {
+                code: -32099,
+                message: "IPC secret unavailable — daemon may still be starting (wait a few seconds and retry)".into(),
+            });
+        }
+        // Invalidate cache so next call re-reads from disk.
+        crate::ipc_auth::invalidate_cache();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
+async fn call_auth_inner(method: &str, mut params: Value, secret: &str) -> Result<Value, DaemonError> {
     match &mut params {
         Value::Object(map) => {
-            map.insert(
-                "auth".into(),
-                Value::String(crate::ipc_auth::secret().to_string()),
-            );
+            map.insert("auth".into(), Value::String(secret.to_string()));
         }
         _ => {
-            params = serde_json::json!({"auth": crate::ipc_auth::secret()});
+            params = serde_json::json!({"auth": secret});
         }
     }
     call(method, params).await

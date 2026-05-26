@@ -1,90 +1,98 @@
-use rand::RngCore;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::Mutex;
 
 pub const ENV_NAME: &str = "SENTINELLA_IPC_SECRET";
 
-static IPC_SECRET: OnceLock<String> = OnceLock::new();
+/// Cached secret as a leaked &'static str — only set after we've actually
+/// read the daemon's file. Until then, each call re-checks so we pick up
+/// the secret once the daemon writes it.
+static CACHED_SECRET: Mutex<Option<&'static str>> = Mutex::new(None);
+/// Empty static string returned when the daemon hasn't written its secret yet.
+/// Calls using this will fail validation server-side; caller should retry.
+const EMPTY_SECRET: &str = "";
 
 pub fn secret() -> &'static str {
-    IPC_SECRET.get_or_init(load_or_create_secret)
+    // Fast path: if we already have it cached, return.
+    {
+        let guard = CACHED_SECRET.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(s) = *guard {
+            return s;
+        }
+    }
+
+    // Try to load now.
+    if let Some(loaded) = try_load_secret() {
+        // Box::leak gives us a true 'static reference. We never free it — the
+        // secret lives for the lifetime of the process, which is correct.
+        let leaked: &'static str = Box::leak(loaded.into_boxed_str());
+        let mut guard = CACHED_SECRET.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(leaked);
+        return leaked;
+    }
+
+    // Daemon hasn't written secret yet. Return empty — call will fail server-side
+    // with a meaningful error. NEVER generate our own secret (would create split-brain).
+    EMPTY_SECRET
 }
 
-fn load_or_create_secret() -> String {
+/// Force-reload from disk (clears cache).
+/// Useful after detecting auth failures — daemon may have rotated the secret.
+#[allow(dead_code)]
+pub fn invalidate_cache() {
+    let mut guard = CACHED_SECRET.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = None;
+}
+
+fn try_load_secret() -> Option<String> {
+    // 1. Environment variable (highest priority — set by supervisor for spawned daemons).
     if let Ok(secret) = std::env::var(ENV_NAME) {
         if secret.len() >= 32 {
-            persist_if_missing(&secret);
-            eprintln!("[ipc_auth] loaded secret from env var");
-            return secret;
+            return Some(secret);
         }
     }
 
-    let path = secret_path();
-    eprintln!("[ipc_auth] secret_path resolved to: {}", path.display());
-    if let Ok(secret) = std::fs::read_to_string(&path) {
-        let trimmed = secret.trim().to_string();
-        if trimmed.len() >= 32 {
-            eprintln!("[ipc_auth] loaded secret from file ({} chars)", trimmed.len());
-            return trimmed;
-        }
-    }
-
-    eprintln!("[ipc_auth] WARNING: generating NEW secret (daemon will reject!)");
-    let secret = generate_secret();
-    persist_secret(&secret);
-    secret
-}
-
-fn secret_path() -> PathBuf {
-    // Dev mode: walk up from CWD to find project root (has crates/sentinelld).
-    if let Ok(cwd) = std::env::current_dir() {
-        for dir in cwd.ancestors() {
-            if dir.join("crates").join("sentinelld").exists() {
-                return dir.join("runtime").join("state").join("ipc_secret");
+    // 2. Read from disk — try all candidate paths.
+    for path in secret_path_candidates() {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            let trimmed = content.trim().to_string();
+            if trimmed.len() >= 32 {
+                return Some(trimmed);
             }
         }
     }
-    // Installed mode: walk up from exe location.
+
+    // Daemon hasn't written it yet. Don't generate — would never match.
+    None
+}
+
+fn secret_path_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    // 1. Installed mode (most common): ProgramData.
+    let pd = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into());
+    candidates.push(PathBuf::from(&pd).join("Sentinella").join("state").join("ipc_secret"));
+
+    // 2. Dev mode: walk up from CWD to find project root.
+    if let Ok(cwd) = std::env::current_dir() {
+        for dir in cwd.ancestors() {
+            if dir.join("crates").join("sentinelld").exists() {
+                candidates.push(dir.join("runtime").join("state").join("ipc_secret"));
+                break;
+            }
+        }
+    }
+
+    // 3. Dev mode: walk up from exe location.
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             for ancestor in dir.ancestors() {
                 if ancestor.join("crates").join("sentinelld").exists() {
-                    return ancestor.join("runtime").join("state").join("ipc_secret");
+                    candidates.push(ancestor.join("runtime").join("state").join("ipc_secret"));
+                    break;
                 }
             }
         }
     }
-    // Fallback: ProgramData or CWD-relative.
-    let pd = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into());
-    let installed = PathBuf::from(&pd).join("Sentinella").join("state").join("ipc_secret");
-    if installed.exists() {
-        return installed;
-    }
-    PathBuf::from("runtime/state/ipc_secret")
-}
 
-fn persist_if_missing(secret: &str) {
-    let path = secret_path();
-    if !path.exists() {
-        persist_secret(secret);
-    }
-}
-
-fn persist_secret(secret: &str) {
-    let path = secret_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(path, secret);
-}
-
-fn generate_secret() -> String {
-    let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        use std::fmt::Write;
-        let _ = write!(out, "{b:02x}");
-    }
-    out
+    candidates
 }
