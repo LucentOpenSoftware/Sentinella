@@ -1,3 +1,5 @@
+<img width="1716" height="561" alt="about1" src="https://github.com/user-attachments/assets/eeb6c7ed-a3c4-4668-b1a1-8fe1c81a9555" />
+
 # Sentinella
 
 A modern, open-source antivirus suite built on the [ClamAV](https://www.clamav.net) scanning engine and the ARGUS heuristic engine.
