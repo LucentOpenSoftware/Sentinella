@@ -2838,33 +2838,62 @@ impl AppState {
             }
         };
 
-        let home = std::env::var("USERPROFILE").unwrap_or_default();
-        let temp =
-            std::env::var("TEMP").unwrap_or_else(|_| format!("{home}\\AppData\\Local\\Temp"));
-        let appdata = std::env::var("APPDATA").unwrap_or_default();
-        let localappdata = std::env::var("LOCALAPPDATA").unwrap_or_default();
-        let programdata = std::env::var("PROGRAMDATA").unwrap_or_default();
+        // CRITICAL: when running as LocalSystem service, USERPROFILE expands to
+        // C:\Windows\system32\config\systemprofile — NOT the logged-in user's profile.
+        // We must enumerate C:\Users\* to find real user profiles to watch.
+        let mut roots: Vec<std::path::PathBuf> = Vec::new();
 
-        // Broad watcher scope: user-writable directories where threats arrive.
-        let roots: Vec<std::path::PathBuf> = [
-            // Primary threat vectors.
-            format!("{home}\\Downloads"),
-            format!("{home}\\Desktop"),
-            temp,
-            // User documents — ransomware targets.
-            format!("{home}\\Documents"),
-            // AppData — malware persistence + browser data.
-            format!("{appdata}"),
-            format!("{localappdata}\\Temp"),
-            // ProgramData — service-level persistence.
-            programdata,
-            // OneDrive if present.
-            format!("{home}\\OneDrive"),
-        ]
-        .iter()
-        .map(std::path::PathBuf::from)
-        .filter(|p| p.exists() && !p.as_os_str().is_empty())
-        .collect();
+        // System-level paths (always present).
+        if let Ok(pd) = std::env::var("PROGRAMDATA") {
+            roots.push(std::path::PathBuf::from(pd));
+        } else {
+            roots.push(std::path::PathBuf::from("C:\\ProgramData"));
+        }
+        if let Ok(t) = std::env::var("TEMP") {
+            roots.push(std::path::PathBuf::from(t));
+        }
+        roots.push(std::path::PathBuf::from("C:\\Windows\\Temp"));
+
+        // Enumerate all real user profiles under C:\Users\.
+        // Skip Default, Public, All Users, Default User, system accounts.
+        let skip_users = ["Default", "Default User", "Public", "All Users", "defaultuser0", "WDAGUtilityAccount"];
+        if let Ok(entries) = std::fs::read_dir("C:\\Users") {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() { continue; }
+                let name = match path.file_name().and_then(|n| n.to_str()) {
+                    Some(n) => n,
+                    None => continue,
+                };
+                if skip_users.iter().any(|s| s.eq_ignore_ascii_case(name)) { continue; }
+                // Each real user gets their high-risk folders watched.
+                for sub in &["Downloads", "Desktop", "Documents", "OneDrive",
+                             "AppData\\Roaming", "AppData\\Local\\Temp"] {
+                    let p = path.join(sub);
+                    if p.exists() {
+                        roots.push(p);
+                    }
+                }
+            }
+        }
+
+        // Also include current-process USERPROFILE (covers dev/portable mode).
+        if let Ok(home) = std::env::var("USERPROFILE") {
+            for sub in &["Downloads", "Desktop", "Documents"] {
+                let p = std::path::PathBuf::from(&home).join(sub);
+                if p.exists() && !roots.iter().any(|r| r == &p) {
+                    roots.push(p);
+                }
+            }
+        }
+
+        // Deduplicate.
+        roots.sort();
+        roots.dedup();
+        // Final filter: only existing, non-empty paths.
+        let roots: Vec<std::path::PathBuf> = roots.into_iter()
+            .filter(|p| p.exists() && !p.as_os_str().is_empty())
+            .collect();
 
         if roots.is_empty() {
             tracing::warn!("no watchable directories found");
