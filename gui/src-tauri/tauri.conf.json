@@ -43,6 +43,7 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
+    "createUpdaterArtifacts": true,
     "publisher": "Lucent Open Software",
     "copyright": "Copyright (c) 2024-2026 Lucent Open Software. GPLv2.",
     "category": "Utility",
