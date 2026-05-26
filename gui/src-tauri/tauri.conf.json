@@ -32,7 +32,7 @@
         "center": true,
         "decorations": false,
         "transparent": true,
-        "alwaysOnTop": true
+        "alwaysOnTop": false
       }
     ],
     "security": {
@@ -72,12 +72,13 @@
     "windows": {
       "certificateThumbprint": null,
       "digestAlgorithm": "sha256",
-      "timestampUrl": ""
-    },
-    "nsis": {
-      "installMode": "both",
-      "displayLanguageSelector": false,
-      "installerIcon": "icons/icon.ico"
+      "timestampUrl": "",
+      "nsis": {
+        "installMode": "both",
+        "displayLanguageSelector": false,
+        "installerIcon": "icons/icon.ico",
+        "installerHooks": "nsis-hooks.nsh"
+      }
     }
   },
   "plugins": {

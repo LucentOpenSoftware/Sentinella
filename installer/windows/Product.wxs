@@ -90,7 +90,7 @@
           Start="delayed"
           Account="LocalSystem"
           ErrorControl="normal"
-          Arguments="--foreground --log-level info --runtime-root &quot;[DATADIRPARENT]&quot; --dll-dir &quot;[INSTALLFOLDER]&quot; --db-dir &quot;[SIGDIR]&quot; --state-db &quot;[STATEDIR]\sentinella.db&quot;" />
+          Arguments="--log-level info --runtime-root &quot;[DATADIRPARENT]&quot; --dll-dir &quot;[INSTALLFOLDER]&quot; --db-dir &quot;[SIGDIR]&quot; --state-db &quot;[STATEDIR]\sentinella.db&quot;" />
         <ServiceControl
           Id="SentinelldControl"
           Name="SentinellaDaemon"

@@ -33,19 +33,13 @@
   }
   .content {
     position: absolute;
-    bottom: 36px;
+    bottom: 16px;
     right: 36px;
     z-index: 1;
     display: flex;
     flex-direction: column;
     align-items: flex-end;
-    gap: 12px;
-  }
-  .status {
-    min-height: 18px;
-    font-size: 11px;
-    color: rgba(255,255,255,0.35);
-    padding-right: 4px;
+    gap: 8px;
   }
   .steps {
     min-width: 260px;
@@ -54,8 +48,8 @@
     gap: 6px;
     padding: 14px 20px;
     border-radius: 12px;
-    border: 1px solid rgba(255,255,255,0.06);
-    background: rgba(0,0,0,0.45);
+    border: none;
+    background: transparent;
   }
   .step {
     display: flex;
@@ -75,20 +69,12 @@
   }
   .step.done .dot { background: #2ecc64; }
   .step.active .dot { background: #3c82f5; }
-  .footer {
-    position: absolute;
-    bottom: 12px;
-    z-index: 1;
-    font-size: 9px;
-    color: rgba(255,255,255,0.15);
-  }
 </style>
 </head>
 <body>
   <div class="splash" data-tauri-drag-region>
     <img class="bg" src="assets/load_ui.png" alt="">
     <div class="content">
-      <div class="status" id="status">Initializing...</div>
       <div class="steps">
         <div class="step active" id="s0"><div class="dot"></div>Connecting to daemon</div>
         <div class="step" id="s1"><div class="dot"></div>Loading ClamAV engine</div>
@@ -97,7 +83,6 @@
         <div class="step" id="s4"><div class="dot"></div>Preparing real-time monitoring</div>
       </div>
     </div>
-    <div class="footer">Lucent Open Software &middot; GPLv2 &middot; v0.1.0</div>
   </div>
   <script src="splash.js"></script>
 </body>

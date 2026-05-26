@@ -41,11 +41,11 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 #[command(name = "sentinelld", about = "Sentinella antivirus daemon")]
 struct Args {
-    /// Run in foreground (don't daemonize). Useful for development.
-    #[arg(long, default_value_t = true)]
+    /// Run in foreground (console mode). When false, enters Windows service mode.
+    #[arg(long)]
     foreground: bool,
 
     /// Config file path override.
@@ -69,19 +69,157 @@ struct Args {
     state_db: Option<String>,
 
     /// Override runtime root directory (PathManager).
-    /// Default: auto-detect (dev → ./runtime, installed → ProgramData/Sentinella).
     #[arg(long)]
     runtime_root: Option<String>,
 
     /// Audit mode: reduced features for stability after repeated crashes.
-    /// Disables idle scanner, forces external ARGUS, reduces worker count.
     #[arg(long)]
     audit_mode: bool,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// Shared state for passing CLI args to the service entry point.
+static SERVICE_ARGS: std::sync::OnceLock<Args> = std::sync::OnceLock::new();
+
+fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+
+    if args.foreground {
+        // Foreground mode: run directly with tokio runtime.
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(run_daemon(args))
+    } else {
+        // Windows service mode.
+        #[cfg(target_os = "windows")]
+        {
+            SERVICE_ARGS.set(args).ok();
+            run_as_windows_service()
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(run_daemon(args))
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn run_as_windows_service() -> anyhow::Result<()> {
+    use windows_service::service_dispatcher;
+    service_dispatcher::start("SentinellaDaemon", service_main)
+        .map_err(|e| anyhow::anyhow!("service dispatcher failed: {e}"))?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
+    use windows_service::service::{
+        ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
+        ServiceType,
+    };
+    use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
+
+    let args = SERVICE_ARGS.get().cloned().unwrap_or_else(|| Args {
+        foreground: false,
+        config: None,
+        log_level: "info".into(),
+        dll_dir: None,
+        db_dir: None,
+        state_db: None,
+        runtime_root: None,
+        audit_mode: false,
+    });
+
+    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown_flag = Arc::clone(&shutdown);
+
+    let status_handle = match service_control_handler::register("SentinellaDaemon", move |control| {
+        match control {
+            ServiceControl::Stop | ServiceControl::Shutdown => {
+                shutdown_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                ServiceControlHandlerResult::NoError
+            }
+            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+            _ => ServiceControlHandlerResult::NotImplemented,
+        }
+    }) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("service control handler registration failed: {e}");
+            return;
+        }
+    };
+
+    // Report: starting.
+    let _ = status_handle.set_service_status(ServiceStatus {
+        service_type: ServiceType::OWN_PROCESS,
+        current_state: ServiceState::StartPending,
+        controls_accepted: ServiceControlAccept::empty(),
+        exit_code: ServiceExitCode::Win32(0),
+        checkpoint: 0,
+        wait_hint: std::time::Duration::from_secs(30),
+        process_id: None,
+    });
+
+    // Build and run tokio runtime.
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("tokio runtime failed: {e}");
+            let _ = status_handle.set_service_status(ServiceStatus {
+                service_type: ServiceType::OWN_PROCESS,
+                current_state: ServiceState::Stopped,
+                controls_accepted: ServiceControlAccept::empty(),
+                exit_code: ServiceExitCode::Win32(1),
+                checkpoint: 0,
+                wait_hint: std::time::Duration::ZERO,
+                process_id: None,
+            });
+            return;
+        }
+    };
+
+    // Report: running.
+    let _ = status_handle.set_service_status(ServiceStatus {
+        service_type: ServiceType::OWN_PROCESS,
+        current_state: ServiceState::Running,
+        controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+        exit_code: ServiceExitCode::Win32(0),
+        checkpoint: 0,
+        wait_hint: std::time::Duration::ZERO,
+        process_id: None,
+    });
+
+    // Run daemon until shutdown signal.
+    let shutdown_for_daemon = Arc::clone(&shutdown);
+    rt.block_on(async {
+        let daemon = run_daemon(args);
+        let stop_wait = async {
+            loop {
+                if shutdown_for_daemon.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        };
+        tokio::select! {
+            result = daemon => { if let Err(e) = result { eprintln!("daemon error: {e}"); } }
+            _ = stop_wait => { /* SCM requested stop */ }
+        }
+    });
+
+    // Report: stopped.
+    let _ = status_handle.set_service_status(ServiceStatus {
+        service_type: ServiceType::OWN_PROCESS,
+        current_state: ServiceState::Stopped,
+        controls_accepted: ServiceControlAccept::empty(),
+        exit_code: ServiceExitCode::Win32(0),
+        checkpoint: 0,
+        wait_hint: std::time::Duration::ZERO,
+        process_id: None,
+    });
+}
+
+async fn run_daemon(args: Args) -> anyhow::Result<()> {
 
     // Initialize PathManager — centralized path resolution.
     if let Some(ref root) = args.runtime_root {
