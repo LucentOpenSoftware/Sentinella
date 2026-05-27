@@ -318,13 +318,26 @@ fn watcher_loop(
                     Ok(meta) => meta,
                 };
 
-                // Cooldown: skip files created less than 500ms ago.
-                // Build tools create+delete files rapidly — scanning during
-                // this window causes file lock contention.
-                if let Ok(created) = path_meta.created() {
-                    if let Ok(age) = created.elapsed() {
-                        if age < std::time::Duration::from_millis(500) {
-                            continue;
+                // Cooldown: skip files created less than 500ms ago — but ONLY
+                // for paths that look like build artifact zones. Originally
+                // this applied to all files to dodge `cargo build` contention,
+                // but it also added 500ms latency to every legit download
+                // (EICAR landed in Downloads → 500ms cooldown → Defender wins).
+                //
+                // User-visible folders (Downloads, Desktop, Documents, OneDrive)
+                // and download partials never need this cooldown — those are
+                // exactly the paths where we MUST scan as fast as possible.
+                let path_str_lower = path.to_string_lossy().to_ascii_lowercase();
+                let is_user_visible_target = path_str_lower.contains("\\downloads\\")
+                    || path_str_lower.contains("\\desktop\\")
+                    || path_str_lower.contains("\\documents\\")
+                    || path_str_lower.contains("\\onedrive\\");
+                if !is_user_visible_target {
+                    if let Ok(created) = path_meta.created() {
+                        if let Ok(age) = created.elapsed() {
+                            if age < std::time::Duration::from_millis(500) {
+                                continue;
+                            }
                         }
                     }
                 }
