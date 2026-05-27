@@ -240,6 +240,26 @@ fn is_installed_context(gui_dir: &Path) -> bool {
     lower.contains(r"\program files\") || lower.contains(r"\program files (x86)\")
 }
 
+/// Returns true if the SentinellaDaemon Windows service is registered.
+/// When true, the supervisor must not spawn its own daemon — SCM owns
+/// the daemon lifecycle and would crash if a second process grabbed the pipe.
+#[cfg(target_os = "windows")]
+fn is_service_registered() -> bool {
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+    // Use sc query — exit code 0 means service exists.
+    let output = Command::new("sc")
+        .args(["query", "SentinellaDaemon"])
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+        .output();
+    matches!(output, Ok(o) if o.status.success())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn is_service_registered() -> bool {
+    false
+}
+
 fn daemon_candidates(gui_dir: &Path) -> [PathBuf; 4] {
     [
         gui_dir.join("resources").join("daemon").join("sentinelld.exe"),
@@ -408,6 +428,16 @@ fn supervisor_loop(state: Arc<SupervisorState>) {
     log::info!("supervisor: starting — waiting for daemon");
     std::thread::sleep(Duration::from_secs(2));
 
+    // CRITICAL: when the Windows service is registered, the SCM owns the
+    // daemon lifecycle (start, restart on failure, ordered shutdown). The
+    // supervisor must NOT spawn its own daemon — doing so creates two
+    // processes racing for the same named pipe, and the service's daemon
+    // crashes with Access Denied because the GUI-spawned one already owns it.
+    let service_managed = is_service_registered();
+    if service_managed {
+        log::info!("supervisor: Windows service detected — SCM manages lifecycle, supervisor will only monitor");
+    }
+
     let mut consecutive_failures = 0u64;
     let mut crash_timestamps: Vec<Instant> = Vec::new();
 
@@ -506,7 +536,17 @@ fn supervisor_loop(state: Arc<SupervisorState>) {
             continue;
         }
 
-        // Daemon still gone — spawn it (audit mode if escalated).
+        // When the Windows service manages the daemon, never spawn our own.
+        // SCM has its own failure recovery (restart 5s/10s/30s). Spawning a
+        // GUI-side daemon would race for the named pipe and force SCM's
+        // daemon to crash with Access Denied.
+        if service_managed {
+            // Just wait longer for SCM to bring it back.
+            std::thread::sleep(Duration::from_secs(5));
+            continue;
+        }
+
+        // Dev/portable mode: no service → supervisor must spawn.
         if spawn_daemon(&state) {
             let mut spawned_ok = false;
             for _wait in 0..20 {

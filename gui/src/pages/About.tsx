@@ -63,7 +63,7 @@ export function AboutPage() {
           <ShieldIcon icon="sentinelAlt" size={48} className="brightness-0 invert opacity-80" />
           <div>
             <p className="text-[20px] font-bold text-white/90 leading-none">Sentinella</p>
-            <p className="text-[12px] text-white/50 mt-1.5">Antivirus Suite v0.1.0</p>
+            <p className="text-[12px] text-white/50 mt-1.5">Antivirus Suite v0.1.3</p>
           </div>
         </div>
       </Card>

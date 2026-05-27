@@ -131,8 +131,32 @@ impl Server {
         info!(pipe = pipe_name, "listening on named pipe");
         let pipe_security = PipeSecurity::new()?;
 
-        // Create first pipe instance.
-        let mut server = create_pipe_server(pipe_name, true, &pipe_security)?;
+        // Create first pipe instance. Retry on contention — another sentinelld
+        // process (e.g., GUI supervisor) may still hold the pipe briefly.
+        // Without this retry, the service crashes immediately at boot if the
+        // GUI-spawned daemon started first.
+        let mut server = {
+            let mut last_err = None;
+            let mut srv = None;
+            for attempt in 0..20 {
+                match create_pipe_server(pipe_name, true, &pipe_security) {
+                    Ok(s) => { srv = Some(s); break; }
+                    Err(e) => {
+                        warn!(attempt, %e, "pipe creation failed, retrying in 3s");
+                        last_err = Some(e);
+                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    }
+                }
+            }
+            match srv {
+                Some(s) => s,
+                None => {
+                    error!("pipe creation failed after 20 attempts (60s) — giving up");
+                    return Err(last_err.map(|e| anyhow::anyhow!(e))
+                        .unwrap_or_else(|| anyhow::anyhow!("pipe creation failed")));
+                }
+            }
+        };
 
         loop {
             // Wait for client connection.
