@@ -12,7 +12,7 @@ const metaKeys: Record<Page, [string, string]> = {
   intelligence: ["nav.intelligence", "ASTRA adaptive analysis"],
   update: ["nav.update", "Signature database"],
   settings: ["nav.settings", "Configure Sentinella"],
-  about: ["nav.about", "Sentinella v0.1.3"],
+  about: ["nav.about", "Sentinella v0.1.4"],
 };
 
 export function AppShell({ currentPage, onNavigate, connected, onRefresh, notices, children }: {

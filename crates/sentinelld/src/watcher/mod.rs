@@ -26,8 +26,17 @@ use crate::fish::{FileMutationEvent, FishDecision, MutationKind};
 /// Max file size the watcher will scan (256 MB).
 const WATCHER_MAX_FILE_SIZE: u64 = 256 * 1024 * 1024;
 
-/// Debounce delay — wait for writes to stabilize.
-const DEBOUNCE_MS: u64 = 800;
+/// Debounce delay — wait for writes to stabilize. Reduced from 800ms in v0.1.4:
+/// small files (downloaded EICAR, scripts, droppers) often write in a single
+/// chunk and don't need long coalescing. Long debounce loses races against
+/// other AVs with kernel filters. Large files still benefit because writes
+/// continue to extend the debounce window.
+const DEBOUNCE_MS: u64 = 150;
+/// Maximum size of file to fast-path scan (skip debounce) on Create events.
+/// Files written atomically (rename-from-temp) and small files (≤2 MB) are
+/// scanned immediately. Larger files fall through to the normal debounce
+/// path so multi-chunk writes coalesce.
+const FAST_PATH_MAX_SIZE: u64 = 2 * 1024 * 1024;
 const DEBOUNCE_CAP: usize = 10_000;
 const OVERFLOW_RESCAN_CAP: usize = 2_000;
 
@@ -188,13 +197,32 @@ fn watcher_loop(
                     continue;
                 }
 
+                // Fast-path: Create events for small files are scanned
+                // immediately without waiting for debounce. EICAR, scripts,
+                // and atomically-renamed downloads land here.
+                let is_create = matches!(event.kind, EventKind::Create(CreateKind::File));
+
                 for path in event.paths {
-                    if path.is_file() {
-                        if recent.len() < DEBOUNCE_CAP {
-                            recent.insert(path);
-                        } else if let Some(parent) = path.parent() {
-                            overflow_dirs.insert(parent.to_path_buf());
+                    if !path.is_file() {
+                        continue;
+                    }
+                    if is_create {
+                        // Check file size — if small enough, scan now and skip debounce.
+                        if let Ok(meta) = std::fs::metadata(&path) {
+                            if meta.len() <= FAST_PATH_MAX_SIZE {
+                                // Force immediate flush by setting last_flush far in the past.
+                                recent.insert(path);
+                                last_flush = Instant::now()
+                                    .checked_sub(Duration::from_millis(DEBOUNCE_MS + 100))
+                                    .unwrap_or(last_flush);
+                                continue;
+                            }
                         }
+                    }
+                    if recent.len() < DEBOUNCE_CAP {
+                        recent.insert(path);
+                    } else if let Some(parent) = path.parent() {
+                        overflow_dirs.insert(parent.to_path_buf());
                     }
                 }
             }

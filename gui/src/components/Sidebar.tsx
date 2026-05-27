@@ -65,7 +65,7 @@ export function Sidebar({ current, onNavigate }: { current: Page; onNavigate: (p
 
       {/* Footer */}
       <div className="px-6 py-6 text-[10px] text-[rgb(var(--t3))]/20">
-        v0.1.3 · GPLv2
+        v0.1.4 · GPLv2
       </div>
     </aside>
   );
