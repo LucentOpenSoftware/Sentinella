@@ -85,29 +85,28 @@ impl MpoolResidencyManager {
 
     /// Prepare for engine load. Creates cache directory, sets env var.
     /// Returns the cache file path for the mpool to use.
+    ///
+    /// Always deletes any existing cache file. The mpool implementation
+    /// appends and 64KB-aligns each region, so reusing an existing file
+    /// causes monotonic growth across reloads (977MB → 1955MB → 2932MB …).
+    /// Starting fresh each time keeps the file at the actual engine size.
     pub fn prepare(&mut self) -> PathBuf {
-        // Ensure cache directory exists.
         if let Err(e) = std::fs::create_dir_all(&self.cache_dir) {
             warn!(error = %e, "residency: cache dir creation failed");
             self.fallback_reason = Some(format!("mkdir failed: {e}"));
         }
 
-        // Check if existing cache is stale.
+        // Always delete previous cache file before each compile.
+        // CREATE_ALWAYS in mpool.c will recreate it fresh. This prevents
+        // the cache file from growing unboundedly across engine reloads.
         if self.cache_path.exists() {
-            if let Some(meta) = self.load_metadata() {
-                debug!(
-                    db_version = meta.db_version,
-                    regions = meta.region_count,
-                    mapped_mb = meta.mapped_bytes / (1024 * 1024),
-                    "residency: existing cache metadata loaded"
-                );
-                self.metadata = Some(meta);
-            } else {
-                // Metadata corrupt or missing — cache is suspect.
-                info!("residency: stale/corrupt metadata — cache will be rebuilt");
-                let _ = std::fs::remove_file(&self.cache_path);
+            match std::fs::remove_file(&self.cache_path) {
+                Ok(()) => info!("residency: previous cache file removed for clean rebuild"),
+                Err(e) => warn!(error = %e, "residency: cache file removal failed (may still be mapped)"),
             }
         }
+        // Also wipe the metadata sidecar so we don't confuse the next load.
+        let _ = std::fs::remove_file(&self.meta_path);
 
         self.cache_path.clone()
     }

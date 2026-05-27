@@ -1,6 +1,6 @@
 [package]
 name = "gui"
-version = "0.1.1"
+version = "0.1.2"
 description = "Sentinella desktop GUI"
 authors = ["Lucent Open Software"]
 edition = "2021"
