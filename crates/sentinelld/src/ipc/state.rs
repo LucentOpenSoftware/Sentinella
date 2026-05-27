@@ -85,6 +85,9 @@ fn load_or_create_ipc_secret() -> Option<String> {
     if let Ok(secret) = std::fs::read_to_string(&path) {
         let trimmed = secret.trim().to_string();
         if trimmed.len() >= 32 {
+            // Always re-apply ACL on startup to repair any prior install that
+            // wrote restrictive permissions before the Users-readable fix.
+            restrict_ipc_secret_permissions(&path);
             return Some(trimmed);
         }
     }
@@ -110,7 +113,16 @@ fn load_or_create_ipc_secret() -> Option<String> {
     }
 }
 
-/// C2 fix: restrict IPC secret file so only SYSTEM and Administrators can read it.
+/// Restrict IPC secret file so only SYSTEM, Administrators, and the
+/// interactive Users group can read it. The GUI (Sentinella.exe) runs as
+/// the unelevated user token via autostart, so it MUST be able to read this
+/// file — otherwise authenticated scans (full/startup) fail with -32602.
+///
+/// Security trade-off: any locally-logged-in user can read the secret and
+/// invoke authenticated IPC actions on this machine. The named pipe ACL
+/// already allows authenticated users to connect; the secret is one more
+/// gate. This matches the consumer-AV pattern where the per-machine daemon
+/// trusts logged-in users on the same machine.
 #[cfg(target_os = "windows")]
 fn restrict_ipc_secret_permissions(path: &Path) {
     use std::os::windows::process::CommandExt;
@@ -121,9 +133,11 @@ fn restrict_ipc_secret_permissions(path: &Path) {
             path_str.as_ref(),
             "/inheritance:r",
             "/grant:r",
-            "SYSTEM:(R)",
+            "*S-1-5-18:(R)",      // NT AUTHORITY\SYSTEM
             "/grant:r",
-            "BUILTIN\\Administrators:(R)",
+            "*S-1-5-32-544:(R)",  // BUILTIN\Administrators
+            "/grant:r",
+            "*S-1-5-32-545:(R)",  // BUILTIN\Users — needed for unelevated GUI
         ])
         .creation_flags(0x08000000) // CREATE_NO_WINDOW
         .output();
@@ -2887,13 +2901,23 @@ impl AppState {
             }
         }
 
-        // Deduplicate.
-        roots.sort();
-        roots.dedup();
-        // Final filter: only existing, non-empty paths.
-        let roots: Vec<std::path::PathBuf> = roots.into_iter()
-            .filter(|p| p.exists() && !p.as_os_str().is_empty())
-            .collect();
+        // Canonicalize + dedupe (case-insensitive on Windows). Critical: notify
+        // crate fails or behaves unpredictably if the same physical path is
+        // registered twice with different casing (e.g., C:\WINDOWS\TEMP and
+        // C:\Windows\Temp both exist as candidates).
+        let mut canonical: Vec<std::path::PathBuf> = Vec::new();
+        let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for p in roots.into_iter() {
+            if p.as_os_str().is_empty() { continue; }
+            // Prefer canonicalized form; fall back to raw if canonicalize fails.
+            let resolved = p.canonicalize().unwrap_or_else(|_| p.clone());
+            if !resolved.exists() { continue; }
+            let key = resolved.to_string_lossy().to_lowercase();
+            if seen_keys.insert(key) {
+                canonical.push(resolved);
+            }
+        }
+        let roots = canonical;
 
         if roots.is_empty() {
             tracing::warn!("no watchable directories found");
