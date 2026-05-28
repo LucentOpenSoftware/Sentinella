@@ -10,6 +10,39 @@ A modern, open-source antivirus suite built on the [ClamAV](https://www.clamav.n
 
 Sentinella wraps the battle-tested ClamAV engine in a modern, beginner-friendly interface and supplements it with ARGUS, an 8-layer heuristic engine. The ClamAV engine itself is kept **unmodified** so upstream security fixes merge cleanly.
 
+## What is ARGUS?
+
+ARGUS is Sentinella’s native heuristic and behavioral analysis engine, designed to complement traditional signature-based detection.
+
+While ClamAV provides fast and reliable signature matching against known malware families, ARGUS focuses on identifying suspicious behavior patterns, anomalous execution characteristics, and threat convergence signals that may indicate previously unseen or modified malware.
+
+The engine is built in Rust and operates as a layered analysis pipeline integrated directly into the Sentinella daemon.
+
+### Current ARGUS components
+
+* **Multi-layer heuristic pipeline** — combines static, behavioral, and contextual analysis
+* **YARA-powered detection** — currently ships with 119 heuristic and malware classification rules
+* **PE structure inspection** — detects malformed or suspicious Windows executables
+* **Behavioral convergence scoring** — correlates weak indicators into higher-confidence detections
+* **Memory analysis integration** — assists the memory scanner in identifying in-memory threats
+* **Ransomware heuristics** — powers parts of the FISH ransomware shield
+* **Cache-aware scanning** — avoids redundant analysis of unchanged files
+
+ARGUS is intentionally designed as a companion engine rather than a replacement for ClamAV. The ClamAV engine remains upstream-compatible and unmodified, while ARGUS adds modern heuristic capabilities around it.
+
+### Design philosophy
+
+The long-term goal of ARGUS is to provide:
+
+* modern heuristic detection,
+* behavioral analysis,
+* lightweight anomaly detection,
+* and layered threat correlation,
+
+without sacrificing transparency, performance, or upstream compatibility.
+
+Unlike cloud-dependent security products, ARGUS is designed to operate locally and remain functional in offline environments.
+
 ## Current capabilities
 
 - **ClamAV signature scanning** — 3.6M+ signatures via subprocess isolation (`clamavd`)
