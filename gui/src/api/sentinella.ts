@@ -92,6 +92,42 @@ export const getSettings = () =>
 export const saveSettings = (config: Record<string, unknown>) =>
   invoke<{ ok: boolean; error?: string }>("save_settings", { config });
 
+// ── v0.1.8 FullConfig surface ───────────────────────────
+
+import type {
+  FullConfig,
+  RestartRequirementMap,
+  SettingsWriteResult,
+} from "../types/sentinella";
+
+/** Current daemon configuration — every TOML knob. */
+export const getFullSettings = () => invoke<FullConfig>("get_full_settings");
+
+/** Defaults for "reset to default" buttons. Pure — never touches disk. */
+export const getDefaultSettings = () =>
+  invoke<FullConfig>("get_default_settings");
+
+/** field path → restart requirement. Drives the "needs restart" pills. */
+export const getRestartRequirements = () =>
+  invoke<RestartRequirementMap>("get_restart_requirements");
+
+/**
+ * Save NON-critical fields. The daemon rejects with
+ * `INSUFFICIENT_PRIVILEGE` if any critical field differs from the
+ * current value — surface that to the user as "Locked field changed —
+ * use the lock button to elevate".
+ */
+export const saveFullSettings = (config: FullConfig) =>
+  invoke<SettingsWriteResult>("save_full_settings", { config });
+
+/**
+ * Mutate kill-vector fields (exclusions, watched roots, etc.). Requires
+ * the GUI to be elevated; if not, response is `{requires_elevation: true}`.
+ * Pass only the fields you want to change.
+ */
+export const setCriticalSettings = (params: Record<string, unknown>) =>
+  invoke<SettingsWriteResult>("set_critical_settings", { params });
+
 // ── Developer mode (local-only perf telemetry, v0.1.6) ──────
 
 export interface DeveloperStatus {

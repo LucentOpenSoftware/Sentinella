@@ -412,3 +412,170 @@ export interface EcosystemTimelineEvent {
   source: string;
   weight: number;
 }
+
+// ─── v0.1.8 FullConfig (Settings page expansion) ────────────────
+//
+// Mirrors `sentinella_ipc_proto::full_config::FullConfig`. All fields
+// optional on the TS side so the GUI can render against an older
+// daemon that doesn't ship a field yet. Server-side strict types are
+// the source of truth.
+
+export type RestartRequirement = "none" | "engine_reload" | "daemon_restart";
+
+export interface RestartRequirementMap {
+  fields: Record<string, RestartRequirement>;
+}
+
+export interface FullScanConfig {
+  argus_worker_enabled: boolean;
+  argus_worker_path: string;
+  argus_worker_timeout_sec: number;
+  orchestrator_file_scan_enabled: boolean;
+  orchestrator_folder_scan_enabled: boolean;
+  orchestrator_quick_scan_enabled: boolean;
+  orchestrator_full_scan_enabled: boolean;
+}
+
+export interface FullPerformanceConfig {
+  /** "low" | "normal" | "aggressive" */
+  memory_profile: string;
+  memory_warning_mb: number;
+  memory_critical_mb: number;
+  external_argus_under_pressure: boolean;
+  max_resident_workers_on_pressure: number;
+}
+
+export interface FullFishConfig {
+  enabled: boolean;
+  observe_only: boolean;
+  window_seconds: number;
+  rename_threshold: number;
+  rewrite_threshold: number;
+  ext_mutation_threshold: number;
+  slow_burn_window_secs: number;
+  slow_burn_threshold: number;
+  entropy_delta_threshold: number;
+  alert_cooldown_seconds: number;
+  /** "observe" | "suspend" | "terminate" */
+  active_response: string;
+}
+
+export interface FullSandboxConfig {
+  enabled: boolean;
+  /** "experimental" | "production" */
+  mode: string;
+  timeout_sec: number;
+  min_score: number;
+  max_score: number;
+}
+
+export interface DeveloperConfigPublic {
+  enabled: boolean;
+  telemetry_enabled: boolean;
+  telemetry_max_kb: number;
+  // password_sha256 is NEVER carried on the wire — see proto::full_config.
+}
+
+export interface FullConfig {
+  // Real-time protection
+  realtime_enabled: boolean;
+  realtime_roots: string[];
+
+  // Scan limits
+  max_file_size_mb: number;
+  scan_archives: boolean;
+  heuristic_alerts: boolean;
+
+  // Updates
+  auto_update: boolean;
+  update_interval_hours: number;
+  signature_stale_days: number;
+  update_mirror: string;
+
+  // Quarantine
+  quarantine_retention_days: number;
+  auto_quarantine: boolean;
+
+  // Exclusions
+  excluded_paths: string[];
+  excluded_extensions: string[];
+  excluded_detections: string[];
+  trusted_hashes: string[];
+
+  // Enhanced signature provider
+  enhanced_signature_provider: string;
+
+  // Logging
+  log_level: string;
+
+  // Scheduler
+  scheduled_scan_enabled: boolean;
+  scheduled_scan_hour: number;
+  scheduled_scan_type: string;
+
+  // Startup
+  startup_critical_scan: boolean;
+
+  // PowerShell bridge
+  powershell_bridge_enabled: boolean;
+  powershell_poll_seconds: number;
+
+  // Idle scanner
+  idle_scan_enabled: boolean;
+  idle_scan_start_delay_secs: number;
+  idle_scan_on_battery: boolean;
+  idle_scan_cpu_pause_threshold: number;
+  idle_scan_max_file_size_mb: number;
+  idle_scan_fullscreen_pause: boolean;
+  idle_scan_disk_latency_pause_ms: number;
+  idle_scan_max_files_per_session: number;
+  idle_scan_slow_delay_min_ms: number;
+  idle_scan_slow_delay_max_ms: number;
+  idle_scan_normal_delay_min_ms: number;
+  idle_scan_normal_delay_max_ms: number;
+  idle_scan_fast_delay_min_ms: number;
+  idle_scan_fast_delay_max_ms: number;
+
+  // ARGUS worker (top-level)
+  argus_worker_enabled: boolean;
+  argus_worker_path: string;
+  argus_worker_timeout_sec: number;
+
+  // ClamAV isolation
+  clamav_isolation: string;
+  clamav_worker_timeout_sec: number;
+
+  // Nested sub-configs
+  scan: FullScanConfig;
+  performance: FullPerformanceConfig;
+  fish: FullFishConfig;
+  sandbox: FullSandboxConfig;
+  developer: DeveloperConfigPublic;
+}
+
+/** Sentinel for "kill-vector" fields — must travel via set_critical_settings, not save_full_settings. */
+export const CRITICAL_FIELDS: ReadonlySet<string> = new Set([
+  "realtime_enabled",
+  "auto_quarantine",
+  "argus_worker_enabled",
+  "argus_worker_path",
+  "scan.argus_worker_enabled",
+  "scan.argus_worker_path",
+  "excluded_paths",
+  "excluded_extensions",
+  "excluded_detections",
+  "trusted_hashes",
+  "realtime_roots",
+  "heuristic_alerts",
+  "idle_scan_enabled",
+  "scheduled_scan_enabled",
+  "enhanced_signature_provider",
+]);
+
+/** Response shape for save_full_settings / set_critical_settings. */
+export interface SettingsWriteResult {
+  ok: boolean;
+  error?: string;
+  requires_elevation?: boolean;
+  changes?: string[];
+}

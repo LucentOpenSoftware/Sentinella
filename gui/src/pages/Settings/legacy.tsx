@@ -2,11 +2,11 @@ import { useState, useEffect } from "react";
 import { Archive, Bell, Bug, CheckCircle, Clock, Eye, FileSearch, FolderOpen, Globe, Palette, RefreshCw, Shield, ShieldOff, Wrench, Loader2, Plus, X, AlertTriangle, Terminal } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
-import { Card } from "../components/Card";
-import { getDeveloperStatus, setDeveloperMode, runBenchmark, type DeveloperStatus, type BenchmarkReport } from "../api/sentinella";
-import { useSettings, type DaemonConfig } from "../hooks/useSettings";
-import { loadNotificationSettings, saveNotificationSettings, type NotificationSettings, type NotificationSeverity } from "../notifications";
-import * as i18n from "../i18n";
+import { Card } from "../../components/Card";
+import { getDeveloperStatus, setDeveloperMode, runBenchmark, type DeveloperStatus, type BenchmarkReport } from "../../api/sentinella";
+import { useSettings, type DaemonConfig } from "../../hooks/useSettings";
+import { loadNotificationSettings, saveNotificationSettings, type NotificationSettings, type NotificationSeverity } from "../../notifications";
+import * as i18n from "../../i18n";
 
 type Tab = "general" | "appearance" | "protection" | "notifications" | "updates" | "advanced";
 
@@ -19,7 +19,7 @@ const tabs: { id: Tab; labelKey: string; Icon: React.ComponentType<{ size?: numb
   { id: "advanced", labelKey: "settings.advanced", Icon: Wrench },
 ];
 
-export function SettingsPage() {
+export function LegacySettingsPage() {
   const [tab, setTab] = useState<Tab>("general");
   const settings = useSettings();
 
@@ -169,7 +169,7 @@ function ProtectionTab({ config, update }: { config: DaemonConfig; update: (p: P
       <Section title={i18n.t("settings.realtime_protection")} desc={i18n.t("settings.realtime_desc")}>
         <Toggle icon={<Eye size={14} />} label={i18n.t("settings.enable_realtime")} desc={i18n.t("settings.enable_realtime_desc")}
           checked={config.realtime_enabled} onChange={async (v) => {
-            const { setCriticalProtection } = await import("../api/sentinella");
+            const { setCriticalProtection } = await import("../../api/sentinella");
             const result = await setCriticalProtection({ realtimeEnabled: v });
             if (result?.requires_elevation) { alert(result.error || i18n.t("settings.requires_admin")); return; }
             if (result?.ok) {
@@ -178,7 +178,7 @@ function ProtectionTab({ config, update }: { config: DaemonConfig; update: (p: P
           }} />
         <Toggle icon={<Archive size={14} />} label={i18n.t("settings.auto_quarantine")} desc={i18n.t("settings.auto_quarantine_desc")}
           checked={config.auto_quarantine} onChange={async (v) => {
-            const { setCriticalProtection } = await import("../api/sentinella");
+            const { setCriticalProtection } = await import("../../api/sentinella");
             const result = await setCriticalProtection({ autoQuarantine: v });
             if (result?.requires_elevation) { alert(result.error || i18n.t("settings.requires_admin")); return; }
             if (result?.ok) {

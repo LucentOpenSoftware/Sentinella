@@ -345,6 +345,143 @@ async fn save_settings(mut config: Value) -> Result<Value, String> {
     daemon_client::call_auth("settings.set", config).await.map_err(Into::into)
 }
 
+// ── v0.1.8 elevation helpers (Settings critical fields) ──────
+
+/// Returns true if the GUI process is running with administrator
+/// privileges. Used by the Settings page to decide whether to lock
+/// the kill-vector fields and show the "Restart as Administrator"
+/// banner. Matches the daemon-side trust model: kill-vector
+/// mutations also require an elevated caller end-to-end.
+#[tauri::command]
+fn is_elevated_check() -> bool {
+    is_elevated()
+}
+
+/// Spawn a NEW elevated copy of the Sentinella GUI exe, then exit
+/// the current (unelevated) process so only one Sentinella window
+/// remains. Used by the Settings page's "Restart as Administrator"
+/// button. Mirrors the dev-console's relaunch-as-admin flow.
+#[cfg(windows)]
+#[tauri::command]
+fn restart_as_admin() -> Result<Value, String> {
+    if is_elevated() {
+        return Ok(serde_json::json!({"ok": true, "already_elevated": true}));
+    }
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::core::PCWSTR;
+
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe_wide: Vec<u16> = std::ffi::OsStr::new(&exe)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let verb: Vec<u16> = std::ffi::OsStr::new("runas")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            PCWSTR(verb.as_ptr()),
+            PCWSTR(exe_wide.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if (result.0 as isize) > 32 {
+        // Elevated instance launched — exit this one. Use a small delay
+        // so the response can return to the UI before the process dies.
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            std::process::exit(0);
+        });
+        Ok(serde_json::json!({"ok": true}))
+    } else {
+        Ok(serde_json::json!({"ok": false, "error": "User denied UAC prompt"}))
+    }
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+fn restart_as_admin() -> Result<Value, String> {
+    Ok(serde_json::json!({"ok": false, "error": "Elevation not supported on this platform"}))
+}
+
+// ── v0.1.8 FullConfig surface (Settings page expansion) ─────────
+
+/// Fetch the full daemon configuration — every TOML knob, structured.
+/// Used by the v0.1.8 Settings page tabs. Returns FullConfig JSON
+/// (with developer.password_sha256 already excluded by the proto type).
+#[tauri::command]
+async fn get_full_settings() -> Result<Value, String> {
+    daemon_client::call_auth("settings.get_full", serde_json::json!({}))
+        .await
+        .map_err(Into::into)
+}
+
+/// Defaults snapshot for "reset to default" buttons. Pure — never
+/// touches the on-disk config, just returns FullConfig::default().
+#[tauri::command]
+async fn get_default_settings() -> Result<Value, String> {
+    daemon_client::call_auth("settings.get_defaults", serde_json::json!({}))
+        .await
+        .map_err(Into::into)
+}
+
+/// Map of field path → RestartRequirement. Drives the per-field
+/// "needs restart" pill and the footer "Restart now" batch button.
+#[tauri::command]
+async fn get_restart_requirements() -> Result<Value, String> {
+    daemon_client::call_auth("settings.restart_requirements", serde_json::json!({}))
+        .await
+        .map_err(Into::into)
+}
+
+/// Save NON-critical fields. Kill-vector fields must use
+/// `set_critical_settings` (UAC-gated). The daemon rejects the whole
+/// request with INSUFFICIENT_PRIVILEGE if any critical field differs
+/// from the current value — surface that error to the user verbatim.
+#[tauri::command]
+async fn save_full_settings(mut config: Value) -> Result<Value, String> {
+    let token = daemon_client::challenge_token("settings.set_full").await.map_err(|e| e.to_string())?;
+    if let Value::Object(ref mut map) = config {
+        map.insert("token".into(), Value::String(token));
+    } else {
+        config = serde_json::json!({"token": token, "value": config});
+    }
+    daemon_client::call_auth("settings.set_full", config).await.map_err(Into::into)
+}
+
+/// Change kill-vector settings (exclusions, watched roots, trusted
+/// hashes, etc.). Requires the GUI to be running elevated — if not,
+/// returns `{ok: false, requires_elevation: true}` and the GUI shows
+/// a "Restart as Administrator" prompt. We do NOT silently relaunch:
+/// any per-op UAC prompt path would have to round-trip through a CLI
+/// stub that accepts JSON, which is fragile compared to the
+/// admin-relaunch flow the dev-console established.
+#[tauri::command]
+async fn set_critical_settings(mut params: Value) -> Result<Value, String> {
+    if !is_elevated() {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "requires_elevation": true,
+            "error": "Administrator privileges required. Run Sentinella as Administrator to change these settings.",
+        }));
+    }
+    let token = daemon_client::challenge_token("protection.set_critical").await.map_err(|e| e.to_string())?;
+    if let Value::Object(ref mut map) = params {
+        map.insert("token".into(), Value::String(token));
+    } else {
+        params = serde_json::json!({"token": token});
+    }
+    daemon_client::call("protection.set_critical", params)
+        .await
+        .map_err(Into::into)
+}
+
 // ── Developer mode (local-only perf telemetry, v0.1.6) ──────────
 
 /// Read developer-mode status (never returns the password hash).
@@ -873,6 +1010,14 @@ pub fn run() {
             get_detections,
             get_settings,
             save_settings,
+            // v0.1.8 FullConfig surface — Settings page expansion
+            is_elevated_check,
+            restart_as_admin,
+            get_full_settings,
+            get_default_settings,
+            get_restart_requirements,
+            save_full_settings,
+            set_critical_settings,
             get_developer_status,
             set_developer_mode,
             run_benchmark,
