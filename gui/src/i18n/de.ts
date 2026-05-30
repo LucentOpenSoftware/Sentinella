@@ -188,6 +188,10 @@ export const de: Record<string, string> = {
   "dash.no_sigs_loaded": "Noch keine Signaturdatenbank geladen. ARGUS-Heuristiken aktiv.",
   "dash.engine_prefix": "Engine",
   "dash.watcher_prefix": "Wächter",
+  "dash.reloading": "Signaturen werden aktualisiert",
+  "dash.reloading_hint": "Neue Signaturdatenbank wird kompiliert. Der aktuelle Schutz bleibt unverändert.",
+  "dash.reload_failed": "Aktualisierung fehlgeschlagen",
+  "dash.reload_failed_hint": "Die letzte Signaturaktualisierung ist fehlgeschlagen. Der aktuelle Schutz bleibt unverändert."
   "dash.events_per_sec_suffix": "Ereignisse/Sek.",
   "dash.files_suffix": "Dateien",
   "dash.files_checked": "Dateien geprüft",

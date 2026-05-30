@@ -17,7 +17,28 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-use sentinella_ipc_proto::engine::{EngineState, EngineStatus};
+use sentinella_ipc_proto::engine::{EngineState, EngineStatus, ReloadPhase};
+
+/// Pack a `ReloadPhase` into an `AtomicU8` slot. Inverse of
+/// `reload_phase_from_u8`. Kept local since the proto crate is a pure
+/// data definition and shouldn't depend on `Atomic*` plumbing.
+fn reload_phase_u8(p: ReloadPhase) -> u8 {
+    match p {
+        ReloadPhase::Idle => 0,
+        ReloadPhase::Compiling => 1,
+        ReloadPhase::Activating => 2,
+        ReloadPhase::Failed => 3,
+    }
+}
+
+fn reload_phase_from_u8(v: u8) -> ReloadPhase {
+    match v {
+        1 => ReloadPhase::Compiling,
+        2 => ReloadPhase::Activating,
+        3 => ReloadPhase::Failed,
+        _ => ReloadPhase::Idle,
+    }
+}
 #[allow(unused_imports)]
 use sentinella_ipc_proto::quarantine::QuarantineEntry;
 use sentinella_ipc_proto::update::{UpdateState, UpdateStatus};
@@ -255,7 +276,24 @@ pub struct AppState {
     started_at: Instant,
     engine: RwLock<Option<Arc<ClamEngine>>>,
     engine_error: RwLock<Option<String>>,
+    /// **v0.1.7 Phase 2 — committed-state mirror.** Updated atomically as
+    /// the LAST step of every successful engine load / reload. Read by
+    /// `engine_status` instead of probing the live `engine` RwLock, so
+    /// the GUI's `engine.status` poll never observes the transient
+    /// freshclam-CVD-replaced-on-disk-but-engine-not-yet-reloaded window
+    /// that previously made `signature_count` and `db_timestamp`
+    /// disagree → false "outdated definitions" banner.
     signature_count: std::sync::atomic::AtomicU64,
+    /// `db_version` snapshot at the most recent successful commit. Read
+    /// by `engine_status`. Mirror; `read_cvd_version()` still reads the
+    /// authoritative CVD header on disk for back-compat callers.
+    committed_db_version: std::sync::atomic::AtomicU32,
+    /// `db_timestamp` snapshot at the most recent successful commit.
+    /// i64::MIN sentinel = "no successful commit yet".
+    committed_db_timestamp: std::sync::atomic::AtomicI64,
+    /// Where the current reload (if any) is in its lifecycle. Stored as
+    /// `u8` so it's lock-free for `engine_status` readers.
+    reload_phase: std::sync::atomic::AtomicU8,
     dll_dir: Option<PathBuf>,
     db_dir: Option<PathBuf>,
     db: Mutex<Option<Database>>,
@@ -744,6 +782,13 @@ impl AppState {
             engine: RwLock::new(engine),
             engine_error: RwLock::new(engine_error),
             signature_count: std::sync::atomic::AtomicU64::new(sig_count),
+            // Committed mirror seeded at construction. If the initial
+            // engine load succeeded, the CVD header is already on disk
+            // and `read_cvd_version()` will populate these on first
+            // status read; the atomics are written by every later commit.
+            committed_db_version: std::sync::atomic::AtomicU32::new(0),
+            committed_db_timestamp: std::sync::atomic::AtomicI64::new(i64::MIN),
+            reload_phase: std::sync::atomic::AtomicU8::new(reload_phase_u8(ReloadPhase::Idle)),
             dll_dir: dll_dir.clone(),
             db_dir: db_dir.clone(),
             db: Mutex::new(database),
@@ -1549,20 +1594,63 @@ impl AppState {
 
     pub fn engine_status(&self) -> EngineStatus {
         let inner = self.lock_inner();
-        let (db_ver, db_ts) = self.read_cvd_version();
+        // Phase 2: prefer the committed mirror. Falls back to the live CVD
+        // read only when no commit has happened yet (initial boot before
+        // the first successful engine load completes).
+        let committed_ver = self.committed_db_version.load(Ordering::Acquire);
+        let committed_ts = self.committed_db_timestamp.load(Ordering::Acquire);
+        let (db_version, db_timestamp) = if committed_ts != i64::MIN {
+            (
+                if committed_ver == 0 { None } else { Some(committed_ver) },
+                Some(committed_ts),
+            )
+        } else {
+            self.read_cvd_version()
+        };
+        let phase = reload_phase_from_u8(self.reload_phase.load(Ordering::Acquire));
+
+        // `state` reflects the COMMITTED engine, not the in-flight one.
+        // A reload that is currently `Compiling` or `Activating` keeps the
+        // previous engine serving scans, so the shield must stay Ready.
+        // The UI distinguishes "engine is busy reloading" via `reload_phase`.
+        let state = if self.read_engine().is_some() {
+            EngineState::Ready
+        } else {
+            EngineState::Error
+        };
+
         EngineStatus {
-            state: if self.read_engine().is_some() {
-                EngineState::Ready
-            } else {
-                EngineState::Error
-            },
+            state,
             protocol_version: 1,
-            db_version: db_ver,
-            db_timestamp: db_ts,
+            db_version,
+            db_timestamp,
             signature_count: self.signature_count.load(Ordering::Relaxed),
             last_update: inner.last_update_timestamp,
             engine_version: sentinella_common::PRODUCT_VERSION.into(),
+            reload_phase: phase,
         }
+    }
+
+    /// Write the committed-state mirror atomically. Called as the LAST step
+    /// of every successful engine load / reload, after the engine slot has
+    /// been swapped to the new `Arc<ClamEngine>`.
+    ///
+    /// Phase 2 invariant: a status snapshot taken after this call observes
+    /// the new (signature_count, db_version, db_timestamp) triple
+    /// consistently. Anything observed between the freshclam CVD write and
+    /// this commit reads the PRIOR mirror — so the GUI never sees the
+    /// "old sigs / new db_ts" inconsistency that triggered the false
+    /// "outdated definitions" banner.
+    fn commit_engine_state(&self, sigs: u64) {
+        let (db_ver, db_ts) = self.read_cvd_version();
+        // Ordering: write `signature_count` LAST so a reader that observes
+        // the new count is guaranteed (via the Release/Acquire pair) to
+        // also see the new db_version + db_timestamp.
+        self.committed_db_version
+            .store(db_ver.unwrap_or(0), Ordering::Release);
+        self.committed_db_timestamp
+            .store(db_ts.unwrap_or(i64::MIN), Ordering::Release);
+        self.signature_count.store(sigs, Ordering::Release);
     }
 
     /// Read ClamAV database version from CVD file header.
@@ -3343,6 +3431,13 @@ impl AppState {
         };
 
         tracing::info!("reloading ClamAV engine...");
+        // Phase 2: announce the compile. The committed mirror is unchanged
+        // until `commit_engine_state` runs, so concurrent `engine.status`
+        // readers see `state = Ready` + `reload_phase = Compiling` and the
+        // GUI can render an "Updating signatures…" badge without flipping
+        // the shield.
+        self.reload_phase
+            .store(reload_phase_u8(ReloadPhase::Compiling), Ordering::Release);
 
         // FAIL-CLOSED reload: load NEW engine first into a local. Only on
         // success do we take the write lock + swap. Previously we dropped the
@@ -3353,6 +3448,10 @@ impl AppState {
         // is strictly preferable to running with no detection engine.
         match ClamEngine::load(dll_dir, db_dir) {
             Ok(new_engine) => {
+                // Phase 2: compile done, entering the (very brief) swap.
+                self.reload_phase
+                    .store(reload_phase_u8(ReloadPhase::Activating), Ordering::Release);
+
                 let sigs = new_engine.signature_count() as u64;
                 self.scan_cache.invalidate_all();
                 // Signatures changed → expire ARGUS per-hash trusted cache too,
@@ -3376,7 +3475,14 @@ impl AppState {
                     prev
                 };
                 drop(old);
-                self.signature_count.store(sigs, Ordering::Relaxed);
+                // Phase 2: commit (signature_count + db_version + db_timestamp)
+                // atomically as the LAST observable state change, then mark
+                // the phase Idle. A `engine.status` snapshot taken after
+                // `commit_engine_state` returns is guaranteed (Release/Acquire)
+                // to see the new triple consistently.
+                self.commit_engine_state(sigs);
+                self.reload_phase
+                    .store(reload_phase_u8(ReloadPhase::Idle), Ordering::Release);
                 self.log_activity(
                     "info",
                     "engine",
@@ -3388,6 +3494,13 @@ impl AppState {
             }
             Err(e) => {
                 tracing::error!(%e, "engine reload failed — keeping previous engine");
+                // Phase 2: surface the failure to GUI as `reload_phase=Failed`.
+                // The committed mirror is NOT touched — `signature_count`,
+                // `db_version`, `db_timestamp` continue to reflect the
+                // previous successful commit, which is what the still-serving
+                // engine actually has loaded.
+                self.reload_phase
+                    .store(reload_phase_u8(ReloadPhase::Failed), Ordering::Release);
                 // Record the error so callers (and the daemon health surface)
                 // observe the failure. Old engine remains in place → scans
                 // continue with prior signatures rather than failing open.

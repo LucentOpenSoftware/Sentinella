@@ -171,6 +171,25 @@ export function Dashboard({ onNavigate }: { onNavigate: (p: Page) => void }) {
                   <span className="rounded-full bg-[rgb(var(--raised))]/25 px-2 py-0.5">
                     {t("dash.watcher_prefix")} {watcher.mode.replace("_", " ")}
                   </span>
+                  {/* v0.1.7 Phase 2 — reload phase pill. Does NOT flip the
+                      shield to degraded; the previous engine is still
+                      serving scans while the new one compiles. */}
+                  {engine.reload_phase === "compiling" || engine.reload_phase === "activating" ? (
+                    <span
+                      className="rounded-full bg-[rgb(var(--accent))]/15 px-2 py-0.5 text-[rgb(var(--accent))]"
+                      title={t("dash.reloading_hint")}
+                    >
+                      {t("dash.reloading")}
+                    </span>
+                  ) : null}
+                  {engine.reload_phase === "failed" ? (
+                    <span
+                      className="rounded-full bg-[rgb(var(--amber))]/15 px-2 py-0.5 text-[rgb(var(--amber))]"
+                      title={t("dash.reload_failed_hint")}
+                    >
+                      {t("dash.reload_failed")}
+                    </span>
+                  ) : null}
                 </div>
               </div>
             </div>

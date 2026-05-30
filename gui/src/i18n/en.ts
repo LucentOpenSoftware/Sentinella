@@ -188,6 +188,10 @@ export const en: Record<string, string> = {
   "dash.no_sigs_loaded": "No signature database loaded yet. ARGUS heuristics active.",
   "dash.engine_prefix": "Engine",
   "dash.watcher_prefix": "Watcher",
+  "dash.reloading": "Updating signatures",
+  "dash.reloading_hint": "Compiling new signature database. Current protection is unchanged.",
+  "dash.reload_failed": "Update failed",
+  "dash.reload_failed_hint": "The last signature update failed. Current protection is unchanged."
   "dash.events_per_sec_suffix": "events/sec",
   "dash.files_suffix": "files",
   "dash.files_checked": "files checked",

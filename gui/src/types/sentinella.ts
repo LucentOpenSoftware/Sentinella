@@ -23,6 +23,15 @@ export interface EngineStatus {
   signature_count: number;
   last_update: number | null;
   engine_version: string;
+  /**
+   * v0.1.7 Phase 2 — where any currently-running engine reload is in its
+   * lifecycle. `state` reflects the COMMITTED engine (a reload-in-flight
+   * keeps the previous engine serving scans, so `state` stays "ready"),
+   * `reload_phase` tells the UI whether to render an "Updating
+   * signatures…" badge alongside without flipping the protection shield
+   * to degraded. Optional for backward compatibility with v0.1.6 daemons.
+   */
+  reload_phase?: "idle" | "compiling" | "activating" | "failed";
 }
 
 export interface ScanStatusResponse {

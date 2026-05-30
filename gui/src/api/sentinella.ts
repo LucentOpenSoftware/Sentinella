@@ -321,7 +321,7 @@ export async function fetchDashboard(): Promise<DashboardData> {
   // Each call is individually caught so one failure doesn't break the dashboard.
   const [engine, scan, watcher, update, quarantine, activity, stats, scanHistory, idleScanner] =
     await Promise.all([
-      getEngineStatus().catch(() => ({ state: "error" as const, protocol_version: 0, db_version: null, db_timestamp: null, signature_count: 0, last_update: null, engine_version: "?" })),
+      getEngineStatus().catch(() => ({ state: "error" as const, protocol_version: 0, db_version: null, db_timestamp: null, signature_count: 0, last_update: null, engine_version: "?", reload_phase: "idle" as const })),
       getScanStatus().catch(() => ({ running: false, job_id: null, state: "idle" as const, scan_type: null, files_scanned: 0, files_total: 0, progress_percent: 0, threats_found: 0, current_path: null, scans_completed: 0, detections: [], started_at: null, finished_at: null, errors_count: 0 })),
       getWatcherStatus().catch(() => ({ enabled: false, mode: "disabled" as const, watched_roots: [], events_per_sec: 0, last_event: null })),
       getUpdateStatus().catch(() => ({ state: "idle" as const, percent: null, bytes_downloaded: 0, bytes_total: null, last_error: null, current_file: null })),

@@ -188,6 +188,10 @@ export const it: Record<string, string> = {
   "dash.no_sigs_loaded": "Nessun database delle firme ancora caricato. Euristica ARGUS attiva.",
   "dash.engine_prefix": "Motore",
   "dash.watcher_prefix": "Watcher",
+  "dash.reloading": "Aggiornamento firme in corso",
+  "dash.reloading_hint": "Compilazione della nuova base dati firme. La protezione attuale non cambia.",
+  "dash.reload_failed": "Aggiornamento non riuscito",
+  "dash.reload_failed_hint": "L ultimo aggiornamento delle firme non e riuscito. La protezione attuale non cambia."
   "dash.events_per_sec_suffix": "eventi/sec",
   "dash.files_suffix": "file",
   "dash.files_checked": "file controllati",

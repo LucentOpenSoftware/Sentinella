@@ -188,6 +188,10 @@ export const es: Record<string, string> = {
   "dash.no_sigs_loaded": "Base de datos de firmas no cargada. Motor heuristico ARGUS activo.",
   "dash.engine_prefix": "Motor",
   "dash.watcher_prefix": "Vigilante",
+  "dash.reloading": "Actualizando firmas",
+  "dash.reloading_hint": "Compilando nueva base de datos de firmas. La proteccion actual no cambia.",
+  "dash.reload_failed": "Actualizacion fallida",
+  "dash.reload_failed_hint": "La ultima actualizacion de firmas fallo. La proteccion actual no cambia."
   "dash.events_per_sec_suffix": "eventos/seg",
   "dash.files_suffix": "archivos",
   "dash.files_checked": "archivos revisados",

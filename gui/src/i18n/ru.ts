@@ -188,6 +188,10 @@ export const ru: Record<string, string> = {
   "dash.no_sigs_loaded": "База сигнатур ещё не загружена. Эвристика ARGUS активна.",
   "dash.engine_prefix": "Движок",
   "dash.watcher_prefix": "Наблюдатель",
+  "dash.reloading": "Обновление сигнатур",
+  "dash.reloading_hint": "Компиляция новой базы сигнатур. Текущая защита не меняется.",
+  "dash.reload_failed": "Обновление не удалось",
+  "dash.reload_failed_hint": "Последнее обновление сигнатур не удалось. Текущая защита не меняется."
   "dash.events_per_sec_suffix": "событий/с",
   "dash.files_suffix": "файлов",
   "dash.files_checked": "файлов проверено",
