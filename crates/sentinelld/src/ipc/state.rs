@@ -5,13 +5,15 @@
 //! ## Lock Safety
 //!
 //! All `Mutex` and `RwLock` access uses poison-recovering helpers
-//! (`lock_inner`, `read_engine`, `write_engine`) so a panic in one
-//! request never brings down the entire daemon.
+//! (`lock_inner`, etc.) so a panic in one request never brings down
+//! the entire daemon. The engine slot is lock-free
+//! (`arc_swap::ArcSwap<EngineSnapshot>`) — see Phase 3 docs on
+//! `engine_state`.
 
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
+    Arc, Mutex, MutexGuard,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -271,13 +273,37 @@ enum UpdatePhase {
     Completed,
 }
 
+/// Atomic snapshot of the engine slot — what `ArcSwap` actually holds.
+///
+/// Phase 3 audit fix: keeping `engine` and `engine_error` in separate
+/// synchronization primitives left a memory-ordering hole. The
+/// `ArcSwap::swap` `Release` synchronizes-with `load_full` on the same
+/// slot only; a `RwLock` write to a sibling `engine_error` field was a
+/// distinct happens-before edge, so a reader on a weakly-ordered
+/// platform could observe (engine = new) paired with (engine_error =
+/// stale-old). On x86_64 TSO this never reproduced, but the Rust model
+/// declares it possible.
+///
+/// Folding both into a single `Arc<EngineSnapshot>` published through
+/// one `ArcSwap` makes the swap atomically deliver both fields. Any
+/// reader sees a self-consistent (engine, last_error) pair, full stop.
+#[derive(Clone)]
+struct EngineSnapshot {
+    engine: Option<Arc<ClamEngine>>,
+    /// Most recent error from a load / reload attempt. `Some` even when
+    /// `engine` is `Some` means "an engine is serving scans, but the
+    /// last reload failed and the prior engine is still in place."
+    last_error: Option<String>,
+}
+
 /// Shared daemon state. Wrapped in `Arc` by the IPC server.
 pub struct AppState {
     started_at: Instant,
     /// **v0.1.7 Phase 3 — lock-free A/B engine swap.** Scans clone the
-    /// `Arc<ClamEngine>` via a relaxed atomic load (no read lock); a
-    /// reload swaps a freshly-compiled engine into the slot atomically
-    /// (no write lock). Net effect:
+    /// inner `Arc<ClamEngine>` from a `Guard<Arc<EngineSnapshot>>` via
+    /// a relaxed atomic load (no read lock); a reload swaps a freshly-
+    /// built `EngineSnapshot` into the slot atomically (no write lock).
+    /// Net effect:
     ///   * Scans NEVER block on a reload, not even microseconds during
     ///     the swap moment.
     ///   * Two engines coexist briefly: the new one freshly compiled,
@@ -285,9 +311,11 @@ pub struct AppState {
     ///     drops naturally when the last in-flight scan releases its
     ///     Arc, freeing its mpool/cache cleanly.
     ///   * Reload is fail-closed: compile the new engine into a local
-    ///     first, then swap. A compile error leaves the slot untouched.
-    engine: arc_swap::ArcSwapOption<ClamEngine>,
-    engine_error: RwLock<Option<String>>,
+    ///     first, then swap. A compile error leaves the slot untouched
+    ///     (an RCU update bumps `last_error` only).
+    ///   * The audit-flagged "engine = new + engine_error = stale"
+    ///     window is closed because both fields are swapped together.
+    engine_state: arc_swap::ArcSwap<EngineSnapshot>,
     /// **v0.1.7 Phase 2 — committed-state mirror.** Updated atomically as
     /// the LAST step of every successful engine load / reload. Read by
     /// `engine_status` instead of probing the live `engine` RwLock, so
@@ -791,8 +819,12 @@ impl AppState {
 
         Self {
             started_at: Instant::now(),
-            engine: arc_swap::ArcSwapOption::new(engine),
-            engine_error: RwLock::new(engine_error),
+            // Phase 3 audit fix: engine and last_error are now atomic
+            // siblings inside one ArcSwap-published snapshot.
+            engine_state: arc_swap::ArcSwap::new(Arc::new(EngineSnapshot {
+                engine,
+                last_error: engine_error,
+            })),
             signature_count: std::sync::atomic::AtomicU64::new(sig_count),
             // Committed mirror seeded at construction. If the initial
             // engine load succeeded, the CVD header is already on disk
@@ -1415,31 +1447,57 @@ impl AppState {
 
     /// Lock-free read of the current engine. Returns an owned
     /// `Option<Arc<ClamEngine>>` whose `Arc` is a refcount bump on the
-    /// engine currently in the swap slot. Cheap: one atomic load + one
-    /// atomic refcount increment. The returned `Arc` keeps the engine
-    /// alive for as long as the caller holds it, even if a concurrent
-    /// reload swaps in a different one — that's the whole point of the
-    /// A/B design.
+    /// engine currently in the swap slot. Cheap: one atomic snapshot
+    /// load + at most one Arc clone. The returned `Arc` keeps the
+    /// engine alive for as long as the caller holds it, even if a
+    /// concurrent reload swaps in a different snapshot.
     fn read_engine(&self) -> Option<Arc<ClamEngine>> {
-        // `load_full` clones the inner `Arc` atomically. Avoids the
-        // `Guard` lifetime tangle of the lighter `load`, at the cost
-        // of one extra refcount op per read — well worth it for code
-        // clarity at the (rare) call sites.
-        self.engine.load_full()
+        self.engine_state.load().engine.clone()
     }
 
-    fn read_engine_error(&self) -> RwLockReadGuard<'_, Option<String>> {
-        self.engine_error.read().unwrap_or_else(|e| {
-            tracing::warn!("engine_error RwLock was poisoned — recovering");
-            e.into_inner()
-        })
+    /// Lock-free read of the full engine snapshot — for callers that
+    /// need both the engine handle and the most recent error in a
+    /// guaranteed-consistent pair (e.g. the scan dispatcher's "engine
+    /// missing → format the last error for the user" path).
+    fn read_engine_snapshot(&self) -> arc_swap::Guard<Arc<EngineSnapshot>> {
+        self.engine_state.load()
     }
 
-    fn write_engine_error(&self) -> RwLockWriteGuard<'_, Option<String>> {
-        self.engine_error.write().unwrap_or_else(|e| {
-            tracing::warn!("engine_error RwLock was poisoned — recovering");
-            e.into_inner()
-        })
+    /// Lock-free read of the most recent engine load/reload error. Always
+    /// observes a snapshot that is internally consistent with whatever
+    /// `read_engine` would return at the same moment. Reserved for future
+    /// callers (e.g. an `engine.health` IPC method that returns the live
+    /// error alongside the engine state); current consumers go through
+    /// `read_engine_snapshot()` to read both at once.
+    #[allow(dead_code)]
+    fn last_engine_error(&self) -> Option<String> {
+        self.engine_state.load().last_error.clone()
+    }
+
+    // (read_engine_error / write_engine_error removed in the Phase 3
+    // audit fix — the error now travels in the same atomic snapshot as
+    // the engine handle. Callers use `last_engine_error()` or
+    // `read_engine_snapshot()` to read, and `publish_engine_snapshot()`
+    // / `record_engine_error()` to write.)
+
+    /// Publish a new engine snapshot atomically (success path of a
+    /// reload). Returns the previous snapshot so the caller can move its
+    /// drop to a dedicated thread — see audit MED #3.
+    fn publish_engine_snapshot(&self, snap: EngineSnapshot) -> Arc<EngineSnapshot> {
+        self.engine_state.swap(Arc::new(snap))
+    }
+
+    /// Update only the `last_error` field of the currently-published
+    /// snapshot (failure path of a reload — the previous engine stays
+    /// in place; only the error annotation changes). Uses ArcSwap's RCU
+    /// loop so concurrent updates compose correctly.
+    fn record_engine_error(&self, err: Option<String>) {
+        self.engine_state.rcu(|current| {
+            Arc::new(EngineSnapshot {
+                engine: current.engine.clone(),
+                last_error: err.clone(),
+            })
+        });
     }
 
     /// Persist an activity event to both in-memory log and SQLite.
@@ -1737,15 +1795,20 @@ impl AppState {
         scan_type: &str,
         target: Option<&str>,
     ) -> ScanStartResponse {
-        // Phase 3: lock-free engine read. The Arc clone keeps this scan's
-        // engine alive even if a concurrent reload swaps the slot.
-        let engine = match self.read_engine() {
+        // Phase 3 + audit fix: take ONE atomic snapshot so the engine
+        // handle and the error message we'd report come from the same
+        // consistent (engine, last_error) pair. Avoids the previous
+        // race where engine could read "new" while the error read
+        // still saw the prior reload's stale string.
+        let snap = self.read_engine_snapshot();
+        let engine = match snap.engine.clone() {
             Some(e) => e,
             None => {
-                let err = self
-                    .read_engine_error()
+                let err = snap
+                    .last_error
                     .clone()
-                    .unwrap_or("No engine".into());
+                    .unwrap_or_else(|| "No engine".to_string());
+                drop(snap);
                 return ScanStartResponse {
                     job_id: Uuid::new_v4().to_string(),
                     status: "error".into(),
@@ -1754,6 +1817,7 @@ impl AppState {
                 };
             }
         };
+        drop(snap);
 
         // Record manual scan activity — blocks quiet re-trim.
         self.activity_tracker.record_manual_scan();
@@ -3476,26 +3540,25 @@ impl AppState {
                 // single critical section so concurrent readers never observe
                 // (engine=new, error=Some(stale)) or (engine=old, error=None).
                 //
-                // Phase 3 invariants under the ArcSwap-based engine slot:
+                // Phase 3 + audit fix: engine and last_error are siblings
+                // inside ONE atomic `EngineSnapshot` published via the
+                // single `engine_state` ArcSwap. The publish delivers both
+                // fields together — a reader can't observe an inconsistent
+                // pair regardless of platform memory model.
                 //
-                //   * Clear `engine_error` FIRST (Release write under its
-                //     lock), then swap the engine. A reader that observes
-                //     `engine=new` is guaranteed via the engine ArcSwap's
-                //     Release ordering to also observe `engine_error=None`.
-                //     If they observe `engine=old` they may transiently see
-                //     `engine_error=None` too — fine, the old engine is
-                //     working.
-                //   * The swap itself is lock-free; no writer waits on
-                //     readers and no reader waits on this writer.
-                //   * The returned `prev` `Arc` is the LAST strong ref the
-                //     swap slot held to the old engine. Once we drop it
-                //     here, the old engine drops as soon as the last
-                //     in-flight scan releases its own `Arc` clone — its
-                //     `cl_engine_free` runs off the hot path with no
-                //     scanner ever blocked on it.
-                *self.write_engine_error() = None;
-                let prev = self.engine.swap(Some(new_arc));
-                drop(prev);
+                // The returned `prev` Arc is the slot's previous strong
+                // ref. When the last in-flight scan also releases its
+                // clone, the old `ClamEngine`'s `cl_engine_free` runs.
+                // Move the `drop(prev)` onto a dedicated thread so neither
+                // the freshclam thread nor an IPC handler ever pays the
+                // tear-down cost — audit MED #3.
+                let prev = self.publish_engine_snapshot(EngineSnapshot {
+                    engine: Some(new_arc),
+                    last_error: None,
+                });
+                let _ = std::thread::Builder::new()
+                    .name("engine-snap-drop".into())
+                    .spawn(move || drop(prev));
                 // Phase 2: commit (signature_count + db_version + db_timestamp)
                 // atomically as the LAST observable state change, then mark
                 // the phase Idle. A `engine.status` snapshot taken after
@@ -3525,7 +3588,7 @@ impl AppState {
                 // Record the error so callers (and the daemon health surface)
                 // observe the failure. Old engine remains in place → scans
                 // continue with prior signatures rather than failing open.
-                *self.write_engine_error() = Some(e.clone());
+                self.record_engine_error(Some(e.clone()));
                 self.log_activity("warning", "engine", "Engine reload failed", &e, None);
                 Err(e)
             }
@@ -6619,65 +6682,98 @@ mod tests {
     // observe the engine vanishing out from under them — exactly the
     // scenario the lock-free ArcSwap migration exists to prevent.
     //
-    // We exercise the type-level guarantee with a stand-in `usize` payload
-    // so the test doesn't need a real ClamEngine (which requires
-    // libclamav + a CVD on disk).
+    // We exercise the type-level guarantee with a stand-in payload so
+    // the test doesn't need a real ClamEngine (which requires libclamav
+    // + a CVD on disk).
     #[test]
     fn arcswap_engine_slot_preserves_in_flight_arc_across_swap() {
-        use arc_swap::ArcSwapOption;
+        use arc_swap::ArcSwap;
         use std::sync::Arc;
-        let slot: ArcSwapOption<usize> = ArcSwapOption::from(Some(Arc::new(11_u32 as usize)));
 
-        // Reader (= a "scan") grabs the current engine.
-        let held = slot.load_full().expect("slot was Some");
+        #[derive(Clone)]
+        struct Snap { engine: Option<Arc<u32>> }
+
+        let slot: ArcSwap<Snap> = ArcSwap::new(Arc::new(Snap { engine: Some(Arc::new(11)) }));
+
+        // Reader (= a "scan") clones the current engine ref.
+        let held = slot.load().engine.clone().expect("slot was Some");
         assert_eq!(*held, 11);
 
-        // Writer (= a reload) swaps a new engine into the slot.
-        let prev = slot.swap(Some(Arc::new(22_u32 as usize)));
+        // Writer (= a reload) publishes a new snapshot.
+        let prev = slot.swap(Arc::new(Snap { engine: Some(Arc::new(22)) }));
 
-        // The held Arc still points at the old engine — no swap can yank
-        // it out from under a scan that already holds it. This is the
-        // entire point of the A/B hot-swap design.
+        // The held Arc still points at the old engine — no publish can
+        // yank it out from under a scan that already holds it.
         assert_eq!(*held, 11);
 
-        // The freshly-swapped slot now serves the new engine to anyone
-        // who reads after the swap.
-        let after = slot.load_full().expect("slot was Some");
+        // The freshly-published slot now serves the new engine to
+        // anyone who reads after the swap.
+        let after = slot.load().engine.clone().expect("slot was Some");
         assert_eq!(*after, 22);
 
-        // The previous slot-held Arc is what `engine.swap(...)` returned;
-        // dropping it last is what releases the old engine's resources.
-        // While `held` still keeps the old engine alive, dropping `prev`
-        // alone must NOT free anything (strong_count still >= 2: `held`
-        // and `prev`).
-        assert!(Arc::strong_count(&held) >= 2);
+        // The previous slot snapshot is what `swap(...)` returned;
+        // dropping it does not free the held inner Arc — `held` is its
+        // own strong ref. This is what lets the daemon move `drop(prev)`
+        // off the IPC handler safely.
         drop(prev);
-        assert!(Arc::strong_count(&held) >= 1);
+        assert_eq!(*held, 11);
     }
 
-    // Phase 3 invariant: clearing engine_error BEFORE the engine swap
-    // means a reader that observes the new engine is guaranteed to
-    // observe `engine_error = None` (no stale failure carried over).
-    // We can't easily race this in a unit test, but we can at least
-    // assert the program order matches the documented invariant.
+    // Phase 3 + audit fix: the engine and last_error are siblings inside
+    // ONE atomic snapshot, so a publish delivers both fields together.
+    // No matter where the writer is in its sequence, a reader takes a
+    // self-consistent (engine, last_error) tuple.
+    //
+    // This test stresses the property with two threads: a writer that
+    // repeatedly publishes (engine=N, last_error=None) snapshots, and a
+    // reader that asserts every snapshot with engine>=2 has
+    // last_error==None. With the pre-audit two-primitive design this
+    // could fail on weakly-ordered hardware; with the combined snapshot
+    // it cannot fail on any platform.
     #[test]
-    fn arcswap_engine_swap_orders_error_clear_before_engine_publish() {
-        use arc_swap::ArcSwapOption;
-        use std::sync::{Arc, RwLock};
+    fn arcswap_engine_snapshot_publishes_engine_and_error_consistently() {
+        use arc_swap::ArcSwap;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-        let engine_error: RwLock<Option<String>> = RwLock::new(Some("stale".into()));
-        let engine: ArcSwapOption<u32> = ArcSwapOption::from(Some(Arc::new(1)));
+        #[derive(Clone)]
+        struct Snap { engine: Option<u32>, err: Option<&'static str> }
 
-        // Mirror the reload swap from `reload_engine_inner`.
-        *engine_error.write().unwrap() = None;
-        let _prev = engine.swap(Some(Arc::new(2)));
+        let slot = Arc::new(ArcSwap::new(Arc::new(Snap {
+            engine: Some(1),
+            err: Some("stale-old-error"),
+        })));
+        let stop = Arc::new(AtomicBool::new(false));
+        let inconsistencies = Arc::new(AtomicUsize::new(0));
 
-        // A reader that observes engine = 2 (post-swap) must also observe
-        // engine_error = None — anything else would mean the swap published
-        // an engine while its error slot was still stale.
-        let observed_engine = engine.load_full().map(|a| *a);
-        let observed_error = engine_error.read().unwrap().clone();
-        assert_eq!(observed_engine, Some(2));
-        assert_eq!(observed_error, None);
+        let r_slot = Arc::clone(&slot);
+        let r_stop = Arc::clone(&stop);
+        let r_count = Arc::clone(&inconsistencies);
+        let reader = std::thread::spawn(move || {
+            while !r_stop.load(Ordering::Relaxed) {
+                let s = r_slot.load();
+                // Writer publishes (engine=N>=2, err=None). Any
+                // snapshot with a post-reload engine MUST also have
+                // err=None.
+                if let Some(e) = s.engine {
+                    if e >= 2 && s.err.is_some() {
+                        r_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        });
+
+        for i in 2..2_000u32 {
+            slot.store(Arc::new(Snap { engine: Some(i), err: None }));
+        }
+        stop.store(true, Ordering::Relaxed);
+        reader.join().unwrap();
+
+        assert_eq!(
+            inconsistencies.load(Ordering::Relaxed),
+            0,
+            "reader observed a post-reload engine paired with a pre-reload error \
+             — engine + last_error must be a single atomic snapshot"
+        );
     }
 }
