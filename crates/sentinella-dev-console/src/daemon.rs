@@ -53,9 +53,49 @@ impl DaemonSnapshot {
     }
 }
 
-/// Look for `argusd.exe` in the conventional Tauri install layout. Returns
-/// the first existing candidate.
+/// Locate an `argusd.exe` to benchmark. Search order is dev-first:
+///
+///   1. Next to this dev-console exe (the developer's personal toolbox
+///      layout — copy `sentinella-dev-console.exe` + `argusd.exe` to one
+///      folder, ship it).
+///   2. Cargo workspace builds: walk `current_exe().ancestors()` looking
+///      for a sibling `target/release/argusd.exe` or `target/debug/
+///      argusd.exe`. This covers `cargo run -p sentinella-dev-console`
+///      from a workspace checkout.
+///   3. The installed Sentinella copy under
+///      `<Program Files>\Sentinella\daemon\argusd.exe`.
+///
+/// Dev-first matters because the whole point of this tool is to bench
+/// the version of ARGUS we *just built*, not whichever version is
+/// installed. (v0.1.5 argusd does not even have the `benchmark`
+/// subcommand — falling through to the installer copy was producing a
+/// confusing "unrecognized subcommand" error.)
 pub fn locate_argusd() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok();
+
+    // (1) Next to this exe.
+    if let Some(parent) = exe.as_ref().and_then(|e| e.parent()) {
+        let side = parent.join("argusd.exe");
+        if side.exists() {
+            return Some(side);
+        }
+    }
+
+    // (2) Workspace target/{release,debug}/argusd.exe — walk ancestors
+    //     so it works when this exe sits at `target/release/`,
+    //     `target/debug/`, or deeper (e.g. `target/release/deps/`).
+    if let Some(ref e) = exe {
+        for ancestor in e.ancestors() {
+            for sub in ["release/argusd.exe", "debug/argusd.exe"] {
+                let p = ancestor.join(sub);
+                if p.exists() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+
+    // (3) Installed Sentinella.
     let pf = std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into());
     let base = PathBuf::from(pf).join("Sentinella");
     for sub in [
@@ -74,6 +114,19 @@ pub fn locate_argusd() -> Option<PathBuf> {
 /// Parse `sc query SentinellaDaemon` and extract the STATE numeric code.
 /// Robust against localized field labels (the numeric is constant).
 /// Returns None when the service is not installed or sc.exe fails.
+///
+/// Locale note: on Spanish Windows the output is
+///
+/// ```text
+/// TIPO   : 10  WIN32_OWN_PROCESS
+/// ESTADO : 1   STOPPED
+/// ```
+///
+/// The naive "first line where digit is followed by whitespace + a letter"
+/// rule would return TIPO=10 instead of ESTADO=1. SERVICE_TYPE codes are
+/// always >= 10 (WIN32_OWN_PROCESS=0x10, WIN32_SHARE_PROCESS=0x20, …) while
+/// STATE codes are 1..=7. Constraining the candidate to that range picks
+/// the right line on every locale we've seen.
 fn query_state_code() -> Option<u32> {
     let out = quiet_command("sc")
         .args(["query", "SentinellaDaemon"])
@@ -84,7 +137,7 @@ fn query_state_code() -> Option<u32> {
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
     for line in stdout.lines() {
-        let idx = line.find(':')?;
+        let Some(idx) = line.find(':') else { continue };
         let rest = line[idx + 1..].trim_start();
         let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
         if digits.is_empty() || digits.len() >= rest.len() {
@@ -94,14 +147,17 @@ fn query_state_code() -> Option<u32> {
         if !tail.starts_with(|c: char| c.is_whitespace()) {
             continue;
         }
-        if tail
+        if !tail
             .trim_start()
             .chars()
             .next()
             .map(|c| c.is_ascii_alphabetic())
             .unwrap_or(false)
         {
-            if let Ok(n) = digits.parse::<u32>() {
+            continue;
+        }
+        if let Ok(n) = digits.parse::<u32>() {
+            if (1..=7).contains(&n) {
                 return Some(n);
             }
         }
@@ -210,3 +266,48 @@ pub fn is_elevated() -> bool {
 
 #[cfg(not(windows))]
 pub fn is_elevated() -> bool { true }
+
+/// Relaunch the current executable through `ShellExecuteW` with the
+/// `runas` verb so Windows shows the UAC prompt and the new process
+/// receives an elevated token. On success the current process exits
+/// cleanly; the caller never returns here. On failure (UAC denied,
+/// missing exe path) returns an error string for the UI to surface.
+#[cfg(windows)]
+pub fn relaunch_as_admin() -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_NORMAL;
+
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("current_exe: {e}"))?;
+    let exe_w: Vec<u16> = exe.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let verb_w: Vec<u16> = "runas\0".encode_utf16().collect();
+
+    // ShellExecuteW returns a HINSTANCE; values <= 32 are error codes.
+    let hinst = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb_w.as_ptr(),
+            exe_w.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_NORMAL,
+        )
+    };
+    if (hinst as isize) <= 32 {
+        let code = hinst as isize;
+        return Err(match code {
+            // SE_ERR_ACCESSDENIED → user clicked No on UAC.
+            5 => "UAC prompt was denied".to_string(),
+            _ => format!("ShellExecuteW failed (code {code})"),
+        });
+    }
+    // Elevated copy spawned successfully — quit this one so we don't
+    // race with the new instance on config writes.
+    std::process::exit(0);
+}
+
+#[cfg(not(windows))]
+pub fn relaunch_as_admin() -> Result<(), String> {
+    Err("relaunch_as_admin is Windows-only".into())
+}

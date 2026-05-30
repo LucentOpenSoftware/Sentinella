@@ -275,6 +275,13 @@ fn is_service_registered() -> bool {
 /// bare small integer FOLLOWED BY A WORD (the state name), e.g. `: 4  RUNNING`.
 /// Exit-code lines are `: 0  (0x0)` (followed by `(`), and CHECKPOINT/WAIT_HINT
 /// are hex `0x0` (no space before the `x`) — both rejected.
+///
+/// Smoke-test fix: on Spanish Windows the SERVICE_TYPE line is
+/// `TIPO : 10  WIN32_OWN_PROCESS` which also satisfies the
+/// digit-followed-by-whitespace-then-letter rule and was getting picked
+/// before the real ESTADO line. SERVICE_TYPE codes are always >= 0x10
+/// (16) while STATE codes are 1..=7 — constraining the candidate to that
+/// range fixes the locale.
 #[cfg(target_os = "windows")]
 fn parse_service_state_code(stdout: &str) -> Option<u32> {
     for line in stdout.lines() {
@@ -293,14 +300,17 @@ fn parse_service_state_code(stdout: &str) -> Option<u32> {
         if !tail.starts_with(|c: char| c.is_whitespace()) {
             continue;
         }
-        if tail
+        if !tail
             .trim_start()
             .chars()
             .next()
             .map(|c| c.is_ascii_alphabetic())
             .unwrap_or(false)
         {
-            if let Ok(n) = digits.parse::<u32>() {
+            continue;
+        }
+        if let Ok(n) = digits.parse::<u32>() {
+            if (1..=7).contains(&n) {
                 return Some(n);
             }
         }

@@ -54,6 +54,22 @@ pub fn draw(ui: &mut egui::Ui, app: &mut App) {
                     egui::Color32::from_rgb(220, 80, 80),
                     format!("argusd exited with {exit:?}"),
                 );
+                // Friendly diagnostic for the most common failure mode: the
+                // located `argusd.exe` is from an installed v0.1.5 (or
+                // earlier) that pre-dates the `benchmark` subcommand. The
+                // search order in `daemon::locate_argusd` already prefers
+                // the workspace build; this hint helps when nothing else
+                // is available.
+                if stderr.contains("unrecognized subcommand") && stderr.contains("benchmark") {
+                    ui.add_space(4.0);
+                    ui.colored_label(
+                        egui::Color32::from_rgb(220, 190, 80),
+                        "This argusd does not have the `benchmark` subcommand. \
+                         Build the workspace (`cargo build --release -p argusd`) \
+                         or install Sentinella v0.1.6+ — the dev-console will \
+                         prefer the workspace copy automatically.",
+                    );
+                }
                 ui.label("stderr:");
                 ui.monospace(stderr);
             }
@@ -66,10 +82,15 @@ pub fn draw(ui: &mut egui::Ui, app: &mut App) {
                     ui.label(r.passes.to_string());
                     ui.end_row();
                     ui.label("Corpus:");
+                    let src = if r.corpus.source.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", r.corpus.source)
+                    };
                     ui.label(format!(
-                        "{} files / {:.2} MB",
-                        r.corpus_files,
-                        r.corpus_bytes as f64 / (1024.0 * 1024.0)
+                        "{} files / {:.2} MB{src}",
+                        r.corpus.files,
+                        r.corpus.total_bytes as f64 / (1024.0 * 1024.0)
                     ));
                     ui.end_row();
                     ui.label("Throughput:");
@@ -81,7 +102,10 @@ pub fn draw(ui: &mut egui::Ui, app: &mut App) {
                     ui.label("Latency (per file):");
                     ui.label(format!(
                         "p50 {} µs · p95 {} µs · max {} µs · mean {} µs",
-                        r.p50_us, r.p95_us, r.max_us, r.mean_us
+                        r.per_file_us.p50,
+                        r.per_file_us.p95,
+                        r.per_file_us.max,
+                        r.per_file_us.mean
                     ));
                     ui.end_row();
                     ui.label("Performance Index:");
@@ -96,16 +120,29 @@ pub fn draw(ui: &mut egui::Ui, app: &mut App) {
                         format!("{:.1}", r.performance_index),
                     );
                     ui.end_row();
-                    ui.label("CPU cores:");
-                    ui.label(r.logical_cores.to_string());
+                    ui.label("CPU:");
+                    let arch = if r.system.arch.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", r.system.arch)
+                    };
+                    ui.label(format!("{} logical cores{arch}", r.system.logical_cores));
                     ui.end_row();
                     ui.label("SIMD:");
-                    ui.label(if r.simd.is_empty() {
+                    ui.label(if r.system.simd.is_empty() {
                         "—".into()
                     } else {
-                        r.simd.join(", ")
+                        r.system.simd.join(", ")
                     });
                     ui.end_row();
+                    if !r.errors.is_empty() {
+                        ui.label("Errors:");
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 100, 80),
+                            r.errors.join("; "),
+                        );
+                        ui.end_row();
+                    }
                 });
 
                 if !r.extra.is_empty() {

@@ -9,38 +9,69 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Stdio;
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// Top-level shape matches `argusd benchmark --json` output.
+///
+/// Note: throughput (`files_per_sec`, `mb_per_sec`) and the composite
+/// `performance_index` are top-level fields, while corpus size, per-file
+/// latency, and host facts are NESTED. A previous version of this struct
+/// assumed everything was flat and silently rendered zeros for everything
+/// the UI needed.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct BenchmarkReport {
     #[serde(default)]
     pub engine_version: String,
     #[serde(default)]
     pub passes: u32,
     #[serde(default)]
-    pub corpus_files: u64,
-    #[serde(default)]
-    pub corpus_bytes: u64,
-    #[serde(default)]
     pub files_per_sec: f64,
     #[serde(default)]
     pub mb_per_sec: f64,
     #[serde(default)]
-    pub p50_us: u64,
-    #[serde(default)]
-    pub p95_us: u64,
-    #[serde(default)]
-    pub max_us: u64,
-    #[serde(default)]
-    pub mean_us: u64,
-    #[serde(default)]
     pub performance_index: f64,
     #[serde(default)]
-    pub logical_cores: u32,
+    pub corpus: CorpusInfo,
     #[serde(default)]
-    pub simd: Vec<String>,
+    pub per_file_us: LatencyInfo,
+    #[serde(default)]
+    pub system: SystemInfo,
+    #[serde(default)]
+    pub errors: Vec<String>,
     /// Everything else the argusd report emits — surfaced verbatim in a
     /// raw-JSON view so we never lose data the parser doesn't model yet.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct CorpusInfo {
+    #[serde(default)]
+    pub files: u64,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub total_bytes: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct LatencyInfo {
+    #[serde(default)]
+    pub p50: u64,
+    #[serde(default)]
+    pub p95: u64,
+    #[serde(default)]
+    pub max: u64,
+    #[serde(default)]
+    pub mean: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct SystemInfo {
+    #[serde(default)]
+    pub arch: String,
+    #[serde(default)]
+    pub logical_cores: u32,
+    #[serde(default)]
+    pub simd: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

@@ -112,8 +112,17 @@ impl eframe::App for App {
                     ui.separator();
                     ui.colored_label(
                         egui::Color32::from_rgb(220, 140, 60),
-                        "⚠ NOT elevated — service ops will fail. Restart as Admin.",
+                        "⚠ NOT elevated — service ops will fail.",
                     );
+                    if ui.button("🛡 Restart as Admin").clicked() {
+                        if let Err(e) = crate::daemon::relaunch_as_admin() {
+                            // Surface in both setup + benchmark logs so the
+                            // user sees it on whichever tab they're on.
+                            let mut s = self.slots.lock().unwrap();
+                            s.setup_log.push(format!("✖ elevate: {e}"));
+                            s.benchmark_log.push(format!("✖ elevate: {e}"));
+                        }
+                    }
                 }
             });
         });
