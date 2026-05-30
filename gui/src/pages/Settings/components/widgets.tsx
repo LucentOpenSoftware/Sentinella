@@ -40,14 +40,18 @@ export function Section({
   experimental?: boolean;
 }) {
   return (
-    <section className="bg-[rgb(var(--surface))]/40 border border-[rgb(var(--border))]/30 rounded-xl p-5 mb-5">
-      <header className="flex items-start gap-3 mb-4">
-        {icon && <div className="text-[rgb(var(--accent))] mt-0.5">{icon}</div>}
+    <section className="bg-[rgb(var(--surface))]/40 border border-[rgb(var(--border))]/30 rounded-lg px-4 py-3 mb-3">
+      <header className="flex items-start gap-2 mb-2">
+        {icon && (
+          <div className="text-[rgb(var(--accent))] mt-0.5 [&>svg]:w-4 [&>svg]:h-4">
+            {icon}
+          </div>
+        )}
         <div className="flex-1 min-w-0">
-          <h3 className="text-base font-semibold flex items-center gap-2">
+          <h3 className="text-sm font-semibold flex items-center gap-2">
             {title}
             {experimental && (
-              <span className="text-[10px] uppercase tracking-wider px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-400 border border-amber-500/30">
+              <span className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded-full bg-amber-500/15 text-amber-400 border border-amber-500/30">
                 {i18n.t("settings.experimental")}
               </span>
             )}
@@ -59,7 +63,7 @@ export function Section({
           )}
         </div>
       </header>
-      <div className="space-y-3">{children}</div>
+      <div className="space-y-1">{children}</div>
     </section>
   );
 }
@@ -98,9 +102,9 @@ export function SettingRow({
         : null;
 
   return (
-    <div className="flex items-start justify-between gap-4 py-2 border-b border-[rgb(var(--border))]/15 last:border-b-0">
+    <div className="flex items-start justify-between gap-3 py-1.5 border-b border-[rgb(var(--border))]/15 last:border-b-0">
       <div className="flex-1 min-w-0">
-        <div className="flex items-center gap-2 mb-0.5">
+        <div className="flex items-center gap-2">
           {locked && (
             <Lock
               className="w-3.5 h-3.5 text-amber-400"

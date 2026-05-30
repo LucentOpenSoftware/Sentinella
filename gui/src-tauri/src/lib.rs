@@ -361,9 +361,30 @@ fn is_elevated_check() -> bool {
 /// the current (unelevated) process so only one Sentinella window
 /// remains. Used by the Settings page's "Restart as Administrator"
 /// button. Mirrors the dev-console's relaunch-as-admin flow.
+///
+/// Race against tauri_plugin_single_instance:
+///   When ShellExecuteW("runas") spawns the elevated copy, the new
+///   process starts up and hits the single-instance mutex check
+///   FAST — within tens of milliseconds. If the unelevated parent
+///   is still alive at that moment, the new process treats itself
+///   as a duplicate, signals the unelevated window to focus, and
+///   exits. Net result: the user accepts the UAC prompt but
+///   nothing happens.
+///
+/// Fix: exit the unelevated process IMMEDIATELY after
+/// ShellExecuteW returns success. Use AppHandle::exit so Tauri
+/// unwinds cleanly and the single-instance mutex is released
+/// before the elevated copy reaches its own check. The Tauri IPC
+/// response is sacrificed (we don't return through the normal
+/// path) but the UI is about to die anyway.
+///
+/// ShellExecuteW with the "runas" verb is synchronous on the UAC
+/// dialog — it does not return until the user dismisses the
+/// dialog (accept or deny). So when we exit, we already know UAC
+/// outcome.
 #[cfg(windows)]
 #[tauri::command]
-fn restart_as_admin() -> Result<Value, String> {
+fn restart_as_admin(app: tauri::AppHandle) -> Result<Value, String> {
     if is_elevated() {
         return Ok(serde_json::json!({"ok": true, "already_elevated": true}));
     }
@@ -391,16 +412,25 @@ fn restart_as_admin() -> Result<Value, String> {
             SW_SHOWNORMAL,
         )
     };
-    if (result.0 as isize) > 32 {
-        // Elevated instance launched — exit this one. Use a small delay
-        // so the response can return to the UI before the process dies.
-        std::thread::spawn(|| {
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            std::process::exit(0);
+    let code = result.0 as isize;
+    if code > 32 {
+        // UAC accepted. Kill this process clean-and-fast so the
+        // single-instance mutex releases before the elevated copy
+        // reaches its check. AppHandle::exit triggers Tauri's
+        // shutdown path (window destroy → plugin teardown →
+        // single-instance lock release). 50 ms gives the IPC
+        // response a chance to flush but is short enough that the
+        // elevated copy's mutex check still wins the race.
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            app.exit(0);
         });
         Ok(serde_json::json!({"ok": true}))
-    } else {
+    } else if code == 5 {
+        // SE_ERR_ACCESSDENIED — UAC denied.
         Ok(serde_json::json!({"ok": false, "error": "User denied UAC prompt"}))
+    } else {
+        Ok(serde_json::json!({"ok": false, "error": format!("ShellExecuteW failed with code {code}")}))
     }
 }
 

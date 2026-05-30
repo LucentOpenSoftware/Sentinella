@@ -17,9 +17,9 @@ import {
   FlaskConical,
   Layers,
   Loader2,
+  Palette,
   RefreshCw,
   Save,
-  Server,
   Shield,
   ShieldAlert,
   Wrench,
@@ -27,90 +27,45 @@ import {
 } from "lucide-react";
 import * as i18n from "../../i18n";
 import { invoke } from "@tauri-apps/api/core";
-import { LegacySettingsPage } from "./legacy";
-import { ProtectionTab } from "./tabs/Protection";
-import { UpdatesTab } from "./tabs/Updates";
+import { AdvancedTab } from "./tabs/Advanced";
+import { AppearanceTab } from "./tabs/Appearance";
 import { EngineTab } from "./tabs/Engine";
-import { ScheduleTab } from "./tabs/Schedule";
+import { NotificationsTab } from "./tabs/Notifications";
+import { ProtectionTab } from "./tabs/Protection";
 import { RansomwareTab } from "./tabs/Ransomware";
 import { SandboxTab } from "./tabs/Sandbox";
-import { TabStub } from "./tabs/Stubs";
+import { ScheduleTab } from "./tabs/Schedule";
+import { UpdatesTab } from "./tabs/Updates";
 import { useFullConfig } from "./hooks/useFullConfig";
 
 type TabKey =
   | "protection"
   | "updates"
-  | "schedule"
   | "engine"
+  | "schedule"
   | "ransomware"
   | "sandbox"
   | "notifications"
-  | "advanced"
-  | "legacy";
+  | "appearance"
+  | "advanced";
 
 interface TabDef {
   key: TabKey;
   label: string;
   icon: React.ReactNode;
-  phase: number;
 }
 
 function tabs(): TabDef[] {
   return [
-    {
-      key: "protection",
-      label: i18n.t("settings.tab_protection"),
-      icon: <Shield className="w-4 h-4" />,
-      phase: 1,
-    },
-    {
-      key: "updates",
-      label: i18n.t("settings.tab_updates"),
-      icon: <RefreshCw className="w-4 h-4" />,
-      phase: 2,
-    },
-    {
-      key: "engine",
-      label: i18n.t("settings.tab_engine"),
-      icon: <Cpu className="w-4 h-4" />,
-      phase: 2,
-    },
-    {
-      key: "schedule",
-      label: i18n.t("settings.tab_schedule"),
-      icon: <Layers className="w-4 h-4" />,
-      phase: 3,
-    },
-    {
-      key: "ransomware",
-      label: i18n.t("settings.tab_ransomware"),
-      icon: <ShieldAlert className="w-4 h-4" />,
-      phase: 4,
-    },
-    {
-      key: "sandbox",
-      label: i18n.t("settings.tab_sandbox"),
-      icon: <FlaskConical className="w-4 h-4" />,
-      phase: 4,
-    },
-    {
-      key: "notifications",
-      label: i18n.t("settings.tab_notifications"),
-      icon: <Bell className="w-4 h-4" />,
-      phase: 5,
-    },
-    {
-      key: "advanced",
-      label: i18n.t("settings.tab_advanced"),
-      icon: <Wrench className="w-4 h-4" />,
-      phase: 5,
-    },
-    {
-      key: "legacy",
-      label: i18n.t("settings.tab_legacy"),
-      icon: <Server className="w-4 h-4" />,
-      phase: 0,
-    },
+    { key: "protection", label: i18n.t("settings.tab_protection"), icon: <Shield /> },
+    { key: "updates", label: i18n.t("settings.tab_updates"), icon: <RefreshCw /> },
+    { key: "engine", label: i18n.t("settings.tab_engine"), icon: <Cpu /> },
+    { key: "schedule", label: i18n.t("settings.tab_schedule"), icon: <Layers /> },
+    { key: "ransomware", label: i18n.t("settings.tab_ransomware"), icon: <ShieldAlert /> },
+    { key: "sandbox", label: i18n.t("settings.tab_sandbox"), icon: <FlaskConical /> },
+    { key: "notifications", label: i18n.t("settings.tab_notifications"), icon: <Bell /> },
+    { key: "appearance", label: i18n.t("settings.tab_appearance"), icon: <Palette /> },
+    { key: "advanced", label: i18n.t("settings.tab_advanced"), icon: <Wrench /> },
   ];
 }
 
@@ -151,22 +106,21 @@ export function SettingsPage() {
   };
 
   const tabList = tabs();
-  const activeTab = tabList.find((t) => t.key === active)!;
 
   return (
     <div className="h-full flex flex-col">
-      <header className="px-6 pt-5 pb-3 border-b border-[rgb(var(--border))]/30">
-        <h2 className="text-2xl font-semibold mb-1">
+      <header className="px-5 pt-3 pb-2 border-b border-[rgb(var(--border))]/30">
+        <h2 className="text-lg font-semibold">
           {i18n.t("settings.title")}
         </h2>
-        <p className="text-sm text-[rgb(var(--muted))]">
+        <p className="text-xs text-[rgb(var(--muted))]">
           {i18n.t("settings.subtitle")}
         </p>
       </header>
 
       {/* ── Windows 11 pill nav ──────────────────────────── */}
       <nav
-        className="px-6 py-3 border-b border-[rgb(var(--border))]/30 flex flex-wrap gap-1.5 overflow-x-auto"
+        className="px-5 py-2 border-b border-[rgb(var(--border))]/30 flex flex-wrap gap-1 overflow-x-auto"
         role="tablist"
       >
         {tabList.map((t) => {
@@ -177,7 +131,7 @@ export function SettingsPage() {
               onClick={() => setActive(t.key)}
               role="tab"
               aria-selected={isActive}
-              className={`px-3 py-1.5 rounded-full text-sm flex items-center gap-2 whitespace-nowrap transition-colors ${
+              className={`px-2.5 py-1 rounded-full text-xs flex items-center gap-1.5 whitespace-nowrap transition-colors [&>svg]:w-3.5 [&>svg]:h-3.5 ${
                 isActive
                   ? "bg-[rgb(var(--accent))]/15 text-[rgb(var(--accent))] border border-[rgb(var(--accent))]/40"
                   : "border border-transparent text-[rgb(var(--muted))] hover:bg-[rgb(var(--surface))]/60"
@@ -191,19 +145,28 @@ export function SettingsPage() {
       </nav>
 
       {/* ── Tab body ────────────────────────────────────── */}
-      <div className="flex-1 overflow-y-auto px-6 py-5">
-        {ctx.status.kind === "loading" && active !== "legacy" && (
-          <div className="flex items-center gap-3 text-[rgb(var(--muted))] text-sm py-12 justify-center">
-            <Loader2 className="w-4 h-4 animate-spin" />
-            {i18n.t("settings.loading")}
-          </div>
-        )}
-        {ctx.status.kind === "error" && active !== "legacy" && (
-          <div className="text-sm text-red-400 py-12 text-center">
-            <XCircle className="w-6 h-6 mx-auto mb-2" />
-            {ctx.status.message}
-          </div>
-        )}
+      <div className="flex-1 overflow-y-auto px-5 py-3">
+        {/* Appearance + Notifications tabs are GUI-local (no FullConfig
+            needed), so they render even while ctx is still loading. */}
+        {active === "appearance" && <AppearanceTab />}
+        {active === "notifications" && <NotificationsTab />}
+
+        {ctx.status.kind === "loading" &&
+          active !== "appearance" &&
+          active !== "notifications" && (
+            <div className="flex items-center gap-3 text-[rgb(var(--muted))] text-sm py-12 justify-center">
+              <Loader2 className="w-4 h-4 animate-spin" />
+              {i18n.t("settings.loading")}
+            </div>
+          )}
+        {ctx.status.kind === "error" &&
+          active !== "appearance" &&
+          active !== "notifications" && (
+            <div className="text-sm text-red-400 py-12 text-center">
+              <XCircle className="w-6 h-6 mx-auto mb-2" />
+              {ctx.status.message}
+            </div>
+          )}
         {ctx.status.kind !== "loading" && ctx.status.kind !== "error" && (
           <>
             {active === "protection" && (
@@ -230,27 +193,15 @@ export function SettingsPage() {
             )}
             {active === "ransomware" && <RansomwareTab ctx={ctx} />}
             {active === "sandbox" && <SandboxTab ctx={ctx} />}
-            {/* Notifications + Advanced still live in legacy until phase 5 */}
-            {active === "notifications" && (
-              <TabStub
-                title={i18n.t("settings.tab_notifications")}
-                phase={activeTab.phase}
-              />
-            )}
-            {active === "advanced" && (
-              <TabStub
-                title={i18n.t("settings.tab_advanced")}
-                phase={activeTab.phase}
-              />
-            )}
-            {active === "legacy" && <LegacySettingsPage />}
+            {active === "advanced" && <AdvancedTab ctx={ctx} />}
           </>
         )}
       </div>
 
       {/* ── Save footer ─────────────────────────────────── */}
-      {active !== "legacy" && (
-        <footer className="px-6 py-3 border-t border-[rgb(var(--border))]/30 flex items-center justify-between gap-3">
+      {/* Hide footer on GUI-local tabs — they auto-save to localStorage. */}
+      {active !== "appearance" && active !== "notifications" && (
+        <footer className="px-5 py-2 border-t border-[rgb(var(--border))]/30 flex items-center justify-between gap-3">
           <div className="text-xs text-[rgb(var(--muted))] flex items-center gap-2">
             {ctx.isDirty ? (
               <>
