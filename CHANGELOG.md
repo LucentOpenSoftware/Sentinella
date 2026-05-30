@@ -1,5 +1,144 @@
 # Changelog
 
+## [0.1.8] - 2026-05-30
+
+Configuration parity release. The Settings page goes from 12
+exposed fields to ~50 — every TOML knob now has a typed control
+in the GUI. Also fixes the v0.1.7 installer staging-mismatch bug
+class, three GUI display bugs in the Update page, and one broken
+ARGUS-reload button.
+
+### Added
+
+- **Tab-organised Settings page** (Windows 11 pill-nav style). New
+  tabs: Protection, Updates, Engine, Schedule, Ransomware,
+  Sandbox. A Legacy view tab keeps the v0.1.7 flat-list UI alive
+  for the Notifications + Advanced sections (Phase 5 in v0.1.9).
+
+    * **Protection tab** (10 fields): real-time master toggle,
+      watched-folder list with directory picker, max file size
+      slider, scan-archives toggle, heuristic-alerts toggle,
+      auto-quarantine toggle, plus 4 exclusion list editors
+      (paths, extensions, detection names, trusted hashes) with
+      chip UI + per-field validators.
+    * **Updates tab**: auto-update cadence, check interval,
+      mirror, signature staleness threshold.
+    * **Engine tab**: ClamAV isolation radio (in-process /
+      subprocess) with subprocess cost copy, ClamAV worker
+      timeout, ARGUS worker (enable + path + timeout), memory
+      profile (low/normal/aggressive) + warning/critical
+      thresholds (cross-validated), startup critical-area scan,
+      scan-orchestrator file/folder/quick/full toggles.
+    * **Schedule tab**: scheduled scan (enable/hour/type) +
+      idle background scanner (10 fields incl. CPU pause
+      threshold, fullscreen-pause, battery-only, start-delay,
+      disk-latency pause) + collapsible Pacing advanced section
+      with slow/normal/fast tier × min/max-ms (min≤max
+      cross-validated).
+    * **Ransomware tab** (FISH): master enable, observe-only
+      toggle with warning when off, active-response radio
+      (observe/suspend/terminate), alert cooldown + collapsible
+      Thresholds with window seconds, rename/rewrite/extension/
+      entropy thresholds and slow-burn window/threshold.
+    * **Sandbox tab**: experimental banner + opt-in
+      acknowledgement checkbox gate, mode (experimental/
+      production), detonation timeout, min/max score (cross-
+      validated).
+
+- **`FullConfig` IPC surface** in `sentinella-ipc-proto`. Mirrors
+  every TOML field daemon-side, with `#[serde(default)]` on every
+  field for forward/backward wire compat. Nested `FullScanConfig`,
+  `FullPerformanceConfig`, `FullFishConfig`, `FullSandboxConfig`,
+  `DeveloperConfigPublic` (deliberately omits
+  `password_sha256` — the wire schema cannot carry it).
+  `RestartRequirement` enum + static `restart_requirement()`
+  lookup + `RestartRequirementMap::build()` drives the per-field
+  "needs restart" pill in the GUI.
+
+- **Four new IPC methods**: `settings.get_full`,
+  `settings.get_defaults`, `settings.restart_requirements`,
+  `settings.set_full`. Same defence-in-depth as `settings.set`:
+  challenge token + auth gate, kill-vector fields refused (must
+  travel via `protection.set_critical`).
+
+- **Expanded `protection.set_critical`**: from 2 fields
+  (realtime_enabled, auto_quarantine) to 12 (plus
+  heuristic_alerts, idle_scan_enabled, scheduled_scan_enabled,
+  argus_worker_enabled, enhanced_signature_provider,
+  argus_worker_path, excluded_paths, excluded_extensions,
+  excluded_detections, trusted_hashes, realtime_roots). Each
+  field gets strict validation — paths reject root/system
+  directories/`..`, extensions are ASCII-alnum ≤16 chars,
+  detection names cannot be empty (R4-C1 kill-switch defence),
+  trusted hashes must be 64-char lowercase hex, signature
+  provider strict allowlist, all lists capped at 64 entries. A
+  validation failure on ANY field rejects the entire request so
+  the user sees one error path, not partial success.
+
+- **`is_elevated_check` + `restart_as_admin` Tauri commands**.
+  Settings page surfaces a "Restart as Administrator" banner
+  whenever a tab contains kill-vector fields; clicking relaunches
+  the GUI elevated via `ShellExecuteW` "runas" and exits the
+  unelevated instance.
+
+- **`scripts/preflight-staging-versions.ps1`** + new
+  `npm run release:build` script: guards against the v0.1.7 bug
+  class (installer shipping a stale daemon). Asserts every
+  binary in `release/staging/windows/` matches the workspace
+  Cargo.toml version (where FileVersion metadata is present) and
+  is no older than Cargo.toml mtime by more than 24 hours.
+
+- **Spanish translations** for every new Settings string (~170
+  keys). Other 8 locales fall back to English via the existing
+  i18n loader path — translation pass deferred.
+
+### Fixed
+
+- **`Signatures never updated` banner false-positive** at boot.
+  `compute_db_stale` returned `(true, 0)` when both
+  `inner.last_update_timestamp` and
+  `newest_signature_db_mtime_secs()` were `None` — fired even
+  when the engine had clearly loaded thousands of signatures.
+  Daemon-side guard: if `signature_count > 0` and there's no
+  effective timestamp yet, treat as not-stale (defer the badge
+  until we have a real timestamp). GUI also stops calling the
+  banner "never updated" when sigs are loaded.
+
+- **`Signatures never updated` banner hardcoded English string**
+  in `App.tsx:155`. Now goes through `t("notice.never_updated")`
+  + two new keys `notice.signatures_{days,hours}_old` so the
+  banner translates to the active locale.
+
+- **`argus.reload` button → RPC error -32602: challenge token
+  required for ARGUS reload`**. The v0.1.7 audit promoted
+  `argus.reload` to PrivilegedMutation in `policy.rs`, but the
+  GUI's `reload_argus` Tauri command was never updated to fetch
+  and inject a challenge token. Fixed: same `challenge_token()` +
+  inject pattern as `settings.set` / `engine.reload`.
+
+### Tests
+
+- +5 proto tests (`sentinella_ipc_proto::full_config`) for
+  defaults round-trip, RestartRequirement classification,
+  CRITICAL_FIELDS coverage of known kill vectors,
+  RestartRequirementMap shape, password-hash exclusion grep.
+- +4 daemon-side bridge tests for `From<&Config> for FullConfig`
+  round-trip, `apply_non_critical` preserving every kill-vector
+  field under hostile FullConfig input, `critical_diff` flagging
+  every attempted kill-vector mutation, password-hash exclusion
+  from wire format.
+- Daemon: **291/291 tests pass.**
+
+### Known gaps (Phase 5 work for v0.1.9)
+
+- Notifications + Advanced Settings tabs not yet ported from
+  Legacy view (the Legacy tab works fine; just hasn't been
+  rebuilt in the tab framework).
+- Translations for de/fr/it/ja/pt-br/ru/zh-cn locales fall back
+  to English on the new Settings strings.
+- ARGUS packs sometimes reports 0 in the Update page despite the
+  daemon loading hundreds of YARA rules — cosmetic, deferred.
+
 ## [0.1.7] - 2026-05-30
 
 Engine-reload UX hardening release. Focused on the three problems

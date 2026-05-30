@@ -3,7 +3,7 @@ export const de: Record<string, string> = {
   // ── App / Global ────────────────────────────────────
   "app.name": "Sentinella",
   "app.subtitle": "Antiviren-Suite",
-  "app.version": "v0.1.7",
+  "app.version": "v0.1.8",
 
   // ── Seitenleiste ────────────────────────────────────
   "nav.dashboard": "Übersicht",
@@ -26,7 +26,7 @@ export const de: Record<string, string> = {
   "meta.notifications_sub": "Warnungsverlauf",
   "meta.update_sub": "Signaturdatenbank",
   "meta.settings_sub": "Sentinella konfigurieren",
-  "meta.about_sub": "Sentinella v0.1.7",
+  "meta.about_sub": "Sentinella v0.1.8",
 
   // ── Übersicht (Dashboard) ───────────────────────────
   "dash.protected": "Ihr System ist geschützt",

@@ -147,12 +147,32 @@ function App() {
         if (ps === "degraded" || ps === "minimal") {
           notices.push(<TopBarNotice key="degraded" variant="warning" message={stats.protection_detail || "Protection degraded"} dismissKey="degraded" />);
         }
-        if (stats.db_stale && notices.length < 3) {
+        // v0.1.8 bug fixes for the v0.1.7 banner pile-up:
+        //   - "Signatures never updated" was a hardcoded English string
+        //     (now goes through t() so Spanish/etc. translate)
+        //   - The banner fired when db_stale=true AND db_stale_hours=0,
+        //     which on the daemon side happens when effective_ts is None
+        //     (newest_signature_db_mtime_secs() returned None at startup
+        //     before file detection completed). Even though the user
+        //     clearly had a signature database loaded (signature_count
+        //     >> 0), the banner shouted "never updated". GUARD: if the
+        //     daemon reports ANY signatures loaded, suppress the
+        //     "never updated" case — the daemon DID load them from
+        //     somewhere, so they can't be never-updated. Stale-by-time
+        //     banners still fire normally.
+        const sigCount = stats.signature_count ?? 0;
+        const reallyNeverUpdated =
+          stats.db_stale && stats.db_stale_hours === 0 && sigCount === 0;
+        const showStaleBanner =
+          stats.db_stale &&
+          (stats.db_stale_hours > 0 || reallyNeverUpdated) &&
+          notices.length < 3;
+        if (showStaleBanner) {
           const msg = stats.db_stale_hours > 24
-            ? `Signatures ${Math.floor(stats.db_stale_hours / 24)}d old`
+            ? t("notice.signatures_days_old").replace("{n}", String(Math.floor(stats.db_stale_hours / 24)))
             : stats.db_stale_hours > 0
-              ? `Signatures ${stats.db_stale_hours}h old`
-              : "Signatures never updated";
+              ? t("notice.signatures_hours_old").replace("{n}", String(stats.db_stale_hours))
+              : t("notice.never_updated");
           notices.push(
             <TopBarNotice
               key="stale-db"

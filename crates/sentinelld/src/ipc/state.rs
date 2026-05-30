@@ -4141,8 +4141,24 @@ impl AppState {
         .into_iter()
         .flatten()
         .max();
-        let (db_stale, db_stale_hours) =
+        let (db_stale_raw, db_stale_hours) =
             compute_db_stale(effective_ts, now_ts, self.signature_stale_hours);
+        // v0.1.8 bug fix: compute_db_stale returns (true, 0) when
+        // effective_ts is None — i.e. no in-RAM `last_update_timestamp`
+        // AND no readable signature file mtime. This wrongly fired
+        // "Signatures never updated" at boot whenever
+        // newest_signature_db_mtime_secs failed to enumerate the .cld/
+        // .cvd files (race against freshclam, transient I/O error, etc.)
+        // even though the daemon HAD compiled an engine with hundreds of
+        // signatures. Truth check: if the engine reports loaded
+        // signatures, they can't be "never updated" — defer the stale
+        // flag until we have a real timestamp to compare against.
+        let sig_count = self.signature_count.load(Ordering::Relaxed);
+        let db_stale = if sig_count > 0 && effective_ts.is_none() {
+            false
+        } else {
+            db_stale_raw
+        };
 
         // Watcher status.
         let watcher_active = self

@@ -3,7 +3,7 @@ export const en: Record<string, string> = {
   // ── App / Global ────────────────────────────────────
   "app.name": "Sentinella",
   "app.subtitle": "Antivirus Suite",
-  "app.version": "v0.1.7",
+  "app.version": "v0.1.8",
 
   // ── Sidebar ─────────────────────────────────────────
   "nav.dashboard": "Dashboard",
@@ -26,7 +26,7 @@ export const en: Record<string, string> = {
   "meta.notifications_sub": "Alert history",
   "meta.update_sub": "Signature database",
   "meta.settings_sub": "Configure Sentinella",
-  "meta.about_sub": "Sentinella v0.1.7",
+  "meta.about_sub": "Sentinella v0.1.8",
 
   // ── Dashboard ───────────────────────────────────────
   "dash.protected": "Your System is Protected",
@@ -290,6 +290,8 @@ export const en: Record<string, string> = {
   "notice.stale_db": "Signatures {days}d old — update recommended",
   "notice.stale_hours": "Signatures {hours}h old — update recommended",
   "notice.never_updated": "Signatures never updated",
+  "notice.signatures_days_old": "Signatures {n}d old",
+  "notice.signatures_hours_old": "Signatures {n}h old",
   "notice.update_now": "Update Now",
 
   // ── Notifications page ──────────────────────────────

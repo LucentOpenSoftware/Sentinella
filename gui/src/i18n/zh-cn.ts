@@ -3,7 +3,7 @@ export const zh_cn: Record<string, string> = {
   // ── 应用 / 全局 ────────────────────────────────────
   "app.name": "Sentinella",
   "app.subtitle": "杀毒套件",
-  "app.version": "v0.1.7",
+  "app.version": "v0.1.8",
 
   // ── 侧边栏 ─────────────────────────────────────────
   "nav.dashboard": "仪表板",
@@ -26,7 +26,7 @@ export const zh_cn: Record<string, string> = {
   "meta.notifications_sub": "警报历史",
   "meta.update_sub": "病毒特征库",
   "meta.settings_sub": "配置 Sentinella",
-  "meta.about_sub": "Sentinella v0.1.7",
+  "meta.about_sub": "Sentinella v0.1.8",
 
   // ── 仪表板 ───────────────────────────────────────
   "dash.protected": "系统已受保护",

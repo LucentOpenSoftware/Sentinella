@@ -536,9 +536,23 @@ async fn argus_version() -> Result<Value, String> {
 }
 
 /// Reload ARGUS intelligence (YARA rules + IOC hashes).
+///
+/// v0.1.7 audit promoted argus.reload to PrivilegedMutation in
+/// policy.rs (Adversary A3 fix — chaining argus.reload with
+/// update.start + engine.reload could multiply the reload-stacking
+/// budget). The GUI command was never updated to fetch a challenge
+/// token, so the button gave "RPC error -32602: challenge token
+/// required for ARGUS reload" every time. Fix: fetch a one-shot
+/// challenge token and inject it before the call, same pattern as
+/// settings.set / engine.reload.
 #[tauri::command]
 async fn reload_argus() -> Result<Value, String> {
-    daemon_client::call_auth("argus.reload", serde_json::json!({})).await.map_err(Into::into)
+    let token = daemon_client::challenge_token("argus.reload")
+        .await
+        .map_err(|e| e.to_string())?;
+    daemon_client::call_auth("argus.reload", serde_json::json!({"token": token}))
+        .await
+        .map_err(Into::into)
 }
 
 /// Get ARGUS intelligence pack info.

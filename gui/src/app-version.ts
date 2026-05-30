@@ -12,5 +12,5 @@
 // the loader gains placeholder interpolation. Until then: bump THIS
 // constant + run `npm run version:bump-locales` (or grep & sed the 9
 // locale files) and you're done.
-export const APP_VERSION = "0.1.7";
+export const APP_VERSION = "0.1.8";
 export const APP_VERSION_TAG = `v${APP_VERSION}`;
