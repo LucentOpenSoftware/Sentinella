@@ -30,6 +30,10 @@ notify-debouncer-mini = "0.5"
 toml = "0.8"
 sha2 = "0.10"
 hmac = "0.12"
+# v0.1.7 Phase 3 — lock-free atomic engine hot-swap. Scans now read the
+# current engine via a relaxed atomic Arc load instead of an RwLock read,
+# so a reload never blocks an in-flight or new scan.
+arc-swap = "1"
 ureq = { version = "2", features = ["tls"] }
 aes-gcm = "0.10"
 rand = "0.8"
