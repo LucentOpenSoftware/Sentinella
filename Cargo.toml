@@ -11,6 +11,7 @@ members = [
     "crates/clamavd",
     "crates/sandboxd",
     "crates/etw_probe",
+    "crates/sentinella-dev-console",
 ]
 exclude = ["gui/src-tauri", "third_party", "fuzz"]
 

@@ -1,0 +1,33 @@
+[package]
+name = "sentinella-dev-console"
+description = "Internal developer console for provisioning Developer Mode and running the ARGUS benchmark against an installed Sentinella daemon. NOT shipped in the public installer."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "sentinella-dev-console"
+path = "src/main.rs"
+
+[dependencies]
+# Native immediate-mode GUI — single static binary, no GTK/webview.
+eframe = { version = "0.30", default-features = false, features = ["default_fonts", "glow"] }
+egui   = "0.30"
+
+# Workspace pulls — already pinned.
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2       = "0.10"
+# Preserves comments/formatting when editing sentinelld.toml.
+toml_edit  = "0.22"
+chrono     = { version = "0.4", default-features = false, features = ["clock"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
