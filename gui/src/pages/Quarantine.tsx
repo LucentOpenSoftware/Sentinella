@@ -96,16 +96,16 @@ export function QuarantinePage() {
     const fileName = item.original_path.split('\\').pop() || "restored_file";
     const dest = await save({
       defaultPath: fileName,
-      title: "Restore quarantined file to...",
+      title: t("quar.restore_dialog_title"),
     });
     if (!dest) return;
     setBusy(item.id);
     try {
       const result = await restoreQuarantineAs(item.id, dest);
       if (result.ok) {
-        setToast({ type: "success", message: `Restored to ${result.restored_to || dest}` });
+        setToast({ type: "success", message: `${t("quar.restored_to")} ${result.restored_to || dest}` });
       } else {
-        setToast({ type: "error", message: result.error || "Restore failed" });
+        setToast({ type: "error", message: result.error || t("quar.restore_failed") });
       }
     } catch (e) {
       setToast({ type: "error", message: String(e) });
@@ -241,10 +241,10 @@ export function QuarantinePage() {
                         disabled={!item.restorable || isBusy}
                         onClick={() => handleRestoreAs(item)}
                         className="text-[11px] font-medium px-4 py-2 rounded-xl bg-[rgb(var(--raised))]/25 text-[rgb(var(--t2))] flex items-center gap-1.5 cursor-pointer disabled:opacity-30"
-                        title="Restore to a different location"
+                        title={t("quar.restore_as_tooltip")}
                       >
                         {isBusy ? <Loader2 size={12} className="animate-spin"/> : <FolderOpen size={12}/>}
-                        Restore as...
+                        {t("quar.restore_as")}
                       </button>
                       <button
                         disabled={!item.restorable || isBusy}

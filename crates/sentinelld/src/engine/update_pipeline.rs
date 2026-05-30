@@ -190,7 +190,13 @@ impl SignatureUpdateManager {
         let activated = match self.activate(&staging_dir, &downloaded) {
             Ok(count) => count,
             Err(e) => {
-                self.rollback();
+                // Do NOT call self.rollback() here: activate() already owns
+                // its own restore / cleanup paths. If activate's swap step
+                // failed AFTER it restored old_dir → active_enhanced_dir, a
+                // subsequent rollback() would wipe active_enhanced_dir of the
+                // just-restored prior signatures — turning a recoverable
+                // failure into a permanent signature loss + fail-open window.
+                self.cleanup_staging(&staging_dir);
                 return self.fail(format!("activation failed: {e}"));
             }
         };
@@ -263,12 +269,22 @@ impl SignatureUpdateManager {
         staging_dir: &Path,
     ) -> Result<Vec<StagedFile>, String> {
         let mut files = Vec::new();
+        // R10: track the last per-file download error so a total failure
+        // surfaces the real cause (TLS/auth/DNS) instead of the generic
+        // "no files downloaded" which hid everything at debug level.
+        let mut last_error: Option<String> = None;
 
         // Strategy 1: Try local source directory (for testing / air-gapped systems).
+        // R9-LETHAL pattern: NEVER fall back to CWD ("."). Daemon runs as SYSTEM
+        // and copies+activates anything it finds under `local_source` as a real
+        // signature DB. CWD-relative resolution lets an attacker who can drop
+        // `provider_sources/<id>/*.ndb` next to the daemon's working directory
+        // poison the engine. Anchor to the PathManager root instead.
         let local_source = self
             .staging_root
             .parent()
-            .unwrap_or(Path::new("."))
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| crate::paths::paths().root().to_path_buf())
             .join("provider_sources")
             .join(&provider.id);
 
@@ -324,8 +340,18 @@ impl SignatureUpdateManager {
                     Err(e) => {
                         // Non-fatal for individual files — provider may not ship all listed files.
                         debug!(file = db_file.as_str(), error = %e, "download skipped");
+                        last_error = Some(format!("{db_file}: {e}"));
                     }
                 }
+            }
+        }
+
+        // R10: if nothing was staged but downloads were attempted and failed,
+        // surface the real error rather than letting the caller report a
+        // misleading "no files downloaded".
+        if files.is_empty() {
+            if let Some(err) = last_error {
+                return Err(format!("all provider downloads failed (last: {err})"));
             }
         }
 
@@ -357,19 +383,12 @@ impl SignatureUpdateManager {
                 return Err(format!("{} is empty", file.name));
             }
 
-            // SHA-256 verification (if hash available).
-            if let Some(ref expected_hash) = file.sha256 {
-                let actual_hash = compute_sha256(&path)?;
-                if actual_hash != *expected_hash {
-                    return Err(format!(
-                        "{} SHA-256 mismatch: expected {}, got {}",
-                        file.name,
-                        &expected_hash[..16],
-                        &actual_hash[..16]
-                    ));
-                }
-                debug!(file = file.name.as_str(), "SHA-256 verified");
-            }
+            // R3-18: do NOT re-compute SHA-256 here and compare against
+            // file.sha256 — that field was computed locally from the same
+            // bytes during download, so the comparison is tautological and
+            // provides zero security guarantee. Authoritative SHA-256
+            // verification happens in Phase 3b against the trusted manifest.
+            // We keep file.sha256 only for diagnostics/logging.
 
             // Text format validation for ClamAV signature files.
             let ext = path
@@ -378,14 +397,22 @@ impl SignatureUpdateManager {
                 .unwrap_or_default();
 
             if matches!(ext.as_str(), "ndb" | "hdb" | "hsb" | "cdb" | "ftm" | "ign2") {
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    if let Some(first_line) = content.lines().next() {
-                        if first_line.chars().any(|c| c.is_control() && c != '\t') {
-                            return Err(format!(
-                                "{} contains binary data in text format",
-                                file.name
-                            ));
-                        }
+                // R3-fix: only the first line is inspected for binary content,
+                // so don't slurp the entire (potentially hundreds-of-MB) CVD
+                // into RAM. Cap the read at 4 KiB via Read::take + BufReader.
+                use std::io::{BufRead, BufReader, Read};
+                if let Ok(f) = std::fs::File::open(&path) {
+                    let mut reader = BufReader::new(f.take(4096));
+                    let mut first_line = String::new();
+                    let _ = reader.read_line(&mut first_line);
+                    if first_line
+                        .chars()
+                        .any(|c| c.is_control() && c != '\t' && c != '\n' && c != '\r')
+                    {
+                        return Err(format!(
+                            "{} contains binary data in text format",
+                            file.name
+                        ));
                     }
                 }
             }
@@ -433,10 +460,23 @@ impl SignatureUpdateManager {
                 ));
             }
 
+            // R10: reject malformed manifest hash BEFORE comparison. The
+            // sha256 comes from untrusted manifest JSON; the previous
+            // `&mf.sha256[..16]` in the error path panicked on any value
+            // shorter than 16 bytes — and that path runs exactly when
+            // verification is already failing (a corrupt manifest would
+            // crash the updater thread instead of returning cleanly).
+            if mf.sha256.len() != 64 || !mf.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(format!(
+                    "{} manifest sha256 malformed (not 64 hex chars)",
+                    mf.name
+                ));
+            }
             let actual_hash = compute_sha256(&path)?;
             if actual_hash != mf.sha256 {
+                // Safe slices: both are now known to be 64 hex chars.
                 return Err(format!(
-                    "{} SHA-256 mismatch: manifest says {}, got {}",
+                    "{} SHA-256 mismatch: manifest says {}…, got {}…",
                     mf.name,
                     &mf.sha256[..16],
                     &actual_hash[..16]
@@ -461,9 +501,17 @@ impl SignatureUpdateManager {
             .map_err(|e| format!("create enhanced dir: {e}"))?;
 
         // Step 1: Move new files to a temporary "pending" directory alongside active.
+        // Hard-fail if stale pending_dir cannot be scrubbed: silent ignore left
+        // verified-signed signature files from a prior failed run in place,
+        // which a subsequent rename-race could promote into the active set.
         let pending_dir = self.active_enhanced_dir.with_file_name("enhanced_pending");
         if pending_dir.exists() {
-            let _ = std::fs::remove_dir_all(&pending_dir);
+            std::fs::remove_dir_all(&pending_dir).map_err(|e| {
+                format!(
+                    "activate: cannot clean stale pending_dir {}: {e}",
+                    pending_dir.display()
+                )
+            })?;
         }
         std::fs::create_dir_all(&pending_dir).map_err(|e| format!("create pending dir: {e}"))?;
 
@@ -505,11 +553,21 @@ impl SignatureUpdateManager {
             if had_existing {
                 let _ = std::fs::rename(&old_dir, &self.active_enhanced_dir);
             }
+            // SECURITY: scrub pending_dir on every failure path. The pending
+            // dir holds manifest-verified, signed signature files. Leaving
+            // them on disk lets a later attacker who can win a rename race
+            // (`enhanced_pending` → `active_enhanced_dir`) bypass manifest
+            // verification entirely by promoting our own verified set.
+            let _ = std::fs::remove_dir_all(&pending_dir);
             return Err(format!("atomic swap failed: {e}"));
         }
 
         // Step 4: Cleanup old directory.
         let _ = std::fs::remove_dir_all(&old_dir);
+        // Belt-and-suspenders: ensure no stale pending_dir survives even on
+        // the success path (e.g. an interrupted prior run that succeeded the
+        // swap but lost power before the unlink).
+        let _ = std::fs::remove_dir_all(&pending_dir);
 
         info!(count = activated, "signature files activated (atomic swap)");
         Ok(activated)
@@ -573,7 +631,16 @@ impl SignatureUpdateManager {
 /// Download a file via HTTP to a local path.
 /// Writes to a temp file first, then renames atomically.
 fn download_file(url: &str, dest: &Path) -> Result<u64, String> {
-    let tmp_path = dest.with_extension("tmp");
+    // Bug R3-5: with_extension("tmp") strips the original extension, so
+    // downloading foo.ndb and foo.hdb in the same dir both resolve to foo.tmp
+    // — sequential downloads overwrite each other's temp file. Append .tmp
+    // instead of replacing the extension so each download gets a unique
+    // staging file (foo.ndb.tmp vs foo.hdb.tmp).
+    let mut tmp_name = dest.file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    tmp_name.push(".tmp");
+    let tmp_path = dest.with_file_name(tmp_name);
 
     let agent = ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(DOWNLOAD_TIMEOUT_SECS))
@@ -637,6 +704,14 @@ fn download_file(url: &str, dest: &Path) -> Result<u64, String> {
         }
     }
 
+    // Durability: fsync the temp before rename. Without it, a crash after
+    // the rename returns success can leave the destination empty/short, which
+    // engine reload then loads as a corrupt signature DB — silent protection
+    // degradation right after a "successful" update.
+    file.sync_all().map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        format!("sync temp: {e}")
+    })?;
     drop(file);
 
     // Atomic rename from temp to final destination.
@@ -732,21 +807,16 @@ mod tests {
             stage: UpdateStage::Idle,
         };
 
-        // Good hash — should pass.
+        // R3-18: verify_staged no longer compares against locally-computed
+        // hashes (tautological). Authoritative verification is done in
+        // verify_against_manifest. We only assert size/format checks here.
+        let _ = actual_hash;
         let good_files = vec![StagedFile {
             name: "test.ndb".into(),
             size: std::fs::metadata(&file_path).unwrap().len(),
-            sha256: Some(actual_hash.clone()),
+            sha256: None,
         }];
         assert!(mgr.verify_staged(&staging, &good_files).is_ok());
-
-        // Bad hash — should fail.
-        let bad_files = vec![StagedFile {
-            name: "test.ndb".into(),
-            size: std::fs::metadata(&file_path).unwrap().len(),
-            sha256: Some("0000000000000000000000000000000000000000000000000000000000000000".into()),
-        }];
-        assert!(mgr.verify_staged(&staging, &bad_files).is_err());
     }
 
     #[test]

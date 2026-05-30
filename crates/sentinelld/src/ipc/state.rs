@@ -14,7 +14,7 @@ use std::sync::{
     Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use sentinella_ipc_proto::engine::{EngineState, EngineStatus};
@@ -40,8 +40,17 @@ fn max_file_size() -> u64 {
         .unwrap_or(DEFAULT_MAX_FILE_SIZE)
 }
 
-/// Number of parallel scan threads for background scans.
-const SCAN_THREADS: usize = 4;
+/// Parallel scan threads for background folder/full scans, derived from the
+/// machine's logical cores. Was a fixed 4 regardless of hardware — a 2c/4t
+/// i7-7200U got the same pool as a 10-thread i5-1265U (oversubscribed on the
+/// small box, under-utilized on the big one). Use ~half the logical CPUs to
+/// leave headroom for UI / OS / the real-time watcher, clamped so a Core 2 Quad
+/// still parallelizes and a big Ryzen doesn't thread-bomb a disk-bound scan.
+fn scan_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| (n.get() / 2).clamp(2, 8))
+        .unwrap_or(4)
+}
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -72,14 +81,33 @@ fn load_or_create_ipc_secret() -> Option<String> {
         .ok()
         .filter(|s| s.len() >= 32);
 
-    if let Some(secret) = env_secret {
-        if !path.exists() {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
+    if let Some(env_s) = env_secret {
+        // Hardening: if disk secret exists, env var MUST match it. An attacker
+        // (or stale GPO/scheduled task) setting the env var would otherwise
+        // poison the persisted secret and lock the GUI out.
+        if let Ok(disk) = std::fs::read_to_string(&path) {
+            let disk_trim = disk.trim();
+            if disk_trim.len() >= 32 {
+                if disk_trim != env_s {
+                    tracing::error!(
+                        "IPC secret env var differs from disk secret — ignoring env var (possible tamper attempt)"
+                    );
+                    restrict_ipc_secret_permissions(&path);
+                    return Some(disk_trim.to_string());
+                }
+                // Matches — accept either, prefer the disk one.
+                restrict_ipc_secret_permissions(&path);
+                return Some(disk_trim.to_string());
             }
-            let _ = std::fs::write(&path, &secret);
         }
-        return Some(secret);
+        // No disk secret yet — accept env, persist it.
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if std::fs::write(&path, &env_s).is_ok() {
+            restrict_ipc_secret_permissions(&path);
+        }
+        return Some(env_s);
     }
 
     if let Ok(secret) = std::fs::read_to_string(&path) {
@@ -99,7 +127,54 @@ fn load_or_create_ipc_secret() -> Option<String> {
             return None;
         }
     }
-    match std::fs::write(&path, &secret) {
+    // R3-25: TOCTOU-safe create. If two daemons race here, only one wins
+    // the create_new; the loser reads the winner's secret from disk so
+    // both end up using the same value.
+    use std::io::Write;
+    let create_result = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path);
+    match create_result {
+        Ok(mut f) => {
+            if f.write_all(secret.as_bytes()).is_err() {
+                tracing::warn!("failed to write IPC secret");
+                return None;
+            }
+            drop(f);
+            restrict_ipc_secret_permissions(&path);
+            return Some(secret);
+        }
+        Err(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Lost the race — read what the winner wrote.
+            if let Ok(s) = std::fs::read_to_string(&path) {
+                let t = s.trim().to_string();
+                if t.len() >= 32 {
+                    restrict_ipc_secret_permissions(&path);
+                    return Some(t);
+                }
+            }
+            // Disk file unreadable/invalid — fall through to the legacy
+            // write path below as a last resort.
+        }
+        Err(_) => {}
+    }
+
+    // Write + fsync the secret before applying ACLs. If the buffered write is
+    // lost on crash, next start reads truncated/empty → spurious auth failures
+    // and a regenerated secret that already-connected GUIs can't use.
+    let write_res = (|| -> std::io::Result<()> {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)?;
+        f.write_all(secret.as_bytes())?;
+        f.sync_all()?;
+        Ok(())
+    })();
+    match write_res {
         Ok(()) => {
             // C2 fix: restrict IPC secret file permissions — only SYSTEM
             // and Administrators should be able to read the shared secret.
@@ -218,6 +293,11 @@ pub struct AppState {
     user_disabled_protection: std::sync::atomic::AtomicBool,
     /// Unix timestamp when protection was disabled (0 = never).
     protection_disabled_at: AtomicU64,
+    /// Race fix: serialize disable/enable so a concurrent pair can't
+    /// interleave — without it, `enable` could start_watcher() *before*
+    /// the racing `disable` stop_watcher() ran, leaving protection silently
+    /// off after the enable call returned success.
+    protection_toggle_lock: std::sync::Mutex<()>,
     // ── FISH (File Integrity Shield) ─────────────────
     fish_window: std::sync::Mutex<crate::fish::MutationWindow>,
     fish_config: crate::fish::FishConfig,
@@ -226,6 +306,11 @@ pub struct AppState {
     // ── Memory pressure ──────────────────────────────
     pressure_tracker: crate::footprint::pressure::PressureTracker,
     performance_config: crate::config::PerformanceConfig,
+    /// Developer-mode state (gates local perf telemetry). Mutable at runtime via
+    /// `load_developer_config` when the mode is toggled.
+    developer_config: std::sync::Mutex<crate::config::DeveloperConfig>,
+    /// Signature-staleness warning threshold (hours), from config.signature_stale_days.
+    signature_stale_hours: u64,
     // ── ClamAV isolation config (cached) ───────────────
     clamav_subprocess_enabled: AtomicBool,
     clamav_worker_timeout_sec: AtomicU64,
@@ -268,6 +353,26 @@ pub struct AppState {
     residency_manager: crate::footprint::residency::ResidencyManager,
     // ── IPC Rate Limiter ──────────────────────────
     pub(crate) rate_limiter: super::policy::RateLimiter,
+    // ── Quarantine F4: post-restore watcher suppression ──
+    /// Paths recently restored from quarantine. The realtime watcher consults
+    /// this set (with a 30s TTL) and skips scans on these paths to break the
+    /// restore → CREATE event → re-detect → re-quarantine loop that could
+    /// otherwise fire before the caller commits the DB status flip.
+    restore_suppress: std::sync::Mutex<std::collections::HashMap<PathBuf, Instant>>,
+    // ── Tamper-detection signals (set once at startup) ──────────
+    /// A startup binary-integrity check found a hash mismatch against the
+    /// stored TOFU baseline (`binary_integrity.json`). Surfaced via the
+    /// `health` IPC so a paused/stopped GUI can flag tampering without
+    /// trusting the daemon log.
+    binary_integrity_drift: AtomicBool,
+    /// The config file's HMAC sidecar (`sentinelld.toml.hmac`) did not match
+    /// the on-disk config at load time → someone edited the config outside
+    /// the daemon. Fail-loud, not fail-closed (daemon continues with the
+    /// loaded values so the operator can see the bad config).
+    config_drift: AtomicBool,
+    /// Number of times the supervisor restarted the watcher after a stalled
+    /// heartbeat. Diagnostics-only; surfaced via `resilience`.
+    watcher_restarts_total: AtomicU64,
 }
 
 struct Inner {
@@ -279,7 +384,13 @@ struct Inner {
     activity: Vec<ActivityEntry>,
 
     // ── Challenge token for dangerous commands ─────────
-    challenge_token: Option<(String, Instant)>, // (token, created_at)
+    // Adversary A2: token is now bound to the IPC method it was issued for.
+    // Without binding, a token approved for (say) quarantine.delete could be
+    // replayed against engine.reload or settings.set in the same UAC window —
+    // defeating the per-dangerous-op consent model. The middle field is the
+    // method name the token is scoped to; validate_challenge_token requires
+    // it to match exactly.
+    challenge_token: Option<(String, String, Instant)>, // (token, method, created_at)
 
     // ── Update tracking ────────────────────────────────
     update_running: bool,
@@ -300,6 +411,10 @@ pub struct ScanPerformanceSummary {
     pub total_argus_us: u64,
     pub total_yara_us: u64,
     pub total_hash_us: u64,
+    /// Aggregated ClamAV phase time across the job (µs). v0.1.6+.
+    pub total_clamav_us: u64,
+    /// Aggregated bytes ClamAV actually scanned across the job. v0.1.6+.
+    pub total_bytes_scanned: u64,
     pub cache_hits: u64,
     pub cache_misses: u64,
     /// Slowest files (path, time_us). Capped at 10.
@@ -307,7 +422,12 @@ pub struct ScanPerformanceSummary {
 }
 
 impl ScanPerformanceSummary {
-    fn record_file(&mut self, path: &str, timing: &argus::verdict::ScanTiming) {
+    fn record_file(
+        &mut self,
+        path: &str,
+        file_size: u64,
+        timing: &argus::verdict::ScanTiming,
+    ) {
         // Strategy counts.
         if let Some(strategy) = timing.strategy {
             match strategy {
@@ -318,9 +438,13 @@ impl ScanPerformanceSummary {
                 argus::verdict::ScanStrategy::TooLarge => self.strategy_too_large += 1,
             }
         }
-        self.total_argus_us += timing.argus_total_us;
-        self.total_yara_us += timing.yara_us;
-        self.total_hash_us += timing.hash_us;
+        self.total_argus_us = self.total_argus_us.saturating_add(timing.argus_total_us);
+        self.total_yara_us = self.total_yara_us.saturating_add(timing.yara_us);
+        self.total_hash_us = self.total_hash_us.saturating_add(timing.hash_us);
+        // ClamAV phase + bytes per file. Sat-add since a busy daemon can run for
+        // weeks and TB-scale scans push these into the high range.
+        self.total_clamav_us = self.total_clamav_us.saturating_add(timing.clamav_us);
+        self.total_bytes_scanned = self.total_bytes_scanned.saturating_add(file_size);
 
         // Track slowest files (top 10).
         if timing.argus_total_us > 100_000 {
@@ -410,6 +534,73 @@ enum ScanJobStatus {
 pub struct Detection {
     path: String,
     virus_name: String,
+}
+
+/// Core of [`AppState::try_reserve_scan`], split out so the atomic
+/// check-and-reserve invariant can be unit-tested without constructing a full
+/// `AppState`. The caller MUST hold the `inner` lock for the entire call so the
+/// overlap check and the reservation are one indivisible critical section
+/// (TOCTOU fix — see `try_reserve_scan`).
+/// Pure staleness decision: given the most-recent signature timestamp (unix
+/// secs, the max of in-memory + file-mtime sources) and the current time,
+/// decide whether the DB is stale and report its age in hours. `None` ts means
+/// no signatures present at all → genuinely stale.
+fn compute_db_stale(effective_ts: Option<i64>, now_ts: i64, threshold_hours: u64) -> (bool, u64) {
+    match effective_ts {
+        Some(ts) => {
+            let hours = ((now_ts - ts).max(0) as u64) / 3600;
+            (hours > threshold_hours, hours)
+        }
+        None => (true, 0),
+    }
+}
+
+/// Extract the actionable reason from freshclam output for the activity log.
+/// freshclam's real error (DNS failure, dead mirror, permission/tempdir issue)
+/// is on the LAST non-empty line(s); the head is banner + progress noise. The
+/// old code logged the first 200 chars, which usually truncated before the
+/// reason — making a tray (scheduled) update failure undiagnosable. Surface the
+/// tail instead so the activity log says *why*.
+fn freshclam_error_detail(message: &str) -> String {
+    let tail: Vec<&str> = message
+        .lines()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .take(3)
+        .collect();
+    if tail.is_empty() {
+        return "freshclam failed (no output)".to_string();
+    }
+    let joined = tail.into_iter().rev().collect::<Vec<_>>().join(" | ");
+    joined.chars().take(300).collect()
+}
+
+fn reserve_active_scan(inner: &mut Inner, job: ScanJob) -> Result<(), ScanStartResponse> {
+    if let Some(ref existing) = inner.active_scan {
+        if matches!(
+            existing.status,
+            ScanJobStatus::Running | ScanJobStatus::Pending | ScanJobStatus::Draining
+        ) {
+            return Err(ScanStartResponse {
+                job_id: existing.id.to_string(),
+                status: "error".into(),
+                result: None,
+                error: Some(format!(
+                    "Another scan is already {} — cancel it or wait",
+                    match existing.status {
+                        ScanJobStatus::Pending => "queued",
+                        ScanJobStatus::Running => "running",
+                        ScanJobStatus::Draining => "draining",
+                        ScanJobStatus::Completed => "completed",
+                        ScanJobStatus::Cancelled => "cancelled",
+                        ScanJobStatus::Failed => "failed",
+                    }
+                )),
+            });
+        }
+    }
+    inner.active_scan = Some(job);
+    Ok(())
 }
 
 impl AppState {
@@ -594,13 +785,61 @@ impl AppState {
             scan_live: Mutex::new(None),
             user_disabled_protection: std::sync::atomic::AtomicBool::new(false),
             protection_disabled_at: AtomicU64::new(0),
+            protection_toggle_lock: std::sync::Mutex::new(()),
             fish_config: crate::fish::FishConfig::default(),
             fish_window: std::sync::Mutex::new(crate::fish::MutationWindow::new(
                 &crate::fish::FishConfig::default(),
             )),
             footprint_baselines: crate::footprint::FootprintBaselines::new(),
             pressure_tracker: crate::footprint::pressure::PressureTracker::new(),
-            performance_config: crate::config::PerformanceConfig::default(),
+            performance_config: {
+                // Honor the user's [performance] config (incl. memory_profile),
+                // which AppState::new previously ignored entirely. When the
+                // thresholds are left at the defaults (treated as "auto"), derive
+                // them from THIS machine's RAM so back-off behavior is consistent
+                // across hardware (4 GB Core 2 Quad ↔ 32 GB i5-1265U) instead of a
+                // static 1500/2500 MB. Explicit user overrides are respected as-is.
+                let mut pc = crate::config::Config::load(None)
+                    .map(|c| c.performance)
+                    .unwrap_or_default();
+                let defaults = crate::config::PerformanceConfig::default();
+                let at_defaults = pc.memory_warning_mb == defaults.memory_warning_mb
+                    && pc.memory_critical_mb == defaults.memory_critical_mb;
+                if at_defaults {
+                    if let Some(ram_mb) = crate::footprint::pressure::detect_total_ram_mb() {
+                        let (w, c) = crate::footprint::pressure::ram_relative_thresholds(
+                            ram_mb,
+                            &pc.memory_profile,
+                        );
+                        pc.memory_warning_mb = w;
+                        pc.memory_critical_mb = c;
+                        tracing::info!(
+                            total_ram_mb = ram_mb,
+                            warning_mb = w,
+                            critical_mb = c,
+                            profile = pc.memory_profile.as_str(),
+                            "memory pressure thresholds auto-derived from total RAM"
+                        );
+                    }
+                } else {
+                    tracing::info!(
+                        warning_mb = pc.memory_warning_mb,
+                        critical_mb = pc.memory_critical_mb,
+                        "using user-configured memory pressure thresholds"
+                    );
+                }
+                pc
+            },
+            developer_config: std::sync::Mutex::new(
+                crate::config::Config::load(None)
+                    .map(|c| c.developer)
+                    .unwrap_or_default(),
+            ),
+            signature_stale_hours: crate::config::Config::load(None)
+                .map(|c| c.signature_stale_days)
+                .unwrap_or(3)
+                .clamp(1, 30) as u64
+                * 24,
             clamav_subprocess_enabled: AtomicBool::new(false),
             clamav_worker_timeout_sec: AtomicU64::new(30),
             excluded_detections: std::sync::Mutex::new(Vec::new()),
@@ -639,6 +878,10 @@ impl AppState {
                 crate::footprint::residency::ResidencyConfig::default(),
             ),
             rate_limiter: super::policy::RateLimiter::new(),
+            restore_suppress: std::sync::Mutex::new(std::collections::HashMap::new()),
+            binary_integrity_drift: AtomicBool::new(false),
+            config_drift: AtomicBool::new(false),
+            watcher_restarts_total: AtomicU64::new(0),
             inner: Mutex::new(Inner {
                 active_scan: None,
                 scan_history: Vec::new(),
@@ -653,12 +896,14 @@ impl AppState {
         }
     }
 
-    /// Generate a single-use challenge token for dangerous IPC commands.
-    /// Token expires after 60 seconds.
-    pub fn generate_challenge_token(&self) -> String {
+    /// Generate a single-use challenge token for a specific dangerous IPC method.
+    /// Token expires after 60 seconds and is REJECTED when presented to a
+    /// different method than the one it was issued for (Adversary A2: prevents
+    /// cross-method token replay across a single UAC consent window).
+    pub fn generate_challenge_token(&self, method: &str) -> String {
         let token = Uuid::new_v4().to_string();
         let mut inner = self.lock_inner();
-        inner.challenge_token = Some((token.clone(), Instant::now()));
+        inner.challenge_token = Some((token.clone(), method.to_string(), Instant::now()));
         token
     }
 
@@ -675,29 +920,44 @@ impl AppState {
         ok
     }
 
-    /// Validate and consume a challenge token. Returns true if valid.
-    pub fn validate_challenge_token(&self, token: &str) -> bool {
+    /// Validate and consume a challenge token. Returns true if valid AND
+    /// scoped to `expected_method`. Adversary A2: a token issued for one
+    /// dangerous method must not be reusable against another, otherwise the
+    /// UAC-per-dangerous-op model collapses (e.g. user approves
+    /// quarantine.delete, the GUI/attacker replays the token into
+    /// engine.reload during the same window).
+    pub fn validate_challenge_token(&self, token: &str, expected_method: &str) -> bool {
         let mut inner = self.lock_inner();
-        if let Some((ref stored, created)) = inner.challenge_token {
-            // Constant-time comparison to prevent timing attacks.
+        if let Some((ref stored, ref stored_method, created)) = inner.challenge_token {
+            // Constant-time comparison on the token bytes to prevent timing
+            // side channels. Method scope is compared with normal equality
+            // since the value comes from a server-side string registry, not
+            // attacker-controlled bytes whose timing leaks would matter.
             let ct_eq = stored.len() == token.len()
                 && stored
                     .bytes()
                     .zip(token.bytes())
                     .fold(0u8, |acc, (a, b)| acc | (a ^ b))
                     == 0;
-            if ct_eq && created.elapsed().as_secs() < 60 {
+            let method_match = stored_method == expected_method;
+            let fresh = created.elapsed().as_secs() < 60;
+            if ct_eq && method_match && fresh {
                 inner.challenge_token = None; // Consumed — single use.
                 return true;
             }
+            // Failure closed: burn the token on any mismatch (wrong value,
+            // wrong scope, or expired) so a replay attempt does not survive
+            // and a parallel legitimate flow has to request a fresh token.
+            inner.challenge_token = None;
         }
-        // Log failed attempt.
+        // Log failed attempt. `expected_method` is the server-known method
+        // string (e.g. "engine.reload"), safe to log.
         drop(inner);
         self.log_activity(
             "warning",
             "security",
             "Invalid challenge token — dangerous command rejected",
-            "",
+            expected_method,
             None,
         );
         false
@@ -812,6 +1072,64 @@ impl AppState {
         }
         // Default: in-process scan.
         engine.scan_file(path)
+    }
+
+    /// Run the ARGUS hardware-parity benchmark via the worker binary and return
+    /// the parsed report. When developer telemetry is on, the result is also
+    /// appended to the local perf-telemetry dump (closing the benchmark→file
+    /// routing gap). The benchmark always needs the worker binary even if the
+    /// external-worker scan path is disabled, so it falls back to "argusd".
+    pub fn run_benchmark(&self, passes: u32) -> Result<serde_json::Value, String> {
+        let worker_path = if self.argus_worker.path.trim().is_empty() {
+            // Match the config default so resolution lands the sibling binary.
+            "argusd.exe".to_string()
+        } else {
+            self.argus_worker.path.clone()
+        };
+        let cancel = AtomicBool::new(false);
+        let report = crate::argus_worker::run_benchmark(
+            &worker_path,
+            passes,
+            std::time::Duration::from_secs(120),
+            &cancel,
+        )?;
+
+        // Route into the dev-mode telemetry file (no-op unless telemetry is on).
+        let dev = self
+            .developer_config
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if crate::devmode::telemetry::enabled(&dev) {
+            let num = |path: &[&str]| -> f64 {
+                let mut cur = &report;
+                for k in path {
+                    match cur.get(k) {
+                        Some(v) => cur = v,
+                        None => return 0.0,
+                    }
+                }
+                cur.as_f64().unwrap_or(0.0)
+            };
+            let files = num(&["corpus", "files"]) as u64;
+            let bytes = num(&["corpus", "total_bytes"]) as u64;
+            let rec = crate::devmode::telemetry::PerfRecord {
+                files,
+                bytes,
+                ..crate::devmode::telemetry::PerfRecord::new("benchmark", "generated")
+            }
+            .note(format!("files_per_sec={:.1}", num(&["files_per_sec"])))
+            .note(format!("mb_per_sec={:.1}", num(&["mb_per_sec"])))
+            .note(format!("performance_index={}", num(&["performance_index"]) as u64))
+            .note(format!(
+                "per_file_us p50={} p95={}",
+                num(&["per_file_us", "p50"]) as u64,
+                num(&["per_file_us", "p95"]) as u64,
+            ));
+            crate::devmode::telemetry::record(&dev, &rec);
+        }
+
+        Ok(report)
     }
 
     pub fn argus_worker_diagnostics(&self) -> serde_json::Value {
@@ -1123,6 +1441,74 @@ impl AppState {
                 db.insert_scan(scan);
             }
         }
+        // Local dev-mode perf telemetry (no-op unless developer mode is on).
+        // persist_scan is the single chokepoint every recorded scan flows
+        // through, so this is the natural completion checkpoint.
+        self.emit_scan_telemetry(scan);
+    }
+
+    /// Append a dev-mode perf record for a completed scan. Cheap no-op unless
+    /// developer mode + telemetry are enabled (gate checked before any work).
+    fn emit_scan_telemetry(&self, scan: &ScanRow) {
+        let dev = self
+            .developer_config
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if !crate::devmode::telemetry::enabled(&dev) {
+            return;
+        }
+        let snap = self.capture_footprint();
+        let pressure = self.pressure_state();
+        let (cache_hits, cache_misses, cache_entries) = self.scan_cache.stats();
+        let rec = crate::devmode::telemetry::PerfRecord {
+            files: scan.files_scanned,
+            // bytes_scanned is now real (B1 follow-up): ClamAV scanned-byte
+            // totals for single-file scans and accumulated per-job for
+            // orchestrated multi-file scans. Drives MB/sec in the dump.
+            bytes: scan.bytes_scanned,
+            duration_ms: scan.duration_ms,
+            threats: scan.threats_found,
+            working_set_mb: snap.working_set_mb,
+            private_bytes_mb: snap.private_bytes_mb,
+            peak_working_set_mb: snap.peak_working_set_mb,
+            pressure: format!("{pressure:?}"),
+            ..crate::devmode::telemetry::PerfRecord::new("scan", scan.scan_type.clone())
+        }
+        .note(format!("status={}", scan.status))
+        .note(format!("scan_id={}", scan.scan_id))
+        .note(format!("errors={}", scan.errors_count))
+        .note(format!(
+            "scan_cache: hits={cache_hits} misses={cache_misses} entries={cache_entries}"
+        ))
+        // ClamAV-vs-ARGUS phase split — answers "where did the time go?"
+        // across hardware. Zero on legacy/failure rows.
+        .note(format!(
+            "phase: clamav={}us argus={}us",
+            scan.clamav_phase_us, scan.argus_phase_us
+        ));
+        crate::devmode::telemetry::record(&dev, &rec);
+    }
+
+    /// Replace the cached developer-mode config (called when the mode is toggled
+    /// at runtime so telemetry gating reflects the new state immediately).
+    /// Wired by the forthcoming `dev.set_developer_mode` IPC (B2).
+    #[allow(dead_code)]
+    pub fn load_developer_config(&self, dev: crate::config::DeveloperConfig) {
+        *self
+            .developer_config
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = dev;
+    }
+
+    /// Snapshot of the current developer-mode config.
+    /// Wired by the forthcoming `dev.status` IPC (B2).
+    #[allow(dead_code)]
+    pub fn developer_config(&self) -> crate::config::DeveloperConfig {
+        self.developer_config
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Persist a detection to SQLite.
@@ -1215,6 +1601,30 @@ impl AppState {
         }
 
         (None, None)
+    }
+
+    /// Most-recent modification time (unix secs) across the signature DB files.
+    /// Reflects when freshclam last WROTE a definition — and unlike the
+    /// in-memory `last_update_timestamp`, it persists across daemon restarts.
+    /// Used for staleness so a freshly-updated DB isn't reported "out of date"
+    /// merely because the daemon (or the whole box) restarted.
+    fn newest_signature_db_mtime_secs(&self) -> Option<i64> {
+        let db_dir = self.db_dir.as_ref()?;
+        let names = [
+            "daily.cvd", "daily.cld", "main.cvd", "main.cld", "bytecode.cvd", "bytecode.cld",
+        ];
+        let mut newest: Option<i64> = None;
+        for name in &names {
+            if let Ok(meta) = std::fs::metadata(db_dir.join(name)) {
+                if let Ok(modified) = meta.modified() {
+                    if let Ok(dur) = modified.duration_since(std::time::UNIX_EPOCH) {
+                        let secs = dur.as_secs() as i64;
+                        newest = Some(newest.map_or(secs, |n| n.max(secs)));
+                    }
+                }
+            }
+        }
+        newest
     }
 
     // ═══════════════════════════════════════════════════════
@@ -1367,7 +1777,13 @@ impl AppState {
         let threats = if result.infected { 1u64 } else { 0 };
         let scan_id_str = id.to_string();
 
-        // Persist scan record.
+        // Persist scan record. Per-job perf fields populated from this single
+        // file's clamav phase (`scanned_bytes`) and the ARGUS phase timing.
+        let (clamav_us, argus_us) = argus_result
+            .as_ref()
+            .and_then(|v| v.timing.as_ref())
+            .map(|t| (t.clamav_us, t.argus_total_us))
+            .unwrap_or((0, 0));
         let scan_row = ScanRow {
             scan_id: scan_id_str.clone(),
             scan_type: "file".into(),
@@ -1377,7 +1793,15 @@ impl AppState {
             files_scanned: 1,
             threats_found: threats,
             errors_count: if result.error.is_some() { 1 } else { 0 },
-            duration_ms: ((finished - now) * 1000) as u64,
+            // .max(0) guard: NTP backward correction between `now` and `finished`
+            // would otherwise underflow the i64 subtraction → cast-to-u64 wraps
+            // to a garbage value and the row, telemetry and UI all show insane
+            // duration_ms. Every other completion site already guards this — this
+            // single-file path was the outlier.
+            duration_ms: ((finished - now).max(0) as u64) * 1000,
+            bytes_scanned: result.scanned_bytes,
+            clamav_phase_us: clamav_us,
+            argus_phase_us: argus_us,
         };
         self.persist_scan(&scan_row);
 
@@ -1435,6 +1859,27 @@ impl AppState {
         }
     }
 
+    /// Atomically reserve `active_scan` for a new scan, or reject if one is
+    /// already in flight. The overlap **check** and the **reservation** happen
+    /// in a SINGLE `inner` critical section.
+    ///
+    /// This closes a TOCTOU race: the IPC server `tokio::spawn`s one task per
+    /// pipe connection, so two `scan.start` requests genuinely run in parallel.
+    /// The previous `check_no_overlapping_scan()` released the lock before the
+    /// caller separately re-acquired it to set `active_scan`, so two callers
+    /// could both pass the check and both install their job — orphaning the
+    /// first (uncancellable; its completion handler no-ops because
+    /// `active.id != job.id`).
+    ///
+    /// On success the caller installs `scan_live` and submits the orchestrated
+    /// job. `active_scan.status` remains the single source of truth for
+    /// "is a scan running?" — the Completed/Cancelled/Failed transitions reset
+    /// it, so do NOT add a parallel flag that could desync.
+    fn try_reserve_scan(&self, job: ScanJob) -> Result<(), ScanStartResponse> {
+        // Hold the SINGLE `inner` lock across the whole check-and-reserve.
+        reserve_active_scan(&mut self.lock_inner(), job)
+    }
+
     fn start_orchestrated_file_scan(
         self: &Arc<Self>,
         engine: Arc<ClamEngine>,
@@ -1442,6 +1887,8 @@ impl AppState {
     ) -> ScanStartResponse {
         let id = Uuid::new_v4();
         let now = chrono::Utc::now().timestamp();
+        // Fail-fast validation BEFORE reserving — don't claim the scan slot
+        // for a request that's about to error out.
         let path_str = match target {
             Some(p) if !p.trim().is_empty() => p.to_string(),
             _ => {
@@ -1468,26 +1915,29 @@ impl AppState {
             current_path: Mutex::new(path_str.clone()),
         });
 
-        {
-            *self.scan_live.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&live));
-            let mut inner = self.lock_inner();
-            inner.active_scan = Some(ScanJob {
-                id,
-                kind: "file".into(),
-                status: ScanJobStatus::Pending,
-                started_at: now,
-                finished_at: None,
-                files_scanned: 0,
-                files_total: 1,
-                threats_found: 0,
-                current_path: path_str.clone(),
-                detections: Vec::new(),
-                errors: Vec::new(),
-                cancel_flag: Arc::clone(&cancel_flag),
-                perf_summary: ScanPerformanceSummary::default(),
-                live: Some(Arc::clone(&live)),
-            });
+        // Atomic check-and-reserve (TOCTOU fix). The fully-built job — with the
+        // real cancel_flag + live — is installed in the same critical section
+        // as the overlap check, so a concurrent scan.cancel in the window
+        // cannot be lost to a throwaway placeholder.
+        if let Err(reject) = self.try_reserve_scan(ScanJob {
+            id,
+            kind: "file".into(),
+            status: ScanJobStatus::Pending,
+            started_at: now,
+            finished_at: None,
+            files_scanned: 0,
+            files_total: 1,
+            threats_found: 0,
+            current_path: path_str.clone(),
+            detections: Vec::new(),
+            errors: Vec::new(),
+            cancel_flag: Arc::clone(&cancel_flag),
+            perf_summary: ScanPerformanceSummary::default(),
+            live: Some(Arc::clone(&live)),
+        }) {
+            return reject;
         }
+        *self.scan_live.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&live));
 
         let job = OrchestratedScanJob {
             id: id.to_string(),
@@ -1636,6 +2086,11 @@ impl AppState {
         self.orchestrated_completed_file
             .fetch_add(1, Ordering::Relaxed);
 
+        let (clamav_us, argus_us) = argus_verdict
+            .timing
+            .as_ref()
+            .map(|t| (t.clamav_us, t.argus_total_us))
+            .unwrap_or((0, 0));
         self.persist_scan(&ScanRow {
             scan_id: job.id.clone(),
             scan_type: "file".into(),
@@ -1646,6 +2101,9 @@ impl AppState {
             threats_found: threats,
             errors_count: if result.error.is_some() { 1 } else { 0 },
             duration_ms: elapsed.as_millis() as u64,
+            bytes_scanned: result.scanned_bytes,
+            clamav_phase_us: clamav_us,
+            argus_phase_us: argus_us,
         });
         self.persist_argus_verdict(&job.id, &argus_verdict);
 
@@ -1818,6 +2276,7 @@ impl AppState {
             threats_found: 0,
             errors_count: 1,
             duration_ms: ((finished - requested_at).max(0) as u64) * 1000,
+            ..ScanRow::default()
         });
         self.log_activity("warning", "scan", "File scan failed", &error, Some(&id));
         let mut inner = self.lock_inner();
@@ -1857,6 +2316,7 @@ impl AppState {
         engine: Arc<ClamEngine>,
         target: Option<&str>,
     ) -> ScanStartResponse {
+        // Fail-fast validation BEFORE reserving the scan slot.
         let folder = match target {
             Some(p) if std::path::Path::new(p).is_dir() => p.to_string(),
             Some(p) => {
@@ -1894,26 +2354,26 @@ impl AppState {
             current_path: Mutex::new(format!("Enumerating {folder}...")),
         });
 
-        {
-            *self.scan_live.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&live));
-            let mut inner = self.lock_inner();
-            inner.active_scan = Some(ScanJob {
-                id,
-                kind: "folder".into(),
-                status: ScanJobStatus::Pending,
-                started_at: now,
-                finished_at: None,
-                files_scanned: 0,
-                files_total: 0,
-                threats_found: 0,
-                current_path: format!("Queued: {folder}"),
-                detections: Vec::new(),
-                errors: Vec::new(),
-                cancel_flag: Arc::clone(&cancel_flag),
-                perf_summary: ScanPerformanceSummary::default(),
-                live: Some(Arc::clone(&live)),
-            });
+        // Atomic check-and-reserve (TOCTOU fix) — single critical section.
+        if let Err(reject) = self.try_reserve_scan(ScanJob {
+            id,
+            kind: "folder".into(),
+            status: ScanJobStatus::Pending,
+            started_at: now,
+            finished_at: None,
+            files_scanned: 0,
+            files_total: 0,
+            threats_found: 0,
+            current_path: format!("Queued: {folder}"),
+            detections: Vec::new(),
+            errors: Vec::new(),
+            cancel_flag: Arc::clone(&cancel_flag),
+            perf_summary: ScanPerformanceSummary::default(),
+            live: Some(Arc::clone(&live)),
+        }) {
+            return reject;
         }
+        *self.scan_live.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&live));
 
         self.log_activity(
             "info",
@@ -1967,6 +2427,7 @@ impl AppState {
         self: &Arc<Self>,
         engine: Arc<ClamEngine>,
     ) -> ScanStartResponse {
+        // Fail-fast validation BEFORE reserving the scan slot.
         let home = std::env::var("USERPROFILE").unwrap_or_default();
         let temp =
             std::env::var("TEMP").unwrap_or_else(|_| format!("{home}\\AppData\\Local\\Temp"));
@@ -2006,26 +2467,26 @@ impl AppState {
             current_path: Mutex::new("Queued: quick scan".into()),
         });
 
-        {
-            *self.scan_live.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&live));
-            let mut inner = self.lock_inner();
-            inner.active_scan = Some(ScanJob {
-                id,
-                kind: "quick".into(),
-                status: ScanJobStatus::Pending,
-                started_at: now,
-                finished_at: None,
-                files_scanned: 0,
-                files_total: 0,
-                threats_found: 0,
-                current_path: "Queued".into(),
-                detections: Vec::new(),
-                errors: Vec::new(),
-                cancel_flag: Arc::clone(&cancel_flag),
-                perf_summary: ScanPerformanceSummary::default(),
-                live: Some(Arc::clone(&live)),
-            });
+        // Atomic check-and-reserve (TOCTOU fix) — single critical section.
+        if let Err(reject) = self.try_reserve_scan(ScanJob {
+            id,
+            kind: "quick".into(),
+            status: ScanJobStatus::Pending,
+            started_at: now,
+            finished_at: None,
+            files_scanned: 0,
+            files_total: 0,
+            threats_found: 0,
+            current_path: "Queued".into(),
+            detections: Vec::new(),
+            errors: Vec::new(),
+            cancel_flag: Arc::clone(&cancel_flag),
+            perf_summary: ScanPerformanceSummary::default(),
+            live: Some(Arc::clone(&live)),
+        }) {
+            return reject;
         }
+        *self.scan_live.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&live));
 
         self.log_activity("info", "scan", "Quick scan queued (orchestrated)", "", None);
 
@@ -2094,37 +2555,26 @@ impl AppState {
         let id = Uuid::new_v4();
         let now = chrono::Utc::now().timestamp();
         let cancel_flag = Arc::new(AtomicBool::new(false));
-        {
-            let mut inner = self.lock_inner();
-            if let Some(ref job) = inner.active_scan {
-                if job.status == ScanJobStatus::Running {
-                    return ScanStartResponse {
-                        job_id: job.id.to_string(),
-                        status: "error".into(),
-                        result: None,
-                        error: Some(
-                            "A scan is already running — cancel it first or wait for completion"
-                                .into(),
-                        ),
-                    };
-                }
-            }
-            inner.active_scan = Some(ScanJob {
-                id,
-                kind: "folder".into(),
-                status: ScanJobStatus::Running,
-                started_at: now,
-                finished_at: None,
-                files_scanned: 0,
-                files_total: 0,
-                threats_found: 0,
-                current_path: "Starting...".into(),
-                detections: Vec::new(),
-                errors: Vec::new(),
-                cancel_flag: Arc::clone(&cancel_flag),
-                perf_summary: ScanPerformanceSummary::default(),
-                live: None,
-            });
+        // Atomic check-and-reserve (covers Running/Pending/Draining — also
+        // rejects an in-flight orchestrated Pending job, which the old
+        // Running-only check missed).
+        if let Err(reject) = self.try_reserve_scan(ScanJob {
+            id,
+            kind: "folder".into(),
+            status: ScanJobStatus::Running,
+            started_at: now,
+            finished_at: None,
+            files_scanned: 0,
+            files_total: 0,
+            threats_found: 0,
+            current_path: "Starting...".into(),
+            detections: Vec::new(),
+            errors: Vec::new(),
+            cancel_flag: Arc::clone(&cancel_flag),
+            perf_summary: ScanPerformanceSummary::default(),
+            live: None,
+        }) {
+            return reject;
         }
         self.log_activity(
             "info",
@@ -2153,35 +2603,28 @@ impl AppState {
 
         {
             let mut inner = self.lock_inner();
-            if let Some(ref job) = inner.active_scan {
-                if job.status == ScanJobStatus::Running {
-                    return ScanStartResponse {
-                        job_id: job.id.to_string(),
-                        status: "error".into(),
-                        result: None,
-                        error: Some(
-                            "A scan is already running — cancel it first or wait for completion"
-                                .into(),
-                        ),
-                    };
-                }
+            // Atomic check-and-reserve (Running/Pending/Draining) in one lock.
+            if let Err(reject) = reserve_active_scan(
+                &mut inner,
+                ScanJob {
+                    id,
+                    kind: "quick".into(),
+                    status: ScanJobStatus::Running,
+                    started_at: now,
+                    finished_at: None,
+                    files_scanned: 0,
+                    files_total: 0,
+                    threats_found: 0,
+                    current_path: "Starting...".into(),
+                    detections: Vec::new(),
+                    errors: Vec::new(),
+                    cancel_flag: Arc::clone(&cancel_flag),
+                    perf_summary: ScanPerformanceSummary::default(),
+                    live: None,
+                },
+            ) {
+                return reject;
             }
-            inner.active_scan = Some(ScanJob {
-                id,
-                kind: "quick".into(),
-                status: ScanJobStatus::Running,
-                started_at: now,
-                finished_at: None,
-                files_scanned: 0,
-                files_total: 0,
-                threats_found: 0,
-                current_path: "Starting...".into(),
-                detections: Vec::new(),
-                errors: Vec::new(),
-                cancel_flag: Arc::clone(&cancel_flag),
-                perf_summary: ScanPerformanceSummary::default(),
-                live: None,
-            });
             inner.activity.push(ActivityEntry {
                 event_type: "scan_start".into(),
                 message: "Quick scan started".into(),
@@ -2213,38 +2656,30 @@ impl AppState {
         let now = chrono::Utc::now().timestamp();
         let cancel_flag = Arc::new(AtomicBool::new(false));
 
-        // Check for running scan.
+        // Atomic check-and-reserve (Running/Pending/Draining) in one lock.
         {
             let mut inner = self.lock_inner();
-            if let Some(ref job) = inner.active_scan {
-                if job.status == ScanJobStatus::Running {
-                    return ScanStartResponse {
-                        job_id: job.id.to_string(),
-                        status: "error".into(),
-                        result: None,
-                        error: Some(
-                            "A scan is already running — cancel it first or wait for completion"
-                                .into(),
-                        ),
-                    };
-                }
+            if let Err(reject) = reserve_active_scan(
+                &mut inner,
+                ScanJob {
+                    id,
+                    kind: "full".into(),
+                    status: ScanJobStatus::Running,
+                    started_at: now,
+                    finished_at: None,
+                    files_scanned: 0,
+                    files_total: 0,
+                    threats_found: 0,
+                    current_path: "Enumerating drives...".into(),
+                    detections: Vec::new(),
+                    errors: Vec::new(),
+                    cancel_flag: Arc::clone(&cancel_flag),
+                    perf_summary: ScanPerformanceSummary::default(),
+                    live: None,
+                },
+            ) {
+                return reject;
             }
-            inner.active_scan = Some(ScanJob {
-                id,
-                kind: "full".into(),
-                status: ScanJobStatus::Running,
-                started_at: now,
-                finished_at: None,
-                files_scanned: 0,
-                files_total: 0,
-                threats_found: 0,
-                current_path: "Enumerating drives...".into(),
-                detections: Vec::new(),
-                errors: Vec::new(),
-                cancel_flag: Arc::clone(&cancel_flag),
-                perf_summary: ScanPerformanceSummary::default(),
-                live: None,
-            });
             inner.activity.push(ActivityEntry {
                 event_type: "scan_start".into(),
                 message: "Full disk scan started".into(),
@@ -2291,26 +2726,26 @@ impl AppState {
             current_path: Mutex::new("Enumerating drives...".into()),
         });
 
-        {
-            *self.scan_live.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&live));
-            let mut inner = self.lock_inner();
-            inner.active_scan = Some(ScanJob {
-                id,
-                kind: "full".into(),
-                status: ScanJobStatus::Pending,
-                started_at: now,
-                finished_at: None,
-                files_scanned: 0,
-                files_total: 0,
-                threats_found: 0,
-                current_path: "Queued: full disk scan".into(),
-                detections: Vec::new(),
-                errors: Vec::new(),
-                cancel_flag: Arc::clone(&cancel_flag),
-                perf_summary: ScanPerformanceSummary::default(),
-                live: Some(Arc::clone(&live)),
-            });
+        // Atomic check-and-reserve (TOCTOU fix) — single critical section.
+        if let Err(reject) = self.try_reserve_scan(ScanJob {
+            id,
+            kind: "full".into(),
+            status: ScanJobStatus::Pending,
+            started_at: now,
+            finished_at: None,
+            files_scanned: 0,
+            files_total: 0,
+            threats_found: 0,
+            current_path: "Queued: full disk scan".into(),
+            detections: Vec::new(),
+            errors: Vec::new(),
+            cancel_flag: Arc::clone(&cancel_flag),
+            perf_summary: ScanPerformanceSummary::default(),
+            live: Some(Arc::clone(&live)),
+        }) {
+            return reject;
         }
+        *self.scan_live.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&live));
 
         self.log_activity(
             "info",
@@ -2381,35 +2816,28 @@ impl AppState {
 
         {
             let mut inner = self.lock_inner();
-            if let Some(ref job) = inner.active_scan {
-                if job.status == ScanJobStatus::Running {
-                    return ScanStartResponse {
-                        job_id: job.id.to_string(),
-                        status: "error".into(),
-                        result: None,
-                        error: Some(
-                            "A scan is already running — cancel it first or wait for completion"
-                                .into(),
-                        ),
-                    };
-                }
+            // Atomic check-and-reserve (Running/Pending/Draining) in one lock.
+            if let Err(reject) = reserve_active_scan(
+                &mut inner,
+                ScanJob {
+                    id,
+                    kind: "startup".into(),
+                    status: ScanJobStatus::Running,
+                    started_at: now,
+                    finished_at: None,
+                    files_scanned: 0,
+                    files_total: 0,
+                    threats_found: 0,
+                    current_path: "Collecting startup targets...".into(),
+                    detections: Vec::new(),
+                    errors: Vec::new(),
+                    cancel_flag: Arc::clone(&cancel_flag),
+                    perf_summary: ScanPerformanceSummary::default(),
+                    live: None,
+                },
+            ) {
+                return reject;
             }
-            inner.active_scan = Some(ScanJob {
-                id,
-                kind: "startup".into(),
-                status: ScanJobStatus::Running,
-                started_at: now,
-                finished_at: None,
-                files_scanned: 0,
-                files_total: 0,
-                threats_found: 0,
-                current_path: "Collecting startup targets...".into(),
-                detections: Vec::new(),
-                errors: Vec::new(),
-                cancel_flag: Arc::clone(&cancel_flag),
-                perf_summary: ScanPerformanceSummary::default(),
-                live: None,
-            });
             inner.activity.push(ActivityEntry {
                 event_type: "scan_start".into(),
                 message: "Startup scan started".into(),
@@ -2611,6 +3039,9 @@ impl AppState {
                 threats_found: r.threats_found,
                 errors_count: 0,
                 duration_ms: ((r.finished_at - r.started_at).max(0) as u64) * 1000,
+                // In-memory fallback (DB unavailable): the legacy ScanRecord
+                // doesn't carry per-job perf aggregates, so these read 0.
+                ..ScanRow::default()
             })
             .collect()
     }
@@ -2648,7 +3079,7 @@ impl AppState {
         if let Err(e) = crate::quarantine::finalize_quarantine_file(&prepared) {
             if let Ok(db_guard) = self.db.lock() {
                 if let Some(ref db) = *db_guard {
-                    db.update_quarantine_status(&prepared.row.quarantine_id, "failed");
+                    let _ = db.update_quarantine_status(&prepared.row.quarantine_id, "failed");
                 }
             }
             // Clean up orphaned vault file on failure.
@@ -2672,6 +3103,36 @@ impl AppState {
         Ok(result)
     }
 
+    /// Quarantine F4: mark `path` as recently restored so the realtime watcher
+    /// will skip it for the suppression TTL (30s). Called BEFORE the restore
+    /// write hits disk so the CREATE event that ReadDirectoryChangesW emits is
+    /// already inside the suppression window when the watcher dispatch sees it.
+    /// Also evicts entries older than the TTL on every call (bounded-by-traffic
+    /// GC — keeps the map small without a background sweeper).
+    pub(crate) fn mark_restore_in_progress(&self, path: &Path) {
+        const TTL: Duration = Duration::from_secs(30);
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if let Ok(mut map) = self.restore_suppress.lock() {
+            let now = Instant::now();
+            map.retain(|_, t| now.duration_since(*t) < TTL);
+            map.insert(canonical, now);
+        }
+    }
+
+    /// Quarantine F4: returns true if `path` was marked for restore-suppression
+    /// within the last 30s. The watcher calls this per CREATE event to break
+    /// the restore → re-quarantine loop.
+    pub fn is_restore_suppressed(&self, path: &Path) -> bool {
+        const TTL: Duration = Duration::from_secs(30);
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if let Ok(map) = self.restore_suppress.lock() {
+            if let Some(t) = map.get(&canonical) {
+                return Instant::now().duration_since(*t) < TTL;
+            }
+        }
+        false
+    }
+
     pub fn quarantine_restore(&self, id: &str) -> Result<String, String> {
         let item = {
             let db_guard = self.db.lock().map_err(|e| format!("DB lock: {e}"))?;
@@ -2679,12 +3140,24 @@ impl AppState {
             db.get_quarantine_item(id)
                 .ok_or_else(|| format!("Not found: {id}"))?
         };
+        // F4: suppress watcher BEFORE the restore writes to original_path so
+        // the CREATE event ReadDirectoryChangesW emits lands inside the TTL.
+        self.mark_restore_in_progress(std::path::Path::new(&item.original_path));
         let path = crate::quarantine::restore_file_from_row(&item)?;
+        // Commit DB status BEFORE purging vault. If the DB write fails, the
+        // restored plaintext file is already on disk (security-positive: user
+        // gets their file back) AND the vault is retained so a future retry
+        // can converge state. The previous order — vault-delete then
+        // fire-and-forget DB write — left an unrecoverable window where a
+        // crash between the two operations meant the row stayed
+        // "quarantined" with no vault file. The realtime watcher could then
+        // re-quarantine the restored file in a loop.
         {
             let db_guard = self.db.lock().map_err(|e| format!("DB lock: {e}"))?;
             let db = db_guard.as_ref().ok_or("Database not available")?;
-            db.update_quarantine_status(id, "restored");
+            db.update_quarantine_status(id, "restored")?;
         }
+        crate::quarantine::purge_vault_after_restore(&item.vault_path);
         self.log_activity(
             "warning",
             "quarantine",
@@ -2703,12 +3176,17 @@ impl AppState {
                 .ok_or_else(|| format!("Not found: {id}"))?
         };
         let dest_path = std::path::Path::new(dest);
+        // F4: suppress watcher BEFORE write — see quarantine_restore.
+        self.mark_restore_in_progress(dest_path);
         let path = crate::quarantine::restore_file_as(&item, dest_path)?;
+        // Same commit-then-cleanup ordering as quarantine_restore — see
+        // that method for the unrecoverable-window rationale.
         {
             let db_guard = self.db.lock().map_err(|e| format!("DB lock: {e}"))?;
             let db = db_guard.as_ref().ok_or("Database not available")?;
-            db.update_quarantine_status(id, "restored");
+            db.update_quarantine_status(id, "restored")?;
         }
+        crate::quarantine::purge_vault_after_restore(&item.vault_path);
         self.log_activity(
             "warning",
             "quarantine",
@@ -2726,11 +3204,31 @@ impl AppState {
             db.get_quarantine_item(id)
                 .ok_or_else(|| format!("Not found: {id}"))?
         };
+        // F3: refuse to delete the vault if a concurrent restore has already
+        // flipped the status. Without this check the vault disappears while
+        // the row is "restored" → next quarantine.list still shows the row
+        // with restorable=false but no way to recover, masking the race.
+        if item.status != "quarantined" {
+            return Err(format!(
+                "Cannot delete: status is '{}', not quarantined",
+                item.status
+            ));
+        }
         crate::quarantine::delete_vault_file(&item)?;
         {
             let db_guard = self.db.lock().map_err(|e| format!("DB lock: {e}"))?;
             let db = db_guard.as_ref().ok_or("Database not available")?;
-            db.update_quarantine_status(id, "deleted");
+            // F3: surface the DB-write failure instead of swallowing it.
+            // The vault is already gone, so we cannot un-delete; but ops
+            // needs to see the inconsistency in the log to manually clean
+            // the orphan row (status stays "quarantined" with no vault).
+            if let Err(e) = db.update_quarantine_status(id, "deleted") {
+                tracing::warn!(
+                    id,
+                    error = %e,
+                    "quarantine.delete: vault unlinked but DB status update failed — row is now orphaned"
+                );
+            }
         }
         self.log_activity(
             "info",
@@ -2777,26 +3275,65 @@ impl AppState {
 
     pub fn reload_engine(&self) -> Result<u64, String> {
         self.activity_tracker.record_reload();
-        let reload_in_progress = &ENGINE_RELOAD_IN_PROGRESS;
-        if reload_in_progress
+        if ENGINE_RELOAD_IN_PROGRESS
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
             return Err("engine reload already in progress".into());
         }
 
+        // RAII guard: flag MUST reset even if reload_engine_inner panics.
+        // Without this, a panic during cl_engine_compile (e.g. corrupt CVD,
+        // OOM) leaves the flag stuck true forever → policy.rs blocks ALL
+        // mutating IPC permanently until daemon restart.
+        struct ReloadGuard;
+        impl Drop for ReloadGuard {
+            fn drop(&mut self) {
+                ENGINE_RELOAD_IN_PROGRESS.store(false, Ordering::SeqCst);
+            }
+        }
+        let _guard = ReloadGuard;
+
         let reload_start = std::time::Instant::now();
-
         let result = self.reload_engine_inner();
-
         let reload_ms = reload_start.elapsed().as_millis();
         match &result {
             Ok(sigs) => tracing::info!(reload_ms, sigs, "engine reload complete"),
             Err(e) => tracing::error!(reload_ms, error = e.as_str(), "engine reload failed"),
         }
-
-        reload_in_progress.store(false, Ordering::SeqCst);
+        self.emit_reload_telemetry(reload_ms as u64, &result);
         result
+    }
+
+    /// Append a dev-mode perf record for an engine reload (signature hot-load).
+    /// Cheap no-op unless developer mode + telemetry are enabled. Reload is a
+    /// natural perf checkpoint: it is the main memory-spike event and its
+    /// duration is the scan-blind window users feel after an update.
+    fn emit_reload_telemetry(&self, reload_ms: u64, result: &Result<u64, String>) {
+        let dev = self
+            .developer_config
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if !crate::devmode::telemetry::enabled(&dev) {
+            return;
+        }
+        let snap = self.capture_footprint();
+        let pressure = self.pressure_state();
+        let (detail, sig_note) = match result {
+            Ok(sigs) => ("ok", format!("signatures={sigs}")),
+            Err(e) => ("failed", format!("error={e}")),
+        };
+        let rec = crate::devmode::telemetry::PerfRecord {
+            duration_ms: reload_ms,
+            working_set_mb: snap.working_set_mb,
+            private_bytes_mb: snap.private_bytes_mb,
+            peak_working_set_mb: snap.peak_working_set_mb,
+            pressure: format!("{pressure:?}"),
+            ..crate::devmode::telemetry::PerfRecord::new("reload", detail)
+        }
+        .note(sig_note);
+        crate::devmode::telemetry::record(&dev, &rec);
     }
 
     fn reload_engine_inner(&self) -> Result<u64, String> {
@@ -2807,23 +3344,38 @@ impl AppState {
 
         tracing::info!("reloading ClamAV engine...");
 
-        // Drop the old engine BEFORE loading the new one.
-        // Without this, both engines coexist briefly → 2× memory (~2 GB).
-        // With file-backed mpool, this prevents creating 2 cache files simultaneously.
-        {
-            let mut engine_guard = self.write_engine();
-            if let Some(old) = engine_guard.take() {
-                drop(old);
-                tracing::debug!("old engine freed before reload");
-            }
-        }
-
+        // FAIL-CLOSED reload: load NEW engine first into a local. Only on
+        // success do we take the write lock + swap. Previously we dropped the
+        // old engine BEFORE the load attempt to save ~1 GB peak — but a load
+        // failure (corrupt sigs, disk full, OOM at exactly the wrong moment)
+        // would leave the slot `None` AND fail to record the error, so all
+        // realtime scans silently passed (fail-open AV). Brief 2x memory peak
+        // is strictly preferable to running with no detection engine.
         match ClamEngine::load(dll_dir, db_dir) {
             Ok(new_engine) => {
                 let sigs = new_engine.signature_count() as u64;
                 self.scan_cache.invalidate_all();
-                *self.write_engine() = Some(Arc::new(new_engine));
-                *self.write_engine_error() = None;
+                // Signatures changed → expire ARGUS per-hash trusted cache too,
+                // so previously-clean signed/reputable files are re-analyzed
+                // (the cache otherwise never invalidated in production).
+                self.argus.trusted_cache.invalidate();
+                let new_arc = Arc::new(new_engine);
+                // Atomic swap: replace engine AND clear stale error in a
+                // single critical section so concurrent readers never observe
+                // (engine=new, error=Some(stale)) or (engine=old, error=None).
+                // Lock ordering (engine → engine_error) matches every other
+                // call site (e.g. start_scan) — do NOT invert here.
+                // Drop the old engine OUTSIDE the locks so its (potentially
+                // slow) cl_engine Drop doesn't block readers.
+                let old = {
+                    let mut engine_guard = self.write_engine();
+                    let mut error_guard = self.write_engine_error();
+                    let prev = engine_guard.take();
+                    *engine_guard = Some(new_arc);
+                    *error_guard = None;
+                    prev
+                };
+                drop(old);
                 self.signature_count.store(sigs, Ordering::Relaxed);
                 self.log_activity(
                     "info",
@@ -2835,7 +3387,11 @@ impl AppState {
                 Ok(sigs)
             }
             Err(e) => {
-                tracing::error!(%e, "engine reload failed");
+                tracing::error!(%e, "engine reload failed — keeping previous engine");
+                // Record the error so callers (and the daemon health surface)
+                // observe the failure. Old engine remains in place → scans
+                // continue with prior signatures rather than failing open.
+                *self.write_engine_error() = Some(e.clone());
                 self.log_activity("warning", "engine", "Engine reload failed", &e, None);
                 Err(e)
             }
@@ -2852,12 +3408,40 @@ impl AppState {
             }
         };
 
-        // CRITICAL: when running as LocalSystem service, USERPROFILE expands to
-        // C:\Windows\system32\config\systemprofile — NOT the logged-in user's profile.
-        // We must enumerate C:\Users\* to find real user profiles to watch.
+        // Priority:
+        //   1. config.realtime_roots (user-configured via Settings → save_settings)
+        //      — honor explicit user choice when set.
+        //   2. Hardcoded enumeration of C:\Users\* (when config empty or only
+        //      contains LocalSystem-expanded garbage).
+        //
+        // When running as LocalSystem service, USERPROFILE expands to
+        // C:\Windows\system32\config\systemprofile — NOT the logged-in user's
+        // profile. Default config from config/mod.rs:171 contains paths like
+        // "{home}\Downloads" that expand to the wrong place under SYSTEM. We
+        // filter those out before deciding whether config is "really empty".
+        let cfg = crate::config::Config::load(None).unwrap_or_default();
         let mut roots: Vec<std::path::PathBuf> = Vec::new();
 
-        // System-level paths (always present).
+        // Filter out config entries that point to non-existent paths or to
+        // the systemprofile directory (LocalSystem-expanded bogus paths).
+        let config_roots: Vec<std::path::PathBuf> = cfg
+            .realtime_roots
+            .iter()
+            .map(std::path::PathBuf::from)
+            .filter(|p| {
+                let s = p.to_string_lossy().to_ascii_lowercase();
+                !s.contains("\\config\\systemprofile\\") && p.exists()
+            })
+            .collect();
+
+        if !config_roots.is_empty() {
+            tracing::info!(count = config_roots.len(), "watcher: using config.realtime_roots");
+            roots.extend(config_roots);
+        } else {
+            tracing::info!("watcher: config.realtime_roots empty or invalid; falling back to enumeration");
+        }
+
+        // System-level paths (always present, regardless of config).
         if let Ok(pd) = std::env::var("PROGRAMDATA") {
             roots.push(std::path::PathBuf::from(pd));
         } else {
@@ -2868,35 +3452,41 @@ impl AppState {
         }
         roots.push(std::path::PathBuf::from("C:\\Windows\\Temp"));
 
-        // Enumerate all real user profiles under C:\Users\.
-        // Skip Default, Public, All Users, Default User, system accounts.
-        let skip_users = ["Default", "Default User", "Public", "All Users", "defaultuser0", "WDAGUtilityAccount"];
-        if let Ok(entries) = std::fs::read_dir("C:\\Users") {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !path.is_dir() { continue; }
-                let name = match path.file_name().and_then(|n| n.to_str()) {
-                    Some(n) => n,
-                    None => continue,
-                };
-                if skip_users.iter().any(|s| s.eq_ignore_ascii_case(name)) { continue; }
-                // Each real user gets their high-risk folders watched.
-                for sub in &["Downloads", "Desktop", "Documents", "OneDrive",
-                             "AppData\\Roaming", "AppData\\Local\\Temp"] {
-                    let p = path.join(sub);
-                    if p.exists() {
-                        roots.push(p);
+        // Enumerate C:\Users\* only as fallback when config gave us nothing.
+        if roots.iter().filter(|p| {
+            let s = p.to_string_lossy().to_ascii_lowercase();
+            s.contains("\\downloads") || s.contains("\\desktop") || s.contains("\\documents")
+        }).count() == 0 {
+            let skip_users = ["Default", "Default User", "Public", "All Users", "defaultuser0", "WDAGUtilityAccount"];
+            if let Ok(entries) = std::fs::read_dir("C:\\Users") {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if !path.is_dir() { continue; }
+                    let name = match path.file_name().and_then(|n| n.to_str()) {
+                        Some(n) => n,
+                        None => continue,
+                    };
+                    if skip_users.iter().any(|s| s.eq_ignore_ascii_case(name)) { continue; }
+                    for sub in &["Downloads", "Desktop", "Documents", "OneDrive",
+                                 "AppData\\Roaming", "AppData\\Local\\Temp"] {
+                        let p = path.join(sub);
+                        if p.exists() {
+                            roots.push(p);
+                        }
                     }
                 }
             }
         }
 
-        // Also include current-process USERPROFILE (covers dev/portable mode).
+        // Dev/portable mode: also include process USERPROFILE if it points to a real user.
         if let Ok(home) = std::env::var("USERPROFILE") {
-            for sub in &["Downloads", "Desktop", "Documents"] {
-                let p = std::path::PathBuf::from(&home).join(sub);
-                if p.exists() && !roots.iter().any(|r| r == &p) {
-                    roots.push(p);
+            let home_lower = home.to_ascii_lowercase();
+            if !home_lower.contains("\\config\\systemprofile") {
+                for sub in &["Downloads", "Desktop", "Documents"] {
+                    let p = std::path::PathBuf::from(&home).join(sub);
+                    if p.exists() && !roots.iter().any(|r| r == &p) {
+                        roots.push(p);
+                    }
                 }
             }
         }
@@ -2917,7 +3507,21 @@ impl AppState {
                 canonical.push(resolved);
             }
         }
-        let roots = canonical;
+        let mut roots = canonical;
+
+        // R3-22: cap watchable roots. ReadDirectoryChangesW + recursive watch
+        // costs ~1 thread/handle per root. A malicious or careless config
+        // listing thousands of paths would exhaust handles and starve the
+        // event pump. 128 is well above any reasonable user need.
+        const MAX_ROOTS: usize = 128;
+        if roots.len() > MAX_ROOTS {
+            tracing::warn!(
+                count = roots.len(),
+                cap = MAX_ROOTS,
+                "watcher: too many roots, truncating"
+            );
+            roots.truncate(MAX_ROOTS);
+        }
 
         if roots.is_empty() {
             tracing::warn!("no watchable directories found");
@@ -3140,6 +3744,23 @@ impl AppState {
         let state = Arc::clone(self);
         let db_dir = crate::paths::paths().signatures_dir();
         std::thread::spawn(move || {
+            // RAII guard: `update_running` MUST be cleared even if this thread
+            // panics (e.g. inside engine/YARA reload). Without it, one panic
+            // left the flag stuck true and the re-entry guard at the top of
+            // start_update rejected EVERY future update (scheduled + manual)
+            // until a daemon restart — a plausible cause of "auto-update stops
+            // working." Drop runs on both normal exit and unwind.
+            struct UpdateGuard(Arc<AppState>);
+            impl Drop for UpdateGuard {
+                fn drop(&mut self) {
+                    let mut inner = self.0.lock_inner();
+                    inner.update_running = false;
+                    inner.update_phase = UpdatePhase::Idle;
+                    inner.update_current_file = String::new();
+                }
+            }
+            let _update_guard = UpdateGuard(Arc::clone(&state));
+
             // Phase 1: Checking for updates.
             {
                 let mut inner = state.lock_inner();
@@ -3233,15 +3854,20 @@ impl AppState {
                     inner.update_phase = UpdatePhase::Completed;
                 }
             } else {
-                let trimmed = message.chars().take(200).collect::<String>();
+                // Surface the ACTIONABLE tail (exit code is already prefixed by
+                // run_freshclam; the reason is on the last stderr line) so a
+                // tray/scheduled update failure is diagnosable from the UI's
+                // activity log instead of blind.
+                let detail = freshclam_error_detail(&message);
                 let mut inner = state.lock_inner();
-                inner.last_update_error = Some(trimmed.clone());
+                inner.last_update_error = Some(detail.clone());
                 drop(inner);
+                tracing::warn!(detail = detail.as_str(), "signature update failed");
                 state.log_activity(
                     "warning",
                     "update",
                     "Signature update failed",
-                    &trimmed,
+                    &detail,
                     None,
                 );
             }
@@ -3302,15 +3928,24 @@ impl AppState {
             }
         };
 
-        // Compute stale DB status.
+        // Compute stale DB status. Base freshness on the most-recent of:
+        //   (a) this session's in-memory update timestamp, and
+        //   (b) the newest signature FILE mtime (persists across restarts).
+        // The old code used only (a), which reset to None on every daemon boot
+        // and wrongly reported a freshly-updated DB as "out of date" until an
+        // in-session update ran (the "updated DB but still shows out of date"
+        // bug). Threshold raised to 3 days so the card only appears when the
+        // definitions are genuinely behind, not after every restart.
         let now_ts = chrono::Utc::now().timestamp();
-        let (db_stale, db_stale_hours) = match inner.last_update_timestamp {
-            Some(ts) => {
-                let hours = ((now_ts - ts).max(0) as u64) / 3600;
-                (hours > 24, hours) // Stale if > 24 hours since last update.
-            }
-            None => (true, 0), // Never updated = stale.
-        };
+        let effective_ts = [
+            inner.last_update_timestamp,
+            self.newest_signature_db_mtime_secs(),
+        ]
+        .into_iter()
+        .flatten()
+        .max();
+        let (db_stale, db_stale_hours) =
+            compute_db_stale(effective_ts, now_ts, self.signature_stale_hours);
 
         // Watcher status.
         let watcher_active = self
@@ -3583,7 +4218,99 @@ impl AppState {
             "watcher_heartbeat_stale": watcher_stale,
             "orchestrator_heartbeat_ts": orch_hb,
             "orchestrator_heartbeat_stale": orch_stale,
+            "watcher_restarts_total": self.watcher_restarts_total.load(Ordering::Relaxed),
+            "binary_integrity_drift": self.binary_integrity_drift.load(Ordering::Relaxed),
+            "config_drift": self.config_drift.load(Ordering::Relaxed),
         })
+    }
+
+    /// Set the binary-integrity drift flag (true = startup detected a hash
+    /// mismatch against the TOFU manifest). Fail-loud surface for `health`.
+    pub fn set_binary_integrity_drift(&self, drifted: bool) {
+        self.binary_integrity_drift.store(drifted, Ordering::Relaxed);
+    }
+
+    /// Whether the daemon's binary or a sibling worker drifted from the
+    /// stored hash baseline at startup.
+    pub fn binary_integrity_drift(&self) -> bool {
+        self.binary_integrity_drift.load(Ordering::Relaxed)
+    }
+
+    /// Set the config-file drift flag (HMAC sidecar mismatch at load).
+    pub fn set_config_drift(&self, drifted: bool) {
+        self.config_drift.store(drifted, Ordering::Relaxed);
+    }
+
+    /// Whether the on-disk config file was edited outside the daemon.
+    pub fn config_drift(&self) -> bool {
+        self.config_drift.load(Ordering::Relaxed)
+    }
+
+    /// Background heartbeat checker: if the watcher's last heartbeat is older
+    /// than 60s while realtime protection is supposed to be on, respawn it.
+    /// Uses `protection_toggle_lock` so a concurrent user pause/resume cannot
+    /// race the restart. Spawned once from `main.rs` after the watcher starts.
+    pub fn spawn_watcher_heartbeat_monitor(self: &Arc<Self>) {
+        let state = Arc::clone(self);
+        // Use a blocking std thread — we touch a std Mutex
+        // (`protection_toggle_lock`) and start_watcher() spawns its own
+        // internal tasks, so we don't need to live on the tokio runtime.
+        std::thread::Builder::new()
+            .name("watcher-heartbeat-monitor".into())
+            .spawn(move || {
+                // Grace period after start so the watcher has time to emit its
+                // first heartbeat before we'd consider it stalled.
+                std::thread::sleep(std::time::Duration::from_secs(90));
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(20));
+                    // Skip restart if user paused protection or realtime is off.
+                    if state.is_user_disabled() {
+                        continue;
+                    }
+                    let realtime_on = crate::config::Config::load(None)
+                        .map(|c| c.realtime_enabled)
+                        .unwrap_or(true);
+                    if !realtime_on {
+                        continue;
+                    }
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let hb = state.watcher_last_heartbeat.load(Ordering::Relaxed);
+                    // hb==0 means the watcher hasn't ticked yet — could be
+                    // start-pending or just no FS events on a quiet box. Only
+                    // act on a positive-but-stale heartbeat (real stall signal).
+                    if hb == 0 || now < hb {
+                        continue;
+                    }
+                    if now - hb > 60 {
+                        tracing::warn!(
+                            stalled_secs = now - hb,
+                            "watcher heartbeat stalled — restarting"
+                        );
+                        // Serialize against user pause/resume.
+                        let _g = state
+                            .protection_toggle_lock
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        // Re-check after acquiring the lock — the user may have
+                        // just paused, and we MUST honor that.
+                        if state.is_user_disabled() {
+                            continue;
+                        }
+                        state.start_watcher();
+                        state
+                            .watcher_restarts_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        // Refresh the heartbeat optimistically — start_watcher
+                        // may not emit immediately, and we don't want a tight
+                        // restart loop while the new watcher warms up.
+                        state.touch_watcher_heartbeat();
+                    }
+                }
+            })
+            .ok();
     }
 
     /// Set ClamAV subprocess isolation mode.
@@ -3630,6 +4357,11 @@ impl AppState {
     /// Re-enable protection after intentional pause.
     /// User intentionally disables protection (pauses watcher).
     pub fn disable_protection(&self) {
+        // Critical section: see `protection_toggle_lock` doc.
+        let _g = self
+            .protection_toggle_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         self.user_disabled_protection.store(true, Ordering::Relaxed);
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3647,6 +4379,11 @@ impl AppState {
 
     /// Re-enable protection after intentional pause.
     pub fn enable_protection(self: &Arc<Self>) {
+        // Critical section: see `protection_toggle_lock` doc.
+        let _g = self
+            .protection_toggle_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         self.user_disabled_protection
             .store(false, Ordering::Relaxed);
         self.protection_disabled_at.store(0, Ordering::Relaxed);
@@ -4223,7 +4960,7 @@ fn folder_scan_worker_inner(
     }
 
     let (tx, rx) = mpsc::channel::<ScanMsg>();
-    let num_threads = SCAN_THREADS;
+    let num_threads = scan_threads();
 
     let mut handles = Vec::new();
     for _ in 0..num_threads {
@@ -4523,7 +5260,8 @@ fn folder_scan_worker_inner(
                 if let Some(ref timing) = verdict.timing {
                     let mut inner = state.lock_inner();
                     if let Some(ref mut job) = inner.active_scan {
-                        job.perf_summary.record_file(&det.path, timing);
+                        job.perf_summary
+                            .record_file(&det.path, verdict.file_size, timing);
                     }
                 }
                 state.persist_argus_verdict(&job_id.to_string(), &verdict);
@@ -4534,7 +5272,8 @@ fn folder_scan_worker_inner(
                 if let Some(ref timing) = verdict.timing {
                     let mut inner = state.lock_inner();
                     if let Some(ref mut job) = inner.active_scan {
-                        job.perf_summary.record_file(&verdict.path, timing);
+                        job.perf_summary
+                            .record_file(&verdict.path, verdict.file_size, timing);
                     }
                 }
                 state.persist_argus_verdict(&job_id.to_string(), &verdict);
@@ -4688,8 +5427,21 @@ fn folder_scan_worker_inner(
             status: status_str.to_string(),
         });
 
-        // Persist scan record to SQLite.
+        // Persist scan record to SQLite. The per-job perf aggregates come from
+        // `perf_summary`, which `record_file` already populates per scanned file.
         let duration_ms = ((finished - scan_started_at).max(0) as u64) * 1000;
+        let (bytes_scanned, clamav_phase_us, argus_phase_us, errors_count) = inner
+            .active_scan
+            .as_ref()
+            .map(|j| {
+                (
+                    j.perf_summary.total_bytes_scanned,
+                    j.perf_summary.total_clamav_us,
+                    j.perf_summary.total_argus_us,
+                    j.errors.len() as u64,
+                )
+            })
+            .unwrap_or((0, 0, 0, 0));
         state.persist_scan(&ScanRow {
             scan_id: scan_id_str.clone(),
             scan_type: scan_type.clone(),
@@ -4698,12 +5450,11 @@ fn folder_scan_worker_inner(
             finished_at: Some(finished),
             files_scanned: scanned,
             threats_found: threats,
-            errors_count: inner
-                .active_scan
-                .as_ref()
-                .map(|j| j.errors.len() as u64)
-                .unwrap_or(0),
+            errors_count,
             duration_ms,
+            bytes_scanned,
+            clamav_phase_us,
+            argus_phase_us,
         });
     }
 
@@ -4782,8 +5533,9 @@ fn collect_files(
         };
         let path = entry.path();
 
-        // Skip symlinks to avoid loops.
-        if path.is_symlink() {
+        // Skip reparse points (symlinks AND NTFS junctions) to avoid loops
+        // and scope-creep into unintended trees.
+        if crate::scan::is_reparse_point(&path) {
             continue;
         }
         if crate::scan::is_excluded(&path, excluded_paths, excluded_extensions) {
@@ -4850,7 +5602,8 @@ fn collect_files_streaming(
         };
         let path = entry.path();
 
-        if path.is_symlink() {
+        // Skip reparse points (symlinks AND NTFS junctions).
+        if crate::scan::is_reparse_point(&path) {
             continue;
         }
         if crate::scan::is_excluded(&path, excluded_paths, excluded_extensions) {
@@ -5143,6 +5896,143 @@ pub fn unify_detection_filtered(
 mod tests {
     use super::*;
     use argus::verdict::{ArgusVerdict, Finding, Layer, Severity, Verdict, VerdictExplanation};
+
+    // ── scan.start overlap TOCTOU regression ─────────────────────
+    //
+    // The IPC server spawns one task per pipe connection, so two scan.start
+    // requests run in parallel. `try_reserve_scan` must perform the overlap
+    // check AND the active_scan reservation in a single critical section, so a
+    // second concurrent caller cannot also pass the check and orphan the first
+    // job. This test exercises the serialization contract directly.
+    fn empty_inner() -> Inner {
+        Inner {
+            active_scan: None,
+            scan_history: Vec::new(),
+            activity: Vec::new(),
+            // Adversary A2: challenge_token shape is now
+            // (token, method_scope, created_at).
+            challenge_token: None,
+            update_running: false,
+            update_phase: UpdatePhase::default(),
+            update_current_file: String::new(),
+            last_update_timestamp: None,
+            last_update_error: None,
+        }
+    }
+
+    fn mk_job(kind: &str) -> ScanJob {
+        ScanJob {
+            id: Uuid::new_v4(),
+            kind: kind.into(),
+            status: ScanJobStatus::Pending,
+            started_at: 0,
+            finished_at: None,
+            files_scanned: 0,
+            files_total: 0,
+            threats_found: 0,
+            current_path: String::new(),
+            detections: Vec::new(),
+            errors: Vec::new(),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            perf_summary: ScanPerformanceSummary::default(),
+            live: None,
+        }
+    }
+
+    #[test]
+    fn db_stale_uses_3_day_threshold_and_handles_restart() {
+        let now = 1_700_000_000_i64;
+        let hour = 3600;
+        let day = 24 * hour;
+        // Freshly updated → not stale.
+        assert_eq!(compute_db_stale(Some(now), now, 72), (false, 0));
+        // 2 days old → still fresh (the restart-after-yesterday's-update case
+        // that previously falsely showed "out of date").
+        assert_eq!(compute_db_stale(Some(now - 2 * day), now, 72).0, false);
+        // 4 days old → stale.
+        assert_eq!(compute_db_stale(Some(now - 4 * day), now, 72).0, true);
+        // Exactly 3 days (72h) → boundary, not yet stale (> threshold).
+        assert_eq!(compute_db_stale(Some(now - 3 * day), now, 72), (false, 72));
+        // No signatures at all → stale.
+        assert_eq!(compute_db_stale(None, now, 72), (true, 0));
+        // Clock skew (future ts) → clamped to 0, not stale.
+        assert_eq!(compute_db_stale(Some(now + day), now, 72), (false, 0));
+    }
+
+    #[test]
+    fn freshclam_error_detail_surfaces_tail_not_banner() {
+        // Real freshclam failure: banner first, actionable reason last.
+        let out = "Exit code 56: ClamAV update process started\n\
+                   Current working dir is /tmp\n\
+                   \n\
+                   ERROR: Can't query current.cvd.clamav.net\n\
+                   ERROR: Can't read DNS, mirror unreachable";
+        let d = freshclam_error_detail(out);
+        assert!(d.contains("mirror unreachable"), "must surface the last error: {d}");
+        assert!(!d.contains("update process started"), "should drop the banner head");
+
+        // No output → explicit fallback, not empty.
+        assert_eq!(freshclam_error_detail(""), "freshclam failed (no output)");
+        assert_eq!(freshclam_error_detail("   \n\n"), "freshclam failed (no output)");
+    }
+
+    #[test]
+    fn scan_threads_in_sane_range() {
+        // Core-relative pool: ~half logical CPUs, clamped [2,8] on any hardware.
+        let n = scan_threads();
+        assert!((2..=8).contains(&n), "scan threads {n} must be in [2,8]");
+    }
+
+    #[test]
+    fn reserve_active_scan_serializes_and_recovers_on_terminal_state() {
+        let mut inner = empty_inner();
+
+        // 1. First reservation succeeds and installs active_scan.
+        let first = mk_job("file");
+        let first_id = first.id;
+        assert!(
+            reserve_active_scan(&mut inner, first).is_ok(),
+            "first reserve must succeed"
+        );
+
+        // 2. A second reservation while the first is Pending is rejected, and
+        //    the rejection references the IN-FLIGHT job — not the newcomer.
+        //    (This is the TOCTOU guarantee: the check + the reservation are one
+        //    critical section, so the second caller can never also install.)
+        let reject = reserve_active_scan(&mut inner, mk_job("quick"))
+            .expect_err("second reserve must be rejected while a scan is in flight");
+        assert_eq!(reject.status, "error");
+        assert_eq!(
+            reject.job_id,
+            first_id.to_string(),
+            "rejection must name the in-flight job"
+        );
+        assert!(reject.error.unwrap_or_default().contains("already"));
+        // active_scan must still be the first job (not overwritten).
+        assert_eq!(
+            inner.active_scan.as_ref().map(|j| j.id),
+            Some(first_id),
+            "rejected reserve must NOT overwrite the in-flight job"
+        );
+
+        // 3. After the in-flight job reaches each terminal state (as the
+        //    completion handlers set it), a fresh reservation succeeds again.
+        for terminal in [
+            ScanJobStatus::Completed,
+            ScanJobStatus::Cancelled,
+            ScanJobStatus::Failed,
+        ] {
+            inner
+                .active_scan
+                .as_mut()
+                .expect("active_scan present")
+                .status = terminal;
+            assert!(
+                reserve_active_scan(&mut inner, mk_job("full")).is_ok(),
+                "reserve must succeed once the prior scan is terminal"
+            );
+        }
+    }
 
     // ── Helpers ──────────────────────────────────────────────────
 
@@ -5537,6 +6427,52 @@ mod tests {
         assert!(
             !live.cancel_flag.load(Ordering::Relaxed),
             "cancel flag should be false on construction"
+        );
+    }
+
+    // ── Adversary A2: challenge token must be method-scoped ─────────
+    //
+    // Before this fix the token was stored as (token, instant) with no
+    // method binding, so a token issued for "engine.reload" (which the
+    // user UAC-approves) could be replayed against "settings.set" or
+    // any other PrivilegedMutation handler in the same 60-second window.
+    // This regression test locks in: a token issued for one method
+    // MUST be rejected when presented to a different method, even if
+    // the token bytes match exactly and the token is still fresh.
+    #[test]
+    fn challenge_token_is_bound_to_method_scope() {
+        // PathManager must be initialized: AppState::new touches paths()
+        // during boot (ARGUS IOC/YARA, scan cache, trust graph, etc.).
+        crate::paths::init_auto();
+        let state = AppState::new(None, None, None);
+
+        // Issue a token scoped to engine.reload.
+        let token = state.generate_challenge_token("engine.reload");
+        assert!(!token.is_empty(), "issued token must be non-empty");
+
+        // Replaying the same token against a different method MUST fail —
+        // this is the whole point of method binding. If this assertion ever
+        // regresses, the per-dangerous-op UAC consent model is bypassed.
+        assert!(
+            !state.validate_challenge_token(&token, "settings.set"),
+            "token issued for engine.reload must NOT validate against settings.set"
+        );
+
+        // The mismatched attempt also burns the token (fail-closed), so a
+        // subsequent legitimate attempt against engine.reload must also fail
+        // until the user re-prompts. This prevents a TOCTOU race where the
+        // attacker probes a different method first to "drain" while the
+        // legitimate caller is mid-flight.
+        let token2 = state.generate_challenge_token("engine.reload");
+        // Correct scope succeeds and consumes the token.
+        assert!(
+            state.validate_challenge_token(&token2, "engine.reload"),
+            "token issued for engine.reload must validate against engine.reload"
+        );
+        // Single-use: second attempt fails even with the correct scope.
+        assert!(
+            !state.validate_challenge_token(&token2, "engine.reload"),
+            "challenge token must be single-use even on the correct scope"
         );
     }
 }

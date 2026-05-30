@@ -5,6 +5,7 @@ import {
 } from "lucide-react";
 import { Card } from "../components/Card";
 import { exportDiagnostics } from "../api/sentinella";
+import { t } from "../i18n";
 
 interface DiagData {
   [key: string]: unknown;
@@ -79,11 +80,11 @@ export function DiagnosticsPage() {
         <div className="flex items-center gap-3">
           <button onClick={() => setRaw(!raw)}
             className="px-3 py-2 rounded-xl bg-[rgb(var(--raised))]/25 text-[11px] text-[rgb(var(--t3))] hover:text-[rgb(var(--t1))] cursor-pointer">
-            {raw ? "Cards" : "Raw JSON"}
+            {raw ? t("diag.cards") : t("diag.raw_json")}
           </button>
           <button onClick={refresh}
             className="flex items-center gap-2 px-3 py-2 rounded-xl bg-[rgb(var(--accent))]/8 text-[11px] text-[rgb(var(--accent))] hover:bg-[rgb(var(--accent))]/15 cursor-pointer">
-            <RefreshCw size={12} /> Refresh
+            <RefreshCw size={12} /> {t("topbar.refresh")}
           </button>
         </div>
       </div>
@@ -98,26 +99,26 @@ export function DiagnosticsPage() {
         <>
           {/* Mode + uptime row */}
           <div className="card-grid-4">
-            <DiagTile icon={<Shield size={16} />} label="Mode" value={audit ? "Audit" : mode} color={audit ? "amber" : "green"} />
-            <DiagTile icon={<Clock size={16} />} label="Uptime" value={`${d.uptime_secs ?? 0}s`} color="accent" />
-            <DiagTile icon={<Database size={16} />} label="Signatures" value={String(d.signature_count ?? 0)} color="green" />
-            <DiagTile icon={<Zap size={16} />} label="ARGUS" value={`${d.argus_layers ?? 0} layers`} color="accent" />
+            <DiagTile icon={<Shield size={16} />} label={t("diag.mode")} value={audit ? t("diag.audit") : mode} color={audit ? "amber" : "green"} />
+            <DiagTile icon={<Clock size={16} />} label={t("diag.uptime")} value={`${d.uptime_secs ?? 0}s`} color="accent" />
+            <DiagTile icon={<Database size={16} />} label={t("diag.signatures")} value={String(d.signature_count ?? 0)} color="green" />
+            <DiagTile icon={<Zap size={16} />} label="ARGUS" value={`${d.argus_layers ?? 0} ${t("diag.layers")}`} color="accent" />
           </div>
 
           {/* Memory / Pressure */}
           <Card>
-            <SectionHead icon={<Cpu size={15} />} title="Memory Footprint" />
+            <SectionHead icon={<Cpu size={15} />} title={t("diag.mem_footprint")} />
             <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4 mt-4">
-              <Stat label="Working Set" value={`${fp.working_set_mb ?? 0} MB`} />
-              <Stat label="Private Bytes" value={`${fp.private_bytes_mb ?? 0} MB`} />
-              <Stat label="Peak" value={`${fp.peak_working_set_mb ?? 0} MB`} />
-              <Stat label="Warning Level" value={fp.warning_level ?? "?"} color={fp.warning_level === "normal" ? "green" : fp.warning_level === "critical" ? "red" : "amber"} />
+              <Stat label={t("diag.working_set")} value={`${fp.working_set_mb ?? 0} MB`} />
+              <Stat label={t("diag.private_bytes")} value={`${fp.private_bytes_mb ?? 0} MB`} />
+              <Stat label={t("diag.peak")} value={`${fp.peak_working_set_mb ?? 0} MB`} />
+              <Stat label={t("diag.warning_level")} value={fp.warning_level ?? "?"} color={fp.warning_level === "normal" ? "green" : fp.warning_level === "critical" ? "red" : "amber"} />
             </div>
             <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4 mt-3">
-              <Stat label="Delta (start)" value={`${fp.delta_since_start_mb ?? 0} MB`} />
-              <Stat label="Delta (scan)" value={`${fp.delta_since_last_scan_mb ?? 0} MB`} />
-              <Stat label="Cache Entries" value={String(fp.scan_cache_entries ?? 0)} />
-              <Stat label="Active Workers" value={String(fp.active_workers ?? 0)} />
+              <Stat label={t("diag.delta_start")} value={`${fp.delta_since_start_mb ?? 0} MB`} />
+              <Stat label={t("diag.delta_scan")} value={`${fp.delta_since_last_scan_mb ?? 0} MB`} />
+              <Stat label={t("diag.cache_entries")} value={String(fp.scan_cache_entries ?? 0)} />
+              <Stat label={t("diag.active_workers")} value={String(fp.active_workers ?? 0)} />
             </div>
             {fp.notes?.length > 0 && (
               <div className="mt-4 space-y-1">
@@ -130,12 +131,12 @@ export function DiagnosticsPage() {
 
           {/* Memory Pressure */}
           <Card>
-            <SectionHead icon={<Activity size={15} />} title="Memory Pressure" />
+            <SectionHead icon={<Activity size={15} />} title={t("diag.mem_pressure")} />
             <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4 mt-4">
-              <Stat label="State" value={mp.state ?? "?"} color={mp.state === "normal" ? "green" : mp.state === "critical" ? "red" : "amber"} />
-              <Stat label="Working Set" value={`${mp.working_set_mb ?? 0} MB`} />
-              <Stat label="External ARGUS" value={mp.prefer_external_argus ? "Yes" : "No"} />
-              <Stat label="Idle Paused" value={mp.pause_idle_scanner ? "Yes" : "No"} />
+              <Stat label={t("diag.state")} value={mp.state ?? "?"} color={mp.state === "normal" ? "green" : mp.state === "critical" ? "red" : "amber"} />
+              <Stat label={t("diag.working_set")} value={`${mp.working_set_mb ?? 0} MB`} />
+              <Stat label={t("diag.external_argus")} value={mp.prefer_external_argus ? t("common.yes") : t("common.no")} />
+              <Stat label={t("diag.idle_paused")} value={mp.pause_idle_scanner ? t("common.yes") : t("common.no")} />
             </div>
             {mp.actions?.length > 0 && (
               <div className="flex flex-wrap gap-1.5 mt-3">
@@ -148,22 +149,22 @@ export function DiagnosticsPage() {
 
           {/* FISH */}
           <Card>
-            <SectionHead icon={<Eye size={15} />} title="FISH — Ransomware Shield" sub="observe-only" />
+            <SectionHead icon={<Eye size={15} />} title={t("diag.fish_title")} sub={t("diag.observe_only")} />
             <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4 mt-4">
-              <Stat label="Enabled" value={fish.enabled ? "Yes" : "No"} color={fish.enabled ? "green" : "amber"} />
-              <Stat label="Recent Events" value={String(fish.recent_events ?? 0)} />
-              <Stat label="Rename Bursts" value={String(fish.rename_bursts ?? 0)} />
-              <Stat label="Rewrite Bursts" value={String(fish.rewrite_bursts ?? 0)} />
+              <Stat label={t("diag.enabled")} value={fish.enabled ? t("common.yes") : t("common.no")} color={fish.enabled ? "green" : "amber"} />
+              <Stat label={t("diag.recent_events")} value={String(fish.recent_events ?? 0)} />
+              <Stat label={t("diag.rename_bursts")} value={String(fish.rename_bursts ?? 0)} />
+              <Stat label={t("diag.rewrite_bursts")} value={String(fish.rewrite_bursts ?? 0)} />
             </div>
             <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4 mt-3">
-              <Stat label="Ext Mutations" value={String(fish.extension_mutations ?? 0)} />
-              <Stat label="Alerts Suppressed" value={String(fish.alerts_suppressed ?? 0)} />
-              <Stat label="Total Events" value={String(fish.total_events ?? 0)} />
-              <Stat label="Observe Only" value={fish.observe_only ? "Yes" : "No"} />
+              <Stat label={t("diag.ext_mutations")} value={String(fish.extension_mutations ?? 0)} />
+              <Stat label={t("diag.alerts_suppressed")} value={String(fish.alerts_suppressed ?? 0)} />
+              <Stat label={t("diag.total_events")} value={String(fish.total_events ?? 0)} />
+              <Stat label={t("diag.observe_only_stat")} value={fish.observe_only ? t("common.yes") : t("common.no")} />
             </div>
             {fish.top_mutated_extensions?.length > 0 && (
               <div className="mt-3">
-                <p className="text-[10px] text-[rgb(var(--t3))] mb-1.5">Top extensions:</p>
+                <p className="text-[10px] text-[rgb(var(--t3))] mb-1.5">{t("diag.top_extensions")}</p>
                 <div className="flex flex-wrap gap-1.5">
                   {(fish.top_mutated_extensions as string[]).map((e: string) => (
                     <span key={e} className="text-[10px] px-2 py-0.5 rounded-full bg-[rgb(var(--raised))]/20 text-[rgb(var(--t3))]">.{e}</span>
@@ -175,32 +176,32 @@ export function DiagnosticsPage() {
 
           {/* Resilience */}
           <Card>
-            <SectionHead icon={<Heart size={15} />} title="Resilience" />
+            <SectionHead icon={<Heart size={15} />} title={t("diag.resilience")} />
             <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4 mt-4">
-              <Stat label="Worker Panics" value={String(res.worker_panics ?? 0)} color={(res.worker_panics ?? 0) > 0 ? "red" : "green"} />
-              <Stat label="Worker Timeouts" value={String(res.worker_timeouts ?? 0)} />
-              <Stat label="ARGUS Fallbacks" value={String(res.argus_fallbacks ?? 0)} />
-              <Stat label="ARGUS Timeouts" value={String(res.argus_timeouts ?? 0)} />
+              <Stat label={t("diag.worker_panics")} value={String(res.worker_panics ?? 0)} color={(res.worker_panics ?? 0) > 0 ? "red" : "green"} />
+              <Stat label={t("diag.worker_timeouts")} value={String(res.worker_timeouts ?? 0)} />
+              <Stat label={t("diag.argus_fallbacks")} value={String(res.argus_fallbacks ?? 0)} />
+              <Stat label={t("diag.argus_timeouts")} value={String(res.argus_timeouts ?? 0)} />
             </div>
             <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4 mt-3">
-              <Stat label="Watcher HB" value={res.watcher_heartbeat_stale ? "Stale" : "OK"} color={res.watcher_heartbeat_stale ? "red" : "green"} />
-              <Stat label="Orchestrator HB" value={res.orchestrator_heartbeat_stale ? "Stale" : "OK"} color={res.orchestrator_heartbeat_stale ? "red" : "green"} />
-              <Stat label="Recovery Reason" value={res.last_recovery_reason ?? "None"} />
+              <Stat label={t("diag.watcher_hb")} value={res.watcher_heartbeat_stale ? t("diag.stale") : t("diag.ok")} color={res.watcher_heartbeat_stale ? "red" : "green"} />
+              <Stat label={t("diag.orchestrator_hb")} value={res.orchestrator_heartbeat_stale ? t("diag.stale") : t("diag.ok")} color={res.orchestrator_heartbeat_stale ? "red" : "green"} />
+              <Stat label={t("diag.recovery_reason")} value={res.last_recovery_reason ?? t("common.none")} />
             </div>
           </Card>
 
           {/* Orchestrator */}
           {orch.queues && (
             <Card>
-              <SectionHead icon={<HardDrive size={15} />} title="Orchestrator" />
+              <SectionHead icon={<HardDrive size={15} />} title={t("diag.orchestrator")} />
               <div className="mt-4 space-y-3">
                 {(orch.queues as any[]).map((q: any) => (
                   <div key={q.kind} className="flex items-center gap-4 px-4 py-3 rounded-xl bg-[rgb(var(--raised))]/12">
                     <span className="text-[11px] font-semibold w-20 capitalize">{q.kind}</span>
-                    <Stat label="Depth" value={String(q.depth)} compact />
-                    <Stat label="Submitted" value={String(q.submitted)} compact />
-                    <Stat label="Completed" value={String(q.completed)} compact />
-                    <Stat label="Avg ms" value={String(q.average_scan_duration_ms)} compact />
+                    <Stat label={t("diag.depth")} value={String(q.depth)} compact />
+                    <Stat label={t("diag.submitted")} value={String(q.submitted)} compact />
+                    <Stat label={t("diag.completed")} value={String(q.completed)} compact />
+                    <Stat label={t("diag.avg_ms")} value={String(q.average_scan_duration_ms)} compact />
                     <span className={`text-[10px] px-2 py-0.5 rounded-full ${
                       q.pressure === "normal" ? "bg-[rgb(var(--green))]/8 text-[rgb(var(--green))]"
                         : q.pressure === "saturated" ? "bg-[rgb(var(--red))]/8 text-[rgb(var(--red))]"
@@ -233,12 +234,12 @@ export function DiagnosticsPage() {
 
           {/* Scan Cache */}
           <Card>
-            <SectionHead icon={<Database size={15} />} title="Scan Cache" />
+            <SectionHead icon={<Database size={15} />} title={t("diag.scan_cache")} />
             <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4 mt-4">
-              <Stat label="Cache Hits" value={String(d.cache_hits ?? 0)} color="green" />
-              <Stat label="Cache Misses" value={String(d.cache_misses ?? 0)} />
-              <Stat label="Entries" value={String(d.cache_entries ?? 0)} />
-              <Stat label="Hit Rate" value={
+              <Stat label={t("diag.cache_hits")} value={String(d.cache_hits ?? 0)} color="green" />
+              <Stat label={t("diag.cache_misses")} value={String(d.cache_misses ?? 0)} />
+              <Stat label={t("diag.entries")} value={String(d.cache_entries ?? 0)} />
+              <Stat label={t("diag.hit_rate")} value={
                 (d.cache_hits as number ?? 0) + (d.cache_misses as number ?? 0) > 0
                   ? `${Math.round(((d.cache_hits as number ?? 0) / ((d.cache_hits as number ?? 0) + (d.cache_misses as number ?? 0))) * 100)}%`
                   : "—"
@@ -248,16 +249,16 @@ export function DiagnosticsPage() {
 
           {/* Watcher */}
           <Card>
-            <SectionHead icon={<Eye size={15} />} title="Real-time Watcher" />
+            <SectionHead icon={<Eye size={15} />} title={t("diag.watcher")} />
             <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4 mt-4">
-              <Stat label="Active" value={(d.watcher_active as boolean) ? "Yes" : "No"} color={(d.watcher_active as boolean) ? "green" : "amber"} />
-              <Stat label="Mode" value={String(d.watcher_mode ?? "?")} />
+              <Stat label={t("diag.active")} value={(d.watcher_active as boolean) ? t("common.yes") : t("common.no")} color={(d.watcher_active as boolean) ? "green" : "amber"} />
+              <Stat label={t("diag.mode")} value={String(d.watcher_mode ?? "?")} />
             </div>
           </Card>
 
           {/* Generated at */}
           <p className="text-[10px] text-[rgb(var(--t3))]/30 text-right">
-            Generated: {d.generated_at as string ?? "?"}
+            {t("diag.generated")}: {d.generated_at as string ?? "?"}
           </p>
         </>
       )}

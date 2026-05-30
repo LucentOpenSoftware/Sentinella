@@ -13,6 +13,7 @@ import { sendNotification, isPermissionGranted, requestPermission } from "@tauri
 import { loadNotificationSettings, meetsMinSeverity, type NotificationSeverity } from "./settings";
 import { dedupeCheck, stormControlled } from "./dedupe";
 import { recordNotification } from "./history";
+import { t } from "../i18n";
 
 // ── Permission ────────────────────────────────────────────────
 
@@ -67,11 +68,11 @@ export function notifyThreatDetected(virusName: string, filePath: string): void 
     "threat",
     () => {
       if (!dedupeCheck(dedupeKey)) return;
-      send("Threat detected", `Sentinella detected ${virusName} in ${fileName}.`);
-      recordNotification("threat", "Threat detected", filePath);
+      send(t("notify.threat_detected"), t("notify.body_threat").replace("{virus}", virusName).replace("{file}", fileName));
+      recordNotification("threat", t("notify.threat_detected"), filePath);
     },
     (count) => {
-      send("Multiple threats detected", `Sentinella detected ${count} threats during monitoring.`);
+      send(t("notify.multiple_threats"), t("notify.body_storm").replace("{count}", String(count)));
       recordNotification("threat_storm", `${count} threats detected`);
     },
   );
@@ -88,11 +89,11 @@ export function notifyQuarantined(virusName: string, filePath: string): void {
     "quarantine",
     () => {
       if (!dedupeCheck(dedupeKey)) return;
-      send("File quarantined", `${fileName} (${virusName}) has been moved to quarantine.`);
-      recordNotification("quarantine", "File quarantined", filePath);
+      send(t("notify.file_quarantined"), t("notify.body_quarantined").replace("{file}", fileName).replace("{virus}", virusName));
+      recordNotification("quarantine", t("notify.file_quarantined"), filePath);
     },
     (count) => {
-      send("Files quarantined", `Sentinella quarantined ${count} files.`);
+      send(t("notify.files_quarantined"), t("notify.body_quar_storm").replace("{count}", String(count)));
       recordNotification("quarantine_storm", `${count} files quarantined`);
     },
   );
@@ -105,8 +106,8 @@ export function notifyQuarantineFailed(filePath: string, reason: string): void {
   if (!dedupeCheck(dedupeKey)) return;
 
   const fileName = filePath.split(/[/\\]/).pop() || filePath;
-  send("Quarantine failed", `Could not quarantine ${fileName}: ${reason}`);
-  recordNotification("quarantine_failed", "Quarantine failed", filePath);
+  send(t("notify.quarantine_failed"), `${t("notify.quarantine_failed")}: ${fileName} — ${reason}`);
+  recordNotification("quarantine_failed", t("notify.quarantine_failed"), filePath);
 }
 
 /** Scan completed with threats. Clean scans are silent. */
@@ -127,8 +128,8 @@ export function notifyUpdateFailed(reason: string): void {
   if (!shouldNotify("onUpdateFailure", "warning")) return;
   if (!dedupeCheck("update_failed")) return;
 
-  send("Signature update failed", `Sentinella could not update virus signatures: ${reason}`);
-  recordNotification("update_failed", "Signature update failed");
+  send(t("notify.update_failed"), `${t("notify.update_failed")}: ${reason}`);
+  recordNotification("update_failed", t("notify.update_failed"));
 }
 
 /** Protection state degraded or unavailable. */
@@ -136,8 +137,8 @@ export function notifyProtectionDegraded(detail: string): void {
   if (!shouldNotify("onDegraded", "critical")) return;
   if (!dedupeCheck("protection_degraded")) return;
 
-  send("Protection degraded", detail || "Some protection subsystems are unavailable.");
-  recordNotification("protection_degraded", "Protection degraded");
+  send(t("notify.protection_degraded"), detail || t("notify.protection_degraded"));
+  recordNotification("protection_degraded", t("notify.protection_degraded"));
 }
 
 /** Realtime protection unavailable. */
@@ -145,8 +146,8 @@ export function notifyRealtimeUnavailable(): void {
   if (!shouldNotify("onDegraded", "critical")) return;
   if (!dedupeCheck("realtime_unavailable")) return;
 
-  send("Real-time protection unavailable", "The filesystem watcher could not start. New files are not being monitored.");
-  recordNotification("realtime_unavailable", "Real-time protection unavailable");
+  send(t("notify.realtime_unavailable"), t("notify.body_realtime"));
+  recordNotification("realtime_unavailable", t("notify.realtime_unavailable"));
 }
 
 /** First-run signature update completed. */
@@ -154,8 +155,8 @@ export function notifyFirstRunUpdateComplete(sigCount: number): void {
   if (!loadNotificationSettings().enabled) return;
   if (!dedupeCheck("first_run_complete")) return;
 
-  send("Sentinella is ready", `Virus signatures loaded (${sigCount.toLocaleString()} signatures). Your system is now protected.`);
-  recordNotification("first_run_complete", "Sentinella is ready");
+  send(t("notify.ready"), `${sigCount.toLocaleString()} signatures loaded.`);
+  recordNotification("first_run_complete", t("notify.ready"));
 }
 
 /** First-run signature update failed. */
@@ -163,6 +164,6 @@ export function notifyFirstRunUpdateFailed(): void {
   if (!loadNotificationSettings().enabled) return;
   if (!dedupeCheck("first_run_failed")) return;
 
-  send("Signature download failed", "Sentinella could not download virus signatures. You can retry from the Update page.");
-  recordNotification("first_run_failed", "Signature download failed");
+  send(t("notify.sig_download_failed"), t("notify.sig_download_failed"));
+  recordNotification("first_run_failed", t("notify.sig_download_failed"));
 }

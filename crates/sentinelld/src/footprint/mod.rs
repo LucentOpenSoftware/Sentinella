@@ -9,6 +9,36 @@ pub mod residency;
 use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Static hardware capability snapshot for diagnostics + the benchmark.
+///
+/// Exists so cross-hardware results are interpretable: a Core 2 Quad (no AVX,
+/// fewer cores) reading slower than an i5-1265U is "old CPU working as
+/// designed", not a regression — the SIMD level + core count make that legible.
+/// SIMD uses the safe runtime `is_x86_feature_detected!` macro.
+pub fn system_info_json() -> serde_json::Value {
+    let logical_cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(0);
+    let total_ram_mb = pressure::detect_total_ram_mb();
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    let simd = serde_json::json!({
+        "avx2": std::arch::is_x86_feature_detected!("avx2"),
+        "avx": std::arch::is_x86_feature_detected!("avx"),
+        "sse4.2": std::arch::is_x86_feature_detected!("sse4.2"),
+        "sse2": std::arch::is_x86_feature_detected!("sse2"),
+    });
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    let simd = serde_json::json!(null);
+
+    serde_json::json!({
+        "logical_cores": logical_cores,
+        "total_ram_mb": total_ram_mb,
+        "arch": std::env::consts::ARCH,
+        "simd": simd,
+    })
+}
+
 /// Snapshot of daemon memory footprint.
 #[derive(Debug, Clone, Serialize)]
 pub struct FootprintSnapshot {
@@ -266,6 +296,21 @@ fn get_process_memory_windows() -> (u64, u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_info_json_has_expected_shape() {
+        let s = system_info_json();
+        assert!(s["logical_cores"].as_u64().unwrap() >= 1, "at least 1 core");
+        assert!(s["arch"].is_string());
+        // total_ram_mb is null if undetectable, else a positive number.
+        assert!(s["total_ram_mb"].is_u64() || s["total_ram_mb"].is_null());
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            // SSE2 is baseline on every x86-64 CPU — must be present + true.
+            assert_eq!(s["simd"]["sse2"], serde_json::json!(true));
+            assert!(s["simd"]["avx2"].is_boolean());
+        }
+    }
 
     #[test]
     fn capture_returns_valid_snapshot() {

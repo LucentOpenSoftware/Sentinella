@@ -188,54 +188,88 @@ impl CalibrationLog {
 
     /// Persist a detection event and update per-layer trigger counts.
     pub fn record_detection(&self, event: &DetectionEvent) -> Result<(), String> {
+        // Audit fix: bounded retention so this DB doesn't grow forever on a
+        // high-detection-rate host.
+        const RETENTION_ROWS: i64 = 50_000;
+
         let layers_json = serde_json::to_string(&event.layers_triggered).unwrap_or_default();
         let tags_json = serde_json::to_string(&event.behavior_tags).unwrap_or_default();
         let yara_json = serde_json::to_string(&event.yara_rules_matched).unwrap_or_default();
         let sandbox_json = serde_json::to_string(&event.sandbox_findings).unwrap_or_default();
 
+        // Audit fix: wrap detection insert + layer upserts in a single
+        // transaction so a mid-loop failure cannot leave the detection row
+        // with partial layer counts. The previous `let _ = ...BEGIN` swallowed
+        // BEGIN failure (DB busy / stale transaction), so subsequent statements
+        // ran in autocommit — and ROLLBACK at the error path became a no-op,
+        // re-introducing the very partial-commit class the audit was meant to
+        // eliminate. Surface BEGIN errors.
         self.conn
-            .execute(
-                "INSERT INTO detection_events \
-                 (id, timestamp, file_path, file_hash, file_size, detection_name, \
-                  detection_source, argus_score, argus_verdict, layers_triggered, \
-                  behavior_tags, yara_rules_matched, sandbox_findings, scan_context, \
-                  action_taken, engine_version, argus_version, yara_rule_count, signature_count) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
-                params![
-                    event.id,
-                    event.timestamp,
-                    event.file_path,
-                    event.file_hash,
-                    event.file_size as i64,
-                    event.detection_name,
-                    event.detection_source,
-                    event.argus_score.map(|s| s as i64),
-                    event.argus_verdict,
-                    layers_json,
-                    tags_json,
-                    yara_json,
-                    sandbox_json,
-                    event.scan_context,
-                    event.action_taken,
-                    event.engine_version,
-                    event.argus_version,
-                    event.yara_rule_count.map(|c| c as i64),
-                    event.signature_count.map(|c| c as i64),
-                ],
-            )
-            .map_err(|e| format!("insert detection_event failed: {e}"))?;
-
-        // Bump per-layer trigger counts.
-        for layer in &event.layers_triggered {
+            .execute_batch("BEGIN")
+            .map_err(|e| format!("BEGIN failed: {e}"))?;
+        let result = (|| -> Result<(), String> {
             self.conn
                 .execute(
-                    "INSERT INTO layer_stats (layer_name, total_triggers, fp_triggers) \
-                     VALUES (?1, 1, 0) \
-                     ON CONFLICT(layer_name) DO UPDATE SET total_triggers = total_triggers + 1",
-                    params![layer],
+                    "INSERT INTO detection_events \
+                     (id, timestamp, file_path, file_hash, file_size, detection_name, \
+                      detection_source, argus_score, argus_verdict, layers_triggered, \
+                      behavior_tags, yara_rules_matched, sandbox_findings, scan_context, \
+                      action_taken, engine_version, argus_version, yara_rule_count, signature_count) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+                    params![
+                        event.id,
+                        event.timestamp,
+                        event.file_path,
+                        event.file_hash,
+                        event.file_size as i64,
+                        event.detection_name,
+                        event.detection_source,
+                        event.argus_score.map(|s| s as i64),
+                        event.argus_verdict,
+                        layers_json,
+                        tags_json,
+                        yara_json,
+                        sandbox_json,
+                        event.scan_context,
+                        event.action_taken,
+                        event.engine_version,
+                        event.argus_version,
+                        event.yara_rule_count.map(|c| c as i64),
+                        event.signature_count.map(|c| c as i64),
+                    ],
                 )
-                .map_err(|e| format!("layer_stats upsert failed: {e}"))?;
+                .map_err(|e| format!("insert detection_event failed: {e}"))?;
+
+            for layer in &event.layers_triggered {
+                self.conn
+                    .execute(
+                        "INSERT INTO layer_stats (layer_name, total_triggers, fp_triggers) \
+                         VALUES (?1, 1, 0) \
+                         ON CONFLICT(layer_name) DO UPDATE SET total_triggers = total_triggers + 1",
+                        params![layer],
+                    )
+                    .map_err(|e| format!("layer_stats upsert failed: {e}"))?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                let _ = self.conn.execute_batch("COMMIT");
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                return Err(e);
+            }
         }
+
+        // Prune oldest detection rows beyond the retention cap.
+        let _ = self.conn.execute(
+            "DELETE FROM detection_events WHERE id NOT IN (
+                SELECT id FROM detection_events ORDER BY timestamp DESC, rowid DESC LIMIT ?1
+            )",
+            params![RETENTION_ROWS],
+        );
 
         Ok(())
     }
@@ -297,12 +331,32 @@ impl CalibrationLog {
     /// Files that have been restored from quarantine — likely false
     /// positives that deserve review.
     pub fn get_fp_candidates(&self) -> Vec<FPCandidate> {
+        // Deterministic per-hash representative row. The old query did
+        // `GROUP BY r.file_hash` while SELECTing bare (non-aggregated)
+        // file_path / detection_name / detection_source / fp_category. SQLite's
+        // "bare column with a single max()" rule made those come from the
+        // max-timestamp row, but on a timestamp TIE the chosen row was
+        // arbitrary → FP-candidate metadata could flip between identical runs.
+        // Window functions pin the representative to the newest restore with a
+        // rowid tiebreak; COUNT/MAX OVER give the same aggregates. Column order
+        // is preserved so the row.get indices below are unchanged.
         let mut stmt = match self.conn.prepare(
-            "SELECT r.file_hash, r.file_path, d.detection_name, d.detection_source, \
-                    r.fp_category, COUNT(*) AS restore_count, MAX(r.timestamp) AS last_ts \
-             FROM restore_events r \
-             JOIN detection_events d ON d.id = r.detection_event_id \
-             GROUP BY r.file_hash \
+            "SELECT file_hash, file_path, detection_name, detection_source, \
+                    fp_category, restore_count, last_ts FROM ( \
+                SELECT r.file_hash AS file_hash, \
+                       r.file_path AS file_path, \
+                       d.detection_name AS detection_name, \
+                       d.detection_source AS detection_source, \
+                       r.fp_category AS fp_category, \
+                       COUNT(*) OVER (PARTITION BY r.file_hash) AS restore_count, \
+                       MAX(r.timestamp) OVER (PARTITION BY r.file_hash) AS last_ts, \
+                       ROW_NUMBER() OVER ( \
+                           PARTITION BY r.file_hash \
+                           ORDER BY r.timestamp DESC, r.rowid DESC \
+                       ) AS rn \
+                FROM restore_events r \
+                JOIN detection_events d ON d.id = r.detection_event_id \
+             ) WHERE rn = 1 \
              ORDER BY restore_count DESC, last_ts DESC",
         ) {
             Ok(s) => s,
@@ -581,6 +635,40 @@ mod tests {
             file_hash: hash.to_string(),
             fp_category: "developer_tool".to_string(),
             user_notes: Some("Known safe build tool".to_string()),
+        }
+    }
+
+    #[test]
+    fn fp_candidates_tiebreak_is_deterministic() {
+        let log = open_mem();
+        // Two detections sharing one file_hash, distinct detection names.
+        let mut d1 = sample_detection("det-a", "feedface");
+        d1.detection_name = "Win.First".into();
+        let mut d2 = sample_detection("det-b", "feedface");
+        d2.detection_name = "Win.Second".into();
+        log.record_detection(&d1).unwrap();
+        log.record_detection(&d2).unwrap();
+
+        // Two restores for the SAME hash with the SAME timestamp → forces a
+        // tie that the old bare-column GROUP BY resolved arbitrarily.
+        let mut r1 = sample_restore("rst-a", "det-a", "feedface");
+        let mut r2 = sample_restore("rst-b", "det-b", "feedface");
+        r1.timestamp = 1_700_009_000;
+        r2.timestamp = 1_700_009_000;
+        log.record_restore(&r1).unwrap(); // lower rowid
+        log.record_restore(&r2).unwrap(); // higher rowid → newest → must win
+
+        let cands = log.get_fp_candidates();
+        assert_eq!(cands.len(), 1, "one candidate per hash");
+        assert_eq!(cands[0].restore_count, 2);
+        assert_eq!(
+            cands[0].detection_name, "Win.Second",
+            "timestamp tie must resolve to the newest restore (highest rowid)"
+        );
+
+        // Deterministic across repeated runs — no arbitrary-row flip.
+        for _ in 0..5 {
+            assert_eq!(log.get_fp_candidates()[0].detection_name, "Win.Second");
         }
     }
 

@@ -243,16 +243,69 @@ fn is_installed_context(gui_dir: &Path) -> bool {
 /// Returns true if the SentinellaDaemon Windows service is registered.
 /// When true, the supervisor must not spawn its own daemon — SCM owns
 /// the daemon lifecycle and would crash if a second process grabbed the pipe.
+///
+/// IMPORTANT: returns true ONLY when the service is in a live state
+/// (RUNNING / START_PENDING / CONTINUE_PENDING). A STOPPED service means the
+/// user manually disabled it OR SCM gave up — in that case the supervisor
+/// should spawn (dev/recovery behavior) rather than wait forever for an SCM
+/// that won't act.
 #[cfg(target_os = "windows")]
 fn is_service_registered() -> bool {
     use std::os::windows::process::CommandExt;
     use std::process::Command;
-    // Use sc query — exit code 0 means service exists.
     let output = Command::new("sc")
         .args(["query", "SentinellaDaemon"])
         .creation_flags(0x08000000) // CREATE_NO_WINDOW
         .output();
-    matches!(output, Ok(o) if o.status.success())
+    let Ok(out) = output else { return false; };
+    if !out.status.success() {
+        return false; // service not registered
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Audit fix: the old `stdout.contains(": 4 ")` matched ANY field in the
+    // whole output. `sc query` always prints WIN32_EXIT_CODE / SERVICE_EXIT_CODE
+    // lines like `: 4  (0x4)` — a stopped service that exited with code 2/4/5
+    // produced a FALSE "running" reading → GUI skipped spawning → no
+    // protection. Parse the STATE numeric specifically.
+    matches!(parse_service_state_code(&stdout), Some(2) | Some(4) | Some(5))
+}
+
+/// Extract the service STATE numeric code from `sc query` output, robust to
+/// localized field labels. The STATE line is the only one whose value is a
+/// bare small integer FOLLOWED BY A WORD (the state name), e.g. `: 4  RUNNING`.
+/// Exit-code lines are `: 0  (0x0)` (followed by `(`), and CHECKPOINT/WAIT_HINT
+/// are hex `0x0` (no space before the `x`) — both rejected.
+#[cfg(target_os = "windows")]
+fn parse_service_state_code(stdout: &str) -> Option<u32> {
+    for line in stdout.lines() {
+        let Some(idx) = line.find(':') else {
+            continue;
+        };
+        let rest = line[idx + 1..].trim_start();
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() || digits.len() >= rest.len() {
+            continue;
+        }
+        // The char immediately after the digits must be whitespace (rules out
+        // hex `0x0`), and the next non-space char must be a letter (the state
+        // name — rules out `(0x0)` exit codes).
+        let tail = &rest[digits.len()..];
+        if !tail.starts_with(|c: char| c.is_whitespace()) {
+            continue;
+        }
+        if tail
+            .trim_start()
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_alphabetic())
+            .unwrap_or(false)
+        {
+            if let Ok(n) = digits.parse::<u32>() {
+                return Some(n);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(not(target_os = "windows"))]

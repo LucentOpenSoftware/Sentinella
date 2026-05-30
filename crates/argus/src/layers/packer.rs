@@ -164,10 +164,17 @@ fn detect_by_structure(pe: &PE, data: &[u8], findings: &mut Vec<Finding>) {
             }
             let offset = s.pointer_to_raw_data as usize;
             let size = s.size_of_raw_data as usize;
-            if size < 256 || offset + size > data.len() {
+            // Defensive: same checked_add reasoning as pe_heuristics —
+            // attacker-controlled u32+u32 wraps to a tiny value on 32-bit
+            // usize, then bypasses the bounds check.
+            let end = match offset.checked_add(size) {
+                Some(e) if e <= data.len() => e,
+                _ => return false,
+            };
+            if size < 256 {
                 return false;
             }
-            let ent = entropy::shannon_entropy(&data[offset..offset + size]);
+            let ent = entropy::shannon_entropy(&data[offset..end]);
             ent > 7.0
         })
         .count();

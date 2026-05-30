@@ -318,11 +318,29 @@ const REGISTRY_GUID: windows::core::GUID =
 
 /// Safely extract a null-terminated wide string from ETW event UserData.
 ///
-/// Reads up to `max_len` wide chars (u16) starting at `offset` bytes into `data`.
-/// Returns `None` if the pointer is null, the offset is out of range, or the
-/// string is empty.
-unsafe fn extract_wide_string(data: *const u8, offset: usize, max_len: usize) -> Option<String> {
-    if data.is_null() {
+/// Reads up to `max_len` wide chars (u16) starting at `offset` bytes into a
+/// `data` buffer of `data_len` bytes. Returns `None` if the pointer is null,
+/// the offset is out of range, or the string is empty.
+///
+/// SAFETY: `data_len` MUST be the true length of the `data` buffer. The bound
+/// is enforced HERE — `offset` past the end or a `max_len` larger than the
+/// remaining bytes is clamped — so a mis-sized caller cannot make this read
+/// past the (attacker-controlled, ETW-provided) buffer. An out-of-bounds read
+/// here is an access violation, which the callback's `catch_unwind` does NOT
+/// catch; the previous version trusted the caller's `max_len` entirely.
+unsafe fn extract_wide_string(
+    data: *const u8,
+    data_len: usize,
+    offset: usize,
+    max_len: usize,
+) -> Option<String> {
+    if data.is_null() || offset >= data_len {
+        return None;
+    }
+    // Wide chars that actually fit in the buffer from `offset`.
+    let avail_chars = (data_len - offset) / 2;
+    let max_len = max_len.min(avail_chars);
+    if max_len == 0 {
         return None;
     }
     let base = unsafe { data.add(offset) as *const u16 };
@@ -459,11 +477,9 @@ unsafe fn etw_event_callback_inner(event: *mut EVENT_RECORD) {
                         unsafe {
                             extract_wide_string(
                                 event.UserData as *const u8,
+                                event.UserDataLength as usize,
                                 60,
-                                std::cmp::min(
-                                    MAX_ETW_STRING_CHARS,
-                                    (event.UserDataLength as usize - 60) / 2,
-                                ),
+                                MAX_ETW_STRING_CHARS,
                             )
                         }
                     } else {
@@ -536,10 +552,14 @@ unsafe fn etw_event_callback_inner(event: *mut EVENT_RECORD) {
         // filename as a wide string (after an 8-byte base address + size prefix
         // on some versions, but the path is the dominant payload).
         if event.UserDataLength > 0 && !event.UserData.is_null() {
-            let max_chars = std::cmp::min(MAX_ETW_STRING_CHARS, event.UserDataLength as usize / 2);
-            if let Some(image_path) =
-                unsafe { extract_wide_string(event.UserData as *const u8, 0, max_chars) }
-            {
+            if let Some(image_path) = unsafe {
+                extract_wide_string(
+                    event.UserData as *const u8,
+                    event.UserDataLength as usize,
+                    0,
+                    MAX_ETW_STRING_CHARS,
+                )
+            } {
                 if is_suspicious_dll_path(&image_path) {
                     let mut r = ctx.report.lock().unwrap_or_else(|e| e.into_inner());
                     // Dedup: skip if we already recorded this exact DLL path.
@@ -563,10 +583,14 @@ unsafe fn etw_event_callback_inner(event: *mut EVENT_RECORD) {
         // Opcode 22 = SetValue, 23 = CreateKey.
         // The key path is a wide string in UserData.
         if event.UserDataLength > 0 && !event.UserData.is_null() {
-            let max_chars = std::cmp::min(MAX_ETW_STRING_CHARS, event.UserDataLength as usize / 2);
-            if let Some(key_path) =
-                unsafe { extract_wide_string(event.UserData as *const u8, 0, max_chars) }
-            {
+            if let Some(key_path) = unsafe {
+                extract_wide_string(
+                    event.UserData as *const u8,
+                    event.UserDataLength as usize,
+                    0,
+                    MAX_ETW_STRING_CHARS,
+                )
+            } {
                 if is_persistence_key(&key_path) {
                     let op = if opcode == 22 {
                         "SetValue"
@@ -727,6 +751,31 @@ fn get_process_name(pid: u32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_wide_string_is_bounds_safe() {
+        // "Hi\0" as UTF-16LE = 6 bytes.
+        let buf: Vec<u8> = vec![0x48, 0, 0x69, 0, 0, 0];
+        unsafe {
+            // Normal decode.
+            assert_eq!(
+                extract_wide_string(buf.as_ptr(), buf.len(), 0, 16).as_deref(),
+                Some("Hi")
+            );
+            // Huge max_len is clamped to the buffer — no OOB read.
+            assert_eq!(
+                extract_wide_string(buf.as_ptr(), buf.len(), 0, 999_999).as_deref(),
+                Some("Hi")
+            );
+            // Offset past the end → None (the OLD code would read past the
+            // buffer here = access violation, uncatchable by catch_unwind).
+            assert_eq!(extract_wide_string(buf.as_ptr(), buf.len(), 99, 16), None);
+            // Offset exactly at end → None.
+            assert_eq!(extract_wide_string(buf.as_ptr(), buf.len(), buf.len(), 16), None);
+            // Null pointer → None.
+            assert_eq!(extract_wide_string(std::ptr::null(), 10, 0, 4), None);
+        }
+    }
 
     #[test]
     fn suspicious_processes() {
@@ -909,7 +958,7 @@ mod tests {
         // Build a null-terminated wide string "hello" in a buffer.
         let wide: Vec<u16> = "hello".encode_utf16().chain(std::iter::once(0)).collect();
         let bytes: Vec<u8> = wide.iter().flat_map(|w| w.to_ne_bytes()).collect();
-        let result = unsafe { extract_wide_string(bytes.as_ptr(), 0, 256) };
+        let result = unsafe { extract_wide_string(bytes.as_ptr(), bytes.len(), 0, 256) };
         assert_eq!(result, Some("hello".to_string()));
     }
 
@@ -919,13 +968,13 @@ mod tests {
         let mut bytes: Vec<u8> = vec![0xAA, 0xBB, 0xCC, 0xDD]; // 4-byte prefix
         let wide: Vec<u16> = "test".encode_utf16().chain(std::iter::once(0)).collect();
         bytes.extend(wide.iter().flat_map(|w| w.to_ne_bytes()));
-        let result = unsafe { extract_wide_string(bytes.as_ptr(), 4, 256) };
+        let result = unsafe { extract_wide_string(bytes.as_ptr(), bytes.len(), 4, 256) };
         assert_eq!(result, Some("test".to_string()));
     }
 
     #[test]
     fn extract_wide_string_null_ptr() {
-        let result = unsafe { extract_wide_string(std::ptr::null(), 0, 256) };
+        let result = unsafe { extract_wide_string(std::ptr::null(), 256, 0, 256) };
         assert_eq!(result, None);
     }
 
@@ -934,7 +983,7 @@ mod tests {
         // Just a null terminator.
         let wide: Vec<u16> = vec![0];
         let bytes: Vec<u8> = wide.iter().flat_map(|w| w.to_ne_bytes()).collect();
-        let result = unsafe { extract_wide_string(bytes.as_ptr(), 0, 256) };
+        let result = unsafe { extract_wide_string(bytes.as_ptr(), bytes.len(), 0, 256) };
         assert_eq!(result, None);
     }
 
@@ -946,7 +995,7 @@ mod tests {
             .chain(std::iter::once(0))
             .collect();
         let bytes: Vec<u8> = wide.iter().flat_map(|w| w.to_ne_bytes()).collect();
-        let result = unsafe { extract_wide_string(bytes.as_ptr(), 0, 3) };
+        let result = unsafe { extract_wide_string(bytes.as_ptr(), bytes.len(), 0, 3) };
         assert_eq!(result, Some("abc".to_string()));
     }
 

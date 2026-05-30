@@ -154,12 +154,18 @@ fn analyze_sections(pe: &PE, data: &[u8], findings: &mut Vec<Finding>) {
         let name = section_name(section);
         let offset = section.pointer_to_raw_data as usize;
         let size = section.size_of_raw_data as usize;
-
-        if size < 256 || offset + size > data.len() {
+        // Defensive: untrusted PE header fields (pointer + size are u32).
+        // `offset + size` wraps on 32-bit usize when attacker sets both to
+        // u32::MAX → wrapped tiny value passes `<= data.len()` → OOB slice.
+        let end = match offset.checked_add(size) {
+            Some(e) if e <= data.len() => e,
+            _ => continue,
+        };
+        if size < 256 {
             continue;
         }
 
-        let section_data = &data[offset..offset + size];
+        let section_data = &data[offset..end];
         let ent = entropy::shannon_entropy(section_data);
 
         if ent > 7.5 {
@@ -188,11 +194,24 @@ fn analyze_sections(pe: &PE, data: &[u8], findings: &mut Vec<Finding>) {
     }
 
     // Entry point in unusual section.
-    let ep_rva = pe.entry as u32;
+    // Defensive: pe.entry is u64 — truncating to u32 silently drops the high
+    // bits, so an attacker-controlled entry above u32::MAX would alias an
+    // arbitrary low RVA. Bail out instead of misclassifying.
+    let ep_rva = match u32::try_from(pe.entry) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
     if ep_rva > 0 {
         for (i, section) in sections.iter().enumerate() {
             let start = section.virtual_address;
-            let end = start + section.virtual_size;
+            // Defensive: untrusted PE header fields — virtual_address +
+            // virtual_size can wrap u32 (both attacker-controlled). A wrap to
+            // a tiny `end` would silently include the entry point in the range
+            // check below. Treat overflow as "section does not contain EP".
+            let end = match start.checked_add(section.virtual_size) {
+                Some(e) => e,
+                None => continue,
+            };
             if ep_rva >= start && ep_rva < end && i == sections.len() - 1 && sections.len() > 2 {
                 let name = section_name(section);
                 findings.push(Finding {
@@ -366,11 +385,16 @@ fn analyze_resources(pe: &PE, data: &[u8], findings: &mut Vec<Finding>) {
 
         let offset = section.pointer_to_raw_data as usize;
         let size = section.size_of_raw_data as usize;
-        if size < 100_000 || offset + size > data.len() {
+        // Defensive: see `analyze_sections` for the rationale on checked_add.
+        let end = match offset.checked_add(size) {
+            Some(e) if e <= data.len() => e,
+            _ => continue,
+        };
+        if size < 100_000 {
             continue;
         }
 
-        let ent = entropy::shannon_entropy(&data[offset..offset + size]);
+        let ent = entropy::shannon_entropy(&data[offset..end]);
         if ent > 7.0 {
             findings.push(Finding {
                 layer: Layer::StructuralAnalysis,
@@ -387,10 +411,15 @@ fn analyze_resources(pe: &PE, data: &[u8], findings: &mut Vec<Finding>) {
 
 fn analyze_overlay(pe: &PE, data: &[u8], findings: &mut Vec<Finding>) {
     // Calculate where the PE ends (last section's raw data end).
+    // Defensive: `pointer_to_raw_data + size_of_raw_data` is u32+u32 from
+    // attacker-controlled PE headers — wraps silently on overflow. Use
+    // checked_add and skip any wrapping section instead of letting a wrapped
+    // small `pe_end` smuggle a section's raw range into the "overlay" tail.
     let pe_end = pe
         .sections
         .iter()
-        .map(|s| (s.pointer_to_raw_data + s.size_of_raw_data) as usize)
+        .filter_map(|s| s.pointer_to_raw_data.checked_add(s.size_of_raw_data))
+        .map(|v| v as usize)
         .max()
         .unwrap_or(0);
 

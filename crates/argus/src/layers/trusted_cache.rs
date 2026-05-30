@@ -115,3 +115,34 @@ impl TrustedCache {
         (inner.entries.len(), inner.sig_generation)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hit_then_expire_on_invalidate() {
+        let cache = TrustedCache::new();
+        // Only signed/reputable, low-score files are cached.
+        cache.record("abc", 0, Some("Acme Corp"), None);
+        assert_eq!(cache.check("abc"), Some(0), "freshly recorded hash must hit");
+
+        // A signature/rule update bumps the generation → the entry must expire,
+        // forcing re-analysis. This is the wiring that production was missing.
+        cache.invalidate();
+        assert_eq!(
+            cache.check("abc"),
+            None,
+            "entry must expire after invalidate() so new rules re-scan it"
+        );
+    }
+
+    #[test]
+    fn unsigned_or_high_score_not_cached() {
+        let cache = TrustedCache::new();
+        cache.record("nosig", 0, None, None); // no trust evidence
+        assert_eq!(cache.check("nosig"), None);
+        cache.record("hot", 40, Some("Acme"), None); // score > 25
+        assert_eq!(cache.check("hot"), None);
+    }
+}

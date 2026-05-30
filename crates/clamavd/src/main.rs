@@ -112,6 +112,40 @@ fn main() {
     });
 }
 
+/// Restrict DLL search order to System32 + the explicit `dll_dir` only.
+/// Excludes CWD and PATH from the search (the actual attack vectors).
+/// Best-effort: failure is logged but doesn't abort — defense-in-depth, the
+/// caller still uses an absolute path for the top-level Library::new.
+#[cfg(target_os = "windows")]
+fn harden_dll_search(dll_dir: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::System::LibraryLoader::{
+        AddDllDirectory, SetDefaultDllDirectories, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+        LOAD_LIBRARY_SEARCH_SYSTEM32, LOAD_LIBRARY_SEARCH_USER_DIRS,
+    };
+    use windows::core::PCWSTR;
+
+    let flags = LOAD_LIBRARY_SEARCH_SYSTEM32
+        | LOAD_LIBRARY_SEARCH_USER_DIRS
+        | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS;
+    let _ = unsafe { SetDefaultDllDirectories(flags) };
+
+    if let Ok(canon) = dll_dir.canonicalize() {
+        let wide: Vec<u16> = canon
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let _ = unsafe { AddDllDirectory(PCWSTR(wide.as_ptr())) };
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn harden_dll_search(_dll_dir: &Path) {
+    // No equivalent attack surface — dlopen uses RPATH / LD_LIBRARY_PATH which
+    // we don't set; not in scope for the v0.1.6 Windows-focused hardening pass.
+}
+
 fn emit_error(cli: &Cli, msg: &str) {
     if cli.json {
         println!(
@@ -166,6 +200,14 @@ struct RawScanResult {
 }
 
 fn load_clamav(dll_dir: &Path, db_dir: &Path) -> Result<(ClamavEngine, u64), String> {
+    // ☠️ DLL hijack hardening: BEFORE loading libclamav.dll (which pulls in
+    // libssl, libcrypto, zlib, etc. via the system DLL search order), restrict
+    // the search to System32 + the explicit dll_dir. Without this, an attacker
+    // who can drop e.g. libcrypto-3-x64.dll into CWD / any user-writable PATH
+    // entry / next-to-the-exe gets arbitrary code execution in this process —
+    // and on the daemon spawn path that is SYSTEM context.
+    harden_dll_search(dll_dir);
+
     let dll_path = dll_dir.join("libclamav.dll");
     let lib = unsafe {
         libloading::Library::new(&dll_path)

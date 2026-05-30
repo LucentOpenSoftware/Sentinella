@@ -3,10 +3,27 @@
 
 import { en } from "./en";
 import { es } from "./es";
+import { pt_br } from "./pt-br";
+import { ja } from "./ja";
+import { fr } from "./fr";
+import { de } from "./de";
+import { it } from "./it";
+import { ru } from "./ru";
+import { zh_cn } from "./zh-cn";
 
 export type TranslationKey = keyof typeof en;
 
-const locales: Record<string, Record<string, string>> = { en, es };
+const locales: Record<string, Record<string, string>> = {
+  en,
+  es,
+  "pt-br": pt_br,
+  ja,
+  fr,
+  de,
+  it,
+  ru,
+  "zh-cn": zh_cn,
+};
 
 let currentLocale = "en";
 
@@ -29,9 +46,26 @@ export function initLocale(): void {
     return;
   }
   // Auto-detect from browser.
-  const browser = navigator.language.split("-")[0].toLowerCase();
-  if (locales[browser]) {
-    currentLocale = browser;
+  const raw = (navigator.language || "en").toLowerCase();
+  // Full BCP-47 tag match first (e.g. "pt-br", "zh-cn").
+  if (locales[raw]) {
+    currentLocale = raw;
+    return;
+  }
+  // Primary language fallbacks for regional variants we don't separately ship.
+  const primary = raw.split("-")[0];
+  // Portuguese — any pt-* variant maps to Brazilian Portuguese (only variant we ship).
+  if (primary === "pt") {
+    currentLocale = "pt-br";
+    return;
+  }
+  // Chinese — any zh-* (zh-tw, zh-hk, zh-sg, bare zh) maps to Simplified mainland.
+  if (primary === "zh") {
+    currentLocale = "zh-cn";
+    return;
+  }
+  if (locales[primary]) {
+    currentLocale = primary;
   }
 }
 
@@ -49,5 +83,12 @@ export function availableLocales(): { code: string; label: string }[] {
   return [
     { code: "en", label: "English" },
     { code: "es", label: "Español" },
+    { code: "pt-br", label: "Português (Brasil)" },
+    { code: "fr", label: "Français" },
+    { code: "de", label: "Deutsch" },
+    { code: "it", label: "Italiano" },
+    { code: "ru", label: "Русский" },
+    { code: "ja", label: "日本語" },
+    { code: "zh-cn", label: "简体中文" },
   ];
 }

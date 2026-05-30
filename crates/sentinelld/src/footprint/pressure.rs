@@ -123,6 +123,22 @@ fn classify(working_set_mb: u64, config: &PerformanceConfig) -> PressureState {
     }
 }
 
+/// The working-set entry threshold (MB) for a given state — the value the
+/// working set must exceed to reach it.
+fn entry_threshold(state: PressureState, config: &PerformanceConfig) -> u64 {
+    match state {
+        PressureState::Normal => 0,
+        PressureState::Elevated => 800,
+        PressureState::Warning => config.memory_warning_mb,
+        PressureState::Critical => config.memory_critical_mb,
+    }
+}
+
+/// Hysteresis margin (MB): a working set hovering at a threshold must drop
+/// this far below it before we step down a level, preventing rapid
+/// flapping (and the log/behaviour thrash that came with it).
+const HYSTERESIS_MARGIN_MB: u64 = 128;
+
 /// Atomic pressure state for lock-free reads from any thread.
 pub struct PressureTracker {
     state: AtomicU8,
@@ -137,8 +153,23 @@ impl PressureTracker {
 
     /// Update pressure state from latest footprint.
     pub fn update(&self, working_set_mb: u64, config: &PerformanceConfig) -> PressureState {
-        let state = classify(working_set_mb, config);
-        let prev = PressureState::from_u8(self.state.swap(state.as_u8(), Ordering::Relaxed));
+        let raw = classify(working_set_mb, config);
+        let prev = self.current();
+        // Hysteresis: only step DOWN a level once the working set has fallen
+        // a clear margin below the current level's entry threshold. Stepping
+        // UP is immediate (respond to pressure fast). Prevents Warning↔Critical
+        // flapping when the working set hovers at a boundary.
+        let state = if (raw.as_u8()) < (prev.as_u8()) {
+            let entry = entry_threshold(prev, config);
+            if working_set_mb + HYSTERESIS_MARGIN_MB > entry {
+                prev // not far enough below — hold current level
+            } else {
+                raw
+            }
+        } else {
+            raw
+        };
+        self.state.store(state.as_u8(), Ordering::Relaxed);
         if state != prev {
             match state {
                 PressureState::Normal => {
@@ -181,12 +212,86 @@ impl PressureTracker {
     }
 }
 
+/// Derive memory-pressure thresholds (warning_mb, critical_mb) from total
+/// physical RAM and the configured `memory_profile`.
+///
+/// Why: the static defaults (1500/2500 MB) are an absolute footprint that does
+/// NOT mean the same thing across hardware. On a 4 GB Core 2 Quad, 2500 MB
+/// "critical" is 62% of RAM — it fires only after the box is already swapping
+/// (libclamav mpool ~970 MB + scan buffers). On a 32 GB box it's trivially low
+/// and pauses the idle scanner needlessly. Scaling by total RAM gives the same
+/// *behavioral* trust across an i7-7200U, a Core 2 Quad, Skylake, Ryzen, and an
+/// i5-1265U: "back off at roughly the same fraction of this machine's memory."
+pub fn ram_relative_thresholds(total_ram_mb: u64, profile: &str) -> (u64, u64) {
+    let (warn_pct, crit_pct) = match profile {
+        "low" => (0.12, 0.22),        // conserve aggressively on constrained boxes
+        "aggressive" => (0.30, 0.50), // allow more footprint for speed
+        _ => (0.20, 0.35),            // "normal"
+    };
+    // Floors keep tiny-RAM boxes from absurdly low caps; ceilings stop a huge-RAM
+    // box from letting the AV balloon (its real footprint is < 1 GB anyway).
+    let warning = ((total_ram_mb as f64 * warn_pct) as u64).clamp(512, 3072);
+    let mut critical = ((total_ram_mb as f64 * crit_pct) as u64).clamp(1024, 4096);
+    if critical <= warning {
+        critical = warning + 256;
+    }
+    (warning, critical)
+}
+
+/// Total physical RAM in MiB, or `None` if it can't be determined (caller keeps
+/// the static absolute defaults). Fail-safe: never panics.
+#[cfg(target_os = "windows")]
+pub fn detect_total_ram_mb() -> Option<u64> {
+    use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut status = MEMORYSTATUSEX {
+        dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+        ..Default::default()
+    };
+    unsafe { GlobalMemoryStatusEx(&mut status).ok()? };
+    Some(status.ullTotalPhys / (1024 * 1024))
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn detect_total_ram_mb() -> Option<u64> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn default_perf() -> PerformanceConfig {
         PerformanceConfig::default()
+    }
+
+    #[test]
+    fn ram_relative_scales_across_hardware() {
+        // 4 GB Core 2 Quad (normal): critical must be FAR below the old 2500 MB
+        // absolute so it fires before the box swaps.
+        let (w4, c4) = ram_relative_thresholds(4096, "normal");
+        assert!(c4 < 1500, "4GB critical {c4} should be well under the old 2500");
+        assert!(w4 < c4);
+
+        // 8 GB i7-7200U (normal).
+        let (_w8, c8) = ram_relative_thresholds(8192, "normal");
+        assert!(c8 > c4, "more RAM → higher critical");
+
+        // 32 GB i5-1265U (normal): capped, not absurd.
+        let (w32, c32) = ram_relative_thresholds(32768, "normal");
+        assert!(c32 <= 4096 && w32 <= 3072, "huge RAM is ceiling-capped");
+        assert!(w32 < c32);
+
+        // 2 GB ancient box: floors apply, still ordered.
+        let (w2, c2) = ram_relative_thresholds(2048, "normal");
+        assert!(w2 >= 512 && c2 >= 1024 && w2 < c2);
+
+        // Profile ordering: low < normal < aggressive critical for same RAM.
+        // Use 8 GB so the values sit below the high-RAM ceiling that would
+        // otherwise flatten normal/aggressive to the same cap.
+        let lo = ram_relative_thresholds(8192, "low").1;
+        let no = ram_relative_thresholds(8192, "normal").1;
+        let ag = ram_relative_thresholds(8192, "aggressive").1;
+        assert!(lo < no && no <= ag);
     }
 
     #[test]

@@ -202,14 +202,18 @@ async fn get_scan_history() -> Result<Value, String> {
 
 #[tauri::command]
 async fn get_quarantine_items() -> Result<Value, String> {
-    daemon_client::call_simple("quarantine.list").await.map_err(Into::into)
+    // R7-LETHAL: daemon now requires auth — list leaks SHA-256 of every
+    // caught malware + original file paths, which is attack-staging intel.
+    daemon_client::call_auth("quarantine.list", serde_json::json!({}))
+        .await
+        .map_err(Into::into)
 }
 
 #[tauri::command]
 async fn quarantine_file(path: String, virus_name: String, scan_id: String) -> Result<Value, String> {
     // Manual quarantine is destructive: daemon requires one-shot challenge.
-    let token_resp = daemon_client::call_auth("security.challenge", serde_json::json!({})).await.map_err(|e| e.to_string())?;
-    let token = token_resp.get("token").and_then(|v| v.as_str()).unwrap_or("");
+    // Adversary A2: token is bound to the method scope it's issued for.
+    let token = daemon_client::challenge_token("quarantine.add").await.map_err(|e| e.to_string())?;
     daemon_client::call("quarantine.add", serde_json::json!({
         "path": path, "virus_name": virus_name, "scan_id": scan_id, "token": token,
     })).await.map_err(Into::into)
@@ -218,16 +222,14 @@ async fn quarantine_file(path: String, virus_name: String, scan_id: String) -> R
 #[tauri::command]
 async fn quarantine_restore(id: String) -> Result<Value, String> {
     // Get challenge token first — quarantine restore is a dangerous operation.
-    let token_resp = daemon_client::call_auth("security.challenge", serde_json::json!({})).await.map_err(|e| e.to_string())?;
-    let token = token_resp.get("token").and_then(|v| v.as_str()).unwrap_or("");
+    let token = daemon_client::challenge_token("quarantine.restore").await.map_err(|e| e.to_string())?;
     daemon_client::call("quarantine.restore", serde_json::json!({"id": id, "token": token})).await.map_err(Into::into)
 }
 
 #[tauri::command]
 async fn quarantine_delete(id: String) -> Result<Value, String> {
     // Permanent deletion — requires challenge token.
-    let token_resp = daemon_client::call_auth("security.challenge", serde_json::json!({})).await.map_err(|e| e.to_string())?;
-    let token = token_resp.get("token").and_then(|v| v.as_str()).unwrap_or("");
+    let token = daemon_client::challenge_token("quarantine.delete").await.map_err(|e| e.to_string())?;
     daemon_client::call("quarantine.delete", serde_json::json!({"id": id, "token": token})).await.map_err(Into::into)
 }
 
@@ -252,14 +254,20 @@ async fn report_safe(
 
 #[tauri::command]
 async fn get_watcher_status() -> Result<Value, String> {
-    daemon_client::call_simple("watcher.status").await.map_err(Into::into)
+    // Scanner-B Finding 2: response now auth-gated (watched_roots leak).
+    daemon_client::call_auth("watcher.status", serde_json::json!({}))
+        .await
+        .map_err(Into::into)
 }
 
 // ── Idle Scanner ────────────────────────────────────────────────
 
 #[tauri::command]
 async fn get_idle_scanner_status() -> Result<Value, String> {
-    daemon_client::call_simple("idle_scanner.status").await.map_err(Into::into)
+    // Scanner-B Finding 3: response now auth-gated (current_target leak).
+    daemon_client::call_auth("idle_scanner.status", serde_json::json!({}))
+        .await
+        .map_err(Into::into)
 }
 
 // ── Updates ─────────────────────────────────────────────────────
@@ -271,7 +279,10 @@ async fn get_update_status() -> Result<Value, String> {
 
 #[tauri::command]
 async fn start_signature_update() -> Result<Value, String> {
-    daemon_client::call("update.start", serde_json::json!({})).await.map_err(Into::into)
+    // R4-LETHAL-4: daemon requires auth (force-reload would open scan-blind window).
+    daemon_client::call_auth("update.start", serde_json::json!({}))
+        .await
+        .map_err(Into::into)
 }
 
 // ── Scan report export ──────────────────────────────────────────
@@ -281,7 +292,10 @@ async fn export_scan_report() -> Result<Value, String> {
     let engine = daemon_client::call_simple("engine.status").await.map_err(|e| e.to_string())?;
     let stats = daemon_client::call_simple("stats.runtime").await.map_err(|e| e.to_string())?;
     let history = daemon_client::call_simple("scan.history").await.map_err(|e| e.to_string())?;
-    let quarantine = daemon_client::call_simple("quarantine.list").await.map_err(|e| e.to_string())?;
+    // R7-LETHAL: quarantine list now requires auth.
+    let quarantine = daemon_client::call_auth("quarantine.list", serde_json::json!({}))
+        .await
+        .map_err(|e| e.to_string())?;
 
     Ok(serde_json::json!({
         "report_type": "sentinella_scan_report",
@@ -301,19 +315,71 @@ async fn get_detections(scan_id: Option<String>) -> Result<Value, String> {
         Some(id) => serde_json::json!({"scan_id": id}),
         None => serde_json::json!({}),
     };
-    daemon_client::call("detections.list", params).await.map_err(Into::into)
+    // R7-LETHAL: detections.list now requires auth (intel leak).
+    daemon_client::call_auth("detections.list", params)
+        .await
+        .map_err(Into::into)
 }
 
 // ── Settings ────────────────────────────────────────────────────
 
 #[tauri::command]
 async fn get_settings() -> Result<Value, String> {
-    daemon_client::call_simple("settings.get").await.map_err(Into::into)
+    // R4-LETHAL-6: settings.get now requires auth (leaks exclusion + trusted_hashes).
+    daemon_client::call_auth("settings.get", serde_json::json!({}))
+        .await
+        .map_err(Into::into)
 }
 
 #[tauri::command]
-async fn save_settings(config: Value) -> Result<Value, String> {
+async fn save_settings(mut config: Value) -> Result<Value, String> {
+    // Scanner-B Finding 1: settings.set now requires a one-shot challenge
+    // token in addition to the IPC secret. Fetch one and inject before send.
+    let token = daemon_client::challenge_token("settings.set").await.map_err(|e| e.to_string())?;
+    if let Value::Object(ref mut map) = config {
+        map.insert("token".into(), Value::String(token));
+    } else {
+        // Caller passed a non-object — wrap so the daemon receives the token.
+        config = serde_json::json!({"token": token, "value": config});
+    }
     daemon_client::call_auth("settings.set", config).await.map_err(Into::into)
+}
+
+// ── Developer mode (local-only perf telemetry, v0.1.6) ──────────
+
+/// Read developer-mode status (never returns the password hash).
+#[tauri::command]
+async fn get_developer_status() -> Result<Value, String> {
+    daemon_client::call_auth("dev.status", serde_json::json!({}))
+        .await
+        .map_err(Into::into)
+}
+
+/// Toggle developer mode. The plaintext password is verified daemon-side
+/// against the provisioned hash; it is never persisted by the GUI.
+#[tauri::command]
+async fn set_developer_mode(
+    password: String,
+    enabled: bool,
+    telemetry_enabled: Option<bool>,
+) -> Result<Value, String> {
+    let mut params = serde_json::json!({ "password": password, "enabled": enabled });
+    if let Some(t) = telemetry_enabled {
+        params["telemetry_enabled"] = serde_json::json!(t);
+    }
+    daemon_client::call_auth("dev.set_developer_mode", params)
+        .await
+        .map_err(Into::into)
+}
+
+/// Run the ARGUS hardware-parity benchmark (developer mode only). Returns the
+/// report JSON; the daemon also appends it to the local perf-telemetry file.
+#[tauri::command]
+async fn run_benchmark(passes: Option<u32>) -> Result<Value, String> {
+    let params = serde_json::json!({ "passes": passes.unwrap_or(3) });
+    daemon_client::call_auth("benchmark.run", params)
+        .await
+        .map_err(Into::into)
 }
 
 // ── ARGUS Heuristics Engine ─────────────────────────────────────
@@ -356,10 +422,18 @@ async fn get_argus_verdicts(scan_id: Option<String>) -> Result<Value, String> {
 
 // ── Security ────────────────────────────────────────────────────
 
-/// Request a challenge token for dangerous IPC operations.
+/// Request a challenge token for a specific dangerous IPC method.
+/// Adversary A2: tokens are method-scoped on the daemon side — callers MUST
+/// declare which method the token is for, and the daemon will reject any
+/// attempt to use it against a different method.
 #[tauri::command]
-async fn request_challenge_token() -> Result<Value, String> {
-    daemon_client::call_auth("security.challenge", serde_json::json!({})).await.map_err(Into::into)
+async fn request_challenge_token(method: String) -> Result<Value, String> {
+    daemon_client::call_auth(
+        "security.challenge",
+        serde_json::json!({ "method": method }),
+    )
+    .await
+    .map_err(Into::into)
 }
 
 // ── Protection Control ──────────────────────────────────────────
@@ -390,7 +464,10 @@ async fn confirmed_shutdown(confirmation: String, app: tauri::AppHandle) -> Resu
 
 #[tauri::command]
 async fn get_activity() -> Result<Value, String> {
-    daemon_client::call_simple("activity.list").await.map_err(Into::into)
+    // R7-LETHAL: activity.list now requires auth (leaks scan history + settings changes).
+    daemon_client::call_auth("activity.list", serde_json::json!({}))
+        .await
+        .map_err(Into::into)
 }
 
 // ── Diagnostics ────────────────────────────────────────────────
@@ -457,13 +534,7 @@ async fn set_critical_protection(
     }
 
     // Already elevated — proceed directly via IPC.
-    let token_resp = daemon_client::call_auth("security.challenge", serde_json::json!({}))
-        .await
-        .map_err(|e| e.to_string())?;
-    let token = token_resp
-        .get("token")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let token = daemon_client::challenge_token("protection.set_critical").await.map_err(|e| e.to_string())?;
 
     let mut params = serde_json::json!({"token": token});
     if let Some(v) = realtime_enabled {
@@ -490,13 +561,7 @@ async fn pause_protection() -> Result<Value, String> {
         };
     }
 
-    let token_resp = daemon_client::call_auth("security.challenge", serde_json::json!({}))
-        .await
-        .map_err(|e| e.to_string())?;
-    let token = token_resp
-        .get("token")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let token = daemon_client::challenge_token("protection.disable").await.map_err(|e| e.to_string())?;
     daemon_client::call(
         "protection.disable",
         serde_json::json!({"token": token}),
@@ -508,13 +573,7 @@ async fn pause_protection() -> Result<Value, String> {
 /// Resume protection. No elevation required (enabling protection is safe).
 #[tauri::command]
 async fn resume_protection() -> Result<Value, String> {
-    let token_resp = daemon_client::call_auth("security.challenge", serde_json::json!({}))
-        .await
-        .map_err(|e| e.to_string())?;
-    let token = token_resp
-        .get("token")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let token = daemon_client::challenge_token("protection.enable").await.map_err(|e| e.to_string())?;
     daemon_client::call(
         "protection.enable",
         serde_json::json!({"token": token}),
@@ -549,12 +608,19 @@ async fn get_runtime_stats() -> Result<Value, String> {
 
 #[tauri::command]
 async fn get_runtime_intelligence() -> Result<Value, String> {
-    daemon_client::call_simple("runtime.status").await.map_err(Into::into)
+    // Adversary A1: runtime.status now requires auth — handler used to leak
+    // PLM/ETW/ps_bridge/trust diagnostics to any local caller.
+    daemon_client::call_auth("runtime.status", serde_json::json!({}))
+        .await
+        .map_err(Into::into)
 }
 
 #[tauri::command]
 async fn get_trust_status() -> Result<Value, String> {
-    daemon_client::call_simple("trust.status").await.map_err(Into::into)
+    // R7-LETHAL: trust.status now requires auth (leaks trusted signer list).
+    daemon_client::call_auth("trust.status", serde_json::json!({}))
+        .await
+        .map_err(Into::into)
 }
 
 #[tauri::command]
@@ -565,8 +631,7 @@ async fn get_signature_sources() -> Result<Value, String> {
 #[tauri::command]
 async fn set_signature_source(provider_id: String) -> Result<Value, String> {
     // Provider change is security-sensitive — requires challenge token.
-    let token_resp = daemon_client::call_auth("security.challenge", serde_json::json!({})).await.map_err(|e| e.to_string())?;
-    let token = token_resp.get("token").and_then(|v| v.as_str()).unwrap_or("");
+    let token = daemon_client::challenge_token("sources.set").await.map_err(|e| e.to_string())?;
     daemon_client::call("sources.set", serde_json::json!({
         "provider": provider_id,
         "challenge_token": token,
@@ -575,8 +640,7 @@ async fn set_signature_source(provider_id: String) -> Result<Value, String> {
 
 #[tauri::command]
 async fn rollback_signature_source() -> Result<Value, String> {
-    let token_resp = daemon_client::call_auth("security.challenge", serde_json::json!({})).await.map_err(|e| e.to_string())?;
-    let token = token_resp.get("token").and_then(|v| v.as_str()).unwrap_or("");
+    let token = daemon_client::challenge_token("sources.rollback").await.map_err(|e| e.to_string())?;
     daemon_client::call("sources.rollback", serde_json::json!({
         "challenge_token": token,
     })).await.map_err(Into::into)
@@ -584,8 +648,7 @@ async fn rollback_signature_source() -> Result<Value, String> {
 
 #[tauri::command]
 async fn update_signature_source() -> Result<Value, String> {
-    let token_resp = daemon_client::call_auth("security.challenge", serde_json::json!({})).await.map_err(|e| e.to_string())?;
-    let token = token_resp.get("token").and_then(|v| v.as_str()).unwrap_or("");
+    let token = daemon_client::challenge_token("sources.update").await.map_err(|e| e.to_string())?;
     daemon_client::call("sources.update", serde_json::json!({
         "challenge_token": token,
     })).await.map_err(Into::into)
@@ -593,8 +656,7 @@ async fn update_signature_source() -> Result<Value, String> {
 
 #[tauri::command]
 async fn quarantine_restore_as(id: String, dest: String) -> Result<Value, String> {
-    let token_resp = daemon_client::call_auth("security.challenge", serde_json::json!({})).await.map_err(|e| e.to_string())?;
-    let token = token_resp.get("token").and_then(|v| v.as_str()).unwrap_or("");
+    let token = daemon_client::challenge_token("quarantine.restore_as").await.map_err(|e| e.to_string())?;
     daemon_client::call("quarantine.restore_as", serde_json::json!({
         "id": id, "dest": dest, "token": token,
     })).await.map_err(Into::into)
@@ -614,6 +676,19 @@ pub fn run() {
     let start_minimized = std::env::args().any(|a| a == "--minimized");
 
     tauri::Builder::default()
+        // Single-instance: if a second Sentinella.exe launches (e.g. user
+        // double-clicks Start Menu shortcut after autostart already ran),
+        // focus the existing main window instead of spawning a duplicate.
+        // Without this: two supervisors, two tray icons (second fails silent),
+        // two tokio runtimes polling daemon — wasted resources + UX confusion.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            use tauri::Manager;
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.show();
+                let _ = win.unminimize();
+                let _ = win.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
@@ -798,6 +873,9 @@ pub fn run() {
             get_detections,
             get_settings,
             save_settings,
+            get_developer_status,
+            set_developer_mode,
+            run_benchmark,
             request_challenge_token,
             confirmed_shutdown,
             set_critical_protection,

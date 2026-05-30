@@ -25,6 +25,23 @@ pub struct RestrictedLaunch {
 }
 
 /// Launch a process with a restricted low-integrity token in suspended state.
+///
+/// CONTAINMENT MODEL — read before trusting this for isolation:
+/// The restricted token is derived from sandboxd's OWN token via
+/// `CreateRestrictedToken(DISABLE_MAX_PRIVILEGE)` with no restricting/deny SIDs.
+/// sandboxd is spawned by the LocalSystem daemon, so that base token is SYSTEM:
+/// the result is "SYSTEM with privileges disabled + low integrity", NOT an
+/// identity-isolated low-privilege principal — the sample still runs under the
+/// SYSTEM SID + admin groups. The **Job Object** (`KILL_ON_JOB_CLOSE`, no
+/// breakaway, memory cap) + network block + low integrity are the REAL
+/// containment; the token only reduces privilege, not identity.
+///
+/// On any token-setup failure this FAILS OPEN to `launch_unrestricted` (full
+/// token), flagged `containment_degraded` by the caller — still Job-contained.
+///
+/// v1.0 hardening (tracked in HANDOFF): run sandboxd under a dedicated
+/// low-privilege account, or add restricting SIDs, so the sample is identity-
+/// isolated and not merely privilege-disabled SYSTEM.
 pub fn launch_restricted(sample: &Path) -> RestrictedLaunch {
     let mut errors = Vec::new();
 

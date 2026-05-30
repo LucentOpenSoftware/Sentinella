@@ -33,9 +33,62 @@ impl IocDatabase {
     /// Load hashes from a text file (one SHA-256 per line).
     /// Lines starting with '#' are comments. Empty lines are skipped.
     /// Can be called multiple times — each call replaces the previous set.
+    ///
+    /// Supply-chain hardened: the IOC file is rejected if it (or any of its
+    /// parent components) is a symlink/junction — an attacker swapping a real
+    /// IOC list for a symlink could otherwise redirect the load at an
+    /// arbitrary file (DoS via huge text file, or controlled hash poisoning
+    /// to whitelist their own samples). A per-file size cap bounds RAM.
     pub fn load_from_file(&self, path: &Path) -> Result<u64, String> {
-        let content = std::fs::read_to_string(path)
+        // 16 MiB — a SHA-256 hex line is 65 bytes; that's still ~250k entries.
+        const MAX_IOC_FILE_BYTES: u64 = 16 * 1024 * 1024;
+        // After read, also cap effective parsed content to keep RAM bounded.
+        const MAX_IOC_CONTENT_BYTES: usize = 8 * 1024 * 1024;
+
+        let meta = std::fs::symlink_metadata(path)
+            .map_err(|e| format!("Cannot stat IOC file {}: {e}", path.display()))?;
+        if meta.file_type().is_symlink() {
+            return Err(format!(
+                "Refusing IOC file {} — path is a symlink",
+                path.display()
+            ));
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::FileTypeExt;
+            let ft = meta.file_type();
+            if ft.is_symlink_dir() || ft.is_symlink_file() {
+                return Err(format!(
+                    "Refusing IOC file {} — path is a Windows junction/symlink",
+                    path.display()
+                ));
+            }
+        }
+        if meta.len() > MAX_IOC_FILE_BYTES {
+            return Err(format!(
+                "Refusing IOC file {} — size {} exceeds cap {}",
+                path.display(),
+                meta.len(),
+                MAX_IOC_FILE_BYTES
+            ));
+        }
+
+        let mut content = std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read IOC file {}: {e}", path.display()))?;
+        if content.len() > MAX_IOC_CONTENT_BYTES {
+            tracing::warn!(
+                path = %path.display(),
+                bytes = content.len(),
+                cap = MAX_IOC_CONTENT_BYTES,
+                "Truncating oversized IOC content"
+            );
+            // Truncate on a UTF-8 char boundary to avoid panicking.
+            let mut cut = MAX_IOC_CONTENT_BYTES;
+            while cut > 0 && !content.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            content.truncate(cut);
+        }
 
         let mut hashes = HashSet::new();
         for line in content.lines() {
@@ -66,13 +119,26 @@ impl IocDatabase {
     #[allow(dead_code)]
     pub fn add_hash(&self, sha256: &str) {
         let lower = sha256.to_lowercase();
-        if lower.len() == 64 {
-            self.sha256_blocklist
+        // Match the load_from_file validation: SHA-256 hex must be exactly 64
+        // chars of [0-9a-f]. Without the hex check, callers could insert
+        // garbage strings (e.g. "ZZ..." or partially-truncated logs) that
+        // would never match a real file hash but would inflate count() and
+        // sit forever in the HashSet.
+        if lower.len() == 64 && lower.chars().all(|c| c.is_ascii_hexdigit()) {
+            // Bug fix: only bump the count when insert actually added a new
+            // entry. The previous unconditional fetch_add inflated `len()`
+            // every time a known IOC was re-added (re-load, dedup, repeat
+            // detection of the same hash), leaving the reported count drifting
+            // higher than the real HashSet size.
+            let inserted = self
+                .sha256_blocklist
                 .write()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(lower);
-            self.count
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if inserted {
+                self.count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
 

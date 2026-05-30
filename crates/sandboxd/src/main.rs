@@ -429,12 +429,15 @@ fn launch_and_monitor(
     // ── Create Job Object for process containment ─────
     let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
     if job.is_null() {
+        // Fail CLOSED: no Job Object means no kill-on-close containment, so we
+        // must NOT detonate. (Do not "fall through to monitoring" — an
+        // uncontained malware process could orphan children that survive
+        // sandboxd exit.)
         errors.push("Failed to create Job Object".into());
         return LaunchResult {
             status: SandboxStatus::Error,
             backend_used: "none".into(),
         };
-        // Fall through without containment — still useful for monitoring.
     } else {
         // Configure limits: kill on close + memory cap + no child breakaway.
         let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
@@ -575,7 +578,18 @@ fn launch_and_monitor(
 
     // Resume only after job containment and best-effort network block.
     // ── ETW behavioral monitoring (runs in parallel with process) ──
-    let sandbox_dir = sample.parent().unwrap_or(Path::new(".")).to_path_buf();
+    // R9-LETHAL pattern: NEVER fall back to CWD when resolving where ETW
+    // behavioural logs land. Sandboxd is spawned by the daemon (SYSTEM) and a
+    // bare-filename `sample` would otherwise dump telemetry to whatever CWD the
+    // parent inherited — potentially user-writable. Use the per-process temp
+    // dir instead, which is bounded to the sandboxd user profile.
+    let sandbox_dir = sample
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("sentinella-sandbox-{}", std::process::id()))
+        });
     let etw_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let etw_timeout = timeout;
     let etw_dir = sandbox_dir.clone();

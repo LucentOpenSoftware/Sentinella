@@ -31,7 +31,7 @@
 //! ```
 
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use tracing::{debug, info, warn};
 
@@ -45,12 +45,15 @@ const MAX_FINDINGS_PER_FILE: usize = 20;
 
 /// The compiled YARA rule engine.
 pub struct YaraEngine {
-    /// Compiled rules — behind RwLock for hot-reload.
-    rules: RwLock<Option<yara_x::Rules>>,
+    /// Compiled rules — behind RwLock for hot-reload. Arc lets scan()
+    /// release the lock immediately so writers (reload) are not starved
+    /// by long scans.
+    rules: RwLock<Option<Arc<yara_x::Rules>>>,
     /// Number of rules currently loaded.
     rule_count: std::sync::atomic::AtomicU64,
-    /// Source directories for rule files.
-    rule_dirs: Vec<PathBuf>,
+    /// Source directories for rule files. RwLock so reload() can be invoked
+    /// through Arc<YaraEngine> without needing &mut self.
+    rule_dirs: RwLock<Vec<PathBuf>>,
 }
 
 impl YaraEngine {
@@ -59,7 +62,7 @@ impl YaraEngine {
         Self {
             rules: RwLock::new(None),
             rule_count: std::sync::atomic::AtomicU64::new(0),
-            rule_dirs: Vec::new(),
+            rule_dirs: RwLock::new(Vec::new()),
         }
     }
 
@@ -76,6 +79,10 @@ impl YaraEngine {
     /// On failure, the previous rule set is preserved (never leaves the
     /// engine without rules if it previously had them).
     pub fn load_rules(&self, dirs: &[PathBuf]) -> Result<u64, String> {
+        // R3-12: remember dirs for reload() so callers don't have to wire
+        // both load_rules + set_rule_dirs.
+        self.set_rule_dirs(dirs.to_vec());
+
         let mut compiler = yara_x::Compiler::new();
         let mut file_count = 0u64;
         let mut errors = Vec::new();
@@ -139,7 +146,7 @@ impl YaraEngine {
                 warn!("YARA rules RwLock poisoned — recovering");
                 e.into_inner()
             });
-            *guard = Some(compiled);
+            *guard = Some(Arc::new(compiled));
         }
 
         self.rule_count
@@ -170,6 +177,9 @@ impl YaraEngine {
     /// generation can exhaust the default 1 MB stack. This method spawns
     /// a dedicated thread with 8 MB stack for the compilation phase.
     pub fn load_rules_on_large_stack(&self, dirs: &[PathBuf]) -> Result<u64, String> {
+        // R3-12: remember dirs for reload().
+        self.set_rule_dirs(dirs.to_vec());
+
         // Collect rule sources on the current thread (cheap I/O).
         let mut all_sources: Vec<(String, String)> = Vec::new(); // (namespace, source)
         for dir in dirs {
@@ -235,7 +245,7 @@ impl YaraEngine {
                 warn!("YARA rules RwLock poisoned — recovering");
                 e.into_inner()
             });
-            *guard = Some(compiled);
+            *guard = Some(Arc::new(compiled));
         }
         self.rule_count
             .store(count, std::sync::atomic::Ordering::Relaxed);
@@ -264,15 +274,21 @@ impl YaraEngine {
 
     /// Hot-reload rules from the previously configured directories.
     pub fn reload(&self) -> Result<u64, String> {
-        if self.rule_dirs.is_empty() {
+        let dirs = self
+            .rule_dirs
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if dirs.is_empty() {
             return Err("No rule directories configured".into());
         }
-        self.load_rules(&self.rule_dirs.clone())
+        self.load_rules(&dirs)
     }
 
     /// Set the rule directories for future reload calls.
-    pub fn set_rule_dirs(&mut self, dirs: Vec<PathBuf>) {
-        self.rule_dirs = dirs;
+    pub fn set_rule_dirs(&self, dirs: Vec<PathBuf>) {
+        let mut g = self.rule_dirs.write().unwrap_or_else(|e| e.into_inner());
+        *g = dirs;
     }
 
     /// Scan a byte buffer against the compiled YARA rules.
@@ -292,15 +308,19 @@ impl YaraEngine {
             return vec![];
         }
 
-        let guard = self.rules.read().unwrap_or_else(|e| {
-            warn!("YARA rules RwLock poisoned — recovering");
-            e.into_inner()
-        });
-
-        let rules = match guard.as_ref() {
-            Some(r) => r,
-            None => return vec![], // No rules loaded.
+        // R3-13: clone the Arc<Rules> and drop the read lock immediately so
+        // a concurrent reload() writer is not starved waiting for this scan.
+        let rules_arc = {
+            let guard = self.rules.read().unwrap_or_else(|e| {
+                warn!("YARA rules RwLock poisoned — recovering");
+                e.into_inner()
+            });
+            match guard.as_ref() {
+                Some(r) => Arc::clone(r),
+                None => return vec![],
+            }
         };
+        let rules = rules_arc.as_ref();
 
         let mut scanner = yara_x::Scanner::new(rules);
         scanner.set_timeout(std::time::Duration::from_secs(10)); // was 30s, reduced
@@ -336,6 +356,18 @@ impl Default for YaraEngine {
 
 // ── Rule match → ARGUS Finding translation ────────────────────────
 
+/// Clamp an untrusted YARA `weight` metadata integer into the valid finding
+/// range `[0, 100]`. yara-x exposes `weight` as a signed i64, and the old
+/// `n as u32` cast turned a negative value into a near-`u32::MAX` weight. A
+/// (3rd-party) rule pack with `weight = -1` or an absurd value would then
+/// overflow the engine's `findings.iter().map(|f| f.weight).sum::<u32>()`
+/// (panic in debug, wrap to a tiny score in release → under-detection).
+/// Clamping at the source keeps every per-finding weight bounded, so the
+/// score sum (≤ MAX_FINDINGS_PER_FILE × 100) can never overflow.
+fn sane_weight(n: i64) -> u32 {
+    n.clamp(0, 100) as u32
+}
+
 /// Translate a YARA rule match into an ARGUS Finding.
 ///
 /// Uses rule metadata (`description`, `severity`, `weight`, `category`)
@@ -366,7 +398,7 @@ fn translate_match(rule: yara_x::Rule<'_, '_>) -> Finding {
             }
             "weight" => {
                 if let yara_x::MetaValue::Integer(n) = value {
-                    weight_val = Some(n as u32);
+                    weight_val = Some(sane_weight(n));
                 }
             }
             "category" => {
@@ -521,8 +553,58 @@ fn humanize_rule_name(name: &str, category: Option<&str>) -> String {
 
 // ── File collection ───────────────────────────────────────────────
 
+/// Supply-chain hardening: reject rule files larger than this. Legitimate
+/// hand-written YARA rule files are well under this; anything bigger is
+/// either a memory-bloat attack or a misconfigured pack.
+const MAX_RULE_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Supply-chain hardening: cap how many rule files we'll load from a single
+/// directory tree. An attacker who can drop files into the rules dir could
+/// otherwise stall the daemon by dumping thousands of empty `.yar` files.
+const MAX_RULE_FILES: usize = 1000;
+
+/// Return true if the file-type entry represents any kind of symbolic link.
+/// On Windows this also covers junctions and symlink-files/dirs, which classic
+/// `is_symlink()` may miss for directory junctions.
+fn is_any_symlink(meta: &std::fs::Metadata) -> bool {
+    let ft = meta.file_type();
+    if ft.is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt;
+        if ft.is_symlink_dir() || ft.is_symlink_file() {
+            return true;
+        }
+    }
+    let _ = ft; // suppress unused on non-windows
+    false
+}
+
 /// Recursively collect `.yar` and `.yara` files from a directory.
+///
+/// Hardened against rule-pack supply-chain attacks:
+///   - rejects symlinks/junctions at the root, at any traversed subdir, and
+///     at each rule file (an attacker swapping a `.yar` for a symlink could
+///     otherwise redirect rule loading at attacker-controlled content outside
+///     the daemon's runtime root);
+///   - enforces a per-file size cap;
+///   - caps total file count.
 fn collect_rule_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    // Refuse if the root itself is a symlink — the whole subtree is then
+    // attacker-relocatable.
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) if is_any_symlink(&meta) => {
+            warn!(path = %dir.display(), "Refusing to load YARA rules — root directory is a symlink/junction");
+            return Err(format!("rule root {} is a symlink", dir.display()));
+        }
+        Ok(_) => {}
+        Err(e) => {
+            return Err(format!("Cannot stat {}: {e}", dir.display()));
+        }
+    }
+
     let mut files = Vec::new();
     collect_recursive(dir, &mut files)?;
     files.sort(); // Deterministic load order.
@@ -540,12 +622,41 @@ fn collect_recursive(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String>
         };
         let path = entry.path();
 
-        if path.is_dir() {
+        // Reject symlinks/junctions before deciding file vs dir — symlink_metadata
+        // does NOT follow the link, so the check sees the link itself.
+        let lmeta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if is_any_symlink(&lmeta) {
+            warn!(path = %path.display(), "Skipping YARA rule entry — symlink/junction rejected");
+            continue;
+        }
+
+        if lmeta.is_dir() {
             collect_recursive(&path, files)?;
+            if files.len() >= MAX_RULE_FILES {
+                warn!(cap = MAX_RULE_FILES, "YARA rule file cap reached — truncating");
+                files.truncate(MAX_RULE_FILES);
+                return Ok(());
+            }
         } else if let Some(ext) = path.extension() {
             let ext_lower = ext.to_string_lossy().to_lowercase();
             if ext_lower == "yar" || ext_lower == "yara" {
+                if lmeta.len() > MAX_RULE_FILE_BYTES {
+                    warn!(
+                        path = %path.display(),
+                        size = lmeta.len(),
+                        cap = MAX_RULE_FILE_BYTES,
+                        "Skipping oversized YARA rule file"
+                    );
+                    continue;
+                }
                 files.push(path);
+                if files.len() >= MAX_RULE_FILES {
+                    warn!(cap = MAX_RULE_FILES, "YARA rule file cap reached — truncating");
+                    return Ok(());
+                }
             }
         }
     }
@@ -603,6 +714,19 @@ mod tests {
         assert!(findings[0].description.contains("ARGUS"));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sane_weight_clamps_untrusted_metadata() {
+        assert_eq!(sane_weight(30), 30);
+        assert_eq!(sane_weight(0), 0);
+        assert_eq!(sane_weight(100), 100);
+        // Negative → 0 (old `as u32` made this ~4.29 billion → score overflow).
+        assert_eq!(sane_weight(-1), 0);
+        assert_eq!(sane_weight(i64::MIN), 0);
+        // Absurdly large → capped at 100.
+        assert_eq!(sane_weight(1_000_000), 100);
+        assert_eq!(sane_weight(i64::MAX), 100);
     }
 
     #[test]

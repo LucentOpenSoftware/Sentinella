@@ -4,13 +4,15 @@
 //! the final scored verdict for every scanned target.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
+use crate::budget::{BudgetTracker, ScanExecutionBudget, TimeoutReason};
 use crate::layers;
 use crate::verdict::*;
 
@@ -172,7 +174,39 @@ impl ArgusEngine {
     /// 2. Computes SHA-256 hash
     /// 3. Runs all enabled analysis layers
     /// 4. Aggregates findings into a scored verdict
+    ///
+    /// Uses the default `ScanExecutionBudget::manual()` budget. For bounded
+    /// scans (realtime, idle, startup), use `analyze_file_with_budget`.
     pub fn analyze_file(&self, path: &Path) -> ArgusVerdict {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let tracker = BudgetTracker::new(ScanExecutionBudget::manual(), cancel);
+        self.analyze_file_with_tracker(path, &tracker)
+    }
+
+    /// Analyze a file with a caller-supplied execution budget.
+    ///
+    /// The tracker enforces total wall-clock time across all phases and
+    /// records `TimeoutReason` evidence when a phase is skipped because the
+    /// total budget is exhausted. Per-phase budgets (YARA) are also enforced
+    /// where the engine has phase boundaries.
+    pub fn analyze_file_with_budget(
+        &self,
+        path: &Path,
+        budget: ScanExecutionBudget,
+    ) -> ArgusVerdict {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let tracker = BudgetTracker::new(budget, cancel);
+        self.analyze_file_with_tracker(path, &tracker)
+    }
+
+    /// Analyze a file with a caller-managed `BudgetTracker`. Use this when
+    /// the caller needs to share a cancellation flag or inspect timeout
+    /// evidence after the scan returns.
+    pub fn analyze_file_with_tracker(
+        &self,
+        path: &Path,
+        tracker: &BudgetTracker,
+    ) -> ArgusVerdict {
         let start = Instant::now();
         let path_str = path.to_string_lossy().to_string();
 
@@ -206,6 +240,39 @@ impl ArgusEngine {
             return self.empty_verdict(&path_str, start);
         }
 
+        // ☠️ TOCTOU hardening: open the file with restricted Windows sharing
+        // semantics (FILE_SHARE_READ only — NO write, NO delete/rename), then
+        // hold the handle in `_scan_lock` for the full scan. The path that
+        // subsequent layers (notably `authenticode::analyze_with_discount` →
+        // WinVerifyTrust + extract_signer) re-open by name now refers to a
+        // file an attacker can no longer swap or rename mid-scan, closing the
+        // hash-then-verify race that previously let a poisoned `trusted_cache`
+        // entry persist (sha256(malicious) cached with score=0 + "Trusted"
+        // label because authenticode raced against benign_signed.exe). On Unix
+        // share modes don't exist (and WinVerifyTrust doesn't either, so the
+        // attack chain is Windows-only) — fall back to plain read.
+        #[cfg(target_os = "windows")]
+        let (data, _scan_lock) = {
+            use std::io::Read as _;
+            use std::os::windows::fs::OpenOptionsExt;
+            // FILE_SHARE_READ = 0x1 (no FILE_SHARE_WRITE 0x2, no FILE_SHARE_DELETE 0x4).
+            let mut f = match std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0x1)
+                .open(path)
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    return self.error_verdict(&path_str, start, format!("Read error: {e}"));
+                }
+            };
+            let mut buf = Vec::with_capacity(file_size as usize);
+            if let Err(e) = f.read_to_end(&mut buf) {
+                return self.error_verdict(&path_str, start, format!("Read error: {e}"));
+            }
+            (buf, f) // f kept alive in `_scan_lock`
+        };
+        #[cfg(not(target_os = "windows"))]
         let data = match std::fs::read(path) {
             Ok(d) => d,
             Err(e) => {
@@ -273,8 +340,13 @@ impl ArgusEngine {
         }
 
         // Layer: PE/ELF structural analysis.
+        // Total-budget gate — if we've already burned the wall-clock budget
+        // on earlier I/O or hashing of a giant file, record evidence and
+        // skip. A skipped phase is NOT failure; it's data for convergence.
         let is_pe = data.len() >= 2 && data[0] == 0x4D && data[1] == 0x5A;
-        if is_pe {
+        if tracker.is_expired() {
+            tracker.record_timeout(TimeoutReason::StructuralTimeout);
+        } else if is_pe {
             if let Ok(pe) = goblin::pe::PE::parse(&data) {
                 if self.config.pe_heuristics {
                     findings.extend(layers::pe_heuristics::analyze(&pe, &data));
@@ -314,28 +386,56 @@ impl ArgusEngine {
 
         // Layer: YARA rule engine (runs compiled rules against buffer).
         // Skip YARA for SignatureOnly strategy (media, firmware, large blobs).
+        // Enforces both the total wall-clock budget and the per-phase
+        // `max_yara_duration` — a pathological rule that runs for tens of
+        // seconds gets recorded as `YaraTimeout` (suspicion weight 5).
         let yara_start = Instant::now();
-        if strategy == ScanStrategy::FullAnalysis || strategy == ScanStrategy::LightAnalysis {
+        let yara_phase_budget = tracker.budget().max_yara_duration;
+        if tracker.is_expired() {
+            tracker.record_timeout(TimeoutReason::TotalTimeout);
+        } else if strategy == ScanStrategy::FullAnalysis
+            || strategy == ScanStrategy::LightAnalysis
+        {
             findings.extend(self.yara.scan(&data));
+            if tracker.phase_expired(yara_start, yara_phase_budget) {
+                tracker.record_timeout(TimeoutReason::YaraTimeout);
+            }
         }
         let yara_us = yara_start.elapsed().as_micros() as u64;
 
         // Layer: Authenticode signature verification (Windows PE only).
+        // PERF: one call (`analyze_with_discount`) collapses what used to be
+        // `analyze` + `signature_discount` — each of which called the expensive
+        // WinVerifyTrust + cert-chain walk independently (2-3 calls/file).
         let mut authenticode_discount: u32 = 0;
         if is_pe {
-            findings.extend(layers::authenticode::analyze(path));
-            authenticode_discount = layers::authenticode::signature_discount(path);
+            if tracker.is_expired() {
+                tracker.record_timeout(TimeoutReason::TotalTimeout);
+            } else {
+                let (ac_findings, discount) = layers::authenticode::analyze_with_discount(path);
+                findings.extend(ac_findings);
+                authenticode_discount = discount;
+            }
         }
 
         // Layer: Software reputation — recognizes known publishers.
-        findings.extend(layers::reputation::analyze(&path_str, &data));
-        let reputation_discount = layers::reputation::reputation_discount(&path_str, &data);
+        // PERF: one call (`analyze_with_discount`) collapses what used to be
+        // `analyze` + `reputation_discount` — each of which scanned the file
+        // buffer for ~11 UTF-16 publisher strings independently (3 scans/file).
+        let (rep_findings, reputation_discount) =
+            layers::reputation::analyze_with_discount(&path_str, &data);
+        findings.extend(rep_findings);
 
         // ── Installer framework detection ──────────────────────
         // NSIS, InnoSetup, WiX, Electron installers are expected to have
         // compressed data, few imports, large overlays, temp extraction,
         // and download capabilities. These are NOT suspicious in an installer.
-        let installer_detected_early = is_pe && is_known_installer(&data, &path_str);
+        // Compute once and reuse — is_known_installer scans the buffer for
+        // multiple signatures (NSIS, InnoSetup, WiX, Electron); running it
+        // twice per file (once here, once during aggregation below) doubled
+        // the cost for every PE.
+        let installer_detected = is_pe && is_known_installer(&data, &path_str);
+        let installer_detected_early = installer_detected;
         if installer_detected_early {
             for f in &mut findings {
                 match f.layer {
@@ -396,7 +496,7 @@ impl ArgusEngine {
         }
 
         // ── Aggregate score + build explanation ────────────────
-        let installer_detected = is_pe && is_known_installer(&data, &path_str);
+        // installer_detected was computed above — reuse instead of re-scanning.
         let (score, verdict, explanation) = aggregate_score(
             &mut findings,
             reputation_discount,
@@ -407,10 +507,12 @@ impl ArgusEngine {
         let elapsed_us = elapsed.as_micros() as u64;
 
         // ── Record event for correlation ──────────────────────
-        let event_type = if score >= 76 {
+        // Surface the full suspicious middle band (26..=75) to the correlator
+        // so directory-level burst detection can count partial-confidence hits,
+        // not just Malicious (>=76). Low-suspicion noise (1..=25) still maps
+        // to ScannedClean to avoid drowning the correlator in benign chatter.
+        let event_type = if score >= 26 {
             crate::correlation::EventType::ScannedSuspicious
-        } else if score > 0 {
-            crate::correlation::EventType::ScannedClean // Suspicious but not threat-level.
         } else {
             crate::correlation::EventType::ScannedClean
         };
@@ -422,10 +524,24 @@ impl ArgusEngine {
             .fetch_add(findings.len() as u64, Ordering::Relaxed);
         self.total_analysis_time_us
             .fetch_add(elapsed_us, Ordering::Relaxed);
-        if matches!(verdict, Verdict::Malicious) {
-            self.threats_detected.fetch_add(1, Ordering::Relaxed);
-        } else if score == 0 {
-            self.clean_files.fetch_add(1, Ordering::Relaxed);
+        // Stat buckets are keyed on the *final* verdict, not the raw score:
+        //   Clean                       → clean_files
+        //   Malicious | HighSuspicion   → threats_detected
+        //   everything else             → uncounted (matches prior
+        //                                 "neither bucket" semantics for
+        //                                 LowSuspicion / PUA / Suspicious).
+        // The previous gate (`score == 0`) silently dropped files with
+        // score 1..=75 from both buckets while still bumping
+        // `files_analyzed`, making the clean/threats sum drift below the
+        // analyzed total.
+        match verdict {
+            Verdict::Clean => {
+                self.clean_files.fetch_add(1, Ordering::Relaxed);
+            }
+            Verdict::Malicious | Verdict::HighSuspicion => {
+                self.threats_detected.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
         }
 
         // Only log files with findings to avoid flooding logs during large scans.
@@ -513,10 +629,11 @@ impl ArgusEngine {
             findings.extend(layers::patterns::analyze(name, data));
         }
 
-        let raw_score: u32 = findings.iter().map(|f| f.weight).sum();
-        let score = raw_score.min(MAX_SCORE);
-        findings.sort_by(|a, b| b.weight.cmp(&a.weight));
-        let verdict = Verdict::from_score(score);
+        // Route through the unified scoring contract so buffer scans share
+        // dedup, per-category caps, convergence, and explanation with file
+        // scans. Reputation and Authenticode are path-only signals, so they
+        // pass through as 0 here.
+        let (score, verdict, explanation) = aggregate_score(&mut findings, 0, 0, false);
 
         ArgusVerdict {
             path: name.to_string(),
@@ -529,7 +646,7 @@ impl ArgusEngine {
             analysis_time_us: start.elapsed().as_micros() as u64,
             engine_version: ENGINE_VERSION,
             timestamp: chrono::Utc::now().timestamp(),
-            explanation: default_explanation(),
+            explanation,
             timing: None,
         }
     }
@@ -943,7 +1060,17 @@ fn is_known_installer(data: &[u8], path: &str) -> bool {
     let has_nsis = contains(b"Nullsoft Inst") || contains(b"NullsoftInst");
     let has_inno = contains(b"Inno Setup S") || contains(b"InnoSetupLdr");
     let has_wix = contains(b"Windows Installer");
-    let has_msi = data.len() >= 8 && data[0..8] == [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+    // MSI is an OLE2 compound file — but so are legacy Office docs
+    // (.doc/.xls/.ppt) and many other formats. Treating bare OLE2 magic as an
+    // "installer" handed every macro-laden Office document a structural+YARA
+    // detection discount (a false-negative vector for macro droppers). Require
+    // an actual MSI indicator: the .msi extension or an MSI-specific marker.
+    let is_ole2 =
+        data.len() >= 8 && data[0..8] == [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+    let has_msi = is_ole2
+        && (path.to_lowercase().ends_with(".msi")
+            || contains(b"Windows Installer")
+            || contains(b"Installation Database"));
     let has_installshield = contains(b"InstallShiel");
     let has_ai = contains(b"Advanced Installer");
 
@@ -1006,9 +1133,21 @@ fn is_known_installer(data: &[u8], path: &str) -> bool {
         return true;
     }
 
-    // Name-only heuristic requires PE header + large size.
+    // Name heuristic. The filename alone is trivially forgeable (rename malware
+    // to "setup.exe" + pad past 2 MB), and the older code granted the discount
+    // on name+size+PE alone — contradicting its own comment about requiring a
+    // marker. Require at least one generic installer body hint (an uninstaller
+    // stub, a CAB/SFX payload). Real installers whose specific framework wasn't
+    // matched above still carry one of these; a bare rename does not.
     let is_pe = data.len() >= 2 && data[0] == 0x4D && data[1] == 0x5A;
-    if has_installer_name && data.len() > 2_000_000 && is_pe {
+    let has_generic_installer_hint = contains(b"uninstall")
+        || contains(b"Uninstall")
+        || contains(b".cab")
+        || contains(b"Cabinet")
+        || contains(b"SFX")
+        || contains(b"7-Zip")
+        || contains(b"setup.ico");
+    if has_installer_name && is_pe && data.len() > 2_000_000 && has_generic_installer_hint {
         return true;
     }
     false
@@ -1049,6 +1188,56 @@ fn check_non_pe_packers(data: &[u8], findings: &mut Vec<Finding>) {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn ole2_office_doc_is_not_treated_as_installer() {
+        // OLE2 compound-file magic — shared by legacy .doc/.xls AND .msi.
+        let mut ole2 = vec![0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+        ole2.extend_from_slice(b"macro payload here, no installer markers");
+
+        // A .doc with bare OLE2 magic must NOT get installer trust (else macro
+        // droppers receive a structural+YARA detection discount).
+        assert!(
+            !is_known_installer(&ole2, "C:\\Users\\me\\invoice.doc"),
+            "bare OLE2 doc must not be treated as an installer"
+        );
+
+        // A real MSI (by extension) still gets installer treatment.
+        assert!(
+            is_known_installer(&ole2, "C:\\Downloads\\app-setup.msi"),
+            ".msi must still be recognized as an installer"
+        );
+
+        // An MSI-specific content marker also qualifies regardless of name.
+        let mut msi_marker = vec![0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+        msi_marker.extend_from_slice(b"...Windows Installer...");
+        assert!(is_known_installer(&msi_marker, "x.bin"));
+
+        // NSIS content marker still works (unchanged path).
+        let nsis = b"MZ........Nullsoft Inst........".to_vec();
+        assert!(is_known_installer(&nsis, "whatever.exe"));
+    }
+
+    #[test]
+    fn name_only_installer_requires_content_hint() {
+        // Malware renamed "setup.exe" + padded past 2 MB, PE header, but NO
+        // installer body hint → must NOT earn the installer discount.
+        let mut padded = vec![0u8; 2_000_064];
+        padded[0] = 0x4D; // 'M'
+        padded[1] = 0x5A; // 'Z'
+        assert!(
+            !is_known_installer(&padded, "C:\\Users\\me\\Downloads\\setup.exe"),
+            "name+size alone must not grant installer trust (rename bypass)"
+        );
+
+        // Same file with a generic installer hint (uninstaller stub) → trusted.
+        let mut real = padded.clone();
+        real.extend_from_slice(b"uninstall.exe");
+        assert!(
+            is_known_installer(&real, "C:\\Users\\me\\Downloads\\setup.exe"),
+            "named installer with an uninstaller stub should be recognized"
+        );
+    }
 
     #[test]
     fn test_clean_text_file() {
@@ -1387,12 +1576,21 @@ mod tests {
         inno_data.extend_from_slice(b"Inno Setup S");
         assert!(is_known_installer(&inno_data, "test.exe"));
 
-        // Filename-based detection requires large PE file (>2MB with MZ header).
+        // Filename-based detection: large PE + installer name + a generic
+        // installer body hint (real installers ship an uninstaller stub).
         let mut large_data = vec![0u8; 3_000_000];
         large_data[0] = 0x4D; // M
         large_data[1] = 0x5A; // Z
+        large_data.extend_from_slice(b"uninstall");
         assert!(is_known_installer(&large_data, "Notion Setup 7.6.1.exe"));
         assert!(is_known_installer(&large_data, "git-2.53.0-installer.exe"));
+
+        // Name + size + PE but NO installer body hint → NOT detected.
+        // Closes the trivial "rename malware to setup.exe and pad to 2 MB" bypass.
+        let mut renamed = vec![0u8; 3_000_000];
+        renamed[0] = 0x4D;
+        renamed[1] = 0x5A;
+        assert!(!is_known_installer(&renamed, "setup.exe"));
 
         // Large non-PE with installer name → NOT detected (prevents FP on archives).
         let large_non_pe = vec![0u8; 3_000_000];

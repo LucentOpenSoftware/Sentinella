@@ -87,8 +87,21 @@ pub fn analyze_path(path: &str) -> Vec<Finding> {
         }
     }
 
-    // Filenames with many spaces before the real extension (hiding it).
-    if name.contains("                ") && EXECUTABLE_EXTENSIONS.contains(&ext.as_str()) {
+    // Filenames with many whitespace chars before the real extension (hiding it).
+    // Count any Unicode whitespace (tab, NBSP, U+2000-U+200B, etc) so attackers
+    // can't bypass the heuristic with non-ASCII spacing.
+    let ws_run = name
+        .chars()
+        .fold((0usize, 0usize), |(cur, max), c| {
+            if c.is_whitespace() {
+                let n = cur + 1;
+                (n, max.max(n))
+            } else {
+                (0, max)
+            }
+        })
+        .1;
+    if ws_run >= 16 && EXECUTABLE_EXTENSIONS.contains(&ext.as_str()) {
         findings.push(Finding {
             layer: Layer::FileDeception,
             severity: Severity::High,

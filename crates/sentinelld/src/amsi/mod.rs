@@ -210,7 +210,6 @@ pub fn runtime_profile() -> argus::profile::ScanProfile {
         max_archive_depth: 0,
         max_extracted_bytes: 0,
         downgrade_transient: false,
-        downgrade_large: false,
         pe_min_size_bytes: 0,
     }
 }

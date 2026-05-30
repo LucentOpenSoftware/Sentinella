@@ -105,16 +105,12 @@ pub fn analyze(path: &str, data: &[u8]) -> Vec<Finding> {
         });
     }
 
-    if has_mz && has_pk {
-        // This is sometimes legitimate (self-extracting archives), but worth noting.
-        findings.push(Finding {
-            layer: Layer::FileDeception,
-            severity: Severity::Low,
-            weight: 5,
-            description: "File contains both executable and archive signatures.".into(),
-            technical_detail: Some("Both MZ (PE) and PK (ZIP) headers detected".into()),
-        });
-    }
+    // NOTE: a real MZ+PK polyglot (self-extracting ZIP) does NOT have PK at
+    // offset 0 — it lives in the overlay after the PE image. The previous
+    // `has_mz && has_pk` check required both signatures at offset 0, which is
+    // structurally impossible, so the branch was dead. Detecting overlay-ZIP
+    // requires scanning past `pe.size_of_image` for the ZIP EOCD record; left
+    // unimplemented here to avoid false positives on every NSIS/InnoSetup file.
 
     findings
 }

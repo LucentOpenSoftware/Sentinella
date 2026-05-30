@@ -213,23 +213,58 @@ impl PathManager {
 /// Installed mode:   `C:\ProgramData\Sentinella\` (Windows)
 ///                   `/var/lib/sentinella/` (Linux)
 fn detect_root() -> PathBuf {
-    // Check if we're in development mode (Cargo.toml exists in CWD or parent).
-    if let Ok(cwd) = std::env::current_dir() {
-        if cwd.join("Cargo.toml").exists() || cwd.join("crates").exists() {
-            let dev_root = cwd.join("runtime");
-            tracing::info!(root = %dev_root.display(), "PathManager: development mode");
-            return dev_root;
+    // ☠️ R5-LETHAL: previously a 1-byte `Cargo.toml` placed in CWD would
+    // flip the daemon into "development mode" and relocate the ENTIRE
+    // data root (config, IPC secret, vault key, YARA rules, signatures)
+    // to `CWD/runtime/`. Any time the daemon was launched with a CWD an
+    // attacker could pre-seed (a user-writable Downloads/Public folder,
+    // a shortcut with a custom "Start in" field, a manual `cd && run`
+    // for testing), the attacker owned every AV artifact.
+    //
+    // Hardening:
+    //   1. Dev mode requires the explicit env var SENTINELLA_DEV=1.
+    //   2. Even then, the Cargo.toml is parsed and must contain the
+    //      `name = "sentinelld"` package — so an attacker-planted stub
+    //      file cannot trip the heuristic.
+    //   3. Portable mode (runtime/ next to the exe) is only honored when
+    //      the exe lives in a path that is NOT a generally user-writable
+    //      directory (rules out dropping sentinelld.exe + runtime/ into
+    //      a Public folder for elevation-by-launch).
+    let dev_requested = std::env::var("SENTINELLA_DEV")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    if dev_requested {
+        if let Ok(cwd) = std::env::current_dir() {
+            let manifest = cwd.join("Cargo.toml");
+            if manifest.exists()
+                && std::fs::read_to_string(&manifest)
+                    .ok()
+                    .map(|c| c.contains("name = \"sentinelld\"") || c.contains("name = \"sentinella\""))
+                    .unwrap_or(false)
+            {
+                let dev_root = cwd.join("runtime");
+                tracing::info!(root = %dev_root.display(), "PathManager: development mode (SENTINELLA_DEV=1)");
+                return dev_root;
+            }
+            tracing::warn!(
+                "SENTINELLA_DEV set but CWD has no sentinelld Cargo.toml — refusing dev mode"
+            );
         }
     }
 
     // Check if exe is in a known install location.
     if let Ok(exe) = std::env::current_exe() {
         if let Some(exe_dir) = exe.parent() {
-            // Installed alongside the exe.
             let runtime = exe_dir.join("runtime");
-            if runtime.exists() {
+            if runtime.exists() && is_trusted_install_dir(exe_dir) {
                 tracing::info!(root = %runtime.display(), "PathManager: portable mode");
                 return runtime;
+            }
+            if runtime.exists() {
+                tracing::warn!(
+                    exe_dir = %exe_dir.display(),
+                    "found runtime/ next to exe but exe is in a user-writable location — refusing portable mode"
+                );
             }
         }
     }
@@ -249,6 +284,47 @@ fn detect_root() -> PathBuf {
         tracing::info!(root = %root.display(), "PathManager: installed mode");
         root
     }
+}
+
+/// True when `dir` is a path we treat as administratively-protected, i.e.
+/// not a directory unprivileged users can write to. Used so we refuse to
+/// honor `runtime/` next to the exe if the exe itself was dropped into a
+/// user-writable location.
+fn is_trusted_install_dir(dir: &Path) -> bool {
+    let s = dir.to_string_lossy().to_lowercase();
+
+    // Explicit deny: classic user-writable roots. Anyone able to drop
+    // sentinelld.exe + a runtime/ tree here must NOT be able to coerce
+    // a future launch into trusting that tree.
+    const USER_WRITABLE_PREFIXES: &[&str] = &[
+        "\\users\\public\\",
+        "\\users\\default\\",
+        "\\windows\\temp\\",
+        "\\temp\\",
+        "\\tmp\\",
+        "\\appdata\\local\\temp\\",
+        "\\downloads\\",
+        "\\desktop\\",
+        "\\$recycle.bin\\",
+        "\\perflogs\\",
+    ];
+    for bad in USER_WRITABLE_PREFIXES {
+        if s.contains(bad) {
+            return false;
+        }
+    }
+
+    // Anything under a user's own profile (C:\Users\<name>\...) is per-user
+    // writable. Trust only the system install roots.
+    let trusted = s.contains("\\program files\\")
+        || s.contains("\\program files (x86)\\")
+        || s.contains("\\programdata\\sentinella")
+        || s.starts_with("/opt/")
+        || s.starts_with("/usr/local/")
+        || s.starts_with("/usr/lib/")
+        || s.starts_with("/var/lib/");
+
+    trusted
 }
 
 #[cfg(test)]
@@ -341,5 +417,47 @@ mod tests {
     fn vault_key_path_under_state() {
         let p = pm("X:\\runtime");
         assert!(p.vault_integrity_key().starts_with("X:\\runtime\\state"));
+    }
+
+    // ── R5-LETHAL regression tests ──────────────────────────
+
+    #[test]
+    fn r5_lethal_user_writable_dirs_not_trusted() {
+        // None of these should ever be treated as trusted install dirs —
+        // dropping `sentinelld.exe + runtime/` there must NOT switch the
+        // root to that user-writable tree.
+        let bad = [
+            "C:\\Users\\Public\\Downloads\\app",
+            "C:\\Users\\Public\\Desktop",
+            "C:\\Users\\victim\\Downloads",
+            "C:\\Windows\\Temp\\drop",
+            "C:\\Temp\\app",
+            "C:\\PerfLogs\\thing",
+            "C:\\Users\\me\\Desktop\\portable",
+        ];
+        for b in &bad {
+            assert!(
+                !is_trusted_install_dir(Path::new(b)),
+                "must REFUSE to trust user-writable install dir: {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn r5_lethal_real_install_dirs_trusted() {
+        let good = [
+            "C:\\Program Files\\Sentinella",
+            "C:\\Program Files (x86)\\Sentinella",
+            "C:\\ProgramData\\Sentinella",
+            "/opt/sentinella",
+            "/usr/local/sentinella",
+            "/var/lib/sentinella",
+        ];
+        for g in &good {
+            assert!(
+                is_trusted_install_dir(Path::new(g)),
+                "should trust real install dir: {g}"
+            );
+        }
     }
 }

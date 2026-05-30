@@ -77,13 +77,17 @@ pub fn analyze(path: &Path, existing_score: u32) -> Vec<Finding> {
     }
 
     // ── Mark-of-the-Web (Zone.Identifier ADS) ──────────────
+    // PERF: read the ADS once and lowercase once — both the zone-ID check and
+    // the monetizer/referrer scan reuse the same buffer.
     #[cfg(target_os = "windows")]
     {
         let zone_path = format!("{}:Zone.Identifier", path.display());
         if let Ok(zone_data) = std::fs::read_to_string(&zone_path) {
             let zone_lower = zone_data.to_lowercase();
+            let is_internet_zone =
+                zone_lower.contains("zoneid=3") || zone_lower.contains("zoneid=4");
 
-            if zone_lower.contains("zoneid=3") || zone_lower.contains("zoneid=4") {
+            if is_internet_zone {
                 context_weight += 3;
                 context_reasons.push("Downloaded from the internet (Zone.Identifier)".into());
 
@@ -118,16 +122,9 @@ pub fn analyze(path: &Path, existing_score: u32) -> Vec<Finding> {
                     }
                 }
             }
-        }
-    }
 
-    // ── Fake downloader / link monetizer residue ─────────
-    // Zone.Identifier referrers from known monetizer domains.
-    #[cfg(target_os = "windows")]
-    {
-        let zone_path = format!("{}:Zone.Identifier", path.display());
-        if let Ok(zone_data) = std::fs::read_to_string(&zone_path) {
-            let zl = zone_data.to_lowercase();
+            // ── Fake downloader / link monetizer residue ─────────
+            // Zone.Identifier referrers from known monetizer domains.
             let monetizer_domains = [
                 "linkvertise",
                 "adf.ly",
@@ -144,7 +141,7 @@ pub fn analyze(path: &Path, existing_score: u32) -> Vec<Finding> {
                 "work.ink",
                 "adfoc.us",
             ];
-            if monetizer_domains.iter().any(|d| zl.contains(d)) {
+            if monetizer_domains.iter().any(|d| zone_lower.contains(d)) {
                 context_weight += 6;
                 context_reasons
                     .push("Download originated from a link monetizer/redirect service".into());

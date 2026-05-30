@@ -28,6 +28,10 @@ sha2 = "0.10"
 md-5 = "0.10"
 hex = "0.4"
 
+# Multi-pattern byte search for pattern-detection layer (single pass)
+aho-corasick = "1"
+once_cell = "1"
+
 # YARA-X rule engine (pure Rust, BSD-3-Clause)
 yara-x = "1.16"
 

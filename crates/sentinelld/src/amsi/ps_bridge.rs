@@ -140,6 +140,25 @@ impl Drop for PsBridge {
     }
 }
 
+/// Filter a freshly-read batch to events strictly newer than `baseline`,
+/// returned in ASCENDING record-id order, plus the new high-water mark.
+///
+/// Bug fix: `wevtutil /rd:true` returns events newest-first (descending id).
+/// The old loop bumped `last_record_id` to the FIRST event's id (the highest)
+/// and then treated every later (lower-id) event as a duplicate — so only the
+/// single newest script block per poll was ever scanned, and a burst of
+/// scripts between polls was silently dropped. De-dup against the immutable
+/// poll baseline and advance the high-water mark to the batch max instead.
+fn unprocessed_ascending(
+    mut batch: Vec<ScriptBlockEvent>,
+    baseline: u64,
+) -> (Vec<ScriptBlockEvent>, u64) {
+    batch.retain(|e| e.record_id > baseline);
+    let new_last = batch.iter().map(|e| e.record_id).max().unwrap_or(baseline);
+    batch.sort_by_key(|e| e.record_id);
+    (batch, new_last)
+}
+
 /// Background polling loop.
 fn ps_bridge_loop(
     diag: Arc<PsBridgeDiagnostics>,
@@ -161,13 +180,21 @@ fn ps_bridge_loop(
                 if !events.is_empty() {
                     diag.sbl_available.store(true, Ordering::Relaxed);
                 }
-                for evt in events {
-                    if evt.record_id <= last_record_id {
-                        diag.duplicates_skipped.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                    last_record_id = evt.record_id;
-                    diag.last_record_id.store(last_record_id, Ordering::Relaxed);
+                // De-dup against the poll baseline (NOT a running max) and
+                // process oldest-first so every genuinely-new event in the
+                // batch is scanned, regardless of wevtutil's newest-first order.
+                let total = events.len();
+                let baseline = last_record_id;
+                let (batch, new_last) = unprocessed_ascending(events, baseline);
+                let dups = total - batch.len();
+                if dups > 0 {
+                    diag.duplicates_skipped
+                        .fetch_add(dups as u64, Ordering::Relaxed);
+                }
+                last_record_id = new_last;
+                diag.last_record_id.store(last_record_id, Ordering::Relaxed);
+
+                for evt in batch {
                     diag.events_seen.fetch_add(1, Ordering::Relaxed);
 
                     // Skip very small blocks (noise from prompt, single commands).
@@ -325,7 +352,14 @@ fn parse_wevtutil_output(
     text: &str,
     after_record_id: u64,
 ) -> Result<Vec<ScriptBlockEvent>, String> {
-    let mut events = Vec::new();
+    // R3-fix: cap per-script text growth so a multi-MB attacker-controlled
+    // ScriptBlock 4104 event cannot force MB-sized allocations per poll
+    // cycle. 256 KiB is well above any legitimate script we want to scan.
+    const MAX_SCRIPT_BYTES: usize = 256 * 1024;
+    // R3-fix: defensive cap on emitted events per parse pass.
+    const MAX_EVENTS: usize = 64;
+
+    let mut events: Vec<ScriptBlockEvent> = Vec::new();
     let mut current_record_id: u64 = 0;
     let mut current_pid: u32 = 0;
     let mut current_script = String::new();
@@ -333,18 +367,43 @@ fn parse_wevtutil_output(
     let mut current_timestamp: i64 = 0;
     let mut in_script_block = false;
 
+    // Helper: append `s` to `current_script` without exceeding the byte cap,
+    // truncating at a UTF-8 char boundary if necessary.
+    fn capped_push(buf: &mut String, s: &str, cap: usize) {
+        if buf.len() >= cap {
+            return;
+        }
+        let remain = cap - buf.len();
+        if s.len() <= remain {
+            buf.push_str(s);
+        } else {
+            let mut cut = remain;
+            while cut > 0 && !s.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            buf.push_str(&s[..cut]);
+        }
+    }
+
     for line in text.lines() {
         let trimmed = line.trim();
 
         // Record ID.
         if let Some(rest) = trimmed.strip_prefix("RecordId:") {
             // Save previous event if any.
-            if current_record_id > after_record_id && !current_script.is_empty() {
+            if current_record_id > after_record_id
+                && !current_script.is_empty()
+                && events.len() < MAX_EVENTS
+            {
+                // Audit fix: capture length BEFORE `mem::take` empties the
+                // string — struct fields evaluate top-to-bottom, so reading
+                // `current_script.len()` after the take always yielded 0.
+                let script_text_len = current_script.len();
                 events.push(ScriptBlockEvent {
                     record_id: current_record_id,
                     pid: current_pid,
                     script_text: std::mem::take(&mut current_script),
-                    script_text_len: current_script.len(),
+                    script_text_len,
                     script_name: current_name.take(),
                     timestamp: current_timestamp,
                 });
@@ -378,7 +437,7 @@ fn parse_wevtutil_output(
                 .nth(1)
                 .unwrap_or("")
                 .trim();
-            current_script.push_str(content);
+            capped_push(&mut current_script, content, MAX_SCRIPT_BYTES);
             in_script_block = true;
         } else if in_script_block
             && !trimmed.is_empty()
@@ -386,8 +445,8 @@ fn parse_wevtutil_output(
             && !trimmed.starts_with("Path")
             && !trimmed.starts_with("RecordId")
         {
-            current_script.push('\n');
-            current_script.push_str(trimmed);
+            capped_push(&mut current_script, "\n", MAX_SCRIPT_BYTES);
+            capped_push(&mut current_script, trimmed, MAX_SCRIPT_BYTES);
         } else {
             in_script_block = false;
         }
@@ -402,7 +461,10 @@ fn parse_wevtutil_output(
     }
 
     // Save last event.
-    if current_record_id > after_record_id && !current_script.is_empty() {
+    if current_record_id > after_record_id
+        && !current_script.is_empty()
+        && events.len() < MAX_EVENTS
+    {
         let len = current_script.len();
         events.push(ScriptBlockEvent {
             record_id: current_record_id,
@@ -420,6 +482,48 @@ fn parse_wevtutil_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mk_evt(record_id: u64) -> ScriptBlockEvent {
+        ScriptBlockEvent {
+            record_id,
+            pid: 0,
+            script_text: "x".repeat(60),
+            script_text_len: 60,
+            script_name: None,
+            timestamp: 0,
+        }
+    }
+
+    #[test]
+    fn descending_batch_processes_all_new_events() {
+        // wevtutil returns newest-first; last seen = 10. All of 11..=15 are new.
+        let batch = vec![mk_evt(15), mk_evt(14), mk_evt(13), mk_evt(12), mk_evt(11)];
+        let (proc, new_last) = unprocessed_ascending(batch, 10);
+        let ids: Vec<u64> = proc.iter().map(|e| e.record_id).collect();
+        assert_eq!(
+            ids,
+            vec![11, 12, 13, 14, 15],
+            "all 5 new events must be processed in ascending order, not just the newest"
+        );
+        assert_eq!(new_last, 15);
+    }
+
+    #[test]
+    fn already_seen_events_are_dropped() {
+        // last seen = 14 → only 15 is new; 13/14 already processed.
+        let batch = vec![mk_evt(15), mk_evt(14), mk_evt(13)];
+        let (proc, new_last) = unprocessed_ascending(batch, 14);
+        assert_eq!(proc.len(), 1);
+        assert_eq!(proc[0].record_id, 15);
+        assert_eq!(new_last, 15);
+    }
+
+    #[test]
+    fn empty_batch_keeps_baseline() {
+        let (proc, new_last) = unprocessed_ascending(Vec::new(), 42);
+        assert!(proc.is_empty());
+        assert_eq!(new_last, 42, "high-water mark must not regress on an empty poll");
+    }
 
     #[test]
     fn diagnostics_json() {

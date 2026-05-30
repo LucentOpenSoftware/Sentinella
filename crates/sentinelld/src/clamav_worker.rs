@@ -81,7 +81,19 @@ pub fn scan_file(
         .spawn()
         .map_err(|e| format!("clamavd spawn failed: {e}"))?;
 
-    let stdout = child.stdout.take().ok_or("no stdout")?;
+    // Real leak fix: Rust's `Child` Drop is a no-op — it does NOT kill or
+    // wait the spawned process. The previous `child.stdout.take().ok_or("no stdout")?`
+    // early-returned, dropping `child` and orphaning the clamavd process. On
+    // a busy realtime watcher that compounds quickly. Kill+wait before
+    // bubbling up if take() fails.
+    let stdout = match child.stdout.take() {
+        Some(s) => s,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("no stdout".into());
+        }
+    };
     let reader = std::thread::spawn(move || read_limited(stdout, MAX_OUTPUT_BYTES));
     let stderr_reader = child
         .stderr

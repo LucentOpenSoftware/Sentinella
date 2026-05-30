@@ -17,6 +17,47 @@ use std::time::SystemTime;
 const MAX_MEMORY_ENTRIES: usize = 50_000;
 const DB_WRITE_QUEUE_CAP: usize = 4096;
 
+/// ☠️ R6-LETHAL: bytes of file content folded into the cache key.
+/// Without this, the cache key was `(path, size, mtime)` only — and a
+/// user with write access to their own file could overwrite the
+/// contents with malware, pad/truncate to the same size, then restore
+/// the mtime via `SetFileTime()`. The watcher would hit the cache, get
+/// "clean", and skip both ARGUS and ClamAV. Total scanner bypass.
+///
+/// Reading 64KB and SHA-256-hashing it costs ~0.1ms — cheap compared to
+/// the 100-500ms ARGUS scan it would replace, but defeats the trivial
+/// in-place overwrite attack because the attacker now also has to match
+/// the first 64KB of the original benign bytes (which on real PE/ELF
+/// payloads contains code, imports, symbol tables — not just a header).
+const FINGERPRINT_PREFIX_BYTES: usize = 64 * 1024;
+
+/// Truncated SHA-256 stored in the cache. 128 bits is enough to make
+/// brute-force preimage attacks against a single file infeasible while
+/// keeping the on-disk row compact.
+type ContentFingerprint = [u8; 16];
+
+fn compute_content_fingerprint(path: &Path) -> Option<ContentFingerprint> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut buf = vec![0u8; FINGERPRINT_PREFIX_BYTES];
+    let mut total_read = 0;
+    while total_read < FINGERPRINT_PREFIX_BYTES {
+        match file.read(&mut buf[total_read..]) {
+            Ok(0) => break,
+            Ok(n) => total_read += n,
+            Err(_) => return None,
+        }
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(&buf[..total_read]);
+    let digest = hasher.finalize();
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&digest[..16]);
+    Some(out)
+}
+
 /// Cache integrity seed — keyed hash (not cryptographic HMAC) to detect
 /// externally injected/modified cache entries. Uses DefaultHasher (SipHash).
 /// An attacker who runs `sqlite3 scan_cache.db "UPDATE scan_cache SET clean=1"`
@@ -37,7 +78,13 @@ pub fn set_cache_integrity_secret(secret: &[u8]) {
 
 /// Compute integrity hash for a cache entry.
 /// Returns a u64 hash that must match for the entry to be trusted.
-fn cache_entry_hash(path: &std::path::Path, size: u64, mtime: u64, clean: bool) -> u64 {
+fn cache_entry_hash(
+    path: &std::path::Path,
+    size: u64,
+    mtime: u64,
+    clean: bool,
+    content_fp: &ContentFingerprint,
+) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
@@ -49,6 +96,7 @@ fn cache_entry_hash(path: &std::path::Path, size: u64, mtime: u64, clean: bool) 
     size.hash(&mut hasher);
     mtime.hash(&mut hasher);
     clean.hash(&mut hasher);
+    content_fp.hash(&mut hasher);
     secret.hash(&mut hasher); // Double-keyed.
     hasher.finish()
 }
@@ -57,6 +105,10 @@ fn cache_entry_hash(path: &std::path::Path, size: u64, mtime: u64, clean: bool) 
 struct CacheEntry {
     size: u64,
     mtime: u64,
+    /// R6-LETHAL: short content fingerprint folded into the cache key so
+    /// in-place tampering (overwrite + SetFileTime to preserve mtime+size)
+    /// produces a cache miss.
+    content_fp: ContentFingerprint,
     clean: bool,
     sig_generation: u64,
     last_accessed: u64,
@@ -82,6 +134,7 @@ enum DbWrite {
         path: PathBuf,
         size: u64,
         mtime: u64,
+        content_fp: ContentFingerprint,
         clean: bool,
         sig_generation: u64,
     },
@@ -157,6 +210,11 @@ impl ScanCache {
     }
 
     /// Check a file using already-fetched metadata to avoid duplicate stat calls.
+    ///
+    /// R6-LETHAL: validates a short content fingerprint in addition to
+    /// (size, mtime). A user-mode attacker can spoof size+mtime via
+    /// `SetFileTime()` on a file they own, so without the fingerprint
+    /// the cache was a trivial scanner bypass.
     pub fn check_with_metadata(&self, path: &Path, meta: &std::fs::Metadata) -> Option<bool> {
         let size = meta.len();
         let mtime = meta
@@ -166,28 +224,62 @@ impl ScanCache {
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        let mut inner = self.inner.lock().ok()?;
-        inner.access_counter += 1;
-        let current_gen = inner.sig_generation;
-        let current_access = inner.access_counter;
-
-        let result = inner.entries.get(path).and_then(|entry| {
-            if entry.size == size && entry.mtime == mtime && entry.sig_generation == current_gen {
-                Some(entry.clean)
-            } else {
-                None
+        // Quick pre-check: lock, look up by path, compare cheap fields
+        // first. Only compute the fingerprint if cheap fields match —
+        // that way a cache MISS still costs zero file I/O.
+        // Capture `clean` here (under the lock) alongside the fingerprint.
+        // Re-fetching `clean` after the lock is released is a fail-open bug:
+        // if the entry is LRU-evicted in the fingerprint-compute window,
+        // `get(path)` returns None and the old `unwrap_or(true)` reported a
+        // vanished entry as CLEAN → scanner skip. Snapshotting `clean` now
+        // turns an eviction race into a correct cache miss.
+        let (expected_fp, cached_clean, current_access) = {
+            let mut inner = self.inner.lock().ok()?;
+            inner.access_counter += 1;
+            let current_gen = inner.sig_generation;
+            let current_access = inner.access_counter;
+            match inner.entries.get(path) {
+                Some(entry)
+                    if entry.size == size
+                        && entry.mtime == mtime
+                        && entry.sig_generation == current_gen =>
+                {
+                    (entry.content_fp, entry.clean, current_access)
+                }
+                _ => {
+                    inner.misses += 1;
+                    return None;
+                }
             }
-        });
+        };
 
-        if result.is_some() {
-            if let Some(entry) = inner.entries.get_mut(path) {
-                entry.last_accessed = current_access;
+        // Compute fingerprint with lock released.
+        let actual_fp = compute_content_fingerprint(path)?;
+        if actual_fp != expected_fp {
+            // mtime+size matched but content differs → in-place tamper.
+            // Treat as miss; the caller will re-scan.
+            tracing::debug!(
+                path = %path.display(),
+                "scan cache: content fingerprint mismatch — re-scanning (mtime+size preserved tamper attempt?)"
+            );
+            if let Ok(mut inner) = self.inner.lock() {
+                inner.misses += 1;
+                // Drop the stale entry so a future record_with_metadata
+                // does not double-evict.
+                inner.entries.remove(path);
             }
-            inner.hits += 1;
-        } else {
-            inner.misses += 1;
+            return None;
         }
-        result
+
+        // Hit — bump LRU stamp. Return the `clean` value snapshotted under
+        // the first lock; an entry evicted in the race is irrelevant since
+        // we already proved content matches what was cached.
+        let mut inner = self.inner.lock().ok()?;
+        if let Some(entry) = inner.entries.get_mut(path) {
+            entry.last_accessed = current_access;
+        }
+        inner.hits += 1;
+        Some(cached_clean)
     }
 
     /// Record using already-fetched metadata to avoid duplicate stat calls.
@@ -199,6 +291,14 @@ impl ScanCache {
             .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
             .map(|d| d.as_secs())
             .unwrap_or(0);
+
+        // R6-LETHAL: compute fingerprint before taking the lock so the
+        // file I/O doesn't serialize cache writers. If the file becomes
+        // unreadable here (race with deletion), skip the record — the
+        // next access will scan fresh.
+        let Some(content_fp) = compute_content_fingerprint(path) else {
+            return;
+        };
 
         let mut inner = match self.inner.lock() {
             Ok(i) => i,
@@ -224,6 +324,7 @@ impl ScanCache {
             CacheEntry {
                 size,
                 mtime,
+                content_fp,
                 clean,
                 sig_generation: current_gen,
                 last_accessed: current_acc,
@@ -238,6 +339,7 @@ impl ScanCache {
                 path: path.to_path_buf(),
                 size,
                 mtime,
+                content_fp,
                 clean,
                 sig_generation: current_gen,
             }) {
@@ -301,11 +403,19 @@ fn start_db_writer(conn: rusqlite::Connection) -> SyncSender<DbWrite> {
                         path,
                         size,
                         mtime,
+                        content_fp,
                         clean,
                         sig_generation,
                     } => {
-                        if let Err(e) = write_to_db(&conn, &path, size, mtime, clean, sig_generation)
-                        {
+                        if let Err(e) = write_to_db(
+                            &conn,
+                            &path,
+                            size,
+                            mtime,
+                            &content_fp,
+                            clean,
+                            sig_generation,
+                        ) {
                             tracing::debug!(%e, path = %path.display(), "scan cache db write failed");
                         }
                     }
@@ -338,7 +448,8 @@ fn open_cache_db(path: &Path) -> Result<rusqlite::Connection, String> {
             clean INTEGER NOT NULL,
             sig_generation INTEGER NOT NULL,
             updated_at INTEGER NOT NULL,
-            integrity_hash INTEGER NOT NULL DEFAULT 0
+            integrity_hash INTEGER NOT NULL DEFAULT 0,
+            content_fp BLOB
         );
         CREATE TABLE IF NOT EXISTS cache_meta (
             key TEXT PRIMARY KEY,
@@ -353,6 +464,8 @@ fn open_cache_db(path: &Path) -> Result<rusqlite::Connection, String> {
         "ALTER TABLE scan_cache ADD COLUMN integrity_hash INTEGER NOT NULL DEFAULT 0",
         [],
     );
+    // R6-LETHAL: add content_fp column if upgrading from older schema.
+    let _ = conn.execute("ALTER TABLE scan_cache ADD COLUMN content_fp BLOB", []);
 
     Ok(conn)
 }
@@ -373,7 +486,7 @@ fn load_from_db(
     // D-3 fix: entries with invalid integrity_hash are REJECTED (cache miss).
     let mut stmt = conn
         .prepare(
-            "SELECT path, size, mtime, clean, integrity_hash FROM scan_cache WHERE sig_generation = ?1 LIMIT ?2",
+            "SELECT path, size, mtime, clean, integrity_hash, content_fp FROM scan_cache WHERE sig_generation = ?1 LIMIT ?2",
         )
         .map_err(|e| format!("prepare: {e}"))?;
 
@@ -387,6 +500,7 @@ fn load_from_db(
                     row.get::<_, i64>(2)? as u64,
                     row.get::<_, i64>(3)? != 0,
                     row.get::<_, i64>(4).unwrap_or(0) as u64,
+                    row.get::<_, Option<Vec<u8>>>(5).unwrap_or(None),
                 ))
             },
         )
@@ -396,13 +510,31 @@ fn load_from_db(
     let mut counter = 0u64;
     let mut rejected = 0u64;
     for row in rows {
-        if let Ok((path_str, size, mtime, clean, stored_hash)) = row {
+        if let Ok((path_str, size, mtime, clean, stored_hash, fp_blob)) = row {
             let path = PathBuf::from(&path_str);
 
+            // R6-LETHAL: reject any row without a content fingerprint.
+            // These would be either pre-upgrade entries (no fingerprint
+            // recorded) or attacker-inserted rows. Either way we cannot
+            // trust them — skip and let the next scan refresh.
+            let fp_vec = match fp_blob {
+                Some(v) if v.len() == 16 => v,
+                _ => {
+                    rejected += 1;
+                    continue;
+                }
+            };
+            let mut content_fp = [0u8; 16];
+            content_fp.copy_from_slice(&fp_vec);
+
             // D-3 fix: verify integrity hash before trusting cache entry.
-            let expected_hash = cache_entry_hash(&path, size, mtime, clean);
-            if stored_hash != 0 && stored_hash != expected_hash {
-                // Hash mismatch → externally tampered entry → reject.
+            // Bug R3-4: previously `stored_hash != 0` allowed an attacker to
+            // bypass tamper detection via SQL `UPDATE scan_cache SET integrity_hash=0`
+            // — entry would be accepted unchecked. Now ANY mismatch (including
+            // zero, which a fresh-keyed entry will never legitimately produce)
+            // is rejected.
+            let expected_hash = cache_entry_hash(&path, size, mtime, clean, &content_fp);
+            if stored_hash != expected_hash {
                 rejected += 1;
                 tracing::warn!(
                     path = path_str,
@@ -417,6 +549,7 @@ fn load_from_db(
                 CacheEntry {
                     size,
                     mtime,
+                    content_fp,
                     clean,
                     sig_generation: sgen,
                     last_accessed: counter,
@@ -449,6 +582,7 @@ fn write_to_db(
     path: &Path,
     size: u64,
     mtime: u64,
+    content_fp: &ContentFingerprint,
     clean: bool,
     sig_generation: u64,
 ) -> Result<(), String> {
@@ -459,11 +593,13 @@ fn write_to_db(
 
     // D-3 fix: include integrity hash — externally inserted/modified entries
     // won't have a valid hash and will be treated as cache misses.
-    let ihash = cache_entry_hash(path, size, mtime, clean) as i64;
+    // R6-LETHAL: fingerprint is part of the integrity hash, so SQL UPDATE
+    // of just `content_fp` invalidates the entry on next load.
+    let ihash = cache_entry_hash(path, size, mtime, clean, content_fp) as i64;
 
     conn.execute(
-        "INSERT OR REPLACE INTO scan_cache (path, size, mtime, clean, sig_generation, updated_at, integrity_hash)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT OR REPLACE INTO scan_cache (path, size, mtime, clean, sig_generation, updated_at, integrity_hash, content_fp)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         rusqlite::params![
             path.to_string_lossy().as_ref(),
             size as i64,
@@ -472,9 +608,84 @@ fn write_to_db(
             sig_generation as i64,
             now,
             ihash,
+            content_fp.as_slice(),
         ],
     )
     .map_err(|e| format!("insert: {e}"))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn write_file(path: &Path, bytes: &[u8]) -> std::fs::Metadata {
+        let mut f = std::fs::File::create(path).unwrap();
+        f.write_all(bytes).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+        std::fs::metadata(path).unwrap()
+    }
+
+    #[test]
+    fn r6_lethal_inplace_content_swap_misses_cache() {
+        // The previous (size, mtime)-only cache key let an attacker
+        // overwrite a "clean" file with malware bytes while preserving
+        // size + mtime → cache HIT → file never re-scanned.
+        // With the content fingerprint folded in, the same trick must
+        // produce a MISS so the scanner re-runs.
+        let dir = std::env::temp_dir().join("sent_r6_cache_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("victim.bin");
+
+        // Fixed payload of EXACTLY this size — we'll overwrite in-place
+        // with another payload of the same length.
+        let clean = vec![0xAAu8; 70_000]; // > 64KB so fingerprint window matters.
+        let dirty = vec![0xBBu8; 70_000];
+
+        let meta_clean = write_file(&p, &clean);
+        let cache = ScanCache::new();
+        cache.record_with_metadata(&p, &meta_clean, true);
+
+        // Cache HIT path: same file, same metadata.
+        assert_eq!(
+            cache.check_with_metadata(&p, &meta_clean),
+            Some(true),
+            "fresh entry should hit"
+        );
+
+        // Tamper: overwrite contents in-place but pretend mtime stayed.
+        // We can't reliably SetFileTime in cross-platform tests, so we
+        // construct the lookup's metadata struct from the ORIGINAL mtime
+        // — emulating the attacker who calls SetFileTime() to restore it.
+        write_file(&p, &dirty); // length identical
+        let attacker_meta = meta_clean.clone(); // pretend mtime unchanged
+
+        // With the fingerprint check, this MUST miss.
+        assert!(
+            cache.check_with_metadata(&p, &attacker_meta).is_none(),
+            "BUG: in-place content swap returned cache hit — scanner bypass possible"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn r6_fingerprint_stable_for_unchanged_file() {
+        // Sanity: repeated lookups on an unchanged file should keep hitting.
+        let dir = std::env::temp_dir().join("sent_r6_cache_test2");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("clean.bin");
+        let meta = write_file(&p, b"hello world");
+
+        let cache = ScanCache::new();
+        cache.record_with_metadata(&p, &meta, true);
+        assert_eq!(cache.check_with_metadata(&p, &meta), Some(true));
+        assert_eq!(cache.check_with_metadata(&p, &meta), Some(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

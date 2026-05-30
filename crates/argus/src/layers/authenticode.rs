@@ -102,6 +102,23 @@ pub fn signature_discount(path: &Path) -> u32 {
     }
 }
 
+/// Combined: run Authenticode verification ONCE and return both the findings
+/// list and the score discount. Engine should prefer this over calling
+/// `analyze` and `signature_discount` separately — those each invoke
+/// `verify_trust` (WinVerifyTrust + cert chain walk), so calling both runs the
+/// expensive PE+CryptoAPI work 2-3× per file. This collapses it to one call.
+pub fn analyze_with_discount(path: &Path) -> (Vec<Finding>, u32) {
+    #[cfg(target_os = "windows")]
+    {
+        analyze_with_discount_windows(path)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = path;
+        (vec![], 0)
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════
 //  Windows implementation
 // ═══════════════════════════════════════════════════════════════════
@@ -207,6 +224,84 @@ fn signature_discount_windows(path: &Path) -> u32 {
         }
         _ => 0,
     }
+}
+
+/// Combined Windows implementation: one verify_trust call drives both the
+/// findings list and the score discount, replacing the 2-3 calls the legacy
+/// pair (`analyze` + `signature_discount`) made per PE.
+#[cfg(target_os = "windows")]
+fn analyze_with_discount_windows(path: &Path) -> (Vec<Finding>, u32) {
+    let (trust_result, signer) = verify_trust(path);
+
+    let findings = match &trust_result {
+        TrustResult::ValidTrusted(publisher) => vec![Finding {
+            layer: Layer::Reputation,
+            severity: Severity::Info,
+            weight: 0,
+            description: format!(
+                "Digitally signed by {} — valid Authenticode signature verified.",
+                publisher,
+            ),
+            technical_detail: signer.as_ref().map(|s| format!("Signer: {s}")),
+        }],
+        TrustResult::ValidUnknown => {
+            let signer_str = signer.as_deref().unwrap_or("Unknown");
+            vec![Finding {
+                layer: Layer::Reputation,
+                severity: Severity::Info,
+                weight: 0,
+                description: format!(
+                    "Digitally signed by {signer_str} — signature valid but publisher is not in the trusted database.",
+                ),
+                technical_detail: signer.as_ref().map(|s| format!("Signer: {s}")),
+            }]
+        }
+        TrustResult::Invalid => vec![Finding {
+            layer: Layer::StructuralAnalysis,
+            severity: Severity::High,
+            weight: 20,
+            description: "Executable has an invalid or tampered digital signature — the file may have been modified after signing.".into(),
+            technical_detail: Some("Authenticode verification failed".into()),
+        }],
+        TrustResult::Unsigned | TrustResult::Error => {
+            if is_windows_system_path(path) {
+                vec![Finding {
+                    layer: Layer::Reputation,
+                    severity: Severity::Info,
+                    weight: 0,
+                    description: "Windows system binary — catalog-signed by Microsoft (not embedded Authenticode).".into(),
+                    technical_detail: Some(format!("System path: {}", path.display())),
+                }]
+            } else {
+                vec![]
+            }
+        }
+    };
+
+    let discount = match &trust_result {
+        TrustResult::ValidTrusted(_) => {
+            if let Some(ref s) = signer {
+                let signer_lower = s.to_lowercase();
+                let mut d = 10; // Valid trusted but didn't match a specific entry.
+                for &(pattern, val) in TRUSTED_SIGNERS {
+                    if signer_lower.contains(&pattern.to_lowercase()) {
+                        d = val;
+                        break;
+                    }
+                }
+                d
+            } else {
+                10
+            }
+        }
+        TrustResult::ValidUnknown => 5,
+        TrustResult::Unsigned | TrustResult::Error => {
+            if is_windows_system_path(path) { 20 } else { 0 }
+        }
+        TrustResult::Invalid => 0,
+    };
+
+    (findings, discount)
 }
 
 /// Check if path is in a protected Windows system directory.
@@ -327,66 +422,140 @@ fn win_verify_trust(wide_path: &[u16]) -> i32 {
     }
 }
 
-/// Extract the signer subject name from a signed PE file.
+/// Extract the signer subject (CN/O) from a PE file's embedded Authenticode
+/// signature using the Windows CryptoAPI.
+///
+/// Returns `None` if the file is unsigned, the signature cannot be parsed,
+/// or any API call fails. Critically, the returned string is the subject
+/// embedded in the actual signing certificate — it cannot be forged by
+/// embedding plaintext bytes inside the file body (the old implementation
+/// scanned the raw file for UTF-16 substrings and was trivially spoofable
+/// by an attacker putting "Microsoft Corporation" in `.rsrc` of an
+/// unsigned PE).
 #[cfg(target_os = "windows")]
-fn extract_signer(path: &Path) -> Option<String> {
-    // Use a simpler approach — read the PE certificate table and parse
-    // the signer from the PKCS#7 structure. For now, use a heuristic:
-    // scan the file for common signer string patterns near the end
-    // where Authenticode data lives.
-    let data = std::fs::read(path).ok()?;
-    if data.len() < 1024 {
-        return None;
-    }
+pub(crate) fn extract_signer(path: &Path) -> Option<String> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Security::Cryptography::{
+        CERT_CONTEXT, CERT_FIND_SUBJECT_CERT, CERT_ISSUER_SERIAL_NUMBER,
+        CERT_NAME_SIMPLE_DISPLAY_TYPE, CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
+        CERT_QUERY_FORMAT_FLAG_BINARY, CERT_QUERY_OBJECT_FILE, CMSG_SIGNER_INFO,
+        CMSG_SIGNER_INFO_PARAM, CertCloseStore, CertFindCertificateInStore,
+        CertFreeCertificateContext, CertGetNameStringW, CryptMsgClose, CryptMsgGetParam,
+        CryptQueryObject, HCERTSTORE, X509_ASN_ENCODING,
+    };
 
-    // Look for UTF-16LE publisher strings in the certificate area.
-    // Authenticode certificates contain the signer's subject in UTF-16.
-    for &(pattern, _) in TRUSTED_SIGNERS {
-        let utf16: Vec<u8> = pattern
-            .encode_utf16()
-            .flat_map(|c| c.to_le_bytes())
-            .collect();
-        if data.windows(utf16.len()).any(|w| w == utf16.as_slice()) {
-            return Some(pattern.to_string());
-        }
-    }
+    let wide_path: Vec<u16> = OsStr::new(path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
 
-    // Try to find organization/common name in the cert area (ASCII).
-    // Certificates in PE overlay use ASN.1 DER with printable strings.
-    let search_start = data.len().saturating_sub(64 * 1024);
-    let tail = &data[search_start..];
+    unsafe {
+        let mut hstore: HCERTSTORE = HCERTSTORE::default();
+        let mut hmsg: *mut std::ffi::c_void = std::ptr::null_mut();
 
-    // Try multiple certificate field prefixes.
-    for prefix in &[b"O=" as &[u8], b"CN="] {
-        for (pos, _) in tail
-            .windows(prefix.len())
-            .enumerate()
-            .filter(|(_, w)| *w == *prefix)
+        // 1. Query the file for an embedded PKCS#7 Authenticode signature.
+        CryptQueryObject(
+            CERT_QUERY_OBJECT_FILE,
+            wide_path.as_ptr() as *const std::ffi::c_void,
+            CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
+            CERT_QUERY_FORMAT_FLAG_BINARY,
+            0,
+            None,
+            None,
+            None,
+            Some(&mut hstore),
+            Some(&mut hmsg),
+            None,
+        )
+        .ok()?;
+
+        // RAII-ish cleanup via a closure on early returns.
+        let cleanup = |store: HCERTSTORE, msg: *mut std::ffi::c_void| {
+            if !msg.is_null() {
+                let _ = CryptMsgClose(Some(msg));
+            }
+            if !store.is_invalid() {
+                let _ = CertCloseStore(store, 0);
+            }
+        };
+
+        // 2. Get size of CMSG_SIGNER_INFO blob.
+        let mut signer_size: u32 = 0;
+        if CryptMsgGetParam(hmsg, CMSG_SIGNER_INFO_PARAM, 0, None, &mut signer_size).is_err()
+            || signer_size == 0
         {
-            let start = pos + prefix.len();
-            if start >= tail.len() {
-                continue;
-            }
-
-            // Read until delimiter — comma, null, or non-printable.
-            let end = tail[start..]
-                .iter()
-                .position(|&b| b == b',' || b == b'\0' || b < 0x20 || b > 0x7E)
-                .map(|p| start + p)
-                .unwrap_or((start + 100).min(tail.len()));
-
-            let name = String::from_utf8_lossy(&tail[start..end])
-                .trim()
-                .to_string();
-            // Valid publisher names are 3-100 chars, contain at least one space or are known single words.
-            if name.len() >= 3
-                && name.len() < 100
-                && name.chars().all(|c| c.is_ascii_graphic() || c == ' ')
-            {
-                return Some(name);
-            }
+            cleanup(hstore, hmsg);
+            return None;
         }
-    }
 
-    None
+        let mut signer_buf = vec![0u8; signer_size as usize];
+        if CryptMsgGetParam(
+            hmsg,
+            CMSG_SIGNER_INFO_PARAM,
+            0,
+            Some(signer_buf.as_mut_ptr() as *mut std::ffi::c_void),
+            &mut signer_size,
+        )
+        .is_err()
+        {
+            cleanup(hstore, hmsg);
+            return None;
+        }
+
+        let signer_info = &*(signer_buf.as_ptr() as *const CMSG_SIGNER_INFO);
+
+        // 3. Look up the signer's cert in the store by issuer + serial.
+        let issuer_serial = CERT_ISSUER_SERIAL_NUMBER {
+            Issuer: signer_info.Issuer,
+            SerialNumber: signer_info.SerialNumber,
+        };
+
+        let cert_ctx: *mut CERT_CONTEXT = CertFindCertificateInStore(
+            hstore,
+            X509_ASN_ENCODING,
+            0,
+            CERT_FIND_SUBJECT_CERT,
+            Some(&issuer_serial as *const _ as *const std::ffi::c_void),
+            None,
+        );
+
+        if cert_ctx.is_null() {
+            cleanup(hstore, hmsg);
+            return None;
+        }
+
+        // 4. Get the display name (CN, falling back to O).
+        let needed = CertGetNameStringW(
+            cert_ctx as *const CERT_CONTEXT,
+            CERT_NAME_SIMPLE_DISPLAY_TYPE,
+            0,
+            None,
+            None,
+        );
+
+        let result = if needed > 1 {
+            let mut name_buf = vec![0u16; needed as usize];
+            let written = CertGetNameStringW(
+                cert_ctx as *const CERT_CONTEXT,
+                CERT_NAME_SIMPLE_DISPLAY_TYPE,
+                0,
+                None,
+                Some(&mut name_buf),
+            );
+            if written > 1 {
+                let len = (written as usize).saturating_sub(1); // drop NUL
+                Some(String::from_utf16_lossy(&name_buf[..len]))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let _ = CertFreeCertificateContext(Some(cert_ctx as *const CERT_CONTEXT));
+        cleanup(hstore, hmsg);
+
+        result.filter(|s| !s.is_empty())
+    }
 }

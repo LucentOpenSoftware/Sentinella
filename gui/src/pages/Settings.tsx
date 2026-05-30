@@ -1,8 +1,9 @@
-import { useState } from "react";
-import { Archive, Bell, Bug, CheckCircle, Clock, Eye, FileSearch, FolderOpen, Globe, Palette, RefreshCw, Shield, ShieldOff, Wrench, Loader2, Plus, X, AlertTriangle } from "lucide-react";
+import { useState, useEffect } from "react";
+import { Archive, Bell, Bug, CheckCircle, Clock, Eye, FileSearch, FolderOpen, Globe, Palette, RefreshCw, Shield, ShieldOff, Wrench, Loader2, Plus, X, AlertTriangle, Terminal } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import { Card } from "../components/Card";
+import { getDeveloperStatus, setDeveloperMode, runBenchmark, type DeveloperStatus, type BenchmarkReport } from "../api/sentinella";
 import { useSettings, type DaemonConfig } from "../hooks/useSettings";
 import { loadNotificationSettings, saveNotificationSettings, type NotificationSettings, type NotificationSeverity } from "../notifications";
 import * as i18n from "../i18n";
@@ -217,6 +218,16 @@ function UpdatesTab({ config, update }: { config: DaemonConfig; update: (p: Part
             <option value="12">{i18n.t("settings.every_12h")}</option><option value="24">{i18n.t("settings.daily")}</option>
           </select>
         </div>
+        <div className="pt-3">
+          <p className="text-[13px] font-medium mb-2">{i18n.t("settings.sig_stale")}</p>
+          <select value={String(config.signature_stale_days)} onChange={e => update({ signature_stale_days: parseInt(e.target.value) })}
+            className="w-48 rounded-xl border border-[rgb(var(--border))]/15 bg-[rgb(var(--raised))]/30 px-4 py-2.5 text-[13px] text-[rgb(var(--t1))] outline-none">
+            {[3, 5, 7, 14].map(d => (
+              <option key={d} value={String(d)}>{d} {i18n.t("settings.days_unit")}</option>
+            ))}
+          </select>
+          <p className="text-[12px] text-[rgb(var(--t3))] mt-1.5">{i18n.t("settings.sig_stale_desc")}</p>
+        </div>
       </Section>
       <Section title={i18n.t("settings.scheduled_scans")} desc={i18n.t("settings.scheduled_scans_desc")}>
         <Toggle icon={<Clock size={14} />} label={i18n.t("settings.enable_scheduled_scan")} desc={i18n.t("settings.enable_scheduled_scan_desc")}
@@ -399,7 +410,133 @@ function AdvancedTab({ config, update }: { config: DaemonConfig; update: (p: Par
           </div>
         )}
       </Section>
+
+      <DeveloperSection />
     </>
+  );
+}
+
+/**
+ * Developer mode (v0.1.6) — password-gated, per-machine, LOCAL ONLY. Enabling it
+ * turns on a perf-telemetry dump written to a txt file in the AV data dir so the
+ * author can compare behavior across hardware. Nothing leaves the machine. The
+ * section only appears once an unlock password hash has been provisioned in the
+ * daemon config (out-of-band). The plaintext password is verified daemon-side
+ * and never stored by the GUI.
+ */
+function DeveloperSection() {
+  const [status, setStatus] = useState<DeveloperStatus | null>(null);
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [benchBusy, setBenchBusy] = useState(false);
+  const [bench, setBench] = useState<BenchmarkReport | null>(null);
+  const [benchError, setBenchError] = useState("");
+
+  const refresh = async () => {
+    try { setStatus(await getDeveloperStatus()); } catch { /* daemon may be offline */ }
+  };
+  useEffect(() => { void refresh(); }, []);
+
+  const toggle = async (enabled: boolean, telemetry?: boolean) => {
+    if (password.length === 0) { setError(i18n.t("settings.dev_password_required")); return; }
+    setBusy(true); setError("");
+    try {
+      const res = await setDeveloperMode(password, enabled, telemetry);
+      if (res?.error) { setError(res.error); }
+      else { setPassword(""); await refresh(); }
+    } catch (e) { setError(String(e)); }
+    finally { setBusy(false); }
+  };
+
+  const doBenchmark = async () => {
+    setBenchBusy(true); setBenchError(""); setBench(null);
+    try {
+      const r = await runBenchmark(3);
+      if (r?.error) { setBenchError(r.error); }
+      else { setBench(r); await refresh(); }
+    } catch (e) { setBenchError(String(e)); }
+    finally { setBenchBusy(false); }
+  };
+
+  // Hidden entirely until the daemon reports dev mode is provisioned.
+  if (!status || !status.provisioned) return null;
+
+  return (
+    <Section title={i18n.t("settings.developer_mode")} desc={i18n.t("settings.developer_mode_desc")}>
+      <div className="space-y-4">
+        <div className="flex items-center gap-3">
+          <Terminal size={14} className="text-[rgb(var(--t3))]" />
+          <span className={`text-[11px] font-semibold px-2 py-0.5 rounded ${status.enabled ? "bg-[rgb(var(--green))]/15 text-[rgb(var(--green))]" : "bg-[rgb(var(--raised))]/40 text-[rgb(var(--t3))]"}`}>
+            {status.enabled ? i18n.t("settings.dev_on") : i18n.t("settings.dev_off")}
+          </span>
+        </div>
+
+        <input
+          type="password"
+          value={password}
+          onChange={(e) => { setPassword(e.target.value); setError(""); }}
+          placeholder={i18n.t("settings.dev_password_placeholder")}
+          className="w-full rounded-xl border border-[rgb(var(--border))]/15 bg-[rgb(var(--base))] px-4 py-2.5 text-[13px] text-[rgb(var(--t1))] outline-none"
+          autoComplete="off"
+          spellCheck={false}
+        />
+        {error && <p className="text-[11px] text-[rgb(var(--red))]">{error}</p>}
+
+        <div className="flex gap-3">
+          {!status.enabled ? (
+            <button onClick={() => toggle(true)} disabled={busy || password.length === 0}
+              className="px-4 py-2 rounded-xl bg-[rgb(var(--accent))] text-white text-[12px] font-semibold hover:opacity-90 cursor-pointer disabled:opacity-30">
+              {i18n.t("settings.dev_enable")}
+            </button>
+          ) : (
+            <button onClick={() => toggle(false)} disabled={busy || password.length === 0}
+              className="px-4 py-2 rounded-xl bg-[rgb(var(--raised))]/40 text-[12px] text-[rgb(var(--t2))] cursor-pointer disabled:opacity-30">
+              {i18n.t("settings.dev_disable")}
+            </button>
+          )}
+        </div>
+
+        {status.enabled && (
+          <div className="border-t border-[rgb(var(--border))]/8 pt-2">
+            <Toggle
+              icon={<Bug size={14} />}
+              label={i18n.t("settings.dev_telemetry")}
+              desc={i18n.t("settings.dev_telemetry_desc")}
+              checked={status.telemetry_enabled}
+              onChange={(v) => toggle(true, v)}
+            />
+            <div className="space-y-2 text-[12px] mt-2">
+              <LR l={i18n.t("settings.dev_dump_path")} v={status.dump_path} />
+              <LR l={i18n.t("settings.dev_dump_size")} v={`${status.dump_size_kb} / ${status.telemetry_max_kb} KB`} />
+            </div>
+
+            <div className="mt-4 border-t border-[rgb(var(--border))]/8 pt-4">
+              <div className="flex items-center justify-between gap-4">
+                <div>
+                  <p className="text-[13px] font-medium">{i18n.t("settings.dev_benchmark")}</p>
+                  <p className="mt-0.5 text-[11px] text-[rgb(var(--t3))]">{i18n.t("settings.dev_benchmark_desc")}</p>
+                </div>
+                <button onClick={doBenchmark} disabled={benchBusy}
+                  className="flex items-center gap-2 px-4 py-2 rounded-xl bg-[rgb(var(--accent))] text-white text-[12px] font-semibold hover:opacity-90 cursor-pointer disabled:opacity-40 flex-shrink-0">
+                  {benchBusy && <Loader2 size={13} className="animate-spin" />}
+                  {benchBusy ? i18n.t("settings.dev_benchmark_running") : i18n.t("settings.dev_benchmark_run")}
+                </button>
+              </div>
+              {benchError && <p className="text-[11px] text-[rgb(var(--red))] mt-3">{benchError}</p>}
+              {bench && (
+                <div className="mt-3 rounded-xl bg-[rgb(var(--raised))]/15 p-4 space-y-2 text-[12px]">
+                  <LR l={i18n.t("settings.dev_bench_index")} v={String(bench.performance_index ?? "—")} />
+                  <LR l={i18n.t("settings.dev_bench_throughput")} v={`${(bench.files_per_sec ?? 0).toFixed(1)} files/s · ${(bench.mb_per_sec ?? 0).toFixed(1)} MB/s`} />
+                  <LR l={i18n.t("settings.dev_bench_latency")} v={`p50 ${bench.per_file_us?.p50 ?? 0}µs · p95 ${bench.per_file_us?.p95 ?? 0}µs`} />
+                  <LR l={i18n.t("settings.dev_bench_system")} v={`${bench.system?.logical_cores ?? 0} cores · ${(bench.system?.simd ?? []).join(",") || "—"}`} />
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    </Section>
   );
 }
 

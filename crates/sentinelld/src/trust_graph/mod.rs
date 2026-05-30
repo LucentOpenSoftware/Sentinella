@@ -40,7 +40,12 @@ pub fn set_trust_integrity_secret(secret: &[u8]) {
 }
 
 /// Compute integrity hash for a trust node's security-critical fields.
-fn trust_node_hash(key: &str, observation_count: u64, stable_days: u32) -> i64 {
+fn trust_node_hash(
+    key: &str,
+    observation_count: u64,
+    stable_days: u32,
+    signer: Option<&str>,
+) -> i64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
@@ -51,6 +56,11 @@ fn trust_node_hash(key: &str, observation_count: u64, stable_days: u32) -> i64 {
     key.hash(&mut hasher);
     observation_count.hash(&mut hasher);
     stable_days.hash(&mut hasher);
+    // Bind the signer into the integrity hash. `has_signer` (and the signer
+    // identity) drives compute_trust_level Established→Trusted, so leaving it
+    // unhashed let an `UPDATE trust_nodes SET signer='Microsoft'` manufacture
+    // a Trusted node (+discount) without breaking integrity verification.
+    signer.unwrap_or("").hash(&mut hasher);
     secret.hash(&mut hasher);
     hasher.finish() as i64
 }
@@ -298,49 +308,78 @@ impl TrustGraph {
     /// Record an observation of an entity.
     pub fn observe(&self, key: &str, kind: TrustNodeKind, signer: Option<&str>) {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        self.observe_locked(&conn, key, kind, signer);
+    }
+
+    /// Same as `observe`, but the caller already holds the connection lock.
+    /// R3-19: lets observe_with_signer perform read+write atomically without
+    /// dropping the lock between them.
+    fn observe_locked(
+        &self,
+        conn: &rusqlite::Connection,
+        key: &str,
+        kind: TrustNodeKind,
+        signer: Option<&str>,
+    ) {
         let now = chrono::Utc::now().timestamp();
         let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let kind_str = format!("{kind:?}");
 
-        // Upsert: insert or update observation.
-        // D-2 fix: integrity_hash updated on every write so it stays valid.
-        // We compute the hash AFTER the upsert using the new values.
-        let result = conn.execute(
-            "INSERT INTO trust_nodes (key, kind, first_seen, last_seen, observation_count, stable_days, signer, last_day_hash, integrity_hash)
-             VALUES (?1, ?2, ?3, ?3, 1, 1, ?4, ?5, 0)
-             ON CONFLICT(key) DO UPDATE SET
-                last_seen = ?3,
-                observation_count = observation_count + 1,
-                stable_days = CASE
-                    WHEN last_day_hash != ?5 THEN stable_days + 1
-                    ELSE stable_days
-                END,
-                last_day_hash = ?5,
-                signer = COALESCE(?4, signer)",
-            params![key, kind_str, now, signer, today],
-        );
+        // Upsert + integrity-hash update MUST be atomic. Previously these
+        // were two separate `conn.execute` calls; a crash, SIGTERM, or
+        // SQLITE_BUSY rollback between them left rows with integrity_hash=0,
+        // which `query()` then rejects as INTEGRITY MISMATCH → silent trust
+        // loss for every entity that hit the window. Wrapping in a
+        // rusqlite Transaction guarantees both statements commit together
+        // or neither does. We use the typed Transaction API (not raw
+        // BEGIN/COMMIT strings) because the calibration-module BEGIN-swallow
+        // bug already proved string-based txn control is fragile.
+        let tx_result: Result<(), rusqlite::Error> = (|| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "INSERT INTO trust_nodes (key, kind, first_seen, last_seen, observation_count, stable_days, signer, last_day_hash, integrity_hash)
+                 VALUES (?1, ?2, ?3, ?3, 1, 1, ?4, ?5, 0)
+                 ON CONFLICT(key) DO UPDATE SET
+                    last_seen = ?3,
+                    observation_count = observation_count + 1,
+                    stable_days = CASE
+                        WHEN last_day_hash != ?5 THEN stable_days + 1
+                        ELSE stable_days
+                    END,
+                    last_day_hash = ?5,
+                    signer = COALESCE(?4, signer)",
+                params![key, kind_str, now, signer, today],
+            )?;
 
-        // Update integrity hash with the new observation_count + stable_days.
-        if result.is_ok() {
-            if let Ok(row) = conn.query_row(
-                "SELECT observation_count, stable_days FROM trust_nodes WHERE key = ?1",
+            // Read the EFFECTIVE signer after the COALESCE upsert (not the
+            // call arg) so the hash matches what query() will verify.
+            let row: (u64, u32, Option<String>) = tx.query_row(
+                "SELECT observation_count, stable_days, signer FROM trust_nodes WHERE key = ?1",
                 params![key],
-                |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u32)),
-            ) {
-                let ihash = trust_node_hash(key, row.0, row.1);
-                let _ = conn.execute(
-                    "UPDATE trust_nodes SET integrity_hash = ?1 WHERE key = ?2",
-                    params![ihash, key],
-                );
-            }
-        }
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)? as u64,
+                        row.get::<_, i64>(1)? as u32,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )?;
 
-        if let Err(e) = result {
-            debug!(error = %e, key, "trust_graph observe failed");
+            let ihash = trust_node_hash(key, row.0, row.1, row.2.as_deref());
+            tx.execute(
+                "UPDATE trust_nodes SET integrity_hash = ?1 WHERE key = ?2",
+                params![ihash, key],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })();
+
+        if let Err(e) = tx_result {
+            debug!(error = %e, key, "trust_graph observe transaction failed");
         }
 
         // Prune if over capacity.
-        self.prune_if_needed(&conn);
+        self.prune_if_needed(conn);
     }
 
     /// Query trust level for an entity.
@@ -364,11 +403,12 @@ impl TrustGraph {
 
         match result {
             Ok((count, stable_days, signer, first_seen, last_seen, stored_hash)) => {
-                // D-2 fix: verify integrity hash before trusting node data.
-                // Tampered nodes (externally modified observation_count/stable_days)
-                // will have mismatched hashes → return Unknown (0 discount).
-                if stored_hash != 0 {
-                    let expected = trust_node_hash(key, count, stable_days);
+                // D-2 fix: verify integrity hash. Bug R3-4: previous `!= 0`
+                // gate let attackers `UPDATE trust_nodes SET integrity_hash=0`
+                // and bypass verification entirely. Now any mismatch including
+                // zero is rejected.
+                {
+                    let expected = trust_node_hash(key, count, stable_days, signer.as_deref());
                     if stored_hash != expected {
                         warn!(
                             key,
@@ -429,22 +469,22 @@ impl TrustGraph {
         kind: TrustNodeKind,
         new_signer: Option<&str>,
     ) -> Option<DriftEvent> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-
-        // Check existing signer before updating.
-        let existing_signer: Option<String> = conn
-            .query_row(
-                "SELECT signer FROM trust_nodes WHERE key = ?1",
-                params![key],
-                |row| row.get(0),
-            )
-            .ok()
-            .flatten();
-
-        drop(conn);
-
-        // Record observation (updates last_seen, count, etc.)
-        self.observe(key, kind, new_signer);
+        // R3-19: read prior signer and write the observation under the SAME
+        // held lock so a concurrent observe cannot slip in between and make
+        // us record drift against a stale value (or miss real drift).
+        let existing_signer: Option<String> = {
+            let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = conn
+                .query_row(
+                    "SELECT signer FROM trust_nodes WHERE key = ?1",
+                    params![key],
+                    |row| row.get(0),
+                )
+                .ok()
+                .flatten();
+            self.observe_locked(&conn, key, kind, new_signer);
+            prev
+        };
 
         // Detect signer drift.
         if let Some(ref old) = existing_signer {
@@ -543,9 +583,12 @@ impl TrustGraph {
     fn reset_trust(&self, key: &str) {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         // D-2 fix: update integrity_hash after reset to keep it consistent.
-        let new_hash = trust_node_hash(key, 1, 0);
+        // Clear signer too (trust is being revoked, often BECAUSE the signer
+        // changed) so the node must re-earn Trusted, and the hash matches the
+        // post-reset (signer = NULL) row.
+        let new_hash = trust_node_hash(key, 1, 0, None);
         let _ = conn.execute(
-            "UPDATE trust_nodes SET observation_count = 1, stable_days = 0, integrity_hash = ?1 WHERE key = ?2",
+            "UPDATE trust_nodes SET observation_count = 1, stable_days = 0, signer = NULL, integrity_hash = ?1 WHERE key = ?2",
             params![new_hash, key],
         );
     }
@@ -730,6 +773,36 @@ mod tests {
 
     fn open_mem() -> TrustGraph {
         TrustGraph::open(std::path::Path::new(":memory:")).unwrap()
+    }
+
+    #[test]
+    fn signer_tamper_revokes_trust_via_integrity() {
+        let g = open_mem();
+        g.observe("C:\\app.exe", TrustNodeKind::Executable, Some("Acme Corp"));
+
+        // Baseline: integrity valid → not revoked.
+        let before = g.query("C:\\app.exe");
+        assert!(
+            !before.explanation.contains("Integrity verification failed"),
+            "fresh node should verify"
+        );
+
+        // Tamper: swap the signer in the DB WITHOUT recomputing the integrity
+        // hash — simulates `UPDATE trust_nodes SET signer='Microsoft'`. Since
+        // signer is now bound into the hash, this must fail verification.
+        {
+            let conn = g.conn.lock().unwrap();
+            conn.execute("UPDATE trust_nodes SET signer = 'Microsoft'", [])
+                .unwrap();
+        }
+
+        let after = g.query("C:\\app.exe");
+        assert_eq!(after.trust_level, TrustLevel::Unknown);
+        assert_eq!(
+            after.confidence_discount, 0,
+            "tampered signer must yield no trust discount"
+        );
+        assert!(after.explanation.contains("Integrity verification failed"));
     }
 
     #[test]

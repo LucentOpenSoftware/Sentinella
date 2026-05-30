@@ -20,12 +20,14 @@
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL
-  ; Set PROGRAMDATA variable explicitly (NSIS doesn't have a clean built-in).
+  ; Resolve ProgramData via env var (handles non-C: system drives).
   Var /GLOBAL SENTI_DATA
   Var /GLOBAL SENTI_DAEMON
-  StrCpy $SENTI_DATA "$PROFILE\..\..\ProgramData\Sentinella"
-  ; Fallback: use known absolute path.
-  StrCpy $SENTI_DATA "C:\ProgramData\Sentinella"
+  Var /GLOBAL SENTI_PD
+  ReadEnvStr $SENTI_PD "ProgramData"
+  StrCmp $SENTI_PD "" 0 +2
+    StrCpy $SENTI_PD "C:\ProgramData"
+  StrCpy $SENTI_DATA "$SENTI_PD\Sentinella"
   ; Tauri 2 NSIS unpacks bundle.resources to $INSTDIR\daemon (mapping preserved).
   ; Fallback to $INSTDIR\resources\daemon in case Tauri version changes behavior.
   StrCpy $SENTI_DAEMON "$INSTDIR\daemon"
@@ -67,7 +69,11 @@
 
   ; === Copy bootstrap ClamAV signatures (only if no signatures present) ===
   ; This avoids overwriting newer signatures from a previous install/freshclam.
+  ; Skip bootstrap if EITHER main.cvd OR main.cld exists.
+  ; freshclam switches from .cvd to incremental .cld; checking only .cvd would
+  ; cause stale bootstrap .cvd to land next to newer .cld → mixed-version DB.
   IfFileExists "$SENTI_DATA\signatures\main.cvd" skip_bootstrap 0
+  IfFileExists "$SENTI_DATA\signatures\main.cld" skip_bootstrap 0
     CopyFiles /SILENT "$SENTI_DAEMON\runtime\signatures_bootstrap\main.cvd" "$SENTI_DATA\signatures\"
     CopyFiles /SILENT "$SENTI_DAEMON\runtime\signatures_bootstrap\daily.cvd" "$SENTI_DATA\signatures\"
     CopyFiles /SILENT "$SENTI_DAEMON\runtime\signatures_bootstrap\bytecode.cvd" "$SENTI_DATA\signatures\"
@@ -76,15 +82,40 @@
   skip_bootstrap:
 
   ; === Stop existing service if running (upgrade scenario) ===
+  ; Poll until STATE != RUNNING/STOP_PENDING. Slow IO machines need >2s for
+  ; clean stop after libclamav.dll DLL flush; old fixed Sleep 2000 raced ahead
+  ; and the subsequent sc delete then went into DELETE_PENDING, breaking
+  ; sc create on next install. Cap at 30s.
   nsExec::ExecToLog 'sc stop SentinellaDaemon'
-  Sleep 2000
+  Var /GLOBAL STOP_TRIES
+  StrCpy $STOP_TRIES 0
+  poll_stopped:
+    Sleep 1000
+    IntOp $STOP_TRIES $STOP_TRIES + 1
+    nsExec::Exec 'cmd /c sc query SentinellaDaemon | findstr /C:": 1 "'
+    Pop $0
+    StrCmp $0 "0" stopped_ok 0
+    IntCmp $STOP_TRIES 30 stopped_ok 0 stopped_ok
+    Goto poll_stopped
+  stopped_ok:
 
   ; === Delete old service if exists (upgrade) ===
   nsExec::ExecToLog 'sc delete SentinellaDaemon'
-  Sleep 1000
+  ; Poll until "service does not exist" (exit 1060). Cap at 15s.
+  Var /GLOBAL DEL_TRIES
+  StrCpy $DEL_TRIES 0
+  poll_deleted:
+    Sleep 1000
+    IntOp $DEL_TRIES $DEL_TRIES + 1
+    nsExec::Exec 'cmd /c sc query SentinellaDaemon'
+    Pop $0
+    StrCmp $0 "1060" deleted_ok 0
+    IntCmp $DEL_TRIES 15 deleted_ok 0 deleted_ok
+    Goto poll_deleted
+  deleted_ok:
 
   ; === Register Windows service (no --foreground → uses Windows Service API) ===
-  nsExec::ExecToLog 'sc create SentinellaDaemon binPath= "\"$SENTI_DAEMON\sentinelld.exe\" --log-level info --runtime-root \"$SENTI_DATA\" --dll-dir \"$SENTI_DAEMON\" --db-dir \"$SENTI_DATA\\signatures\"" DisplayName= "Sentinella Protection Service" start= delayed-auto obj= "LocalSystem"'
+  nsExec::ExecToLog 'sc create SentinellaDaemon binPath= "\"$SENTI_DAEMON\sentinelld.exe\" --log-level info --runtime-root \"$SENTI_DATA\" --dll-dir \"$SENTI_DAEMON\" --db-dir \"$SENTI_DATA\signatures\"" DisplayName= "Sentinella Protection Service" start= delayed-auto obj= "LocalSystem"'
 
   ; === Set service description ===
   nsExec::ExecToLog 'sc description SentinellaDaemon "Sentinella antivirus daemon with ClamAV signatures and ARGUS heuristic intelligence engine."'

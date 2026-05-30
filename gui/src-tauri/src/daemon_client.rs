@@ -67,7 +67,9 @@ pub async fn call(method: &str, params: Value) -> Result<Value, DaemonError> {
                     if code == 231 && attempt < 3 {
                         // PIPE_BUSY → daemon running but all instances occupied.
                         // Retry after short backoff.
-                        std::thread::sleep(std::time::Duration::from_millis(50 * (attempt as u64 + 1)));
+                        // tokio::time::sleep — std::thread::sleep would block
+                        // the executor and freeze unrelated tasks during pipe storms.
+                        tokio::time::sleep(std::time::Duration::from_millis(50 * (attempt as u64 + 1))).await;
                         last_err = Some(e);
                         continue;
                     }
@@ -144,6 +146,27 @@ pub async fn call(method: &str, params: Value) -> Result<Value, DaemonError> {
 /// Call with no params.
 pub async fn call_simple(method: &str) -> Result<Value, DaemonError> {
     call(method, Value::Null).await
+}
+
+/// Fetch a one-shot challenge token (authenticated) scoped to a specific
+/// dangerous IPC method. Adversary A2: tokens are now method-bound — calling
+/// with `method = "engine.reload"` yields a token the daemon will reject if
+/// later presented against `settings.set`. Always pass the exact method name
+/// you are about to invoke; the daemon enforces a closed allowlist of legal
+/// scopes.
+pub async fn challenge_token(method: &str) -> Result<String, DaemonError> {
+    let resp = call_auth(
+        "security.challenge",
+        serde_json::json!({ "method": method }),
+    )
+    .await?;
+    match resp.get("token").and_then(|v| v.as_str()) {
+        Some(t) if !t.is_empty() => Ok(t.to_string()),
+        _ => Err(DaemonError::Rpc {
+            code: -32098,
+            message: "daemon did not issue a challenge token (is it still starting?)".into(),
+        }),
+    }
 }
 
 /// Send an authenticated request for dangerous local-only operations.

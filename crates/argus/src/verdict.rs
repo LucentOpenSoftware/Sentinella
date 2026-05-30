@@ -333,9 +333,12 @@ impl ConfidenceLabel {
 
         match score {
             // ── Clean / Trusted zone ──────────────────────
+            // Trusted is clamped to the Clean/LowSuspicion band (0..=25)
+            // so the UI label cannot contradict Verdict::Suspicious (26..=50).
+            // Anything 26+ falls through to Normal/Unusual even with strong trust.
             0 if has_trust => Self::Trusted,
             0 => Self::Normal,
-            1..=40 if has_strong_trust && installer => Self::Trusted,
+            1..=25 if has_strong_trust && installer => Self::Trusted,
             1..=15 if has_trust => Self::Trusted,
             1..=15 => Self::Unusual,
             16..=40 if has_trust => Self::Normal,

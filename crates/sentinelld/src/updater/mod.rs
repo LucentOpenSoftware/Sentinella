@@ -40,6 +40,44 @@ where
         );
     }
 
+    // Tamper-check freshclam against the binary-integrity manifest before
+    // spawning. An attacker who can swap freshclam.exe for a poisoned copy
+    // can otherwise smuggle arbitrary code in under our daemon's network/FS
+    // privileges every update cycle. Fail CLOSED here (refuse to spawn) —
+    // this differs from the startup self-check (fail-loud) because a bad
+    // freshclam runs adversary code with our privileges, whereas a bad
+    // self-binary already has whatever access the running daemon has.
+    {
+        let state_dir = crate::paths::paths().state_dir();
+        let key_path = crate::paths::paths().vault_integrity_key();
+        if let Ok(key_bytes) = std::fs::read(&key_path) {
+            if key_bytes.len() == 32 {
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&key_bytes);
+                match crate::runtime_integrity::verify_binary_against_manifest(
+                    &state_dir,
+                    &key,
+                    freshclam_path,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        error!(
+                            path = %freshclam_path.display(),
+                            "freshclam binary HMAC mismatch — refusing to spawn (tamper signal)"
+                        );
+                        return (
+                            false,
+                            "freshclam binary failed integrity check — refusing to spawn".into(),
+                        );
+                    }
+                    Err(e) => {
+                        warn!(%e, "freshclam integrity check inconclusive — allowing spawn");
+                    }
+                }
+            }
+        }
+    }
+
     info!(path = %freshclam_path.display(), "starting freshclam update");
 
     // Resolve relative paths in config to absolute paths.
@@ -170,27 +208,33 @@ fn push_capped_output(
 }
 
 /// Find freshclam binary in common locations.
+///
+/// ☠️ R9-LETHAL: never resolve relative paths against CWD. The daemon
+/// runs as SYSTEM and invokes whatever this function returns; a
+/// CWD-relative candidate (`"build/clamav/.../freshclam.exe"`) is a
+/// SYSTEM-exec hijack waiting for any moment the daemon's working
+/// directory ends up under attacker control (portable invocation,
+/// shortcut "Start in" field, manual `cd && run`). Resolve only against
+/// the daemon's own exe directory (write-protected install path).
 pub fn find_freshclam() -> Option<PathBuf> {
-    // Check relative to the exe's directory first.
     let exe_dir = std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))?;
 
-    let mut candidates = vec![
-        PathBuf::from("build/clamav/freshclam/Release/freshclam.exe"),
-        PathBuf::from("third_party/clamav/build/freshclam/Release/freshclam.exe"),
+    // Trusted candidates — all anchored to the daemon's install dir.
+    let candidates = [
+        exe_dir.join("freshclam.exe"),
+        exe_dir.join("build").join("clamav").join("freshclam").join("Release").join("freshclam.exe"),
+        exe_dir.join("third_party").join("clamav").join("build").join("freshclam").join("Release").join("freshclam.exe"),
     ];
-    if let Some(ref dir) = exe_dir {
-        candidates.push(dir.join("freshclam.exe"));
-    }
-
     for c in &candidates {
         if c.exists() {
             return Some(c.clone());
         }
     }
 
-    // Try PATH.
+    // PATH fallback is acceptable: PATH for a Windows service is
+    // %SystemRoot%\system32 etc. — directories ordinary users cannot write to.
     if let Ok(output) = Command::new("where").arg("freshclam.exe").output() {
         let path = String::from_utf8_lossy(&output.stdout);
         let first = path.lines().next().unwrap_or("").trim();
@@ -205,9 +249,16 @@ pub fn find_freshclam() -> Option<PathBuf> {
 /// Resolve relative paths in freshclam.conf to absolute paths.
 /// Returns path to a temp config file with resolved paths, or None if
 /// the original config already uses absolute paths.
+///
+/// ☠️ R9-LETHAL pattern: anchor relatives to the daemon's data root (via
+/// `PathManager`), NEVER to CWD. CWD drift between manual-trigger and
+/// scheduled/auto-trigger code paths was the suspected cause of the tray
+/// update failing while the same update succeeded from the GUI's Update page
+/// (the daemon would write the resolved temp config + signatures under a
+/// directory that didn't exist or wasn't writable from that CWD).
 fn resolve_freshclam_config(config_path: &Path) -> Option<PathBuf> {
     let content = std::fs::read_to_string(config_path).ok()?;
-    let cwd = std::env::current_dir().ok()?;
+    let base = crate::paths::paths().root().to_path_buf();
 
     let mut rewritten = String::new();
     let mut changed = false;
@@ -218,7 +269,7 @@ fn resolve_freshclam_config(config_path: &Path) -> Option<PathBuf> {
         if let Some(rest) = trimmed.strip_prefix("DatabaseDirectory") {
             let val = rest.trim();
             if !val.is_empty() && !Path::new(val).is_absolute() {
-                let abs = cwd.join(val);
+                let abs = base.join(val);
                 let _ = std::fs::create_dir_all(&abs);
                 rewritten.push_str(&format!("DatabaseDirectory {}\n", abs.display()));
                 changed = true;
@@ -227,7 +278,7 @@ fn resolve_freshclam_config(config_path: &Path) -> Option<PathBuf> {
         } else if let Some(rest) = trimmed.strip_prefix("UpdateLogFile") {
             let val = rest.trim();
             if !val.is_empty() && !Path::new(val).is_absolute() {
-                let abs = cwd.join(val);
+                let abs = base.join(val);
                 if let Some(parent) = abs.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
@@ -244,11 +295,10 @@ fn resolve_freshclam_config(config_path: &Path) -> Option<PathBuf> {
         return None;
     }
 
-    // Write resolved config to temp file.
-    let tmp = cwd
-        .join("runtime")
-        .join("config")
-        .join("freshclam.resolved.conf");
+    // Write resolved config under the daemon's own config dir (CWD-independent).
+    let cfg_dir = crate::paths::paths().config_dir();
+    let _ = std::fs::create_dir_all(&cfg_dir);
+    let tmp = cfg_dir.join("freshclam.resolved.conf");
     std::fs::write(&tmp, &rewritten).ok()?;
     info!(path = %tmp.display(), "freshclam config resolved to absolute paths");
     Some(tmp)

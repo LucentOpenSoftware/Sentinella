@@ -506,8 +506,8 @@ function RuntimeIntelligenceCard() {
             <Activity size={15} className="text-[rgb(var(--accent))]" />
           </div>
           <div>
-            <h4 className="text-[13px] font-semibold">Runtime Intelligence</h4>
-            <p className="text-[10px] text-[rgb(var(--t3))] mt-0.5">ASTRA adaptive analysis · observe-only</p>
+            <h4 className="text-[13px] font-semibold">{t("dash.runtime_intelligence")}</h4>
+            <p className="text-[10px] text-[rgb(var(--t3))] mt-0.5">{t("dash.runtime_intel_desc")}</p>
           </div>
         </div>
         <span className={`text-[10px] px-2.5 py-1 rounded-full ${
@@ -517,23 +517,23 @@ function RuntimeIntelligenceCard() {
               ? "bg-[rgb(var(--accent))]/8 text-[rgb(var(--accent))]"
               : "bg-[rgb(var(--raised))]/20 text-[rgb(var(--t3))]"
         }`}>
-          {ri.plm?.etw_running ? "ETW Realtime" : plmActive ? "Snapshot" : "Standby"}
+          {ri.plm?.etw_running ? t("dash.plm_etw_realtime") : plmActive ? t("dash.plm_snapshot") : t("dash.plm_standby")}
         </span>
       </div>
 
       {/* Compact stats row */}
       <div className="grid grid-cols-4 gap-4 mb-4">
-        <MiniStat label={ri.plm?.mode === "Etw" ? "PLM (ETW)" : "PLM nodes"} value={plmNodes} />
-        <MiniStat label="PS buffers" value={psEvents} />
-        <MiniStat label="Suspicious chains" value={plmChains} color={plmChains > 0 ? "amber" : undefined} />
-        <MiniStat label="SBL" value={ri.powershell?.sbl_available ? "Available" : "Unavailable"} />
+        <MiniStat label={ri.plm?.mode === "Etw" ? t("dash.plm_etw") : t("dash.plm_nodes")} value={plmNodes} />
+        <MiniStat label={t("dash.ps_buffers")} value={psEvents} />
+        <MiniStat label={t("dash.suspicious_chains")} value={plmChains} color={plmChains > 0 ? "amber" : undefined} />
+        <MiniStat label="SBL" value={ri.powershell?.sbl_available ? t("common.available") : t("common.unavailable")} />
       </div>
 
       {/* Recent events (if any) */}
       {recentEvents.length > 0 && (
         <div>
           <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[rgb(var(--t3))]/40 mb-2">
-            Recent runtime events
+            {t("dash.recent_runtime_events")}
           </p>
           <div className="space-y-1.5">
             {recentEvents.slice(-5).reverse().map((evt, i) => (
@@ -607,8 +607,8 @@ function BehavioralFamiliarityCard() {
             <Eye size={15} className="text-[rgb(var(--accent))]" />
           </div>
           <div>
-            <h4 className="text-[13px] font-semibold">Behavioral Familiarity</h4>
-            <p className="text-[10px] text-[rgb(var(--t3))] mt-0.5">ASTRA local behavioral memory</p>
+            <h4 className="text-[13px] font-semibold">{t("dash.behavioral_familiarity")}</h4>
+            <p className="text-[10px] text-[rgb(var(--t3))] mt-0.5">{t("dash.behavioral_memory_desc")}</p>
           </div>
         </div>
         {ts.drift_events_24h > 0 && (
@@ -620,10 +620,10 @@ function BehavioralFamiliarityCard() {
 
       {/* Stats */}
       <div className="grid grid-cols-4 gap-4 mb-4">
-        <MiniStat label="Stable" value={ts.stable_nodes} />
-        <MiniStat label="Rare" value={ts.rare_nodes} color={ts.rare_nodes > 10 ? "amber" : undefined} />
-        <MiniStat label="Recent" value={ts.recently_seen} />
-        <MiniStat label="Drifts" value={ts.drift_events_total} color={ts.drift_events_total > 0 ? "amber" : undefined} />
+        <MiniStat label={t("dash.trust_stable")} value={ts.stable_nodes} />
+        <MiniStat label={t("dash.trust_rare")} value={ts.rare_nodes} color={ts.rare_nodes > 10 ? "amber" : undefined} />
+        <MiniStat label={t("dash.trust_recent")} value={ts.recently_seen} />
+        <MiniStat label={t("dash.trust_drifts")} value={ts.drift_events_total} color={ts.drift_events_total > 0 ? "amber" : undefined} />
       </div>
 
       {/* Recent drift events */}

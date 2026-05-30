@@ -14,6 +14,10 @@ pub struct Config {
     pub heuristic_alerts: bool,
     pub auto_update: bool,
     pub update_interval_hours: u32,
+    /// Age (days) at which the signature DB is reported "out of date" in the UI.
+    /// Freshness is measured from the newest signature file's mtime. Default 3.
+    #[serde(default = "default_signature_stale_days")]
+    pub signature_stale_days: u32,
     pub update_mirror: String,
     pub quarantine_retention_days: u32,
     pub auto_quarantine: bool,
@@ -73,6 +77,8 @@ pub struct Config {
     pub fish: crate::fish::FishConfig,
     // ── Behavioral sandbox (experimental) ────────────
     pub sandbox: SandboxConfig,
+    // ── Developer mode (v0.1.6 only — local perf telemetry) ──
+    pub developer: DeveloperConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +104,41 @@ impl Default for SandboxConfig {
             timeout_sec: 10,
             min_score: 26,
             max_score: 75,
+        }
+    }
+}
+
+/// Developer mode (v0.1.6 only). Per-machine, password-gated, LOCAL-ONLY perf
+/// telemetry — dumps scan/engine performance to a txt file in the AV data dir.
+/// NOT a cloud/aggregate telemetry system; nothing leaves the machine.
+///
+/// SECURITY NOTE: this is a low-harm local convenience gate (it only enables a
+/// performance dump), not an auth boundary. `password_sha256` is a plain
+/// SHA-256 (no salt/KDF) compared constant-time; that is sufficient to stop a
+/// casual flip but is deliberately NOT a credential store.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DeveloperConfig {
+    /// Current per-machine developer-mode state. Only ever set true after a
+    /// successful password check (see `verify_developer_password`); validation
+    /// forces this back to false if no password is provisioned.
+    pub enabled: bool,
+    /// Lowercase hex SHA-256 of the unlock password. Empty = unprovisioned →
+    /// developer mode cannot be enabled.
+    pub password_sha256: String,
+    /// When developer mode is on, append perf telemetry to the dump file.
+    pub telemetry_enabled: bool,
+    /// Hard cap (KiB) on the telemetry dump file; rotated/truncated past this.
+    pub telemetry_max_kb: u64,
+}
+
+impl Default for DeveloperConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            password_sha256: String::new(),
+            telemetry_enabled: true,
+            telemetry_max_kb: 2048,
         }
     }
 }
@@ -183,6 +224,7 @@ impl Default for Config {
             heuristic_alerts: true,
             auto_update: true,
             update_interval_hours: 4,
+            signature_stale_days: 3,
             update_mirror: "database.clamav.net".into(),
             quarantine_retention_days: 90,
             auto_quarantine: true,
@@ -222,6 +264,7 @@ impl Default for Config {
             performance: PerformanceConfig::default(),
             fish: crate::fish::FishConfig::default(),
             sandbox: SandboxConfig::default(),
+            developer: DeveloperConfig::default(),
         }
     }
 }
@@ -237,22 +280,36 @@ impl Config {
             match toml::from_str::<Config>(&content) {
                 Ok(config) => {
                     tracing::debug!(path = %config_path.display(), "configuration loaded");
-                    Ok(config.expanded())
+                    // R4-C1 (CRITICAL): every Config::load() call site relied on
+                    // top-level `pub fn load` for validation. Anyone calling
+                    // `Config::load(None)` directly bypassed it — meaning the
+                    // excluded_detections=[""] kill-switch (which suppresses
+                    // ALL detections) was never filtered. Validate here too.
+                    let mut config = config.expanded();
+                    config.validate();
+                    Ok(config)
                 }
                 Err(e) => {
                     warn!(path = %config_path.display(), %e, "config parse error, using defaults");
-                    // Backup the bad config.
-                    let backup = config_path.with_extension("toml.bad");
+                    // R4-C17: backup with timestamp suffix so repeated parse
+                    // failures don't keep overwriting the same .bad file.
+                    let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
+                    let backup = config_path.with_extension(format!("toml.bad.{ts}"));
                     let _ = std::fs::copy(&config_path, &backup);
                     warn!(backup = %backup.display(), "bad config backed up");
-                    let config = Config::default();
+                    // Match the loaded path: env-var literals in defaults
+                    // should be expanded before persisting, otherwise the
+                    // saved file embeds unexpanded `%VAR%` strings.
+                    let mut config = Config::default().expanded();
+                    config.validate();
                     let _ = config.save(&config_path);
                     Ok(config)
                 }
             }
         } else {
             info!(path = %config_path.display(), "config not found, creating defaults");
-            let config = Config::default();
+            let mut config = Config::default().expanded();
+            config.validate();
             let _ = config.save(&config_path);
             Ok(config)
         }
@@ -263,8 +320,36 @@ impl Config {
             std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
         }
         let content = toml::to_string_pretty(self).map_err(|e| format!("serialize: {e}"))?;
-        std::fs::write(path, content).map_err(|e| format!("write: {e}"))?;
+        // R4-C18: atomic write — write to .tmp then rename. A crash mid-write
+        // previously left a truncated config that load() would treat as parse
+        // error and silently reset to defaults (losing user settings).
+        //
+        // Durability: `fs::write` buffers in the OS page cache; without
+        // `sync_all` the rename can complete and the system can crash with
+        // the destination file empty/short on disk. Sync the temp file BEFORE
+        // the rename so the post-rename file is durable.
+        let tmp = path.with_extension("toml.tmp");
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp)
+                .map_err(|e| format!("open temp: {e}"))?;
+            f.write_all(content.as_bytes())
+                .map_err(|e| format!("write: {e}"))?;
+            f.sync_all().map_err(|e| format!("sync: {e}"))?;
+        }
+        std::fs::rename(&tmp, path).map_err(|e| format!("rename: {e}"))?;
         info!(path = %path.display(), "configuration saved");
+        // Best-effort HMAC sidecar — keeps the on-disk config bound to the
+        // last daemon-issued save. `load_verified` compares the sidecar to
+        // detect out-of-band edits. We deliberately do NOT fail the save if
+        // the sidecar can't be written (no vault key yet during very early
+        // startup, ACL issue, etc.) — the config write itself succeeded and
+        // the worst case is just a missing drift signal next load.
+        let _ = write_config_hmac_sidecar(path, content.as_bytes());
         Ok(())
     }
 
@@ -290,11 +375,142 @@ impl Config {
         if self.update_interval_hours > 168 {
             self.update_interval_hours = 168;
         }
+        // Signature staleness warning age — clamp to a sane [1, 30] day range
+        // (0 would warn constantly; >30 would hide a genuinely abandoned DB).
+        self.signature_stale_days = self.signature_stale_days.clamp(1, 30);
+        // R4-C8: 0 days = instant cleanup on every scheduler tick — wipes
+        // quarantine. Enforce a 1-day minimum so accidental UI input does
+        // not destroy quarantined evidence.
+        if self.quarantine_retention_days == 0 {
+            warn!("quarantine_retention_days = 0 would delete all quarantine on next cleanup — bumping to 1");
+            self.quarantine_retention_days = 1;
+        }
         if self.quarantine_retention_days > 365 {
             self.quarantine_retention_days = 365;
         }
+        // R4-C10: update_mirror should be a bare hostname. Strip protocol
+        // prefixes and trailing paths so URL composition downstream cannot
+        // produce malformed targets (e.g. "https://https://host").
         if self.update_mirror.is_empty() {
             self.update_mirror = "database.clamav.net".into();
+        } else {
+            let trimmed = self
+                .update_mirror
+                .trim()
+                .trim_start_matches("https://")
+                .trim_start_matches("http://")
+                .split('/')
+                .next()
+                .unwrap_or("database.clamav.net")
+                .to_string();
+            if trimmed.is_empty() || trimmed.len() > 253 {
+                warn!(value = self.update_mirror.as_str(), "invalid update_mirror — reset to default");
+                self.update_mirror = "database.clamav.net".into();
+            } else if trimmed != self.update_mirror {
+                self.update_mirror = trimmed;
+            }
+        }
+        // R4-C3: scheduled_scan_hour > 23 → scheduler hour check never matches → silently disabled.
+        if self.scheduled_scan_hour > 23 {
+            warn!(
+                value = self.scheduled_scan_hour,
+                "scheduled_scan_hour > 23 — clamped to 3 AM"
+            );
+            self.scheduled_scan_hour = 3;
+        }
+        // "custom" was previously accepted but the scheduler dispatch in
+        // ipc::state::start_scan only handles "quick" / "full" / "folder" /
+        // "file" / "startup" — a scheduled "custom" type produced a silent
+        // "Unknown scan type" error and no scan ever ran.
+        if !matches!(self.scheduled_scan_type.as_str(), "quick" | "full") {
+            self.scheduled_scan_type = "quick".into();
+        }
+        // R4-C11: invalid log_level breaks tracing init silently.
+        if !matches!(
+            self.log_level.as_str(),
+            "trace" | "debug" | "info" | "warn" | "error"
+        ) {
+            self.log_level = "info".into();
+        }
+        // R4-C4: cpu_pause_threshold > 100 → never pauses; 0 → always pauses → idle scan dead.
+        if self.idle_scan_cpu_pause_threshold == 0 {
+            self.idle_scan_cpu_pause_threshold = 5;
+        }
+        if self.idle_scan_cpu_pause_threshold > 100 {
+            self.idle_scan_cpu_pause_threshold = 100;
+        }
+        // R4-C5: disk_latency_pause_ms = 0 → always paused.
+        if self.idle_scan_disk_latency_pause_ms == 0 {
+            self.idle_scan_disk_latency_pause_ms = 50;
+        }
+        if self.idle_scan_disk_latency_pause_ms > 60_000 {
+            self.idle_scan_disk_latency_pause_ms = 60_000;
+        }
+        // R4-C7: max_files_per_session = 0 wedges the scanner.
+        if self.idle_scan_max_files_per_session == 0 {
+            self.idle_scan_max_files_per_session = 10_000;
+        }
+        if self.idle_scan_max_file_size_mb == 0 {
+            self.idle_scan_max_file_size_mb = 256;
+        }
+        // Mirror max_file_size_mb cap — consumed downstream as
+        // `* 1024 * 1024` (u64) and a huge value would overflow / wrap,
+        // silently defeating idle scanning.
+        if self.idle_scan_max_file_size_mb > 4096 {
+            self.idle_scan_max_file_size_mb = 4096;
+        }
+        // R4-C6: rand::gen_range(min..=max) panics if min > max. Swap pairs.
+        for (lo, hi) in [
+            (
+                &mut self.idle_scan_slow_delay_min_ms,
+                &mut self.idle_scan_slow_delay_max_ms,
+            ),
+            (
+                &mut self.idle_scan_normal_delay_min_ms,
+                &mut self.idle_scan_normal_delay_max_ms,
+            ),
+            (
+                &mut self.idle_scan_fast_delay_min_ms,
+                &mut self.idle_scan_fast_delay_max_ms,
+            ),
+        ] {
+            if *lo > *hi {
+                std::mem::swap(lo, hi);
+            }
+        }
+        // R4-C20: powershell_poll_seconds = 0 → tight loop spawning PS processes.
+        if self.powershell_poll_seconds == 0 {
+            self.powershell_poll_seconds = 5;
+        }
+        if self.powershell_poll_seconds > 3600 {
+            self.powershell_poll_seconds = 3600;
+        }
+        // R4-C14: enhanced_signature_provider allowlist.
+        if !matches!(
+            self.enhanced_signature_provider.as_str(),
+            "none" | "securiteinfo" | "urlhaus" | "malwarepatrol"
+        ) {
+            warn!(
+                value = self.enhanced_signature_provider.as_str(),
+                "unknown enhanced_signature_provider — reset to none"
+            );
+            self.enhanced_signature_provider = "none".into();
+        }
+        // R4-C12: memory_warning must be < memory_critical.
+        if self.performance.memory_warning_mb >= self.performance.memory_critical_mb {
+            warn!(
+                warning = self.performance.memory_warning_mb,
+                critical = self.performance.memory_critical_mb,
+                "memory_warning_mb >= memory_critical_mb — resetting to defaults"
+            );
+            self.performance.memory_warning_mb = 1500;
+            self.performance.memory_critical_mb = 2500;
+        }
+        if !matches!(
+            self.performance.memory_profile.as_str(),
+            "low" | "normal" | "aggressive"
+        ) {
+            self.performance.memory_profile = "normal".into();
         }
         if self.argus_worker_path.trim().is_empty() {
             self.argus_worker_path = "argusd.exe".into();
@@ -322,11 +538,35 @@ impl Config {
             );
             self.clamav_isolation = "in_process".into();
         }
-        if self.clamav_worker_timeout_sec == 0 {
+        // R4-C15: clamp lower bound — 1-sec timeout makes every scan fail.
+        if self.clamav_worker_timeout_sec < 5 {
             self.clamav_worker_timeout_sec = 30;
         }
         if self.clamav_worker_timeout_sec > 300 {
             self.clamav_worker_timeout_sec = 300;
+        }
+        // ── Developer mode (v0.1.6) ──
+        // password_sha256 must be empty (unprovisioned) or exactly 64 lowercase
+        // hex chars. A malformed value can never match any password, so reset it
+        // to empty (which also forces enabled=false below).
+        {
+            let h = self.developer.password_sha256.trim().to_ascii_lowercase();
+            let valid_hash =
+                h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit());
+            self.developer.password_sha256 = if valid_hash { h } else { String::new() };
+        }
+        // Cannot be enabled without a provisioned password — refuse a config
+        // that sets enabled=true with no/invalid hash.
+        if self.developer.enabled && self.developer.password_sha256.is_empty() {
+            warn!("developer_mode enabled but no valid password provisioned — disabling");
+            self.developer.enabled = false;
+        }
+        // Telemetry dump file size bounds.
+        if self.developer.telemetry_max_kb < 64 {
+            self.developer.telemetry_max_kb = 64;
+        }
+        if self.developer.telemetry_max_kb > 65_536 {
+            self.developer.telemetry_max_kb = 65_536;
         }
         // Sandbox validation.
         if self.sandbox.timeout_sec < 5 {
@@ -335,16 +575,26 @@ impl Config {
         if self.sandbox.timeout_sec > 120 {
             self.sandbox.timeout_sec = 120;
         }
-        if self.sandbox.min_score > self.sandbox.max_score {
-            warn!("sandbox min_score > max_score — swapping");
-            std::mem::swap(&mut self.sandbox.min_score, &mut self.sandbox.max_score);
+        // Clamp min_score to [0, 100] BEFORE the swap. Otherwise a config like
+        // `min_score=200, max_score=300` would clamp max to 100 but leave min
+        // at 200 → empty trigger range → sandbox silently disabled.
+        if self.sandbox.min_score > 100 {
+            self.sandbox.min_score = 100;
         }
         if self.sandbox.max_score > 100 {
             self.sandbox.max_score = 100;
         }
+        if self.sandbox.min_score > self.sandbox.max_score {
+            warn!("sandbox min_score > max_score — clamping min below max");
+            self.sandbox.min_score = self.sandbox.max_score.saturating_sub(1);
+        }
         if !matches!(self.sandbox.mode.as_str(), "experimental" | "production") {
             self.sandbox.mode = "experimental".into();
         }
+        // FISH validation — hostile or typo'd TOML could otherwise produce a
+        // process-kill primitive (`active_response="terminate"`) with thresholds
+        // that trip on the first event. Delegated to FishConfig::validate.
+        self.fish.validate();
         // C2 fix: validate excluded_paths — reject dangerously broad entries.
         self.excluded_paths.retain(|p| {
             let trimmed = p.trim();
@@ -361,6 +611,39 @@ impl Config {
                 );
                 return false;
             }
+            // R4-C16: reject bare drive-letter roots (e.g. "C:\", "D:/") and
+            // raw drive specs ("C:") which would exclude the entire drive
+            // from realtime scanning when used as a path prefix.
+            let lower = trimmed.to_ascii_lowercase();
+            let bytes = lower.as_bytes();
+            let is_drive_root = bytes.len() <= 3
+                && bytes.len() >= 2
+                && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && (bytes.len() == 2 || bytes[2] == b'\\' || bytes[2] == b'/');
+            if is_drive_root {
+                warn!(
+                    entry = trimmed,
+                    "excluded_paths entry is a drive root — refused (would disable AV on entire drive)"
+                );
+                return false;
+            }
+            // Refuse system roots that would gut protection of the OS.
+            for forbidden in [
+                "c:\\windows",
+                "c:\\windows\\",
+                "c:\\program files",
+                "c:\\program files (x86)",
+                "c:\\users",
+            ] {
+                if lower == forbidden || lower == format!("{forbidden}\\") {
+                    warn!(
+                        entry = trimmed,
+                        "excluded_paths entry would disable protection on a critical system root — refused"
+                    );
+                    return false;
+                }
+            }
             // Warn about very broad exclusions (single path component, no separator).
             if !trimmed.contains('\\') && !trimmed.contains('/') && !trimmed.contains(':') {
                 warn!(
@@ -370,6 +653,18 @@ impl Config {
             }
             true
         });
+
+        // R4-C9: cap realtime_roots regardless of watcher cap. Otherwise a
+        // bloated config gets serialized back to disk repeatedly and grows.
+        const MAX_REALTIME_ROOTS: usize = 64;
+        if self.realtime_roots.len() > MAX_REALTIME_ROOTS {
+            warn!(
+                count = self.realtime_roots.len(),
+                max = MAX_REALTIME_ROOTS,
+                "realtime_roots truncated"
+            );
+            self.realtime_roots.truncate(MAX_REALTIME_ROOTS);
+        }
 
         // ☠️ CRITICAL FIX: empty string in excluded_detections matches EVERYTHING.
         // "any_string".contains("") == true in Rust. An attacker setting
@@ -395,14 +690,43 @@ impl Config {
             );
         }
 
-        // Validate excluded_extensions — reject overly broad entries.
+        // R4-LETHAL-1: validate excluded_extensions. Previous code comment
+        // promised to "block excluding ALL executable types at once" but
+        // returned `true` unconditionally — the validation was a no-op.
+        // Anyone able to write the config (admin, scheduled task, GPO,
+        // tampered TOML) could set excluded_extensions=["exe","dll","ps1",
+        // "scr","bat","cmd","js","msi","lnk","vbs"] and silently disable
+        // scanning of every executable artifact on the box. That is the
+        // entire AV defeated by 10 strings.
+        //
+        // Fix: enforce a hard deny-list of high-risk executable extensions
+        // that may NEVER be added to the exclusion list, regardless of who
+        // writes the config.
+        const NEVER_EXCLUDABLE_EXTENSIONS: &[&str] = &[
+            "exe", "dll", "sys", "drv", "scr", "ocx", "cpl", "msi", "msp", "msc",
+            "bat", "cmd", "com", "ps1", "psm1", "vbs", "vbe", "js", "jse", "wsf",
+            "wsh", "hta", "lnk", "url", "pif", "reg", "inf", "jar", "py", "pyw",
+            "rb", "pl", "sh",
+        ];
         self.excluded_extensions.retain(|e| {
-            let trimmed = e.trim().trim_start_matches('.');
+            let trimmed = e.trim().trim_start_matches('.').to_ascii_lowercase();
             if trimmed.is_empty() {
                 warn!("excluded_extensions: empty entry removed");
                 return false;
             }
-            // Block excluding ALL executable types at once.
+            // Reject wildcards / glob attempts.
+            if trimmed.contains('*') || trimmed.contains('?') {
+                warn!(entry = trimmed.as_str(), "excluded_extensions: glob characters refused");
+                return false;
+            }
+            // Hard deny: never let a config disable executable scanning.
+            if NEVER_EXCLUDABLE_EXTENSIONS.contains(&trimmed.as_str()) {
+                warn!(
+                    entry = trimmed.as_str(),
+                    "excluded_extensions: REFUSED — executable extension cannot be excluded (silent AV bypass)"
+                );
+                return false;
+            }
             true
         });
 
@@ -462,6 +786,9 @@ fn default_enhanced_provider() -> String {
 fn default_idle_scan_start_delay() -> u64 {
     300
 }
+fn default_signature_stale_days() -> u32 {
+    3
+}
 
 fn expand_vec(values: &mut [String]) {
     for value in values {
@@ -477,13 +804,35 @@ fn expand_vars(value: &str) -> String {
         ("TEMP", ""),
         ("PROGRAMDATA", r"C:\ProgramData"),
     ] {
-        if let Ok(env) = std::env::var(key) {
-            out = out.replace(&format!("%{key}%"), &env);
-            out = out.replace(&format!("${key}"), &env);
-        } else if !fallback.is_empty() {
-            out = out.replace(&format!("%{key}%"), fallback);
-            out = out.replace(&format!("${key}"), fallback);
+        let resolved = std::env::var(key).unwrap_or_else(|_| fallback.to_string());
+        if resolved.is_empty() {
+            continue;
         }
+        // %VAR% form (Windows-style, unambiguous delimiters) — safe to replace.
+        out = out.replace(&format!("%{key}%"), &resolved);
+        // R4-C23: $VAR form is greedy — "$USERPROFILEEXT" would partially
+        // match "$USERPROFILE". Replace only when the next char is NOT a
+        // valid identifier continuation (alnum / underscore).
+        let needle = format!("${key}");
+        let mut rebuilt = String::with_capacity(out.len());
+        let mut i = 0;
+        while i < out.len() {
+            if out[i..].starts_with(&needle) {
+                let after = out[i + needle.len()..].chars().next();
+                let is_word_continuation =
+                    after.map(|c| c.is_ascii_alphanumeric() || c == '_').unwrap_or(false);
+                if !is_word_continuation {
+                    rebuilt.push_str(&resolved);
+                    i += needle.len();
+                    continue;
+                }
+            }
+            // Push one char (handle multi-byte safely).
+            let c = out[i..].chars().next().unwrap();
+            rebuilt.push(c);
+            i += c.len_utf8();
+        }
+        out = rebuilt;
     }
     out
 }
@@ -494,9 +843,198 @@ pub fn load(path: Option<&str>) -> anyhow::Result<Config> {
     Ok(config)
 }
 
+/// Load the config AND verify its HMAC sidecar against the runtime-integrity
+/// vault key. Returns `(config, drift)` where `drift=true` means the on-disk
+/// config bytes did not match the sidecar — someone edited the file outside
+/// the daemon (or the sidecar is stale because the daemon last saved before
+/// this hardening shipped). Caller should surface drift via the `health`
+/// IPC and decide whether to refuse start (we don't — fail-loud).
+///
+/// First-start behavior: if the sidecar is missing, we write a fresh one
+/// for the just-loaded file (TOFU) and return `drift=false`. This avoids a
+/// nuisance drift report on every daemon upgrade.
+///
+/// The vault key is read directly from disk (vault file) instead of taking
+/// an `IntegrityVault` ref so this can be called BEFORE the `AppState` lock
+/// graph is wired. If the vault key isn't present yet (very first daemon
+/// start), we cannot verify and return `drift=false` — the post-save hook
+/// in `Config::save` will lay down a sidecar shortly after.
+pub fn load_verified(path: Option<&str>) -> anyhow::Result<(Config, bool)> {
+    let config_path = path
+        .map(PathBuf::from)
+        .unwrap_or_else(|| crate::paths::paths().config_file());
+
+    // Load the config first so a missing-sidecar / missing-key situation
+    // never blocks startup.
+    let config = load(path)?;
+
+    // If the config file itself doesn't exist on disk (load() just synthesized
+    // defaults + wrote them), there's nothing to verify — Config::save will
+    // have written a sidecar already (best-effort).
+    if !config_path.exists() {
+        return Ok((config, false));
+    }
+
+    let key_path = crate::paths::paths().vault_integrity_key();
+    let key_bytes = match std::fs::read(&key_path) {
+        Ok(b) if b.len() == 32 => b,
+        _ => return Ok((config, false)), // no key yet — can't verify
+    };
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&key_bytes);
+
+    let hmac_path = config_path.with_extension("toml.hmac");
+    let content = match std::fs::read(&config_path) {
+        Ok(c) => c,
+        Err(_) => return Ok((config, false)),
+    };
+    let computed = crate::runtime_integrity::hmac_bytes(&key, &content);
+
+    if !hmac_path.exists() {
+        // TOFU — record the current content's HMAC so a future edit is
+        // detectable. Best-effort: a write failure here is just "no drift
+        // detection until next save".
+        let _ = write_config_hmac_sidecar(&config_path, &content);
+        return Ok((config, false));
+    }
+
+    match std::fs::read_to_string(&hmac_path) {
+        Ok(stored_raw) => {
+            let stored = stored_raw.trim().to_ascii_lowercase();
+            if stored == computed {
+                Ok((config, false))
+            } else {
+                warn!(
+                    config = %config_path.display(),
+                    "config HMAC sidecar mismatch — file edited outside the daemon"
+                );
+                Ok((config, true))
+            }
+        }
+        Err(_) => Ok((config, false)),
+    }
+}
+
+/// Write `<path>.hmac` containing the lowercase hex HMAC-SHA256 of `content`
+/// under the runtime-integrity vault key. Same atomic-rename + fsync pattern
+/// as the config write so a crash mid-write cannot leave a torn sidecar that
+/// would mis-flag the config as drifted on next start.
+fn write_config_hmac_sidecar(config_path: &Path, content: &[u8]) -> Result<(), String> {
+    // Vault key is required; absent → no sidecar (caller treats as "no drift").
+    let key_path = crate::paths::paths().vault_integrity_key();
+    let key_bytes = std::fs::read(&key_path).map_err(|e| format!("read vault key: {e}"))?;
+    if key_bytes.len() != 32 {
+        return Err(format!(
+            "vault key wrong size: {} (expected 32)",
+            key_bytes.len()
+        ));
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&key_bytes);
+
+    let hex = crate::runtime_integrity::hmac_bytes(&key, content);
+    let hmac_path = config_path.with_extension("toml.hmac");
+    let tmp = hmac_path.with_extension("hmac.tmp");
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)
+            .map_err(|e| format!("open temp hmac: {e}"))?;
+        f.write_all(hex.as_bytes())
+            .map_err(|e| format!("write hmac: {e}"))?;
+        f.sync_all().map_err(|e| format!("sync hmac: {e}"))?;
+    }
+    std::fs::rename(&tmp, &hmac_path).map_err(|e| format!("rename hmac: {e}"))?;
+    Ok(())
+}
+
+/// Hash a developer-mode password to lowercase hex SHA-256. Used both to
+/// provision `DeveloperConfig.password_sha256` and to verify an unlock attempt.
+pub fn hash_developer_password(password: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(password.as_bytes());
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Constant-time check of a developer-mode password against the stored hex
+/// hash. Returns false if the stored hash is empty (unprovisioned) or malformed
+/// — developer mode is locked until a valid hash is provisioned.
+pub fn verify_developer_password(input: &str, stored_hash_hex: &str) -> bool {
+    let stored = stored_hash_hex.trim().to_ascii_lowercase();
+    if stored.len() != 64 || !stored.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return false;
+    }
+    let computed = hash_developer_password(input);
+    if computed.len() != stored.len() {
+        return false;
+    }
+    // Constant-time over the fixed 64-char hex — no early exit on first mismatch.
+    let mut diff = 0u8;
+    for (a, b) in computed.bytes().zip(stored.bytes()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn developer_password_roundtrip_and_lock() {
+        let hash = hash_developer_password("s3kr3t-local");
+        assert_eq!(hash.len(), 64);
+        assert!(verify_developer_password("s3kr3t-local", &hash));
+        assert!(!verify_developer_password("wrong", &hash));
+        // Unprovisioned (empty) or malformed hash → always locked.
+        assert!(!verify_developer_password("s3kr3t-local", ""));
+        assert!(!verify_developer_password("s3kr3t-local", "zzzz"));
+    }
+
+    #[test]
+    fn developer_mode_disabled_without_password() {
+        let mut c = Config {
+            developer: DeveloperConfig {
+                enabled: true,
+                password_sha256: String::new(), // not provisioned
+                ..DeveloperConfig::default()
+            },
+            ..Config::default()
+        };
+        c.validate();
+        assert!(!c.developer.enabled, "enabled must be forced off with no password");
+
+        // Malformed hash is scrubbed to empty → also forces disabled.
+        let mut c2 = Config {
+            developer: DeveloperConfig {
+                enabled: true,
+                password_sha256: "NOT-HEX".into(),
+                ..DeveloperConfig::default()
+            },
+            ..Config::default()
+        };
+        c2.validate();
+        assert!(c2.developer.password_sha256.is_empty());
+        assert!(!c2.developer.enabled);
+
+        // Valid 64-hex hash → enabled allowed to stand + telemetry cap clamped.
+        let mut c3 = Config {
+            developer: DeveloperConfig {
+                enabled: true,
+                password_sha256: hash_developer_password("ok"),
+                telemetry_max_kb: 999_999,
+                ..DeveloperConfig::default()
+            },
+            ..Config::default()
+        };
+        c3.validate();
+        assert!(c3.developer.enabled);
+        assert_eq!(c3.developer.telemetry_max_kb, 65_536);
+    }
 
     #[test]
     fn expands_programdata_path() {
@@ -520,5 +1058,61 @@ mod tests {
         config.validate();
 
         assert_eq!(config.excluded_extensions.len(), 50);
+    }
+
+    #[test]
+    fn r4_lethal1_executable_extensions_cannot_be_excluded() {
+        // THE BIG ONE: previous validate() unconditionally accepted every
+        // entry, letting `excluded_extensions=["exe","dll",...]` silently
+        // disable scanning of all executables.
+        let mut config = Config {
+            excluded_extensions: vec![
+                "exe".into(),
+                ".dll".into(),
+                "PS1".into(), // case insensitive
+                "scr".into(),
+                "bat".into(),
+                "cmd".into(),
+                "js".into(),
+                "msi".into(),
+                "lnk".into(),
+                "vbs".into(),
+                "txt".into(), // benign — should remain
+                "log".into(), // benign — should remain
+            ],
+            ..Config::default()
+        };
+
+        config.validate();
+
+        for forbidden in [
+            "exe", "dll", "ps1", "scr", "bat", "cmd", "js", "msi", "lnk", "vbs",
+        ] {
+            assert!(
+                !config
+                    .excluded_extensions
+                    .iter()
+                    .any(|e| e.trim().trim_start_matches('.').eq_ignore_ascii_case(forbidden)),
+                "executable extension '{forbidden}' leaked through validate() — AV bypass possible"
+            );
+        }
+        assert!(
+            config
+                .excluded_extensions
+                .iter()
+                .any(|e| e.eq_ignore_ascii_case("txt")),
+            "benign 'txt' was wrongly removed"
+        );
+    }
+
+    #[test]
+    fn r4_lethal1_glob_extensions_refused() {
+        let mut config = Config {
+            excluded_extensions: vec!["*".into(), "ex?".into(), "txt".into()],
+            ..Config::default()
+        };
+        config.validate();
+        assert!(!config.excluded_extensions.iter().any(|e| e.contains('*')));
+        assert!(!config.excluded_extensions.iter().any(|e| e.contains('?')));
     }
 }

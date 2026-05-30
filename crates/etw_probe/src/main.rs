@@ -219,8 +219,14 @@ mod windows_probe {
                 session_name_wide.len() * 2,
             )
         };
-        if name_offset + name_bytes.len() <= props_buf.len() {
-            props_buf[name_offset..name_offset + name_bytes.len()].copy_from_slice(name_bytes);
+        // Defensive: `name_offset` is a u32 from `LoggerNameOffset`; in normal
+        // operation it is small but checked_add eliminates a 32-bit-usize wrap
+        // that would otherwise let `<= props_buf.len()` succeed with a wrapped
+        // tiny end → OOB slice panic. The cost is one branch per session start.
+        if let Some(end) = name_offset.checked_add(name_bytes.len()) {
+            if end <= props_buf.len() {
+                props_buf[name_offset..end].copy_from_slice(name_bytes);
+            }
         }
 
         // Re-bind props after modifying buffer.

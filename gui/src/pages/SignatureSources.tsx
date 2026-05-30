@@ -4,6 +4,7 @@ import { Card } from "../components/Card";
 import { getSignatureSources, setSignatureSource, rollbackSignatureSource, updateSignatureSource } from "../api/sentinella";
 import { useDaemonContext } from "../hooks/DaemonContext";
 import type { SignatureSourcesStatus, SignatureProviderInfo } from "../types/sentinella";
+import { t } from "../i18n";
 
 export function SignatureSourcesPage() {
   const { connected } = useDaemonContext();
@@ -21,10 +22,10 @@ export function SignatureSourcesPage() {
     try {
       const result = await updateSignatureSource();
       if (result.ok) {
-        setSuccess(`Signatures downloaded (${result.files_activated || 0} files). Restart daemon to apply.`);
+        setSuccess(t("sources.update_success").replace("{count}", String(result.files_activated || 0)));
         setRestartNeeded(true);
       } else {
-        setError(result.error || "Update failed");
+        setError(result.error || t("sources.update_failed"));
       }
     } catch (e) {
       setError(String(e));
@@ -51,18 +52,18 @@ export function SignatureSourcesPage() {
         // Rollback to official-only.
         const result = await rollbackSignatureSource();
         if (result.ok) {
-          setSuccess("Rolled back to official ClamAV only. Restart daemon to apply.");
+          setSuccess(t("sources.rollback_success"));
           setRestartNeeded(true);
         } else {
-          setError(result.error || "Rollback failed");
+          setError(result.error || t("sources.rollback_failed"));
         }
       } else {
         const result = await setSignatureSource(providerId);
         if (result.ok) {
-          setSuccess(`Provider "${providerId}" activated. Restart daemon to apply.`);
+          setSuccess(t("sources.provider_activated").replace("{id}", providerId));
           setRestartNeeded(true);
         } else {
-          setError(result.error || "Failed to set provider");
+          setError(result.error || t("sources.set_failed"));
         }
       }
       refresh();
@@ -77,7 +78,7 @@ export function SignatureSourcesPage() {
     return (
       <div className="page-stack">
         <Card className="text-center py-14">
-          <p className="text-[14px] text-[rgb(var(--t2))]">Connect to daemon to view signature sources.</p>
+          <p className="text-[14px] text-[rgb(var(--t2))]">{t("sources.connect_prompt")}</p>
         </Card>
       </div>
     );
@@ -92,9 +93,9 @@ export function SignatureSourcesPage() {
             <Database size={18} className="text-[rgb(var(--accent))]" />
           </div>
           <div>
-            <h3 className="text-[18px] font-bold">Signature Sources</h3>
+            <h3 className="text-[18px] font-bold">{t("sources.title")}</h3>
             <p className="text-[12px] text-[rgb(var(--t3))] mt-0.5">
-              Manage detection intelligence providers
+              {t("sources.subtitle")}
             </p>
           </div>
         </div>
@@ -105,11 +106,9 @@ export function SignatureSourcesPage() {
         <div className="flex items-start gap-3">
           <AlertTriangle size={16} className="text-[rgb(var(--amber))] mt-0.5 flex-shrink-0" />
           <div>
-            <p className="text-[12px] text-[rgb(var(--t1))] font-semibold">Advanced Feature</p>
+            <p className="text-[12px] text-[rgb(var(--t1))] font-semibold">{t("sources.advanced_feature")}</p>
             <p className="text-[11px] text-[rgb(var(--t2))] mt-1 leading-relaxed">
-              Enhanced providers add detection coverage beyond official ClamAV signatures.
-              Only one enhanced provider can be active at a time. Changing providers requires
-              an engine rebuild and daemon restart.
+              {t("sources.advanced_desc")}
             </p>
           </div>
         </div>
@@ -131,7 +130,7 @@ export function SignatureSourcesPage() {
           <div className="flex items-center gap-2">
             <RotateCcw size={14} className="text-[rgb(var(--accent))]" />
             <p className="text-[12px] text-[rgb(var(--accent))] font-semibold">
-              Daemon restart required to apply provider change.
+              {t("sources.restart_required")}
             </p>
           </div>
         </Card>
@@ -142,9 +141,9 @@ export function SignatureSourcesPage() {
         <Card>
           <div className="flex items-center justify-between">
             <div>
-              <p className="text-[13px] font-semibold">Download Enhanced Signatures</p>
+              <p className="text-[13px] font-semibold">{t("sources.download_title")}</p>
               <p className="text-[11px] text-[rgb(var(--t3))]">
-                Fetch latest signatures from {sources.enhanced.active_name || sources.enhanced.active_provider}
+                {t("sources.download_desc").replace("{name}", sources.enhanced.active_name || sources.enhanced.active_provider || "")}
               </p>
             </div>
             <button
@@ -153,7 +152,7 @@ export function SignatureSourcesPage() {
               className="flex items-center gap-2 px-3 py-1.5 text-[12px] font-semibold rounded-lg bg-[rgb(var(--accent))]/10 text-[rgb(var(--accent))] hover:bg-[rgb(var(--accent))]/20 disabled:opacity-40 transition-colors"
             >
               {updating ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
-              {updating ? "Downloading..." : "Download Now"}
+              {updating ? t("sources.downloading") : t("sources.download_now")}
             </button>
           </div>
         </Card>
@@ -167,14 +166,14 @@ export function SignatureSourcesPage() {
               <Shield size={16} className="text-[rgb(var(--green))]" />
             </div>
             <div>
-              <h4 className="text-[14px] font-semibold">Official ClamAV</h4>
+              <h4 className="text-[14px] font-semibold">{t("sources.official_clamav")}</h4>
               <p className="text-[11px] text-[rgb(var(--t3))]">
-                {sources?.core?.name || "Core signature database"} — always enabled
+                {t("sources.core_db_always").replace("{name}", sources?.core?.name || t("sources.official_clamav"))}
               </p>
             </div>
           </div>
           <span className="text-[10px] font-bold text-[rgb(var(--green))] bg-[rgb(var(--green))]/8 px-2 py-1 rounded-full uppercase">
-            Required
+            {t("sources.required_badge")}
           </span>
         </div>
       </Card>
@@ -182,7 +181,7 @@ export function SignatureSourcesPage() {
       {/* Enhanced providers */}
       <div>
         <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[rgb(var(--t3))]/40 mb-3 px-1">
-          Enhanced Providers (select one)
+          {t("sources.enhanced_providers_label")}
         </p>
         <div className="space-y-3">
           {/* "None" option */}
@@ -210,13 +209,13 @@ export function SignatureSourcesPage() {
       {pending && (
         <Card className="text-center py-6">
           <Loader2 size={20} className="animate-spin mx-auto text-[rgb(var(--accent))] mb-2" />
-          <p className="text-[12px] text-[rgb(var(--t2))]">Applying provider change...</p>
+          <p className="text-[12px] text-[rgb(var(--t2))]">{t("sources.applying")}</p>
         </Card>
       )}
 
       {/* Footer */}
       <p className="text-center text-[10px] text-[rgb(var(--t3))]/20">
-        Enhanced providers are optional · one provider at a time · changes require restart
+        {t("sources.footer_note")}
       </p>
     </div>
   );
@@ -251,8 +250,8 @@ function ProviderCard({
             {isActive && <div className="w-1.5 h-1.5 rounded-full bg-white" />}
           </div>
           <div>
-            <p className="text-[13px] font-semibold">Official ClamAV Only</p>
-            <p className="text-[11px] text-[rgb(var(--t3))]">No enhanced signatures — lowest footprint, zero FP risk from third parties</p>
+            <p className="text-[13px] font-semibold">{t("sources.official_only")}</p>
+            <p className="text-[11px] text-[rgb(var(--t3))]">{t("sources.official_only_desc")}</p>
           </div>
         </div>
       </Card>
@@ -289,7 +288,7 @@ function ProviderCard({
             </span>
             {provider.recommendation === "Recommended" && (
               <span className="text-[8px] font-bold px-1.5 py-0.5 rounded-full uppercase tracking-wider text-[rgb(var(--green))] bg-[rgb(var(--green))]/8">
-                Recommended
+                {t("sources.recommended_badge")}
               </span>
             )}
           </div>
@@ -300,19 +299,19 @@ function ProviderCard({
           <div className="grid grid-cols-4 gap-3 mb-2">
             <div>
               <p className="text-[14px] font-bold text-[rgb(var(--t1))]">{(provider.estimated_signatures / 1000).toFixed(0)}K</p>
-              <p className="text-[9px] text-[rgb(var(--t3))]">Signatures</p>
+              <p className="text-[9px] text-[rgb(var(--t3))]">{t("sources.stat_signatures")}</p>
             </div>
             <div>
               <p className="text-[14px] font-bold text-[rgb(var(--t1))]">+{provider.estimated_footprint_mb}</p>
-              <p className="text-[9px] text-[rgb(var(--t3))]">MB mapped</p>
+              <p className="text-[9px] text-[rgb(var(--t3))]">{t("sources.stat_mb_mapped")}</p>
             </div>
             <div>
               <p className={`text-[14px] font-bold text-[rgb(var(--${riskColor}))]`}>{provider.fp_risk}</p>
-              <p className="text-[9px] text-[rgb(var(--t3))]">FP risk</p>
+              <p className="text-[9px] text-[rgb(var(--t3))]">{t("sources.stat_fp_risk")}</p>
             </div>
             <div>
               <p className="text-[14px] font-bold text-[rgb(var(--t2))]">{provider.update_frequency.split(' ')[0]}</p>
-              <p className="text-[9px] text-[rgb(var(--t3))]">Updates</p>
+              <p className="text-[9px] text-[rgb(var(--t3))]">{t("sources.stat_updates")}</p>
             </div>
           </div>
 
@@ -324,11 +323,11 @@ function ProviderCard({
             <span>Focus: {provider.focus}</span>
             <span>·</span>
             <span>{provider.license}</span>
-            {provider.homepage && (
+            {provider.homepage && /^https?:\/\//i.test(provider.homepage) && (
               <>
                 <span>·</span>
-                <a href={provider.homepage} target="_blank" rel="noopener" className="flex items-center gap-0.5 text-[rgb(var(--accent))]/60 hover:text-[rgb(var(--accent))]">
-                  Website <ExternalLink size={8} />
+                <a href={provider.homepage} target="_blank" rel="noopener noreferrer" className="flex items-center gap-0.5 text-[rgb(var(--accent))]/60 hover:text-[rgb(var(--accent))]">
+                  {t("sources.website")} <ExternalLink size={8} />
                 </a>
               </>
             )}

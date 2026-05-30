@@ -92,6 +92,50 @@ export const getSettings = () =>
 export const saveSettings = (config: Record<string, unknown>) =>
   invoke<{ ok: boolean; error?: string }>("save_settings", { config });
 
+// ── Developer mode (local-only perf telemetry, v0.1.6) ──────
+
+export interface DeveloperStatus {
+  enabled: boolean;
+  telemetry_enabled: boolean;
+  provisioned: boolean;
+  telemetry_max_kb: number;
+  dump_path: string;
+  dump_size_kb: number;
+}
+
+export const getDeveloperStatus = () =>
+  invoke<DeveloperStatus>("get_developer_status");
+
+/** Toggle developer mode. Password is verified daemon-side, never stored here. */
+export const setDeveloperMode = (
+  password: string,
+  enabled: boolean,
+  telemetryEnabled?: boolean,
+) =>
+  invoke<{ ok?: boolean; enabled?: boolean; telemetry_enabled?: boolean; error?: string }>(
+    "set_developer_mode",
+    { password, enabled, telemetryEnabled },
+  );
+
+export interface BenchmarkReport {
+  argus_benchmark?: boolean;
+  engine_version?: string;
+  system?: { logical_cores?: number; arch?: string; simd?: string[] };
+  corpus?: { files?: number; total_bytes?: number; source?: string };
+  passes?: number;
+  files_per_sec?: number;
+  mb_per_sec?: number;
+  per_file_us?: { p50?: number; p95?: number; max?: number; mean?: number };
+  performance_index?: number;
+  errors?: string[];
+  ok?: boolean;
+  error?: string;
+}
+
+/** Run the ARGUS hardware-parity benchmark (developer mode only). */
+export const runBenchmark = (passes?: number) =>
+  invoke<BenchmarkReport>("run_benchmark", { passes });
+
 // ── Watcher ─────────────────────────────────────────────────
 
 export const getWatcherStatus = () =>
@@ -117,9 +161,11 @@ export const getActivity = () =>
 
 // ── Security ───────────────────────────────────────────────
 
-/** Request a single-use challenge token for dangerous operations. */
-export const requestChallengeToken = () =>
-  invoke<{ token: string }>("request_challenge_token");
+/** Request a single-use challenge token scoped to a specific dangerous IPC
+ *  method (e.g. "engine.reload", "settings.set"). Adversary A2: the daemon
+ *  rejects any presentation of the token against a different method. */
+export const requestChallengeToken = (method: string) =>
+  invoke<{ token: string; method: string }>("request_challenge_token", { method });
 
 // ── Protection critical settings ────────────────────────────
 

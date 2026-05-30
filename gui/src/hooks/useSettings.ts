@@ -9,6 +9,7 @@ export interface DaemonConfig {
   heuristic_alerts: boolean;
   auto_update: boolean;
   update_interval_hours: number;
+  signature_stale_days: number;
   update_mirror: string;
   quarantine_retention_days: number;
   auto_quarantine: boolean;
@@ -30,6 +31,7 @@ const DEFAULTS: DaemonConfig = {
   heuristic_alerts: true,
   auto_update: true,
   update_interval_hours: 4,
+  signature_stale_days: 3,
   update_mirror: "database.clamav.net",
   quarantine_retention_days: 90,
   auto_quarantine: true,

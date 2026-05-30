@@ -213,7 +213,7 @@ fn compute_escalation(evidence: &[EcosystemEvidence], recurrence_count: u32) -> 
     let diversity = source_count(evidence) as u32;
 
     // Base escalation from source diversity.
-    let base = if diversity >= 5 {
+    let base: u32 = if diversity >= 5 {
         15
     } else if diversity >= 4 {
         10
@@ -226,9 +226,14 @@ fn compute_escalation(evidence: &[EcosystemEvidence], recurrence_count: u32) -> 
     };
 
     // Recurrence bonus: repeated patterns escalate slightly.
-    let recurrence_bonus = (recurrence_count * RECURRENCE_BONUS_PER).min(MAX_RECURRENCE_BONUS);
+    // saturating_mul: recurrence_count is u32 and could (in pathological
+    // long-running scenarios) be large enough that `* 2` overflows in debug.
+    let recurrence_bonus = recurrence_count
+        .saturating_mul(RECURRENCE_BONUS_PER)
+        .min(MAX_RECURRENCE_BONUS);
 
-    (base + recurrence_bonus).min(MAX_ECOSYSTEM_ESCALATION)
+    base.saturating_add(recurrence_bonus)
+        .min(MAX_ECOSYSTEM_ESCALATION)
 }
 
 /// Count unique evidence sources.
@@ -348,8 +353,15 @@ fn generate_narrative(root: &str, evidence: &[EcosystemEvidence]) -> String {
     }
 
     // Enforce max length.
+    // Audit fix: `String::truncate` panics if the index isn't a UTF-8 char
+    // boundary — a multi-byte char (non-ASCII file path / description) at
+    // offset MAX_NARRATIVE_LEN-3 would crash. Step back to a boundary.
     if joined.len() > MAX_NARRATIVE_LEN {
-        joined.truncate(MAX_NARRATIVE_LEN - 3);
+        let mut cut = MAX_NARRATIVE_LEN - 3;
+        while cut > 0 && !joined.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        joined.truncate(cut);
         joined.push_str("...");
     }
 
@@ -462,10 +474,13 @@ impl EcosystemTracker {
         });
 
         // Dedup: skip if same source+description within DEDUP_WINDOW.
+        // Audit fix: `now_ts - e.timestamp` is i64 subtraction and panics
+        // on overflow in debug builds if a stored timestamp is extreme
+        // (caller-supplied). Use saturating_sub.
         let dominated = eco.evidence.iter().any(|e| {
             e.source == evidence.source
                 && e.description == evidence.description
-                && (now_ts - e.timestamp).unsigned_abs() < DEDUP_WINDOW.as_secs()
+                && now_ts.saturating_sub(e.timestamp).unsigned_abs() < DEDUP_WINDOW.as_secs()
         });
         if dominated {
             return;
@@ -579,11 +594,27 @@ impl EcosystemTracker {
 
     /// Update lifecycle states and expire old ecosystems.
     pub fn expire(&self) {
+        self.expire_at(Instant::now());
+    }
+
+    /// Testable core of [`expire`]: `now` is the reference instant used to
+    /// compute idle time. Production always passes `Instant::now()`.
+    ///
+    /// Tests pass a *future* instant (`Instant::now() + idle`) instead of
+    /// pushing `last_activity` into the past with `Instant::checked_sub`.
+    /// Adding a `Duration` to an `Instant` can never underflow the monotonic
+    /// clock, so aging is deterministic regardless of machine uptime — the
+    /// subtraction approach silently no-ops on a freshly-booted box (the
+    /// monotonic epoch is < the subtracted duration), which is exactly what
+    /// made the aging tests flaky.
+    fn expire_at(&self, now: Instant) {
         let mut map = self.ecosystems.lock().unwrap_or_else(|e| e.into_inner());
 
         // Phase 1: update states.
         for eco in map.values_mut() {
-            let idle = eco.last_activity.elapsed();
+            // saturating: if `now` precedes `last_activity` (shouldn't happen
+            // for real callers), treat idle as zero rather than panicking.
+            let idle = now.saturating_duration_since(eco.last_activity);
             if idle >= ECOSYSTEM_TTL {
                 eco.state = EcosystemState::Expired;
             } else if idle >= COOLING_THRESHOLD && eco.state == EcosystemState::Active {
@@ -641,20 +672,24 @@ impl EcosystemTracker {
             return;
         }
 
-        // Try lock — if already held (by expire()), skip.
-        if let Ok(mut fp_map) = self.expired_fingerprints.try_lock() {
-            let fp = EcosystemFingerprint::from_ecosystem(eco);
-            let count = fp_map.entry(fp).or_insert(0);
-            *count = count.saturating_add(1);
+        // R3-16: blocking lock so fingerprints are not silently dropped under
+        // contention. Recurrence detection only works if every expiry is
+        // recorded; lock hold time is microseconds (HashMap ops only).
+        let mut fp_map = self
+            .expired_fingerprints
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fp = EcosystemFingerprint::from_ecosystem(eco);
+        let count = fp_map.entry(fp).or_insert(0);
+        *count = count.saturating_add(1);
 
-            if fp_map.len() > MAX_FINGERPRINTS {
-                if let Some(key) = fp_map
-                    .iter()
-                    .min_by_key(|(_, v)| *v)
-                    .map(|(k, _)| k.clone())
-                {
-                    fp_map.remove(&key);
-                }
+        if fp_map.len() > MAX_FINGERPRINTS {
+            if let Some(key) = fp_map
+                .iter()
+                .min_by_key(|(_, v)| *v)
+                .map(|(k, _)| k.clone())
+            {
+                fp_map.remove(&key);
             }
         }
     }
@@ -870,20 +905,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "depends on Instant arithmetic; flaky early after boot due to monotonic clock overflow"]
     fn expire_removes_old() {
         let tracker = EcosystemTracker::new();
         tracker.add_evidence("old.exe", ev(EvidenceSource::Argus, "old", 5));
-        // Manually age.
-        {
-            let mut map = tracker.ecosystems.lock().unwrap();
-            if let Some(eco) = map.get_mut("old.exe") {
-                eco.last_activity = Instant::now()
-                    .checked_sub(Duration::from_secs(7200))
-                    .unwrap_or_else(Instant::now);
-            }
-        }
-        tracker.expire();
+        // Evaluate aging as if 2 hr have passed (past ECOSYSTEM_TTL of 1 hr)
+        // via a future reference instant — robust regardless of uptime.
+        let later = Instant::now() + Duration::from_secs(7200);
+        tracker.expire_at(later);
         assert!(tracker.get("old.exe").is_none());
     }
 
@@ -891,16 +919,12 @@ mod tests {
     fn cooling_transition() {
         let tracker = EcosystemTracker::new();
         tracker.add_evidence("cool.exe", ev(EvidenceSource::Argus, "test", 5));
-        // Age past cooling threshold but not TTL.
-        {
-            let mut map = tracker.ecosystems.lock().unwrap();
-            if let Some(eco) = map.get_mut("cool.exe") {
-                eco.last_activity = Instant::now()
-                    .checked_sub(Duration::from_secs(900))
-                    .unwrap_or_else(Instant::now); // 15 min
-            }
-        }
-        tracker.expire();
+        // Evaluate aging as if 15 min have passed: past COOLING_THRESHOLD
+        // (10 min) but under ECOSYSTEM_TTL (1 hr). Use a future reference
+        // instant instead of back-dating last_activity, so this is robust on
+        // any machine uptime (Instant + Duration never underflows).
+        let later = Instant::now() + Duration::from_secs(900);
+        tracker.expire_at(later);
         let eco = tracker.get("cool.exe").unwrap();
         assert_eq!(eco.state, EcosystemState::Cooling);
     }
@@ -1054,7 +1078,6 @@ mod tests {
     // ── Recurrence ─────────────────────────────────
 
     #[test]
-    #[ignore = "depends on Instant arithmetic; flaky early after boot due to monotonic clock overflow"]
     fn recurrence_detected_after_expiration() {
         let tracker = EcosystemTracker::new();
         // Create initial ecosystem with enough severity for fingerprint.
@@ -1062,16 +1085,10 @@ mod tests {
         tracker.add_evidence("recur.exe", ev(EvidenceSource::Plm, "Chain", 8));
         tracker.add_evidence("recur.exe", ev(EvidenceSource::Persistence, "Run key", 8));
 
-        // Manually expire it.
-        {
-            let mut map = tracker.ecosystems.lock().unwrap();
-            if let Some(eco) = map.get_mut("recur.exe") {
-                eco.last_activity = Instant::now()
-                    .checked_sub(Duration::from_secs(7200))
-                    .unwrap_or_else(Instant::now);
-            }
-        }
-        tracker.expire();
+        // Expire it by evaluating aging 2 hr in the future (past TTL) via a
+        // future reference instant — robust regardless of uptime.
+        let later = Instant::now() + Duration::from_secs(7200);
+        tracker.expire_at(later);
         assert!(tracker.get("recur.exe").is_none());
 
         // Same pattern recurs.
@@ -1199,13 +1216,11 @@ mod tests {
                 ev(EvidenceSource::Argus, "fill", 1),
             );
         }
-        // Age one to cooling.
+        // Mark one as cooling (pruning prefers non-Active victims). State is
+        // set directly; no last_activity back-dating needed.
         {
             let mut map = tracker.ecosystems.lock().unwrap();
             if let Some(eco) = map.get_mut("fill_0.exe") {
-                eco.last_activity = Instant::now()
-                    .checked_sub(Duration::from_secs(900))
-                    .unwrap_or_else(Instant::now);
                 eco.state = EcosystemState::Cooling;
             }
         }

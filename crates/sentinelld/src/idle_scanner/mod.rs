@@ -238,6 +238,15 @@ fn collect_scannable_files(
 
             // Skip build/dev/sentinella dirs.
             if path.is_dir() {
+                // Skip symlinked directories — following them allows traversal
+                // loops and scope-creep into unintended trees (e.g. a symlink
+                // into another user's profile while the daemon runs as SYSTEM).
+                // Files already skip symlinks below; directories must too.
+                // is_reparse_point also catches NTFS junctions (mount points),
+                // which `is_symlink` misses.
+                if crate::scan::is_reparse_point(&path) {
+                    continue;
+                }
                 let name = path
                     .file_name()
                     .map(|n| n.to_string_lossy().to_lowercase())
@@ -289,7 +298,7 @@ fn collect_scannable_files(
             if !path.is_file() {
                 continue;
             }
-            if path.is_symlink() {
+            if crate::scan::is_reparse_point(&path) {
                 continue;
             }
             if crate::scan::should_skip_file(&path) {
@@ -826,8 +835,9 @@ fn idle_scanner_loop(
                 }
                 c.WorkingSetSize as u64 / (1024 * 1024)
             };
-            let _ =
-                unsafe { SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX) };
+            let trim_ok = unsafe {
+                SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX).is_ok()
+            };
             let ws_after = {
                 use windows::Win32::System::ProcessStatus::GetProcessMemoryInfo;
                 let mut c: windows::Win32::System::ProcessStatus::PROCESS_MEMORY_COUNTERS =
@@ -838,11 +848,23 @@ fn idle_scanner_loop(
                 }
                 c.WorkingSetSize as u64 / (1024 * 1024)
             };
-            info!(
-                ws_before_mb = ws_before,
-                ws_after_mb = ws_after,
-                "idle scanner: post-cycle working set trim"
-            );
+            // R3-20: log warning if trim silently failed (privilege missing,
+            // pinned pages, etc.) — otherwise we'd think trimming worked when
+            // residency stayed flat.
+            if !trim_ok || ws_after >= ws_before {
+                tracing::warn!(
+                    ws_before_mb = ws_before,
+                    ws_after_mb = ws_after,
+                    trim_ok,
+                    "idle scanner: working set trim had no effect"
+                );
+            } else {
+                info!(
+                    ws_before_mb = ws_before,
+                    ws_after_mb = ws_after,
+                    "idle scanner: post-cycle working set trim"
+                );
+            }
         }
 
         // Wait before next cycle — long pause (30-60 min).

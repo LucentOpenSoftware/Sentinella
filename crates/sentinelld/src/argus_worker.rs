@@ -4,6 +4,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -76,27 +77,45 @@ pub fn scan_file(
         .spawn()
         .map_err(|e| format!("ARGUS worker spawn failed ({}): {e}", worker.display()))?;
 
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "ARGUS worker stdout unavailable".to_string())?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "ARGUS worker stderr unavailable".to_string())?;
+    // See clamav_worker for the rationale: Rust's `Child` Drop is a no-op,
+    // so a `?` here would orphan the argusd subprocess.
+    let stdout = match child.stdout.take() {
+        Some(s) => s,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("ARGUS worker stdout unavailable".into());
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(s) => s,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("ARGUS worker stderr unavailable".into());
+        }
+    };
 
-    let stdout_reader =
-        std::thread::spawn(move || read_limited(stdout, MAX_WORKER_JSON_BYTES, "stdout"));
-    let stderr_reader =
-        std::thread::spawn(move || read_limited(stderr, MAX_WORKER_STDERR_BYTES, "stderr"));
+    let (tx_out, rx_out) = mpsc::channel();
+    let (tx_err, rx_err) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx_out.send(read_limited(stdout, MAX_WORKER_JSON_BYTES, "stdout"));
+    });
+    std::thread::spawn(move || {
+        let _ = tx_err.send(read_limited(stderr, MAX_WORKER_STDERR_BYTES, "stderr"));
+    });
 
     let status = wait_child(&mut child, settings.timeout, cancel)?;
-    let stdout = stdout_reader
-        .join()
-        .map_err(|_| "ARGUS worker stdout reader panicked".to_string())??;
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| "ARGUS worker stderr reader panicked".to_string())??;
+    // Bounded recv so a grandchild holding the pipe cannot hang us forever.
+    let stdout = match rx_out.recv_timeout(Duration::from_secs(2)) {
+        Ok(Ok(data)) => data,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Err("ARGUS worker stdout reader timeout".into()),
+    };
+    let stderr = rx_err
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap_or_else(|_| Ok(Vec::new()))
+        .unwrap_or_default();
 
     let code = status.code().unwrap_or(-1);
     if code >= 3 || code < 0 {
@@ -137,6 +156,93 @@ pub fn scan_file(
         explanation: parsed.explanation,
         timing: parsed.timing,
     })
+}
+
+/// Run the ARGUS hardware-parity benchmark by invoking the worker's
+/// `benchmark --json` subcommand and returning the parsed report. Reuses the
+/// same hardened spawn path as `scan_file` (no CWD search, bounded reads,
+/// timeout + cancel). The generated corpus is tiny, so this completes in ~1-2s
+/// on a release build.
+pub fn run_benchmark(
+    worker_path: &str,
+    passes: u32,
+    timeout: Duration,
+    cancel: &AtomicBool,
+) -> Result<serde_json::Value, String> {
+    let worker = resolve_worker_path(worker_path);
+    let passes = passes.clamp(1, 10);
+    let mut child = Command::new(&worker)
+        .arg("benchmark")
+        .arg("--json")
+        .arg("--passes")
+        .arg(passes.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("ARGUS benchmark spawn failed ({}): {e}", worker.display()))?;
+
+    // See scan_file above — kill+wait before bubbling up to avoid orphan child.
+    let stdout = match child.stdout.take() {
+        Some(s) => s,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("ARGUS benchmark stdout unavailable".into());
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(s) => s,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("ARGUS benchmark stderr unavailable".into());
+        }
+    };
+
+    let (tx_out, rx_out) = mpsc::channel();
+    let (tx_err, rx_err) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx_out.send(read_limited(stdout, MAX_WORKER_JSON_BYTES, "stdout"));
+    });
+    std::thread::spawn(move || {
+        let _ = tx_err.send(read_limited(stderr, MAX_WORKER_STDERR_BYTES, "stderr"));
+    });
+
+    let status = wait_child(&mut child, timeout, cancel)?;
+    let stdout = match rx_out.recv_timeout(Duration::from_secs(2)) {
+        Ok(Ok(data)) => data,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Err("ARGUS benchmark stdout reader timeout".into()),
+    };
+    let stderr = rx_err
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap_or_else(|_| Ok(Vec::new()))
+        .unwrap_or_default();
+
+    // benchmark exits EXIT_CLEAN(0); anything else is a failure.
+    if status.code().unwrap_or(-1) != 0 {
+        let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
+        return Err(format!(
+            "ARGUS benchmark exit {}{}",
+            status.code().unwrap_or(-1),
+            if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {stderr}")
+            },
+        ));
+    }
+    if stdout.is_empty() {
+        return Err("ARGUS benchmark produced empty JSON".into());
+    }
+
+    let value: serde_json::Value = serde_json::from_slice(&stdout)
+        .map_err(|e| format!("ARGUS benchmark JSON parse failed: {e}"))?;
+    // Sanity: must be our benchmark report shape.
+    if value.get("argus_benchmark").and_then(|v| v.as_bool()) != Some(true) {
+        return Err("ARGUS benchmark JSON missing expected shape".into());
+    }
+    Ok(value)
 }
 
 fn wait_child(
@@ -232,6 +338,11 @@ fn resolve_worker_path(configured: &str) -> PathBuf {
         return raw;
     }
 
+    // ☠️ R9-LETHAL: never search CWD. Daemon runs as SYSTEM; CWD-relative
+    // worker resolution was a direct SYSTEM-exec hijack if CWD ever
+    // landed in a user-writable directory. Resolve only against the
+    // daemon's own exe directory (and its dev-mode target/{debug,release}
+    // sibling for in-tree testing).
     let mut candidates = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
@@ -241,11 +352,6 @@ fn resolve_worker_path(configured: &str) -> PathBuf {
                 candidates.push(root.join("target").join("debug").join(&raw));
             }
         }
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join(&raw));
-        candidates.push(cwd.join("target").join("release").join(&raw));
-        candidates.push(cwd.join("target").join("debug").join(&raw));
     }
 
     for candidate in candidates {

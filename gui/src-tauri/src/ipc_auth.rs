@@ -22,10 +22,23 @@ pub fn secret() -> &'static str {
 
     // Try to load now.
     if let Some(loaded) = try_load_secret() {
-        // Box::leak gives us a true 'static reference. We never free it — the
-        // secret lives for the lifetime of the process, which is correct.
-        let leaked: &'static str = Box::leak(loaded.into_boxed_str());
         let mut guard = CACHED_SECRET.lock().unwrap_or_else(|e| e.into_inner());
+        // Double-check: another thread may have raced us. If they cached
+        // already and content matches, reuse — don't leak another copy.
+        if let Some(existing) = *guard {
+            if existing == loaded.as_str() {
+                return existing;
+            }
+            // Different content (shouldn't happen — daemon doesn't rotate
+            // mid-session). Log and proceed with new leak so caller doesn't
+            // keep using a stale value.
+            log::warn!("ipc_auth: cached secret differs from disk — accepting new value");
+        }
+        // First load (or post-invalidation): allocate stable 'static storage.
+        // Note: Box::leak across many invalidate→load cycles accumulates;
+        // we minimize by deduping above. In practice the daemon secret is
+        // set once per install lifetime, so this leaks exactly once.
+        let leaked: &'static str = Box::leak(loaded.into_boxed_str());
         *guard = Some(leaked);
         return leaked;
     }

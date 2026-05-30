@@ -5,6 +5,7 @@ import {
 } from "lucide-react";
 import { Card } from "../components/Card";
 import { loadNotificationHistory, clearNotificationHistory, type NotificationRecord } from "../notifications";
+import { t } from "../i18n";
 
 const ICON_MAP: Record<string, React.ReactNode> = {
   threat: <ShieldAlert size={14} className="text-[rgb(var(--red))]" />,
@@ -40,15 +41,15 @@ export function NotificationsPage() {
     <div className="page-stack">
       <div className="flex items-center justify-between">
         <div>
-          <h3 className="text-[16px] font-semibold">Notification History</h3>
+          <h3 className="text-[16px] font-semibold">{t("notif.title")}</h3>
           <p className="text-[11px] text-[rgb(var(--t3))] mt-1">
-            {history.length} notification{history.length !== 1 ? "s" : ""} recorded this session
+            {t("notif.count").replace("{count}", String(history.length))}
           </p>
         </div>
         {history.length > 0 && (
           <button onClick={handleClear}
             className="flex items-center gap-2 px-3 py-2 rounded-xl bg-[rgb(var(--raised))]/25 text-[11px] text-[rgb(var(--t3))] hover:text-[rgb(var(--red))] cursor-pointer">
-            <Trash2 size={12} /> Clear All
+            <Trash2 size={12} /> {t("notif.clear")}
           </button>
         )}
       </div>
@@ -57,9 +58,9 @@ export function NotificationsPage() {
         <Card>
           <div className="flex flex-col items-center py-12 text-center">
             <Bell size={32} className="mb-3 text-[rgb(var(--t3))]/20" />
-            <p className="text-[14px] font-medium text-[rgb(var(--t2))]">No notifications yet</p>
+            <p className="text-[14px] font-medium text-[rgb(var(--t2))]">{t("notif.empty")}</p>
             <p className="mt-1 text-[12px] text-[rgb(var(--t3))]">
-              Threat detections, quarantine actions, and scan results appear here.
+              {t("notif.empty_desc")}
             </p>
           </div>
         </Card>
@@ -103,8 +104,8 @@ export function NotificationsPage() {
 
 function formatRelative(ts: number): string {
   const diff = Math.floor((Date.now() - ts) / 1000);
-  if (diff < 60) return "just now";
-  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
-  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
-  return `${Math.floor(diff / 86400)}d ago`;
+  if (diff < 60) return t("notif.just_now");
+  if (diff < 3600) return t("notif.minutes_ago").replace("{n}", String(Math.floor(diff / 60)));
+  if (diff < 86400) return t("notif.hours_ago").replace("{n}", String(Math.floor(diff / 3600)));
+  return t("notif.days_ago").replace("{n}", String(Math.floor(diff / 86400)));
 }

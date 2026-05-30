@@ -2031,13 +2031,13 @@ pub fn analyze(path: &str, data: &[u8]) -> Vec<Finding> {
         }];
     }
 
-    if let Some(entry) = match_by_pe_strings(data) {
+    if let Some(entry) = match_by_pe_strings(path, data) {
         return vec![Finding {
             layer: Layer::Reputation,
             severity: Severity::Info,
             weight: 0,
             description: format!(
-                "Publisher identified as {} via embedded version information — structural characteristics are expected.",
+                "Publisher identified as {} via signed Authenticode certificate — structural characteristics are expected.",
                 entry.publisher,
             ),
             technical_detail: Some(format!(
@@ -2070,16 +2070,96 @@ pub fn reputation_discount(path: &str, data: &[u8]) -> u32 {
         .unwrap_or_default();
 
     if let Some(entry) = match_by_filename(&filename) {
-        // Filename-only match without PE version info → halve discount (spoofable).
-        if match_by_pe_strings(data).is_some() {
-            return entry.tier.discount(); // Confirmed by PE strings.
+        // Filename-only match without cert confirmation → halve discount (spoofable).
+        if match_by_pe_strings(path, data).is_some() {
+            return entry.tier.discount(); // Confirmed by Authenticode cert.
         }
         return entry.tier.discount() / 2; // Unconfirmed → reduced.
     }
-    if let Some(entry) = match_by_pe_strings(data) {
+    if let Some(entry) = match_by_pe_strings(path, data) {
         return entry.tier.discount();
     }
     0
+}
+
+/// Combined analyze + discount in a single pass.
+///
+/// PERF: `analyze` + `reputation_discount` used to scan the file buffer with
+/// `match_by_pe_strings` up to three separate times per file (once in analyze,
+/// twice in reputation_discount). This entry point collapses all those scans
+/// into one filename lookup and at most one PE-strings scan, returning both
+/// the findings and the discount in a single call.
+pub fn analyze_with_discount(path: &str, data: &[u8]) -> (Vec<Finding>, u32) {
+    // Domain gate: reputation only applies to executable/script/archive domains.
+    if !is_reputation_compatible(path) {
+        return (vec![], 0);
+    }
+
+    let filename = std::path::Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+
+    let filename_match = match_by_filename(&filename);
+    // Single Authenticode cert lookup — used to either confirm a filename hit
+    // (full vs halved discount) or to serve as the fallback identifier.
+    let pe_match = match_by_pe_strings(path, data);
+
+    // Build findings (mirrors `analyze` semantics: filename takes precedence).
+    let findings = if let Some(entry) = filename_match {
+        vec![Finding {
+            layer: Layer::Reputation,
+            severity: Severity::Info,
+            weight: 0,
+            description: format!(
+                "Recognized as known software from {} — structural anomalies are expected for this type of application.",
+                entry.publisher,
+            ),
+            technical_detail: Some(format!(
+                "Publisher: {} | Category: {} | Tier: {} | Discount: -{}",
+                entry.publisher,
+                entry.category,
+                match entry.tier {
+                    Tier::Trusted => "Trusted",
+                    Tier::Recognized => "Recognized",
+                },
+                entry.tier.discount(),
+            )),
+        }]
+    } else if let Some(entry) = pe_match {
+        vec![Finding {
+            layer: Layer::Reputation,
+            severity: Severity::Info,
+            weight: 0,
+            description: format!(
+                "Publisher identified as {} via signed Authenticode certificate — structural characteristics are expected.",
+                entry.publisher,
+            ),
+            technical_detail: Some(format!(
+                "Publisher: {} | Category: {} | Discount: -{}",
+                entry.publisher,
+                entry.category,
+                entry.tier.discount(),
+            )),
+        }]
+    } else {
+        vec![]
+    };
+
+    // Compute discount using the same precedence as `reputation_discount`.
+    let discount = if let Some(entry) = filename_match {
+        if pe_match.is_some() {
+            entry.tier.discount()
+        } else {
+            entry.tier.discount() / 2
+        }
+    } else if let Some(entry) = pe_match {
+        entry.tier.discount()
+    } else {
+        0
+    };
+
+    (findings, discount)
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -2123,53 +2203,59 @@ fn pattern_matches(filename: &str, pattern: &str) -> bool {
     }
 }
 
-fn match_by_pe_strings(data: &[u8]) -> Option<&'static ReputationEntry> {
-    // Check for well-known publisher strings in PE version info (UTF-16LE).
-    // Only check files large enough to have resources.
-    if data.len() < 4096 {
-        return None;
-    }
+/// Identify the publisher by extracting the **real signer subject** from the
+/// PE's Authenticode certificate via the Windows CryptoAPI. The `_data`
+/// argument is retained for ABI compatibility but is intentionally unused.
+///
+/// The prior implementation scanned the entire file body for UTF-16LE
+/// publisher substrings — an attacker could trivially forge a reputation hit
+/// by embedding bytes like "Python Software Foundation" in a `.rsrc` section
+/// or debug overlay of an arbitrary unsigned PE. The new path returns `None`
+/// for unsigned / unparseable / non-PE files, so the discount only fires
+/// when the cert chain actually says the publisher.
+fn match_by_pe_strings(path: &str, _data: &[u8]) -> Option<&'static ReputationEntry> {
+    #[cfg(target_os = "windows")]
+    {
+        let signer =
+            crate::layers::authenticode::extract_signer(std::path::Path::new(path))?;
+        let signer_lower = signer.to_lowercase();
 
-    // Sample a few high-confidence publisher strings.
-    let checks: &[(&str, &str)] = &[
-        ("Python Software Foundation", "python"),
-        ("Mozilla Foundation", "firefox"),
-        ("VideoLAN", "vlc"),
-        ("Igor Pavlov", "7z"),
-        ("Notepad++", "npp."),
-        ("JetBrains", "ideaic"),
-        ("Valve", "steam"),
-        ("Blender Foundation", "blender"),
-        ("The GIMP Team", "gimp"),
-        ("Inkscape", "inkscape"),
-        ("KeePassXC Team", "keepass"),
-    ];
+        // Map cert-subject substrings → REPUTATION_DB pattern keys.
+        // Only high-confidence mappings — a generic cert (e.g. "Acme Inc")
+        // shouldn't earn a reputation discount.
+        let mappings: &[(&str, &str)] = &[
+            ("python software foundation", "python"),
+            ("mozilla", "firefox"),
+            ("videolan", "vlc"),
+            ("igor pavlov", "7z"),
+            ("notepad++", "npp."),
+            ("don ho", "npp."),
+            ("jetbrains", "ideaic"),
+            ("valve", "steam"),
+            ("blender", "blender"),
+            ("the gimp team", "gimp"),
+            ("inkscape", "inkscape"),
+            ("keepassxc", "keepass"),
+            ("dominik reichl", "keepass"),
+        ];
 
-    for &(publisher_utf16, pattern) in checks {
-        if contains_utf16(data, publisher_utf16) {
-            // Find the matching entry by pattern.
-            if let Some(entry) = REPUTATION_DB
-                .iter()
-                .find(|e| e.patterns.iter().any(|&p| p.contains(pattern)))
-            {
-                return Some(entry);
+        for &(needle, db_pat) in mappings {
+            if signer_lower.contains(needle) {
+                if let Some(entry) = REPUTATION_DB
+                    .iter()
+                    .find(|e| e.patterns.iter().any(|&p| p.contains(db_pat)))
+                {
+                    return Some(entry);
+                }
             }
         }
+        None
     }
-
-    None
-}
-
-/// Check if data contains a string in UTF-16LE (common in PE resources).
-fn contains_utf16(data: &[u8], needle: &str) -> bool {
-    let utf16: Vec<u8> = needle
-        .encode_utf16()
-        .flat_map(|c| c.to_le_bytes())
-        .collect();
-    if utf16.len() > data.len() {
-        return false;
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = path;
+        None
     }
-    data.windows(utf16.len()).any(|w| w == utf16.as_slice())
 }
 
 #[cfg(test)]

@@ -40,7 +40,9 @@ impl Drop for Scheduler {
 fn scheduler_loop(state: Arc<crate::ipc::AppState>, running: Arc<AtomicBool>) {
     let mut last_scan_day: Option<u32> = None;
     let mut last_cleanup_day: Option<u32> = None;
-    let mut last_update_hour: Option<(u32, u32)> = None; // (day, hour)
+    // R3-11: use monotonic Instant for interval logic. Wall-clock arithmetic
+    // (h + interval) is broken across DST/midnight and breaks on clock skew.
+    let mut last_update_at: Option<std::time::Instant> = None;
 
     while running.load(Ordering::Relaxed) {
         std::thread::sleep(std::time::Duration::from_secs(60));
@@ -55,20 +57,14 @@ fn scheduler_loop(state: Arc<crate::ipc::AppState>, running: Arc<AtomicBool>) {
         // ── Auto-update signatures (every N hours) ─────────────
         let config = crate::config::Config::load(None).unwrap_or_default();
         if config.auto_update {
-            let interval = config.update_interval_hours.max(1);
-            let should_update = match last_update_hour {
-                Some((d, h)) => {
-                    if d != day {
-                        true
-                    } else {
-                        hour >= h + interval
-                    }
-                }
-                None => hour % interval == 0, // Run on interval boundaries
+            let interval_secs = u64::from(config.update_interval_hours.max(1)) * 3600;
+            let should_update = match last_update_at {
+                Some(t) => t.elapsed().as_secs() >= interval_secs,
+                None => true, // First tick after start.
             };
 
             if should_update {
-                last_update_hour = Some((day, hour));
+                last_update_at = Some(std::time::Instant::now());
                 debug!("scheduler: auto-update triggered");
                 let result = state.start_update();
                 let ok = result.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);

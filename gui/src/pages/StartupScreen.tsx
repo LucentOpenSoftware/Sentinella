@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { CheckCircle, Loader2, AlertCircle, RefreshCw } from "lucide-react";
 import { getEngineStatus, getWatcherStatus, getRuntimeStats } from "../api/sentinella";
+import { t } from "../i18n";
 import loadBg from "../assets/load_ui.png";
 
 export type StartupState =
@@ -20,17 +21,6 @@ interface SubsystemStatus {
   watcher: "waiting" | "ok" | "error";
   signatures: "waiting" | "ok" | "error";
 }
-
-const STEP_LABELS: Record<string, string> = {
-  launching: "Starting protection...",
-  connecting: "Connecting to daemon...",
-  loading_engine: "Loading ClamAV engine...",
-  loading_argus: "Preparing ARGUS intelligence...",
-  starting_watcher: "Starting real-time monitoring...",
-  ready: "Protection active",
-  degraded: "Protection started with limitations",
-  failed: "Could not start protection",
-};
 
 export function StartupScreen({ onReady }: { onReady: (degraded: boolean) => void }) {
   const [state, setState] = useState<StartupState>("launching");
@@ -160,17 +150,17 @@ export function StartupScreen({ onReady }: { onReady: (degraded: boolean) => voi
       <div className="absolute z-10 bottom-10 right-10 flex flex-col items-end gap-5">
         {/* Subsystem checklist */}
         <div className="p-4 min-w-[240px] rounded-lg" style={{ background: "rgba(0,0,0,0.45)", backdropFilter: "blur(8px)" }}>
-          <SubLine label="Connecting to daemon" status={subs.daemon} />
-          <SubLine label="Loading ClamAV engine" status={subs.engine} />
-          <SubLine label="Loading signatures" status={subs.signatures} />
-          <SubLine label="Initializing ARGUS · ASTRA analysis" status={subs.argus} />
-          <SubLine label="Preparing real-time monitoring" status={subs.watcher} />
+          <SubLine label={t("startup.sub.daemon")} status={subs.daemon} />
+          <SubLine label={t("startup.sub.engine")} status={subs.engine} />
+          <SubLine label={t("startup.sub.signatures")} status={subs.signatures} />
+          <SubLine label={t("startup.sub.argus")} status={subs.argus} />
+          <SubLine label={t("startup.sub.watcher")} status={subs.watcher} />
         </div>
 
         {/* Status + elapsed */}
         {state !== "ready" && state !== "degraded" && state !== "failed" && (
           <p className="text-[11px] text-white/35 pr-1">
-            {STEP_LABELS[state]}{elapsed > 0 ? ` · ${elapsed}s` : ""}
+            {t(`startup.step.${state}`)}{elapsed > 0 ? ` · ${elapsed}s` : ""}
           </p>
         )}
 
@@ -178,20 +168,20 @@ export function StartupScreen({ onReady }: { onReady: (degraded: boolean) => voi
         {state === "failed" && (
           <div className="flex flex-col items-end gap-2">
             <p className="text-[11px] text-white/40 text-right max-w-[260px]">
-              Could not connect to daemon. Make sure sentinelld is running.
+              {t("startup.failed_detail")}
             </p>
             <button onClick={retry} className="flex items-center gap-2 px-4 py-2 rounded-lg bg-white/10 text-white/70 text-[12px] font-medium hover:bg-white/15 cursor-pointer">
-              <RefreshCw size={12} /> Retry
+              <RefreshCw size={12} /> {t("startup.retry")}
             </button>
             <button onClick={() => onReady(true)} className="text-[10px] text-white/25 hover:text-white/40 cursor-pointer">
-              Continue in limited mode
+              {t("startup.continue_limited")}
             </button>
           </div>
         )}
 
         {showRetry && state !== "failed" && state !== "ready" && state !== "degraded" && (
           <p className="text-[10px] text-white/25 animate-pulse pr-1">
-            Still starting...
+            {t("startup.still_starting")}
           </p>
         )}
       </div>

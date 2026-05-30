@@ -131,13 +131,37 @@ fn watcher_loop(
     cache: Arc<crate::scan::cache::ScanCache>,
 ) {
     // Channel for debounced events.
-    let (tx, rx) = std::sync::mpsc::channel();
+    //
+    // BOUNDED on purpose: the notify callback fires at filesystem speed. Under
+    // a storm (ransomware mass-rewrite, archive unpack, recursive copy of a
+    // large tree) the previous unbounded `channel()` queued every event,
+    // letting the daemon grow without limit until OOM — exactly the scenario
+    // the watcher exists to detect.
+    //
+    // With `sync_channel(NOTIFY_QUEUE_CAP)` + `try_send` the queue is capped
+    // and surplus events get dropped (with a tracked counter), preserving
+    // memory at the cost of some debounce coverage during the storm. The
+    // post-storm rescan/overflow path then catches anything missed.
+    const NOTIFY_QUEUE_CAP: usize = 8192;
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Event>(NOTIFY_QUEUE_CAP);
+    let dropped_events = Arc::new(AtomicU64::new(0));
+    let dropped_clone = Arc::clone(&dropped_events);
 
     // Create the filesystem watcher.
     let mut watcher =
         match notify::recommended_watcher(move |res: Result<Event, notify::Error>| match res {
             Ok(event) => {
-                let _ = tx.send(event);
+                if tx.try_send(event).is_err() {
+                    // Channel full — log periodically (every 1024th drop) to
+                    // avoid spamming when the storm produces millions of events.
+                    let n = dropped_clone.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n.is_power_of_two() || n % 1024 == 0 {
+                        warn!(
+                            dropped_total = n,
+                            "watcher queue full — dropping events (FS event storm)"
+                        );
+                    }
+                }
             }
             Err(e) => warn!(%e, "watcher error"),
         }) {
@@ -164,6 +188,10 @@ fn watcher_loop(
     let mut recent: HashSet<PathBuf> = HashSet::new();
     let mut overflow_dirs: HashSet<PathBuf> = HashSet::new();
     let mut last_flush = Instant::now();
+    // Fast-path force flag — set by Create-of-small-file events to bypass
+    // debounce wait on the next loop iteration. Replaces fragile
+    // Instant::checked_sub trick which silently failed on low-uptime boots.
+    let mut force_flush = false;
 
     // Sandbox dedup guard — tracks recently detonated files to prevent
     // double score_delta application when the watcher fires twice for
@@ -177,7 +205,49 @@ fn watcher_loop(
 
     // FISH — observe-only ransomware detection via AppState's shared MutationWindow.
 
+    // Watcher config snapshot, throttle-refreshed from disk.
+    //
+    // History: originally re-loaded on every flush (disk read every ~150ms
+    // under busy filesystems — wasteful); then switched to load-once, which
+    // meant GUI edits to exclusions/heuristics/sandbox had NO effect until a
+    // daemon restart (silent UX gap). Compromise: keep an in-memory snapshot
+    // (no per-flush disk I/O) but refresh it at most once per
+    // CONFIG_RELOAD_INTERVAL. GUI exclusion edits take effect within ~5s.
+    const CONFIG_RELOAD_INTERVAL: Duration = Duration::from_secs(5);
+    let config = crate::config::Config::load(None).unwrap_or_default();
+    let mut excluded_paths_static = config.excluded_paths.clone();
+    let mut excluded_extensions_static = config.excluded_extensions.clone();
+    let mut heuristic_alerts_static = config.heuristic_alerts;
+    let mut sandbox_config_static = config.sandbox.clone();
+    let mut last_config_reload = Instant::now();
+    // mtime gate: only re-read when the file actually changed. This avoids a
+    // periodic disk read on a stable config AND avoids re-triggering
+    // Config::load's parse-error side effects (timestamped .bad backup +
+    // defaults save) every interval when a config happens to be malformed.
+    let config_path = crate::paths::paths().config_file();
+    let config_mtime = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let mut last_config_mtime = config_mtime(&config_path);
+
     while running.load(Ordering::Relaxed) {
+        // Throttled live-reload: every CONFIG_RELOAD_INTERVAL, cheaply stat the
+        // config file; only when its mtime changed do we re-parse. Settings
+        // changes apply within ~5s without a daemon restart.
+        if last_config_reload.elapsed() >= CONFIG_RELOAD_INTERVAL {
+            last_config_reload = Instant::now();
+            let cur_mtime = config_mtime(&config_path);
+            if cur_mtime != last_config_mtime {
+                if let Ok(fresh) = crate::config::Config::load(None) {
+                    excluded_paths_static = fresh.excluded_paths;
+                    excluded_extensions_static = fresh.excluded_extensions;
+                    heuristic_alerts_static = fresh.heuristic_alerts;
+                    sandbox_config_static = fresh.sandbox;
+                }
+                // Re-stat: Config::load may have rewritten the file (parse
+                // error → defaults saved), so record the post-load mtime to
+                // avoid reloading the same content again next tick.
+                last_config_mtime = config_mtime(&config_path);
+            }
+        }
         // Wait for events with timeout.
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(event) => {
@@ -210,11 +280,18 @@ fn watcher_loop(
                         // Check file size — if small enough, scan now and skip debounce.
                         if let Ok(meta) = std::fs::metadata(&path) {
                             if meta.len() <= FAST_PATH_MAX_SIZE {
-                                // Force immediate flush by setting last_flush far in the past.
-                                recent.insert(path);
-                                last_flush = Instant::now()
-                                    .checked_sub(Duration::from_millis(DEBOUNCE_MS + 100))
-                                    .unwrap_or(last_flush);
+                                // Audit fix: the fast-path previously inserted
+                                // unconditionally, bypassing DEBOUNCE_CAP. A
+                                // flood of small-file Create events could grow
+                                // `recent` without bound. Respect the cap here
+                                // too; over the cap, demote to a directory
+                                // rescan like the slow path.
+                                if recent.len() < DEBOUNCE_CAP {
+                                    recent.insert(path);
+                                    force_flush = true;
+                                } else if let Some(parent) = path.parent() {
+                                    overflow_dirs.insert(parent.to_path_buf());
+                                }
                                 continue;
                             }
                         }
@@ -230,10 +307,11 @@ fn watcher_loop(
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
 
-        // Flush debounce buffer after delay.
+        // Flush debounce buffer after delay OR force_flush from fast-path.
         if (!recent.is_empty() || !overflow_dirs.is_empty())
-            && last_flush.elapsed() >= Duration::from_millis(DEBOUNCE_MS)
+            && (force_flush || last_flush.elapsed() >= Duration::from_millis(DEBOUNCE_MS))
         {
+            force_flush = false;
             let mut batch: Vec<PathBuf> = recent.drain().collect();
             if !overflow_dirs.is_empty() {
                 let dirs: Vec<PathBuf> = overflow_dirs.drain().collect();
@@ -250,7 +328,6 @@ fn watcher_loop(
             }
             last_flush = Instant::now();
             state.touch_watcher_heartbeat();
-            let config = crate::config::Config::load(None).unwrap_or_default();
 
             for path in batch {
                 events_count.fetch_add(1, Ordering::Relaxed);
@@ -270,8 +347,8 @@ fn watcher_loop(
                 }
                 if crate::scan::is_excluded(
                     &path,
-                    &config.excluded_paths,
-                    &config.excluded_extensions,
+                    &excluded_paths_static,
+                    &excluded_extensions_static,
                 ) {
                     continue;
                 }
@@ -327,11 +404,19 @@ fn watcher_loop(
                 // User-visible folders (Downloads, Desktop, Documents, OneDrive)
                 // and download partials never need this cooldown — those are
                 // exactly the paths where we MUST scan as fast as possible.
-                let path_str_lower = path.to_string_lossy().to_ascii_lowercase();
-                let is_user_visible_target = path_str_lower.contains("\\downloads\\")
-                    || path_str_lower.contains("\\desktop\\")
-                    || path_str_lower.contains("\\documents\\")
-                    || path_str_lower.contains("\\onedrive\\");
+                // Exact-component match (case-insensitive). Substring matching
+                // missed localized folders like German OneDrive's
+                // "OneDrive - Persönlich" and falsely matched things like
+                // "OneDrive2" or "Downloads2". Now we check each path
+                // component against a set of recognized names. OneDrive
+                // matches any component STARTING with "OneDrive" (covers
+                // localized variants like "OneDrive - Personal").
+                let is_user_visible_target = path.components().any(|c| {
+                    let s = c.as_os_str().to_string_lossy();
+                    let lower = s.to_ascii_lowercase();
+                    matches!(lower.as_str(), "downloads" | "desktop" | "documents")
+                        || lower.starts_with("onedrive")
+                });
                 if !is_user_visible_target {
                     if let Ok(created) = path_meta.created() {
                         if let Ok(age) = created.elapsed() {
@@ -340,6 +425,18 @@ fn watcher_loop(
                             }
                         }
                     }
+                }
+
+                // Quarantine F4: if this path was just restored from
+                // quarantine, skip scanning it. The restore handler marks the
+                // path BEFORE writing plaintext to disk so the CREATE event
+                // emitted by the write lands inside the suppression window —
+                // without this check, the watcher would re-detect and
+                // re-quarantine the file before the caller commits the DB
+                // status flip, creating an infinite restore→quarantine loop.
+                if state.is_restore_suppressed(&path) {
+                    debug!(file = %path.display(), "watcher: skip — recently restored");
+                    continue;
                 }
 
                 // TOCTOU fix: capture file identity snapshot BEFORE scan.
@@ -431,7 +528,7 @@ fn watcher_loop(
                         }
                     }
                     continue;
-                } else if config.heuristic_alerts {
+                } else if heuristic_alerts_static {
                     let argus_start = std::time::Instant::now();
                     let v = state.argus().analyze_file(&path);
                     if rt_tracker.phase_expired(argus_start, rt_tracker.budget().max_yara_duration)
@@ -554,7 +651,7 @@ fn watcher_loop(
                 // Watcher thread NEVER blocks on sandbox (up to 35s).
                 // If sandbox raises score into threat range, background thread
                 // handles quarantine + notification autonomously.
-                let sandbox_config = config.sandbox.clone();
+                let sandbox_config = sandbox_config_static.clone();
                 if crate::sandbox_worker::should_sandbox(argus_verdict.score, &sandbox_config)
                     && !result.infected
                     && path
@@ -915,6 +1012,14 @@ fn fish_feed_event(event: &Event, state: &Arc<crate::ipc::AppState>) {
                         state,
                         path,
                         &format!("Extension mutation: {count} files → .{pattern}"),
+                    );
+                }
+                FishDecision::SlowBurn { count, window_secs } => {
+                    warn!(count, window_secs, "FISH: slow-burn mass mutation detected");
+                    fish_handle_burst(
+                        state,
+                        path,
+                        &format!("Slow-burn: {count} files mutated in {window_secs}s"),
                     );
                 }
                 FishDecision::Cooldown {

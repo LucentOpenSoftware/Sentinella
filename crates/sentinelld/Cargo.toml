@@ -29,6 +29,7 @@ notify = { version = "7", default-features = false, features = ["macos_kqueue"] 
 notify-debouncer-mini = "0.5"
 toml = "0.8"
 sha2 = "0.10"
+hmac = "0.12"
 ureq = { version = "2", features = ["tls"] }
 aes-gcm = "0.10"
 rand = "0.8"
@@ -43,12 +44,16 @@ windows = { version = "0.58", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_ProcessStatus",
     "Win32_System_Memory",
+    "Win32_System_LibraryLoader",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Diagnostics_Etw",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Time",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_System_Pipes",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_SystemInformation",
 ] }
 
 [dev-dependencies]

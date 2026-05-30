@@ -11,6 +11,7 @@ pub mod calibration;
 mod clamav_worker;
 mod config;
 pub mod convergence;
+mod devmode;
 pub mod paths;
 pub mod runtime_integrity;
 // Sandbox worker is called from scan flow when config.sandbox.enabled = true.
@@ -86,7 +87,7 @@ fn main() -> anyhow::Result<()> {
     if args.foreground {
         // Foreground mode: run directly with tokio runtime.
         let rt = tokio::runtime::Runtime::new()?;
-        rt.block_on(run_daemon(args))
+        rt.block_on(run_daemon(args, None))
     } else {
         // Windows service mode.
         #[cfg(target_os = "windows")]
@@ -97,7 +98,7 @@ fn main() -> anyhow::Result<()> {
         #[cfg(not(target_os = "windows"))]
         {
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(run_daemon(args))
+            rt.block_on(run_daemon(args, None))
         }
     }
 }
@@ -188,37 +189,57 @@ extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
         process_id: None,
     });
 
-    // Run daemon until shutdown signal.
-    let shutdown_for_daemon = Arc::clone(&shutdown);
-    rt.block_on(async {
-        let daemon = run_daemon(args);
-        let stop_wait = async {
+    // Audit fix: report StopPending promptly when the SCM Stop arrives, with
+    // a wait_hint, so services.msc doesn't show "Running" during teardown and
+    // SCM doesn't treat the stop as hung. A watcher task fires it once.
+    {
+        let h = status_handle;
+        let sd = Arc::clone(&shutdown);
+        rt.spawn(async move {
             loop {
-                if shutdown_for_daemon.load(std::sync::atomic::Ordering::Relaxed) {
+                if sd.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = h.set_service_status(ServiceStatus {
+                        service_type: ServiceType::OWN_PROCESS,
+                        current_state: ServiceState::StopPending,
+                        controls_accepted: ServiceControlAccept::empty(),
+                        exit_code: ServiceExitCode::Win32(0),
+                        checkpoint: 1,
+                        wait_hint: std::time::Duration::from_secs(30),
+                        process_id: None,
+                    });
                     break;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
-        };
-        tokio::select! {
-            result = daemon => { if let Err(e) = result { eprintln!("daemon error: {e}"); } }
-            _ = stop_wait => { /* SCM requested stop */ }
+        });
+    }
+
+    // Run daemon until shutdown signal. run_daemon now observes `shutdown`
+    // itself and performs graceful cleanup before returning.
+    let exit_code = match rt.block_on(run_daemon(args, Some(Arc::clone(&shutdown)))) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("daemon error: {e}");
+            1
         }
-    });
+    };
 
     // Report: stopped.
     let _ = status_handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
         current_state: ServiceState::Stopped,
         controls_accepted: ServiceControlAccept::empty(),
-        exit_code: ServiceExitCode::Win32(0),
+        exit_code: ServiceExitCode::Win32(exit_code),
         checkpoint: 0,
         wait_hint: std::time::Duration::ZERO,
         process_id: None,
     });
 }
 
-async fn run_daemon(args: Args) -> anyhow::Result<()> {
+async fn run_daemon(
+    args: Args,
+    shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
+) -> anyhow::Result<()> {
     // Initialize PathManager — centralized path resolution.
     if let Some(ref root) = args.runtime_root {
         paths::init(std::path::PathBuf::from(root));
@@ -227,8 +248,11 @@ async fn run_daemon(args: Args) -> anyhow::Result<()> {
     }
     let p = paths::paths();
     if let Err(e) = p.ensure_dirs() {
-        eprintln!("FATAL: {e}");
-        std::process::exit(1);
+        // Audit fix: under the Windows service, `std::process::exit(1)` here
+        // bypassed the SCM `Stopped` status report → SCM saw the process die
+        // mid-StartPending with no clean exit code. Return an error so the
+        // caller reports Stopped(exit_code) properly.
+        return Err(anyhow::anyhow!("failed to create runtime directories: {e}"));
     }
 
     // Initialize tracing with file + stdout output.
@@ -359,6 +383,62 @@ async fn run_daemon(args: Args) -> anyhow::Result<()> {
     let server = ipc::Server::with_engine(dll_dir, db_dir, database)?;
     info!("IPC server listening");
 
+    // ── Self-binary integrity (TOFU) ────────────────────────────────
+    // Hash the daemon's own exe + sibling workers against the stored
+    // baseline. First start creates the baseline; subsequent starts
+    // surface drift via the `health` IPC's `binary_integrity_drift` flag.
+    // Fail-loud (warn + flag), not fail-closed — admins upgrade binaries
+    // legitimately, and a daemon that refuses to start can't tell anyone.
+    {
+        let state_dir = p.state_dir();
+        // Reuse the runtime-integrity vault key — no second secret to manage.
+        match runtime_integrity::IntegrityVault::init(&state_dir) {
+            Ok(vault) => {
+                let key = *vault.key_bytes();
+                match runtime_integrity::verify_or_init_binaries(&state_dir, &key) {
+                    Ok(report) => {
+                        if report.tofu_initialized {
+                            info!("binary integrity: TOFU baseline written");
+                        } else if report.has_drift() {
+                            for p in &report.drifted {
+                                error!(path = %p.display(), "binary integrity: HASH MISMATCH (tamper signal)");
+                            }
+                            server.state().set_binary_integrity_drift(true);
+                        } else {
+                            if !report.new_entries.is_empty() {
+                                for p in &report.new_entries {
+                                    warn!(path = %p.display(), "binary integrity: new binary not in baseline");
+                                }
+                            }
+                            info!(
+                                verified = report.verified.len(),
+                                "binary integrity: all known binaries match baseline"
+                            );
+                        }
+                    }
+                    Err(e) => warn!(%e, "binary integrity check failed"),
+                }
+            }
+            Err(e) => warn!(%e, "integrity vault init failed — binary check skipped"),
+        }
+    }
+
+    // ── Config tamper detection (HMAC sidecar) ──────────────────────
+    // Re-load the config through the verifying loader to compare the
+    // on-disk bytes against the HMAC sidecar laid down by the last save.
+    // Drift means someone edited sentinelld.toml outside the daemon
+    // (manual TOML edit, GPO push, scripted tweak). Fail-loud: keep the
+    // loaded values, surface via `health.config_drift`.
+    match config::load_verified(args.config.as_deref()) {
+        Ok((_cfg, drift)) => {
+            if drift {
+                error!("config drift: sentinelld.toml HMAC sidecar does NOT match file contents");
+                server.state().set_config_drift(true);
+            }
+        }
+        Err(e) => warn!(%e, "config verify failed — drift detection unavailable this start"),
+    }
+
     // Load ClamAV isolation config.
     if config.clamav_isolation == "subprocess" {
         server
@@ -418,6 +498,12 @@ async fn run_daemon(args: Args) -> anyhow::Result<()> {
     // Watcher runs even in audit mode (minimal protection).
     server.state().start_watcher();
 
+    // Heartbeat-driven auto-restart: if the watcher stops ticking for >60s
+    // while protection is supposed to be on, respawn it. A targeted attacker
+    // who manages to crash the watcher silently otherwise wins until the
+    // operator notices the stale `watcher_heartbeat_stale` flag in the GUI.
+    server.state().spawn_watcher_heartbeat_monitor();
+
     // Post-boot critical areas scan — lightweight, 1 thread, BELOW_NORMAL.
     // Fires AFTER watcher so realtime is never delayed.
     // Skips in audit mode (minimal footprint).
@@ -466,16 +552,44 @@ async fn run_daemon(args: Args) -> anyhow::Result<()> {
         }
     });
 
-    // Main event loop.
-    if let Err(e) = server.run().await {
+    // Audit fix: under the Windows service there is no Ctrl+C — the SCM sets
+    // the `shutdown` flag. Previously the service path cancelled the whole
+    // run_daemon future on stop, so the cleanup below (scheduler.stop, final
+    // log) NEVER ran. Now we race `server.run()` against the shutdown flag so
+    // that on an SCM stop we fall through to graceful cleanup.
+    let run_result = {
+        let shutdown_signal = async {
+            match &shutdown {
+                Some(flag) => loop {
+                    if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                },
+                // Foreground/non-service: rely on server.run()'s own Ctrl+C
+                // handling — never trip this branch.
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            res = server.run() => res,
+            _ = shutdown_signal => {
+                info!("SCM stop requested — beginning graceful shutdown");
+                Ok(())
+            }
+        }
+    };
+
+    // Cleanup ALWAYS runs now (both error and stop paths).
+    if let Some(s) = scheduler {
+        s.stop();
+    }
+
+    if let Err(e) = run_result {
         error!(%e, "daemon shutting down due to error");
         return Err(e);
     }
 
-    // Cleanup.
-    if let Some(s) = scheduler {
-        s.stop();
-    }
     info!("sentinelld stopped gracefully");
     Ok(())
 }

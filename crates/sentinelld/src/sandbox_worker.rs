@@ -7,6 +7,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -96,12 +97,27 @@ pub fn detonate(
         .spawn()
         .map_err(|e| format!("sandboxd spawn: {e}"))?;
 
-    let stdout = child.stdout.take().ok_or("no stdout")?;
-    let stdout_reader = std::thread::spawn(move || read_limited(stdout, MAX_OUTPUT_BYTES));
-    let stderr_reader = child
-        .stderr
-        .take()
-        .map(|stderr| std::thread::spawn(move || read_limited(stderr, MAX_OUTPUT_BYTES)));
+    // See clamav_worker for the rationale: Rust's `Child` Drop is a no-op,
+    // so `?` here would orphan the sandboxd subprocess.
+    let stdout = match child.stdout.take() {
+        Some(s) => s,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("no stdout".into());
+        }
+    };
+    let (tx_out, rx_out) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx_out.send(read_limited(stdout, MAX_OUTPUT_BYTES));
+    });
+    if let Some(stderr) = child.stderr.take() {
+        // Drain stderr into a detached thread; pipe closes when child dies,
+        // so the reader exits naturally. We do not block on it.
+        std::thread::spawn(move || {
+            let _ = read_limited(stderr, MAX_OUTPUT_BYTES);
+        });
+    }
 
     // Wait with timeout + cancellation.
     let timeout = Duration::from_secs(config.timeout_sec + 5); // Extra buffer beyond detonation timeout.
@@ -128,13 +144,13 @@ pub fn detonate(
         }
     }
 
-    let stdout_data = stdout_reader
-        .join()
-        .map_err(|_| "stdout reader panicked")?
-        .map_err(|e| format!("stdout: {e}"))?;
-    if let Some(reader) = stderr_reader {
-        let _ = reader.join().map_err(|_| "stderr reader panicked")?;
-    }
+    // Bounded wait on stdout — if grandchildren keep pipe alive, fail fast
+    // rather than block forever joining a leaked thread.
+    let stdout_data = match rx_out.recv_timeout(Duration::from_secs(2)) {
+        Ok(Ok(data)) => data,
+        Ok(Err(e)) => return Err(format!("stdout: {e}")),
+        Err(_) => return Err("stdout reader timeout (pipe held by grandchild?)".into()),
+    };
 
     if stdout_data.is_empty() {
         return Err("sandboxd produced empty output".into());

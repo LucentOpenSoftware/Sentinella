@@ -86,13 +86,15 @@ pub fn check_persistence_context(path: &Path) -> Option<PersistenceType> {
         return Some(PersistenceType::ScheduledTask);
     }
 
-    // Service binaries in System32.
-    if p.contains("\\system32\\") && (p.ends_with(".sys") || p.ends_with(".dll")) {
-        // Only flag if not a known Windows binary path.
-        if !p.contains("\\windows\\system32\\drivers\\") {
-            return Some(PersistenceType::Service);
-        }
-    }
+    // Service binaries in System32 — DISABLED. Previously flagged every
+    // .dll/.sys in \system32\ as PersistenceType::Service worth +12 weight,
+    // including legitimate kernel32.dll, ntdll.dll, user32.dll, etc. This
+    // boosted ARGUS scores for every scan touching System32 — massive FP
+    // cascade. To re-enable safely, would need either (a) cross-reference
+    // against actual SCM service binary registry, or (b) Authenticode
+    // trust-anchor check filtering Microsoft-signed binaries. Until then,
+    // service persistence is detected only via the ScheduledTask + Run-key
+    // + StartupFolder paths above which are far more specific.
 
     // IFEO registry-related paths (binaries targeted by IFEO).
     // This is detected at scan time when we correlate with registry data.

@@ -14,6 +14,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, error, info, warn};
 
+mod client_auth;
 mod policy;
 mod state;
 pub use state::{AppState, unify_detection_filtered};
@@ -131,18 +132,28 @@ impl Server {
         info!(pipe = pipe_name, "listening on named pipe");
         let pipe_security = PipeSecurity::new()?;
 
-        // Create first pipe instance. Retry on contention — another sentinelld
-        // process (e.g., GUI supervisor) may still hold the pipe briefly.
-        // Without this retry, the service crashes immediately at boot if the
-        // GUI-spawned daemon started first.
+        // Create first pipe instance. Retry on contention.
+        // Strategy: first 10 attempts with FILE_FLAG_FIRST_PIPE_INSTANCE=true
+        // (proper ownership). If an orphan holds the pipe and refuses to die,
+        // last 10 attempts fall back to first_instance=false so we can at
+        // least attach to the existing pipe and serve requests. Without the
+        // fallback the service would crash indefinitely while an orphan
+        // GUI-spawned daemon held the pipe forever.
         let mut server = {
             let mut last_err = None;
             let mut srv = None;
             for attempt in 0..20 {
-                match create_pipe_server(pipe_name, true, &pipe_security) {
-                    Ok(s) => { srv = Some(s); break; }
+                let first = attempt < 10;
+                match create_pipe_server(pipe_name, first, &pipe_security) {
+                    Ok(s) => {
+                        if !first {
+                            warn!(attempt, "attached to existing pipe (orphan owner)");
+                        }
+                        srv = Some(s);
+                        break;
+                    }
                     Err(e) => {
-                        warn!(attempt, %e, "pipe creation failed, retrying in 3s");
+                        warn!(attempt, first_instance = first, %e, "pipe creation failed, retrying in 3s");
                         last_err = Some(e);
                         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                     }
@@ -179,24 +190,53 @@ impl Server {
             // IMMEDIATELY create next pipe instance BEFORE handling connection.
             // This eliminates the PIPE_BUSY window — a new listener is always ready.
             let connected_pipe = server;
+
+            // Retry-with-backoff loop instead of `?` propagation.
+            // Old code escaped run() entirely on the second failure, killing
+            // the daemon's IPC server forever (only SCM restart would bring
+            // it back). Now retries indefinitely with capped backoff.
             server = match create_pipe_server(pipe_name, false, &pipe_security) {
                 Ok(s) => s,
                 Err(e) => {
-                    error!(%e, "failed to create next pipe instance");
-                    // Handle the current connection anyway, then retry.
-                    let st = Arc::clone(&self.state);
-                    tokio::spawn(async move {
-                        if let Err(e) = handle_connection(connected_pipe, st).await {
-                            warn!(%e, "client session error");
+                    error!(%e, "failed to create next pipe instance, retrying with backoff");
+                    let mut backoff_ms: u64 = 100;
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                        match create_pipe_server(pipe_name, false, &pipe_security) {
+                            Ok(s) => break s,
+                            Err(e2) => {
+                                warn!(%e2, backoff_ms, "pipe recreate failed, backing off");
+                                backoff_ms = (backoff_ms * 2).min(5000);
+                                self.state.record_ipc_error();
+                            }
                         }
-                    });
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    server = create_pipe_server(pipe_name, false, &pipe_security)?;
-                    continue;
+                    }
                 }
             };
 
-            // Spawn handler for connected client.
+            // Per-connection client-SID authorization — independent of the
+            // shared secret (which is world-readable for GUI compat). Rejects
+            // anonymous and cross-user/non-console unprivileged callers. Runs
+            // AFTER the next listener is ready so a reject can't starve the
+            // pipe. Fail-open inside `authorize_pipe_client` on any resolution
+            // error, so an API quirk never bricks a legit GUI. Env kill-switch
+            // for field debugging.
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::io::AsRawHandle;
+                let bypass = std::env::var("SENTINELLA_DISABLE_CLIENT_SID_CHECK")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+                if !bypass && !client_auth::authorize_pipe_client(connected_pipe.as_raw_handle()) {
+                    // Unauthorized — close without serving; next listener is ready.
+                    drop(connected_pipe);
+                    self.state.record_ipc_error();
+                    continue;
+                }
+            }
+
+            // Spawn handler for connected client. Single spawn site regardless
+            // of whether server recreation succeeded immediately or after retries.
             debug!("client connected");
             let st = Arc::clone(&self.state);
             tokio::spawn(async move {
@@ -334,6 +374,31 @@ where
     }
 }
 
+/// Adversary A2 — closed allowlist of methods that may be scoped by a
+/// challenge token. Keep this list in lockstep with every handler call site
+/// that invokes `validate_challenge_token`. An attacker who can request a
+/// challenge for an arbitrary string could reuse it against any handler that
+/// happens to validate against that same string, so we hard-code the legal
+/// set here rather than echo whatever the caller asked for.
+fn is_challengeable_method(method: &str) -> bool {
+    matches!(
+        method,
+        "engine.reload"
+            | "argus.reload"
+            | "settings.set"
+            | "sources.set"
+            | "sources.update"
+            | "sources.rollback"
+            | "protection.set_critical"
+            | "protection.disable"
+            | "protection.enable"
+            | "quarantine.add"
+            | "quarantine.restore"
+            | "quarantine.restore_as"
+            | "quarantine.delete"
+    )
+}
+
 /// Synchronous dispatch — all handlers are sync (no async needed).
 fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
     debug!(method = %req.method, id = req.id, "dispatch");
@@ -401,6 +466,26 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
                 ))
                 .unwrap_or_default();
             }
+            // Scanner-B Finding 1: policy declares engine.reload as
+            // PrivilegedMutation (challenge required) but the central
+            // dispatcher does not enforce class, so the declared
+            // protection was effectively just AuthenticatedAction.
+            // Attacker with the IPC secret could force unlimited engine
+            // reloads (~5-8s scan-blind window each). Now requires a
+            // one-shot challenge token — mirrors protection.set_critical.
+            let token = req
+                .params
+                .get("token")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !state.validate_challenge_token(token, "engine.reload") {
+                return serde_json::to_vec(&RpcErrorResponse::err(
+                    req.id,
+                    error_codes::INVALID_PARAMS,
+                    "challenge token required for engine reload".to_string(),
+                ))
+                .unwrap_or_default();
+            }
             match state.reload_engine() {
                 Ok(sigs) => Ok(serde_json::json!({"ok": true, "signatures": sigs})),
                 Err(e) => Ok(serde_json::json!({"ok": false, "error": e})),
@@ -413,21 +498,23 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
                 .get("type")
                 .and_then(|v| v.as_str())
                 .unwrap_or("quick");
-            // Full/startup scans require auth (resource-intensive).
-            if matches!(scan_type, "full" | "startup") {
-                let auth = req
-                    .params
-                    .get("auth")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if !state.validate_ipc_auth(auth) {
-                    return serde_json::to_vec(&RpcErrorResponse::err(
-                        req.id,
-                        error_codes::INVALID_PARAMS,
-                        "full/startup scans require IPC authentication".to_string(),
-                    ))
-                    .unwrap_or_default();
-                }
+            // R4-LETHAL-5: previously only full/startup required auth.
+            // Quick scans were unauthenticated → any caller could spam
+            // scan.start to chew disk I/O, evict the page cache and
+            // induce sustained scan pressure as a DoS (and as cover for
+            // payload drops happening in parallel).
+            let auth = req
+                .params
+                .get("auth")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !state.validate_ipc_auth(auth) {
+                return serde_json::to_vec(&RpcErrorResponse::err(
+                    req.id,
+                    error_codes::INVALID_PARAMS,
+                    format!("{scan_type} scans require IPC authentication"),
+                ))
+                .unwrap_or_default();
             }
             let target = req.params.get("target").and_then(|v| v.as_str());
             // Validate target path if provided.
@@ -445,6 +532,44 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
                         req.id,
                         error_codes::INVALID_PARAMS,
                         "target path too long",
+                    ))
+                    .unwrap_or_default();
+                }
+                // ☠️ R8-LETHAL: refuse UNC / device-namespace targets.
+                //
+                // Daemon runs as SYSTEM. A `target` of "\\attacker.com\share\"
+                // makes the scan walker authenticate to the remote SMB
+                // server using the machine-account NTLM hash — captured by
+                // responder/inveigh and relayed to LDAP/CIFS/HTTP for AD
+                // compromise. A `target` of "\\.\PHYSICALDRIVE0" reads the
+                // raw disk as SYSTEM. "\\?\GLOBALROOT\Device\…" bypasses
+                // path-canonicalization sanity checks downstream.
+                //
+                // We must still allow `\\?\C:\very-long-path` (Windows
+                // long-path namespace — std::fs::canonicalize returns
+                // exactly this), so the filter is precise.
+                let lower = t.to_ascii_lowercase();
+                let is_unc_share =
+                    (t.starts_with("\\\\") && !lower.starts_with(r"\\?\") && !lower.starts_with(r"\\.\"))
+                        || t.starts_with("//");
+                let is_long_unc = lower.starts_with(r"\\?\unc\");
+                let is_device_ns = lower.starts_with(r"\\.\")
+                    || lower.contains(r"\globalroot\")
+                    || lower.contains(r"\physicaldrive");
+                if is_unc_share || is_long_unc || is_device_ns {
+                    return serde_json::to_vec(&RpcErrorResponse::err(
+                        req.id,
+                        error_codes::INVALID_PARAMS,
+                        "scan target must be a local non-UNC path",
+                    ))
+                    .unwrap_or_default();
+                }
+                // Embedded NUL = win32 path-truncation trick.
+                if t.contains('\0') {
+                    return serde_json::to_vec(&RpcErrorResponse::err(
+                        req.id,
+                        error_codes::INVALID_PARAMS,
+                        "scan target contains embedded NUL",
                     ))
                     .unwrap_or_default();
                 }
@@ -479,6 +604,26 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
         }
 
         "quarantine.list" => {
+            // R7-LETHAL: this endpoint returns the SHA-256 of every malware
+            // Sentinella has ever caught + its original file path + virus
+            // family name. Without auth, any IPC caller gathers exactly the
+            // intel needed to (a) identify which malware variant the user
+            // ran into via VirusTotal lookup, (b) craft a sibling payload
+            // tuned to evade the same signature, (c) pick a drop location
+            // the user demonstrably visits. Now requires the IPC secret.
+            let auth = req
+                .params
+                .get("auth")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !state.validate_ipc_auth(auth) {
+                return serde_json::to_vec(&RpcErrorResponse::err(
+                    req.id,
+                    error_codes::INVALID_PARAMS,
+                    "authenticated IPC quarantine list required".to_string(),
+                ))
+                .unwrap_or_default();
+            }
             let rows = state.quarantine_list();
             let items: Vec<serde_json::Value> = rows
                 .into_iter()
@@ -513,11 +658,20 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
                 .get("token")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            if !state.validate_challenge_token(token) {
+            if !state.validate_challenge_token(token, "quarantine.add") {
                 Ok(
                     serde_json::json!({"ok": false, "error": "Challenge token required for quarantine add"}),
                 )
             } else {
+                // ARGUS-2 Phase 2: bound caller-controlled strings before they
+                // hit the DB/log. virus_name/scan_id are attacker-influenced
+                // when the caller is anything other than our own scanners,
+                // and we previously stored them unbounded → log injection and
+                // DB row bloat (rows are 1 SHA-256 from rare → effectively
+                // permanent retention).
+                const MAX_PATH_LEN: usize = 4096;
+                const MAX_VIRUS_NAME: usize = 256;
+                const MAX_SCAN_ID: usize = 128;
                 let path = req
                     .params
                     .get("path")
@@ -533,9 +687,20 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
                     .get("scan_id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
+                if path.len() > MAX_PATH_LEN
+                    || virus.len() > MAX_VIRUS_NAME
+                    || scan_id.len() > MAX_SCAN_ID
+                {
+                    return serde_json::to_vec(&RpcErrorResponse::err(
+                        req.id,
+                        error_codes::INVALID_PARAMS,
+                        "quarantine.add param too long".to_string(),
+                    ))
+                    .unwrap_or_default();
+                }
                 match state.quarantine_file(path, virus, scan_id) {
                     Ok(r) => ok_json(r),
-                    Err(e) => Ok(serde_json::json!({"error": e})),
+                    Err(e) => Ok(serde_json::json!({"ok": false, "error": e})),
                 }
             }
         }
@@ -546,7 +711,7 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
                 .get("token")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            if !state.validate_challenge_token(token) {
+            if !state.validate_challenge_token(token, "quarantine.restore") {
                 Ok(
                     serde_json::json!({"ok": false, "error": "Challenge token required for quarantine restore"}),
                 )
@@ -564,18 +729,25 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
                 .get("token")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            if !state.validate_challenge_token(token) {
+            if !state.validate_challenge_token(token, "quarantine.restore_as") {
                 Ok(
                     serde_json::json!({"ok": false, "error": "Challenge token required for quarantine restore"}),
                 )
             } else {
+                // ARGUS-2 Phase 2: cap dest length to keep validate_restore_path
+                // from canonicalize-stalling on a 1-MB attacker path, and to
+                // keep error/log lines bounded.
+                const MAX_ID_LEN: usize = 128;
+                const MAX_DEST_LEN: usize = 4096;
                 let id = req.params.get("id").and_then(|v| v.as_str()).unwrap_or("");
                 let dest = req
                     .params
                     .get("dest")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                if dest.is_empty() {
+                if id.len() > MAX_ID_LEN || dest.len() > MAX_DEST_LEN {
+                    Ok(serde_json::json!({"ok": false, "error": "id/dest param too long"}))
+                } else if dest.is_empty() {
                     Ok(serde_json::json!({"ok": false, "error": "dest path required"}))
                 } else {
                     match state.quarantine_restore_as(id, dest) {
@@ -592,7 +764,7 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
                 .get("token")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            if !state.validate_challenge_token(token) {
+            if !state.validate_challenge_token(token, "quarantine.delete") {
                 Ok(
                     serde_json::json!({"ok": false, "error": "Challenge token required for quarantine delete"}),
                 )
@@ -668,11 +840,47 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
         }
 
         "runtime.status" => {
+            // Adversary A1: policy declared this auth_read but the handler had
+            // no gate, so an unauth caller still received full PLM/ETW/ps_bridge
+            // /trust diagnostics — useful intel for attackers profiling the
+            // daemon's runtime surface (which probes are armed, which features
+            // are configured, etc.). Mirror trust.status auth pattern.
+            let auth = req
+                .params
+                .get("auth")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !state.validate_ipc_auth(auth) {
+                return serde_json::to_vec(&RpcErrorResponse::err(
+                    req.id,
+                    error_codes::INVALID_PARAMS,
+                    "authenticated IPC runtime status required".to_string(),
+                ))
+                .unwrap_or_default();
+            }
             let diag = state.runtime_intelligence_diagnostics();
             Ok(diag)
         }
 
         "trust.status" => {
+            // R7-LETHAL: trust graph diagnostics reveal which signers and
+            // binary identities the daemon trusts. Useful intel for
+            // living-off-the-land selection — attacker picks a binary
+            // the trust graph rates highly, knowing ARGUS will give
+            // it a trust discount. Auth-gate.
+            let auth = req
+                .params
+                .get("auth")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !state.validate_ipc_auth(auth) {
+                return serde_json::to_vec(&RpcErrorResponse::err(
+                    req.id,
+                    error_codes::INVALID_PARAMS,
+                    "authenticated IPC trust status required".to_string(),
+                ))
+                .unwrap_or_default();
+            }
             // Trust graph diagnostics + recent drift events.
             if let Some(tg) = state.trust_graph() {
                 let mut diag = tg.diagnostics();
@@ -798,6 +1006,23 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
         }
 
         "detections.list" => {
+            // R7-LETHAL: same intel-leak class as quarantine.list — returns
+            // detection signature names + paths for every malware ever
+            // found. Auth-gate so an unprivileged caller cannot enumerate
+            // the user's malware history to fingerprint their environment.
+            let auth = req
+                .params
+                .get("auth")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !state.validate_ipc_auth(auth) {
+                return serde_json::to_vec(&RpcErrorResponse::err(
+                    req.id,
+                    error_codes::INVALID_PARAMS,
+                    "authenticated IPC detections list required".to_string(),
+                ))
+                .unwrap_or_default();
+            }
             let scan_id = req
                 .params
                 .get("scan_id")
@@ -827,14 +1052,87 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
             }
         }
 
-        "watcher.status" => ok_json(state.watcher_status()),
-        "idle_scanner.status" => ok_json(state.idle_scanner_stats()),
+        "watcher.status" => {
+            // Scanner-B Finding 2: response includes the full list of
+            // watched roots — gives an unauth local caller an oracle for
+            // "drop your payload in this sibling directory and it will
+            // be missed." Now requires the IPC secret.
+            let auth = req
+                .params
+                .get("auth")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !state.validate_ipc_auth(auth) {
+                return serde_json::to_vec(&RpcErrorResponse::err(
+                    req.id,
+                    error_codes::INVALID_PARAMS,
+                    "authenticated IPC required for watcher status".to_string(),
+                ))
+                .unwrap_or_default();
+            }
+            ok_json(state.watcher_status())
+        }
+        "idle_scanner.status" => {
+            // Scanner-B Finding 3: response includes current_target (the
+            // path being scanned). Unauth poll = oracle for "where the
+            // scanner is NOT looking right now" → window for drops.
+            let auth = req
+                .params
+                .get("auth")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !state.validate_ipc_auth(auth) {
+                return serde_json::to_vec(&RpcErrorResponse::err(
+                    req.id,
+                    error_codes::INVALID_PARAMS,
+                    "authenticated IPC required for idle scanner status".to_string(),
+                ))
+                .unwrap_or_default();
+            }
+            ok_json(state.idle_scanner_stats())
+        }
         "update.status" => ok_json(state.update_status()),
         "update.start" => {
+            // R4-LETHAL-4: no auth was required → any unprivileged caller
+            // could trigger a signature update at will. That forces an
+            // engine reload (~5-8s scan-blind window) and lets an attacker
+            // open repeatable scanning gaps on demand to drop payloads.
+            let auth = req
+                .params
+                .get("auth")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !state.validate_ipc_auth(auth) {
+                return serde_json::to_vec(&RpcErrorResponse::err(
+                    req.id,
+                    error_codes::INVALID_PARAMS,
+                    "authenticated IPC update start required".to_string(),
+                ))
+                .unwrap_or_default();
+            }
             let r = AppState::start_update(state);
             Ok(r)
         }
-        "activity.list" => ok_json(state.activity_list()),
+        "activity.list" => {
+            // R7-LETHAL: activity log includes scan history, settings
+            // changes, protection state transitions, recent errors.
+            // Useful to an attacker for timing-attack scheduling
+            // (drop right after the most-recent scheduled scan).
+            let auth = req
+                .params
+                .get("auth")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !state.validate_ipc_auth(auth) {
+                return serde_json::to_vec(&RpcErrorResponse::err(
+                    req.id,
+                    error_codes::INVALID_PARAMS,
+                    "authenticated IPC activity list required".to_string(),
+                ))
+                .unwrap_or_default();
+            }
+            ok_json(state.activity_list())
+        }
         "activity.log" => {
             let auth = req
                 .params
@@ -859,10 +1157,36 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
                     .take(max)
                     .collect()
             };
-            let severity = bounded("severity", "info", 24);
-            let category = bounded("category", "ipc", 48);
-            let title = bounded("title", "Activity event", 160);
+            let severity_raw = bounded("severity", "info", 24);
+            let category_raw = bounded("category", "general", 40);
+            let title_raw = bounded("title", "Activity event", 154);
             let message = bounded("message", "", 512);
+            // Scanner-B Finding 5: IPC-originated activity must never be
+            // able to impersonate internal severities or categories used
+            // by the daemon to flag real incidents. Otherwise an attacker
+            // with the IPC secret can poison the defender's activity feed
+            // with fake "critical/security" entries, burying genuine
+            // alerts under decoy noise (defender-blinding primitive).
+            //
+            // - Restrict severity to {info, warning}. critical|error are
+            //   reserved for internal categories (engine, security, etc.).
+            // - Force category to start with "gui:" so internal categories
+            //   ("security", "engine", "scan", "settings", "sources",
+            //   "protection", ...) can never be impersonated from IPC.
+            let severity = match severity_raw.as_str() {
+                "info" | "warning" => severity_raw,
+                _ => "info".to_string(),
+            };
+            let category = format!("gui:{}", category_raw);
+            // Adversary A4: the gui: category prefix and severity allowlist
+            // weren't enough — an attacker could still submit
+            // `severity=warning, title="CRITICAL: malware ABC quarantined"`
+            // and slip an authoritative-looking string into the GUI alert
+            // feed + diagnostics.export.recent_errors. Force a "[gui] "
+            // prefix on the title too so defenders can visually distinguish
+            // (and grep-filter) IPC-injected events. Title length cap
+            // remains 160 chars including prefix.
+            let title = format!("[gui] {}", title_raw);
             state.log_activity(&severity, &category, &title, &message, None);
             Ok(serde_json::json!({"ok": true}))
         }
@@ -951,7 +1275,7 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
                 .get("challenge_token")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            if !state.validate_challenge_token(token) {
+            if !state.validate_challenge_token(token, "sources.set") {
                 return serde_json::to_vec(&RpcErrorResponse::err(
                     req.id,
                     error_codes::INSUFFICIENT_PRIVILEGE,
@@ -1028,7 +1352,7 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
                 .get("challenge_token")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            if !state.validate_challenge_token(token) {
+            if !state.validate_challenge_token(token, "sources.update") {
                 return serde_json::to_vec(&RpcErrorResponse::err(
                     req.id,
                     error_codes::INSUFFICIENT_PRIVILEGE,
@@ -1114,7 +1438,7 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
                 .get("challenge_token")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            if !state.validate_challenge_token(token) {
+            if !state.validate_challenge_token(token, "sources.rollback") {
                 return serde_json::to_vec(&RpcErrorResponse::err(
                     req.id,
                     error_codes::INSUFFICIENT_PRIVILEGE,
@@ -1162,6 +1486,25 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
                 ))
                 .unwrap_or_default();
             }
+            // Adversary A3: argus.reload was the unfixed sibling of
+            // engine.reload/update.start — same reload-stacking DoS class
+            // (YARA reload + trusted_cache.invalidate() shortens the
+            // ARGUS-effective window for seconds). Now PrivilegedMutation
+            // and challenge-token gated; an attacker with the IPC secret
+            // can no longer chain reloads to extend the scan-blind window.
+            let token = req
+                .params
+                .get("token")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !state.validate_challenge_token(token, "argus.reload") {
+                return serde_json::to_vec(&RpcErrorResponse::err(
+                    req.id,
+                    error_codes::INVALID_PARAMS,
+                    "challenge token required for ARGUS reload".to_string(),
+                ))
+                .unwrap_or_default();
+            }
             let yara_dirs = crate::paths::paths().yara_rule_dirs();
             let yara_result = state.argus().yara.load_rules_on_large_stack(&yara_dirs);
             let yara_msg = match yara_result {
@@ -1179,6 +1522,14 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
                     }
                 }
             }
+
+            // Detection capability just changed — expire the per-hash trusted
+            // cache so files previously scored clean are RE-analyzed against the
+            // new rules/IOCs. Without this the cache's sig_generation never
+            // advanced in production (only a test called invalidate()), so a
+            // signed/reputable file cached clean would shortcut ARGUS forever,
+            // even when a freshly-loaded YARA rule now matches it.
+            state.argus().trusted_cache.invalidate();
 
             state.log_activity(
                 "info",
@@ -1277,7 +1628,30 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
         }
 
         "settings.get" => {
-            let config = crate::config::Config::load(None).unwrap_or_default();
+            // R4-LETHAL-6: previously no auth → any caller could read the
+            // entire config including `excluded_paths`, `excluded_extensions`,
+            // `excluded_detections`, `trusted_hashes` and `realtime_roots`.
+            // That is *exactly* the intel an attacker needs to choose a
+            // payload drop location the scanner will skip and a SHA the
+            // scanner will trust. Reading the config is now authenticated.
+            let auth = req
+                .params
+                .get("auth")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !state.validate_ipc_auth(auth) {
+                return serde_json::to_vec(&RpcErrorResponse::err(
+                    req.id,
+                    error_codes::INVALID_PARAMS,
+                    "authenticated IPC settings read required".to_string(),
+                ))
+                .unwrap_or_default();
+            }
+            let mut config = crate::config::Config::load(None).unwrap_or_default();
+            // Redact the developer-mode password hash — never expose it over IPC
+            // even though it is one-way (the GUI never needs it; it sends the
+            // plaintext password to dev.set_developer_mode for verification).
+            config.developer.password_sha256.clear();
             ok_json(config)
         }
         // Challenge token — GUI requests before dangerous commands.
@@ -1295,8 +1669,26 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
                 ))
                 .unwrap_or_default();
             }
-            let token = state.generate_challenge_token();
-            Ok(serde_json::json!({"token": token}))
+            // Adversary A2: tokens are method-scoped. The caller MUST declare
+            // up-front which dangerous method this token is for; the server
+            // rejects any presentation against a different method. The
+            // registry is a closed allowlist so a typo or attacker-chosen
+            // method string can't get a token issued for an unintended op.
+            let method = req
+                .params
+                .get("method")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !is_challengeable_method(method) {
+                return serde_json::to_vec(&RpcErrorResponse::err(
+                    req.id,
+                    error_codes::INVALID_PARAMS,
+                    "challenge token requires a known dangerous-method scope (param: method)".to_string(),
+                ))
+                .unwrap_or_default();
+            }
+            let token = state.generate_challenge_token(method);
+            Ok(serde_json::json!({"token": token, "method": method}))
         }
 
         "settings.set" => {
@@ -1310,6 +1702,28 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
                     req.id,
                     error_codes::INVALID_PARAMS,
                     "authenticated IPC settings update required".to_string(),
+                ))
+                .unwrap_or_default();
+            }
+            // Scanner-B Finding 1: settings.set is declared PrivilegedMutation
+            // in policy, but the central dispatcher does not enforce the class
+            // — it only blocks rate/reload, never demanding a token. Result:
+            // anyone with the IPC secret could mutate configuration without
+            // ever obtaining a challenge token, downgrading effective protection
+            // to AuthenticatedAction. Even though the kill-vector fields
+            // (excluded_*, trusted_hashes, realtime_roots, etc.) are pinned to
+            // current values below, the remaining mutable surface is still
+            // worth a token gate (e.g. heuristic thresholds, scheduler windows).
+            let token = req
+                .params
+                .get("token")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !state.validate_challenge_token(token, "settings.set") {
+                return serde_json::to_vec(&RpcErrorResponse::err(
+                    req.id,
+                    error_codes::INVALID_PARAMS,
+                    "challenge token required for settings update".to_string(),
                 ))
                 .unwrap_or_default();
             }
@@ -1349,6 +1763,17 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
                     config.scheduled_scan_enabled = current.scheduled_scan_enabled;
                     config.enhanced_signature_provider = current.enhanced_signature_provider;
 
+                    // ☠️ KILL VECTOR FIX: preserve developer-mode password hash.
+                    // settings.get redacts password_sha256 to "" before returning,
+                    // so a round-trip GUI settings.set would otherwise wipe the
+                    // provisioned hash. Worse, an attacker with the IPC secret
+                    // could inject a hash they know the plaintext of, then
+                    // unlock developer mode without ever knowing the original
+                    // password. The hash is provisioned out-of-band by editing
+                    // the config file directly (documented dev-mode setup);
+                    // IPC settings.set must never be a path to mutate it.
+                    config.developer.password_sha256 = current.developer.password_sha256;
+
                     // Validate the remaining mutable fields.
                     config.validate();
 
@@ -1385,6 +1810,10 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
             "audit_mode": state.is_audit_mode(),
             "memory_pressure": state.pressure_state(),
             "working_set": state.residency_diagnostics(),
+            // Tamper-detection signals (fail-loud: daemon keeps running,
+            // operator sees the drift via this health endpoint).
+            "binary_integrity_drift": state.binary_integrity_drift(),
+            "config_drift": state.config_drift(),
         })),
 
         // ── Protection critical settings (requires challenge token) ──
@@ -1396,7 +1825,7 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
                 .get("token")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            if !state.validate_challenge_token(token) {
+            if !state.validate_challenge_token(token, "protection.set_critical") {
                 return serde_json::to_vec(&RpcErrorResponse::err(
                     req.id,
                     error_codes::INVALID_PARAMS,
@@ -1446,7 +1875,7 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
                 .get("token")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            if !state.validate_challenge_token(token) {
+            if !state.validate_challenge_token(token, "protection.disable") {
                 return serde_json::to_vec(&RpcErrorResponse::err(
                     req.id,
                     error_codes::INVALID_PARAMS,
@@ -1471,7 +1900,7 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
                 .get("token")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            if !state.validate_challenge_token(token) {
+            if !state.validate_challenge_token(token, "protection.enable") {
                 return serde_json::to_vec(&RpcErrorResponse::err(
                     req.id,
                     error_codes::INVALID_PARAMS,
@@ -1558,6 +1987,7 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
                 "argus_version": argus::ENGINE_VERSION,
                 "os": std::env::consts::OS,
                 "arch": std::env::consts::ARCH,
+                "system": crate::footprint::system_info_json(),
                 "uptime_secs": stats.uptime_secs,
                 "protection_state": stats.protection_state,
                 "protection_detail": stats.protection_detail,
@@ -1585,6 +2015,158 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
                 "residency": state.residency_diagnostics(),
                 "generated_at": chrono::Utc::now().to_rfc3339(),
             }))
+        }
+
+        // ── Developer mode (local-only perf telemetry gate) ──
+        // Read current dev-mode status. Never returns the password hash.
+        "dev.status" => {
+            let auth = req
+                .params
+                .get("auth")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !state.validate_ipc_auth(auth) {
+                return serde_json::to_vec(&RpcErrorResponse::err(
+                    req.id,
+                    error_codes::INVALID_PARAMS,
+                    "authenticated IPC dev status read required".to_string(),
+                ))
+                .unwrap_or_default();
+            }
+            let dev = state.developer_config();
+            Ok(serde_json::json!({
+                "enabled": dev.enabled,
+                "telemetry_enabled": dev.telemetry_enabled,
+                // Whether an unlock password has been provisioned (never the hash).
+                "provisioned": !dev.password_sha256.is_empty(),
+                "telemetry_max_kb": dev.telemetry_max_kb,
+                "dump_path": crate::devmode::telemetry::dump_path().to_string_lossy(),
+                "dump_size_kb": crate::devmode::telemetry::dump_size_kb(),
+            }))
+        }
+
+        // Toggle developer mode. Password-gated, local-only, low-harm. The GUI
+        // sends the plaintext password (verified against the provisioned hash);
+        // on success we flip `developer.enabled` (and optionally
+        // `telemetry_enabled`), persist, and refresh the in-memory gate.
+        "dev.set_developer_mode" => {
+            let auth = req
+                .params
+                .get("auth")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !state.validate_ipc_auth(auth) {
+                return serde_json::to_vec(&RpcErrorResponse::err(
+                    req.id,
+                    error_codes::INVALID_PARAMS,
+                    "authenticated IPC dev toggle required".to_string(),
+                ))
+                .unwrap_or_default();
+            }
+
+            let password = req
+                .params
+                .get("password")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let enabled = req
+                .params
+                .get("enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            let mut config = crate::config::Config::load(None).unwrap_or_default();
+
+            // Verify against the provisioned hash. Empty hash = unprovisioned →
+            // verify returns false → mode cannot be enabled. Constant-time.
+            if !crate::config::verify_developer_password(
+                password,
+                &config.developer.password_sha256,
+            ) {
+                state.log_activity(
+                    "warning",
+                    "developer",
+                    "Developer-mode toggle rejected (bad/absent password)",
+                    "",
+                    None,
+                );
+                return serde_json::to_vec(&RpcErrorResponse::err(
+                    req.id,
+                    error_codes::INVALID_PARAMS,
+                    "developer mode locked: invalid password or not provisioned".to_string(),
+                ))
+                .unwrap_or_default();
+            }
+
+            config.developer.enabled = enabled;
+            // Optional sub-switch for the telemetry writer.
+            if let Some(t) = req.params.get("telemetry_enabled").and_then(|v| v.as_bool()) {
+                config.developer.telemetry_enabled = t;
+            }
+            // validate() keeps `enabled` only because the hash is provisioned.
+            config.validate();
+
+            // Refresh the in-memory gate so telemetry reflects the change now.
+            state.load_developer_config(config.developer.clone());
+
+            state.log_activity(
+                "info",
+                "developer",
+                &format!(
+                    "Developer mode {} (telemetry {})",
+                    if config.developer.enabled { "enabled" } else { "disabled" },
+                    if config.developer.telemetry_enabled { "on" } else { "off" },
+                ),
+                "",
+                None,
+            );
+
+            let path = crate::paths::paths().config_file();
+            match config.save(&path) {
+                Ok(()) => Ok(serde_json::json!({
+                    "ok": true,
+                    "enabled": config.developer.enabled,
+                    "telemetry_enabled": config.developer.telemetry_enabled,
+                })),
+                Err(e) => Ok(serde_json::json!({"ok": false, "error": e})),
+            }
+        }
+
+        // Run the ARGUS hardware-parity benchmark. Gated behind developer mode
+        // (it is a hardware-testing aid, not a normal-user feature) and the
+        // result is routed into the perf-telemetry file by the daemon.
+        "benchmark.run" => {
+            let auth = req
+                .params
+                .get("auth")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !state.validate_ipc_auth(auth) {
+                return serde_json::to_vec(&RpcErrorResponse::err(
+                    req.id,
+                    error_codes::INVALID_PARAMS,
+                    "authenticated IPC benchmark run required".to_string(),
+                ))
+                .unwrap_or_default();
+            }
+            if !state.developer_config().enabled {
+                return serde_json::to_vec(&RpcErrorResponse::err(
+                    req.id,
+                    error_codes::INVALID_PARAMS,
+                    "benchmark requires developer mode".to_string(),
+                ))
+                .unwrap_or_default();
+            }
+            let passes = req
+                .params
+                .get("passes")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(3)
+                .clamp(1, 10) as u32;
+            match state.run_benchmark(passes) {
+                Ok(report) => Ok(report),
+                Err(e) => Ok(serde_json::json!({"ok": false, "error": e})),
+            }
         }
 
         _ => Err((

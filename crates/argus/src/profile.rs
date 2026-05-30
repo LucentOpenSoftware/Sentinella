@@ -86,8 +86,6 @@ pub struct ScanProfile {
     // ── Strategy overrides ───────────────────────────────
     /// If true, transient/temp artifacts get SignatureOnly instead of FullAnalysis.
     pub downgrade_transient: bool,
-    /// If true, files >50MB get SignatureOnly regardless of extension.
-    pub downgrade_large: bool,
     /// Minimum file size (bytes) for full PE heuristic analysis.
     /// Smaller files skip heavy PE parsing.
     pub pe_min_size_bytes: u64,
@@ -111,7 +109,6 @@ impl ScanProfile {
             max_archive_depth: 5,
             max_extracted_bytes: 100 * 1024 * 1024,
             downgrade_transient: true,
-            downgrade_large: true,
             pe_min_size_bytes: 1024,
         }
     }
@@ -133,7 +130,6 @@ impl ScanProfile {
             max_archive_depth: 10,
             max_extracted_bytes: 500 * 1024 * 1024,
             downgrade_transient: false,
-            downgrade_large: false,
             pe_min_size_bytes: 512,
         }
     }
@@ -155,7 +151,6 @@ impl ScanProfile {
             max_archive_depth: 10,
             max_extracted_bytes: 500 * 1024 * 1024,
             downgrade_transient: false,
-            downgrade_large: false,
             pe_min_size_bytes: 256,
         }
     }
@@ -177,7 +172,6 @@ impl ScanProfile {
             max_archive_depth: 3,
             max_extracted_bytes: 50 * 1024 * 1024,
             downgrade_transient: true,
-            downgrade_large: true,
             pe_min_size_bytes: 1024,
         }
     }
@@ -199,7 +193,6 @@ impl ScanProfile {
             max_archive_depth: 10,
             max_extracted_bytes: 500 * 1024 * 1024,
             downgrade_transient: false,
-            downgrade_large: true,
             pe_min_size_bytes: 512,
         }
     }
@@ -221,7 +214,6 @@ impl ScanProfile {
             max_archive_depth: 5,
             max_extracted_bytes: 100 * 1024 * 1024,
             downgrade_transient: false,
-            downgrade_large: false,
             pe_min_size_bytes: 0,
         }
     }
@@ -238,15 +230,8 @@ impl ScanProfile {
             return ScanStrategy::SignatureOnly;
         }
 
-        // Large files → downgrade if profile says so.
-        if self.downgrade_large && file_size > 50 * 1024 * 1024 {
-            let ext = path.rsplit('.').next().unwrap_or("").to_lowercase();
-            if !matches!(ext.as_str(), "exe" | "dll" | "scr" | "sys" | "drv" | "msi") {
-                return ScanStrategy::SignatureOnly;
-            }
-        }
-
-        // Default: use standard strategy classification.
+        // Large non-executable files (>50MB) are downgraded inside
+        // `ScanStrategy::classify` itself — no profile-level override needed.
         ScanStrategy::classify(path, file_size)
     }
 

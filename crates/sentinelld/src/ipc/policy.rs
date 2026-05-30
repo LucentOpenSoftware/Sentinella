@@ -123,16 +123,24 @@ impl RateLimiter {
         };
 
         // Refill tokens based on elapsed time.
+        //
+        // Race fix: the previous `load` + `store(current + refill)` lost any
+        // concurrent consume that happened in between (consume's CAS succeeded,
+        // refill's store then overwrote it with the pre-consume value + refill
+        // → token went back up, request was effectively free → rate limit
+        // weakened under load). `fetch_update` retries until it observes the
+        // latest value, so concurrent consumes are never overwritten.
         {
             let mut last = state.last_refill.lock().unwrap_or_else(|e| e.into_inner());
             let elapsed = last.elapsed();
             let refill = (elapsed.as_secs_f64() * state.config.max_per_minute as f64 / 60.0) as u64;
             if refill > 0 {
-                let current = state.tokens.load(Ordering::Relaxed);
-                let new_val = current
-                    .saturating_add(refill)
-                    .min(state.config.burst as u64);
-                state.tokens.store(new_val, Ordering::Relaxed);
+                let burst = state.config.burst as u64;
+                let _ = state.tokens.fetch_update(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |cur| Some(cur.saturating_add(refill).min(burst)),
+                );
                 *last = Instant::now();
             }
         }
@@ -141,7 +149,10 @@ impl RateLimiter {
         loop {
             let current = state.tokens.load(Ordering::Relaxed);
             if current == 0 {
-                let retry_secs = 60 / state.config.max_per_minute.max(1);
+                // Audit fix: for buckets >60/min, `60 / max_per_minute` is 0
+                // → client told to retry after 0s → immediate retry storm
+                // with no backoff. Floor at 1s.
+                let retry_secs = (60 / state.config.max_per_minute.max(1)).max(1);
                 return Err(retry_secs);
             }
             if state
@@ -208,8 +219,11 @@ pub fn method_registry() -> HashMap<&'static str, MethodPolicy> {
     m.insert("health", pub_status(512));
     m.insert("engine.status", pub_status(512));
     m.insert("scan.status", pub_status(512));
-    m.insert("watcher.status", pub_status(512));
-    m.insert("idle_scanner.status", pub_status(512));
+    // Scanner-B Finding 2/3: previously PublicStatus — leaked watched_roots
+    // and current_target to any unauth local caller (oracle for "where the
+    // scanner isn't looking"). Now auth-gated.
+    m.insert("watcher.status", auth_read(512, RateBucket::Status));
+    m.insert("idle_scanner.status", auth_read(512, RateBucket::Status));
     m.insert("update.status", pub_status(512));
     m.insert("argus.version", pub_status(512));
     m.insert("security.challenge", pub_status(1024));
@@ -234,6 +248,7 @@ pub fn method_registry() -> HashMap<&'static str, MethodPolicy> {
         auth_read(1024, RateBucket::MemoryScan),
     );
     m.insert("settings.get", auth_read(512, RateBucket::Status));
+    m.insert("dev.status", auth_read(512, RateBucket::Status));
 
     // ── Authenticated actions ──────────────────────────
     m.insert(
@@ -244,20 +259,37 @@ pub fn method_registry() -> HashMap<&'static str, MethodPolicy> {
         "scan.cancel",
         auth_action(512, RateBucket::ScanControl, true),
     );
-    // Signature update is safe to trigger: it only runs freshclam against
-    // pinned local config and cannot lower protection settings.
-    m.insert("update.start", pub_status(1024));
+    // Scanner-B Finding 4: update.start was pub_status (no audit, allowed
+    // while reloading, Status bucket = 120/min). An auth'd-but-malicious
+    // caller could stack engine reloads back-to-back to extend the scan-blind
+    // window indefinitely. Now auth_action with ScanControl bucket (10/min,
+    // burst 3), audit_log=true, allowed_while_reloading=false.
+    m.insert(
+        "update.start",
+        auth_action(1024, RateBucket::ScanControl, true),
+    );
+    // Scanner-B Finding 5: activity.log was Unlimited + no audit. Attacker
+    // with IPC secret could flood the DB or inject fake severity entries
+    // impersonating internal categories ("security", "engine"). Now bounded
+    // by DiagnosticsExport bucket (6/min, burst 2); handler restricts
+    // severity to info|warning and prefixes user-supplied category with "gui:".
     m.insert(
         "activity.log",
-        auth_action(4096, RateBucket::Unlimited, false),
+        auth_action(4096, RateBucket::DiagnosticsExport, false),
     );
     m.insert(
         "argus.analyze",
         auth_action(8192, RateBucket::ScanControl, false),
     );
+    // Adversary A3: argus.reload is the unfixed sibling of update.start /
+    // engine.reload — it triggers a YARA reload + ARGUS trusted-cache wipe
+    // (~seconds of degraded detection per call). Without challenge-token
+    // gating an attacker who learned the IPC secret could chain
+    // update.start + engine.reload + argus.reload to multiply the
+    // reload-stacking budget. Now PrivilegedMutation, matching engine.reload.
     m.insert(
         "argus.reload",
-        auth_action(1024, RateBucket::ScanControl, true),
+        priv_mutation(1024, RateBucket::ScanControl),
     );
     m.insert(
         "runtime.scan_buffer",
@@ -277,6 +309,19 @@ pub fn method_registry() -> HashMap<&'static str, MethodPolicy> {
     );
     m.insert(
         "diagnostics.export",
+        auth_action(1024, RateBucket::DiagnosticsExport, false),
+    );
+    // Developer-mode toggle: password-gated, local-only, low-harm (it enables a
+    // perf dump, not an auth boundary). AuthenticatedAction + the ConfigMutation
+    // bucket rate-limits password guessing of the unlock gate.
+    m.insert(
+        "dev.set_developer_mode",
+        auth_action(1024, RateBucket::ConfigMutation, true),
+    );
+    // Benchmark: spins up the worker to scan a corpus (CPU/IO heavy). Gated to
+    // developer mode in the handler; the DiagnosticsExport bucket throttles it.
+    m.insert(
+        "benchmark.run",
         auth_action(1024, RateBucket::DiagnosticsExport, false),
     );
 
@@ -384,6 +429,27 @@ mod tests {
             assert_eq!(policy.class, MethodClass::DangerousOperation);
             assert!(policy.audit_log);
         }
+    }
+
+    #[test]
+    fn dev_mode_methods_registered() {
+        let reg = method_registry();
+        // Status read: authenticated, allowed while reloading/degraded.
+        let status = &reg["dev.status"];
+        assert_eq!(status.class, MethodClass::AuthenticatedRead);
+        assert!(status.allowed_while_reloading);
+        // Toggle: authenticated action, audit-logged, rate-limited via
+        // ConfigMutation to blunt password guessing.
+        let toggle = &reg["dev.set_developer_mode"];
+        assert_eq!(toggle.class, MethodClass::AuthenticatedAction);
+        assert!(toggle.audit_log);
+        assert_eq!(toggle.rate_bucket, RateBucket::ConfigMutation);
+        // Benchmark: heavy, authenticated, throttled via DiagnosticsExport,
+        // blocked while reloading.
+        let bench = &reg["benchmark.run"];
+        assert_eq!(bench.class, MethodClass::AuthenticatedAction);
+        assert_eq!(bench.rate_bucket, RateBucket::DiagnosticsExport);
+        assert!(!bench.allowed_while_reloading);
     }
 
     #[test]

@@ -87,12 +87,21 @@ impl LineageGraph {
             let now = Instant::now();
             map.retain(|_, n| now.duration_since(n.created_at) < NODE_TTL);
 
-            // If still at capacity after TTL eviction (all nodes fresh), remove oldest.
-            while map.len() >= MAX_NODES {
-                if let Some(oldest_pid) = map.values().min_by_key(|n| n.timestamp).map(|n| n.pid) {
-                    map.remove(&oldest_pid);
-                } else {
-                    break;
+            // If still at capacity after TTL eviction (all nodes fresh), drop the
+            // oldest in ONE batch down to 90% capacity. The previous code did a
+            // fresh O(n) `min_by_key` scan + single removal on EVERY insert once
+            // full → O(n) per insert under an ETW process storm. Batching to a
+            // low-water mark amortizes the O(n log n) sort over ~10% of MAX_NODES
+            // inserts, so the steady-state cost per insert is negligible.
+            if map.len() >= MAX_NODES {
+                let low_water = MAX_NODES * 9 / 10;
+                let mut by_age: Vec<(i64, u32)> =
+                    map.values().map(|n| (n.timestamp, n.pid)).collect();
+                // Oldest first (ascending timestamp); pid as deterministic tiebreak.
+                by_age.sort_unstable();
+                let drop_count = map.len().saturating_sub(low_water);
+                for (_, pid) in by_age.into_iter().take(drop_count) {
+                    map.remove(&pid);
                 }
             }
         }
@@ -107,13 +116,28 @@ impl LineageGraph {
         let mut chain = Vec::new();
         let mut current = pid;
         let max_depth = 8;
+        // PID-reuse guard: the map is keyed on PID alone, but the OS recycles
+        // PIDs. If a child recorded parent_pid=N and PID N was later reused by
+        // a NEWER process, walking parent_pid would attribute the child to the
+        // wrong ancestor (false lineage → bogus convergence escalation). A real
+        // parent must have been recorded no later than its child, so we reject
+        // any hop where the candidate parent's `created_at` is AFTER the child's.
+        let mut child_created_at: Option<Instant> = None;
 
         for _ in 0..max_depth {
             if let Some(node) = map.get(&current) {
+                if let Some(child_ts) = child_created_at {
+                    if node.created_at > child_ts {
+                        // Candidate parent is younger than its child → the PID
+                        // was recycled. Stop before recording false lineage.
+                        break;
+                    }
+                }
                 chain.push(node.clone());
                 if node.parent_pid == 0 || node.parent_pid == node.pid {
                     break; // Root or self-parent.
                 }
+                child_created_at = Some(node.created_at);
                 current = node.parent_pid;
             } else {
                 break;
@@ -533,15 +557,27 @@ fn snapshot_processes(graph: &LineageGraph, diagnostics: &PlmDiagnostics) {
         }
     };
 
+    // RAII handle guard: previously CloseHandle was called manually on each
+    // exit path. The daemon snapshots processes repeatedly; any panic between
+    // acquisition and close leaked a kernel handle each pass — bounded by the
+    // per-process handle table on long-running boxes. The guard closes on
+    // every drop (normal, early-return, panic).
+    struct SnapshotGuard(windows::Win32::Foundation::HANDLE);
+    impl Drop for SnapshotGuard {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(self.0);
+            }
+        }
+    }
+    let _snap_guard = SnapshotGuard(snapshot);
+
     let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
     entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
 
     let ok = unsafe { Process32FirstW(snapshot, &mut entry) };
     if ok.is_err() {
-        unsafe {
-            let _ = windows::Win32::Foundation::CloseHandle(snapshot);
-        }
-        return;
+        return; // guard closes the handle
     }
 
     let now = Instant::now();
@@ -584,10 +620,7 @@ fn snapshot_processes(graph: &LineageGraph, diagnostics: &PlmDiagnostics) {
             break;
         }
     }
-
-    unsafe {
-        let _ = windows::Win32::Foundation::CloseHandle(snapshot);
-    }
+    // _snap_guard closes the handle on drop here.
     diagnostics.events_seen.fetch_add(count, Ordering::Relaxed);
 }
 
@@ -680,6 +713,34 @@ mod tests {
         let finding = lineage_finding(&chain);
         assert!(finding.is_some());
         assert!(finding.unwrap().weight >= 10);
+    }
+
+    #[test]
+    fn pid_reuse_does_not_produce_false_lineage() {
+        // Legit chain: 100 (explorer) → 200 (powershell) → 300 (cmd).
+        let graph = LineageGraph::new();
+        graph.record_process(make_node(100, 0, "explorer.exe"));
+        graph.record_process(make_node(200, 100, "powershell.exe"));
+        graph.record_process(make_node(300, 200, "cmd.exe"));
+
+        // PID 200 is recycled by a NEWER, unrelated process recorded later.
+        // (sleep so its created_at is strictly after node 300's.)
+        std::thread::sleep(Duration::from_millis(5));
+        graph.record_process(make_node(200, 999, "malware.exe"));
+
+        // Walking from 300 must NOT attach 300 to the recycled 200/999 lineage.
+        // The younger parent is rejected, so the chain stops at 300.
+        let chain = graph.get_chain(300);
+        assert_eq!(chain.depth, 1, "recycled parent must not extend the chain");
+        assert_eq!(chain.nodes[0].image_name, "cmd.exe");
+        assert!(
+            !chain.nodes.iter().any(|n| n.image_name == "malware.exe"),
+            "recycled-PID process leaked into a victim's lineage"
+        );
+
+        // A genuinely older parent still links correctly.
+        let chain2 = graph.get_chain(200);
+        assert_eq!(chain2.nodes.last().unwrap().image_name, "malware.exe");
     }
 
     #[test]

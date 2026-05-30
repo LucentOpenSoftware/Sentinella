@@ -264,6 +264,15 @@ fn run_etw_session(
 
     let _ = unsafe { ProcessTrace(&handles, None, None) };
 
+    // R3-10: clear callback context BEFORE releasing handle so any late
+    // event delivery sees null pointers and bails out, preventing UAF
+    // when the caller drops its Arc<LineageGraph> / Arc<EtwIntakeDiagnostics>.
+    CALLBACK_GRAPH.store(0, Ordering::SeqCst);
+    CALLBACK_DIAG.store(0, Ordering::SeqCst);
+
+    // R3-10: release consumer handle (was leaked).
+    let _ = unsafe { CloseTrace(trace_handle) };
+
     // Signal stop thread that ProcessTrace has returned.
     trace_done.store(true, Ordering::Relaxed);
     let _ = stop_thread.join();
@@ -324,18 +333,30 @@ unsafe extern "system" fn etw_event_callback(record: *mut EVENT_RECORD) {
                 event.UserDataLength as usize,
             );
 
-            if data.len() < 8 {
+            // PID from the event header (authoritative).
+            let pid = event.EventHeader.ProcessId;
+
+            // Audit fix: the kernel Process_TypeGroup1 layout is
+            //   UniqueProcessKey (pointer-sized: 4 on x86, 8 on x64)
+            //   ProcessId  (u32)
+            //   ParentId   (u32)   ← what we want
+            // The previous code read ParentId from offset 4, which on an
+            // x64 OS is the HIGH DWORD of the 8-byte UniqueProcessKey →
+            // garbage parent PIDs → broken lineage chains. ParentId sits at
+            // `ptr_size + 4`. Sentinella ships x64 and the kernel event
+            // layout follows the OS bitness, so size_of::<usize>() is the
+            // correct pointer width here.
+            let ptr_size = std::mem::size_of::<usize>();
+            let ppid_off = ptr_size + 4;
+            if data.len() < ppid_off + 4 {
                 return;
             }
-
-            // Process start event layout (varies by OS version):
-            // Offset 0: ProcessId (u32) — but this is in the header.
-            let pid = event.EventHeader.ProcessId;
-            let ppid = if data.len() >= 8 {
-                u32::from_le_bytes([data[4], data[5], data[6], data[7]])
-            } else {
-                0
-            };
+            let ppid = u32::from_le_bytes([
+                data[ppid_off],
+                data[ppid_off + 1],
+                data[ppid_off + 2],
+                data[ppid_off + 3],
+            ]);
 
             // Image name resolution for process START events.
             // ETW event data (authoritative, free) → ToolHelp fallback (expensive).
@@ -378,10 +399,11 @@ unsafe extern "system" fn etw_event_callback(record: *mut EVENT_RECORD) {
 
 /// Try to extract image path from ETW process start event data.
 ///
-/// Process start event layout (kernel provider, opcode 1):
-///   Offset 0:   UniqueProcessKey (u64 on x64, u32 on x86)
-///   Offset 4/8: ProcessId (u32)  — but we use the header PID
-///   Offset 8:   ParentId (u32)   — already parsed
+/// Process start event layout (kernel provider, opcode 1), x64:
+///   Offset 0:   UniqueProcessKey (pointer-sized: 8 on x64, 4 on x86)
+///   Offset 8:   ProcessId (u32)  — but we use the header PID
+///   Offset 12:  ParentId (u32)
+///   Offset 16:  SessionId (u32), ExitStatus (i32), DirectoryTableBase, …
 ///   Variable:   ImageFileName as null-terminated wide string after fixed fields
 ///
 /// The image path is typically at offset 52+ (x64) after SessionId, ExitStatus, etc.
@@ -392,8 +414,9 @@ fn extract_image_from_event(data: &[u8]) -> Option<String> {
         return None;
     }
 
-    // Scan for a wide-string path pattern: drive letter (C-Z) followed by ':'
-    // as UTF-16LE: [0x43-0x5A, 0x00, 0x3A, 0x00]
+    // Scan for a wide-string path pattern: drive letter (A-Z) followed by ':'
+    // as UTF-16LE: [0x41-0x5A, 0x00, 0x3A, 0x00]. Audit fix: previously
+    // `ch >= b'C'` dropped legitimate A:/B: paths.
     for offset in (40..data.len().saturating_sub(8)).step_by(2) {
         if offset + 4 > data.len() {
             break;
@@ -403,7 +426,7 @@ fn extract_image_from_event(data: &[u8]) -> Option<String> {
         let colon = data[offset + 2];
         let colon_hi = data[offset + 3];
 
-        if ch_hi == 0 && colon == 0x3A && colon_hi == 0 && ch.is_ascii_alphabetic() && ch >= b'C' {
+        if ch_hi == 0 && colon == 0x3A && colon_hi == 0 && ch.is_ascii_uppercase() {
             // Found potential path start. Read until null terminator or end.
             let path_start = offset;
             let mut path_end = path_start;
@@ -434,22 +457,32 @@ fn extract_image_from_event(data: &[u8]) -> Option<String> {
 
 /// Look up process image path by PID via ToolHelp32 snapshot.
 fn get_process_image(pid: u32) -> Option<String> {
-    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::System::Diagnostics::ToolHelp::*;
+
+    // RAII guard: see plm::snapshot_processes for the rationale (manual
+    // CloseHandle on every path leaks the kernel handle on any panic).
+    struct SnapshotGuard(HANDLE);
+    impl Drop for SnapshotGuard {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
 
     unsafe {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
+        let _guard = SnapshotGuard(snapshot);
         let mut entry: PROCESSENTRY32W = std::mem::zeroed();
         entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
 
         if Process32FirstW(snapshot, &mut entry).is_err() {
-            let _ = CloseHandle(snapshot);
             return None;
         }
 
         loop {
             if entry.th32ProcessID == pid {
-                let _ = CloseHandle(snapshot);
                 let len = entry
                     .szExeFile
                     .iter()
@@ -461,8 +494,6 @@ fn get_process_image(pid: u32) -> Option<String> {
                 break;
             }
         }
-
-        let _ = CloseHandle(snapshot);
         None
     }
 }

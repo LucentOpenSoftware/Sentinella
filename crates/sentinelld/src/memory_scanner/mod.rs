@@ -222,6 +222,19 @@ fn scan_process_windows(
             }
         }
     };
+    // RAII handle close: the scan loop allocates `vec![0u8; region_size]` per
+    // committed-exec region (up to max_region_size). A panic on OOM here would
+    // skip the manual CloseHandle at the end → process handle leak in the
+    // long-running daemon. The guard fires on every drop, including unwind.
+    struct OpenHandleGuard(windows::Win32::Foundation::HANDLE);
+    impl Drop for OpenHandleGuard {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(self.0);
+            }
+        }
+    }
+    let _handle_guard = OpenHandleGuard(handle);
 
     // Enumerate memory regions.
     let mut address: usize = 0;
@@ -309,7 +322,7 @@ fn scan_process_windows(
                     .push(MemoryTimeoutReason::RegionTooLarge);
             }
 
-            if result.bytes_scanned + region_size as u64 > max_scan_bytes {
+            if result.bytes_scanned.saturating_add(region_size as u64) > max_scan_bytes {
                 result.regions_skipped += 1;
                 result
                     .skip_reasons
@@ -381,16 +394,19 @@ fn scan_process_windows(
             break;
         }
 
-        // Advance to next region.
-        address = (mbi.BaseAddress as usize) + mbi.RegionSize;
+        // Advance to next region. checked_add catches wrap-around at the
+        // 64-bit address space tail; old `if address == 0` only caught exact
+        // wrap to zero, not partial wrap.
+        match (mbi.BaseAddress as usize).checked_add(mbi.RegionSize) {
+            Some(next) => address = next,
+            None => break, // wrap → end of address space
+        }
         if address == 0 {
-            break; // Overflow — end of address space.
+            break;
         }
     }
 
-    unsafe {
-        let _ = CloseHandle(handle);
-    }
+    // _handle_guard closes the OpenProcess handle on drop (incl. panic unwind).
 }
 
 #[cfg(target_os = "windows")]
@@ -458,14 +474,20 @@ fn check_memory_patterns(
         // Check for valid PE signature at offset in e_lfanew.
         if data.len() >= 64 {
             let lfanew = u32::from_le_bytes([data[60], data[61], data[62], data[63]]) as usize;
-            if lfanew + 4 <= data.len() && data[lfanew..lfanew + 4] == [0x50, 0x45, 0x00, 0x00] {
-                findings.push(MemoryFinding {
-                    region_address: base_addr,
-                    region_size: size,
-                    description: "PE header found in executable memory — possible injected or unpacked module".into(),
-                    severity: MemorySeverity::Suspicious,
-                    yara_rule: None,
-                });
+            // Defensive: `lfanew` is attacker-controlled (raw memory bytes). On
+            // 32-bit usize, `lfanew + 4` can wrap (lfanew=u32::MAX) → tiny
+            // result → in-bounds slice into the wrong place → panic / OOB read.
+            // checked_add eliminates the class.
+            if let Some(end) = lfanew.checked_add(4) {
+                if end <= data.len() && data[lfanew..end] == [0x50, 0x45, 0x00, 0x00] {
+                    findings.push(MemoryFinding {
+                        region_address: base_addr,
+                        region_size: size,
+                        description: "PE header found in executable memory — possible injected or unpacked module".into(),
+                        severity: MemorySeverity::Suspicious,
+                        yara_rule: None,
+                    });
+                }
             }
         }
     }

@@ -47,11 +47,23 @@ pub struct ConvergenceLedger {
     finalized: bool,
 }
 
+/// Per-finding sanity cap — no single post-ARGUS finding may contribute
+/// more than this in raw weight. R4-CV5: prevents one rogue caller from
+/// blowing out `raw_post` and bypassing the global cap via integer
+/// overflow.
+const MAX_SINGLE_POST_WEIGHT: u32 = POST_ARGUS_CAP;
+
+/// Score values must fit 0..=100. R4-CV9: clamp ingest so a misbehaving
+/// ARGUS engine version (e.g. one that emitted `score=999`) cannot poison
+/// downstream verdict mapping.
+const MAX_VALID_SCORE: u32 = 100;
+
 impl ConvergenceLedger {
     /// Create a ledger from an ARGUS verdict.
     pub fn new(verdict: &argus::verdict::ArgusVerdict, clamav_positive: bool) -> Self {
         Self {
-            base_score: verdict.score,
+            // R4-CV9: clamp base_score to the documented 0..=100 range.
+            base_score: verdict.score.min(MAX_VALID_SCORE),
             findings: verdict.findings.clone(),
             post_additions: Vec::new(),
             trust_discount: 0,
@@ -64,10 +76,24 @@ impl ConvergenceLedger {
     /// so that cap scaling targets ONLY post-ARGUS findings.
     ///
     /// Panics (debug) / no-ops (release) if called after `finalize()`.
-    pub fn add_evidence(&mut self, source: &'static str, finding: argus::Finding) {
+    pub fn add_evidence(&mut self, source: &'static str, mut finding: argus::Finding) {
         debug_assert!(!self.finalized, "add_evidence() called after finalize()");
         if self.finalized {
             return;
+        }
+
+        // R4-CV5: clamp per-finding weight before tracking. A single
+        // weight=u32::MAX entry would overflow raw_post (panic in debug,
+        // wrap in release → cap silently bypassed and POST_ARGUS_CAP=40
+        // could become 39 or 0).
+        if finding.weight > MAX_SINGLE_POST_WEIGHT {
+            tracing::warn!(
+                source,
+                weight = finding.weight,
+                cap = MAX_SINGLE_POST_WEIGHT,
+                "convergence: post-ARGUS finding weight exceeds per-finding cap — clamped"
+            );
+            finding.weight = MAX_SINGLE_POST_WEIGHT;
         }
 
         let weight = finding.weight;
@@ -83,6 +109,14 @@ impl ConvergenceLedger {
     /// Apply trust discount (reduces score for familiar entities).
     /// NEVER applied when ClamAV is positive.
     /// No-ops if called after `finalize()`.
+    ///
+    /// R4-CV1: callers historically invoke this exactly once per ledger. If
+    /// called multiple times we keep the LARGEST discount so a later
+    /// adversary-controlled path cannot reduce a previously-applied
+    /// strong trust discount, AND so the "trusted, no action" semantic is
+    /// not erased by a zero-discount follow-up. Bumping (not overwriting)
+    /// also means the test `apply_trust_discount(8) + apply_trust_discount(0)`
+    /// still ends with discount=8.
     pub fn apply_trust_discount(&mut self, discount: u32, finding: Option<argus::Finding>) {
         debug_assert!(
             !self.finalized,
@@ -92,8 +126,20 @@ impl ConvergenceLedger {
             return;
         }
 
-        if !self.clamav_positive && discount > 0 {
-            self.trust_discount = discount;
+        // R4-CV11: previously, when ClamAV was positive we still pushed the
+        // trust finding into `findings` even though the discount itself was
+        // rejected — producing UX where the verdict explanation listed a
+        // "Trusted, no action" reason on a confirmed malware hit. Now we
+        // drop the trust finding entirely when the discount is suppressed
+        // so the explanation stays coherent.
+        if self.clamav_positive {
+            return;
+        }
+        if discount > 0 {
+            // R4-CV8: clamp so attribution()'s `-(trust_discount as i32)`
+            // cannot hit i32::MIN and panic on negation.
+            let capped = discount.min(MAX_VALID_SCORE);
+            self.trust_discount = self.trust_discount.max(capped);
         }
         if let Some(f) = finding {
             self.findings.push(f);
@@ -110,80 +156,78 @@ impl ConvergenceLedger {
         // Idempotency guard: if already finalized, recompute score from
         // current (already-scaled) finding weights without re-scaling.
         if self.finalized {
+            // R4-CV6: saturating accumulation. Plain `.sum()` panics in
+            // debug if total exceeds u32::MAX, wraps in release.
             let post_sum: u32 = self
                 .post_additions
                 .iter()
                 .filter_map(|a| self.findings.get(a.finding_index))
                 .map(|f| f.weight)
-                .sum::<u32>()
+                .fold(0u32, |acc, w| acc.saturating_add(w))
                 .min(POST_ARGUS_CAP);
             let score = self
                 .base_score
                 .saturating_add(post_sum)
                 .saturating_sub(self.trust_discount)
-                .min(100);
+                .min(MAX_VALID_SCORE);
             let verdict = argus::verdict::Verdict::from_score(score);
             let explanation = self.build_explanation(score, &verdict);
             return (score, verdict, explanation);
         }
         self.finalized = true;
 
-        // Sum post-ARGUS additions, capped.
-        let raw_post: u32 = self.post_additions.iter().map(|a| a.original_weight).sum();
+        // R4-CV6: saturating sum to prevent overflow panics if many
+        // findings somehow slip past add_evidence's per-finding clamp.
+        let raw_post: u32 = self
+            .post_additions
+            .iter()
+            .map(|a| a.original_weight)
+            .fold(0u32, |acc, w| acc.saturating_add(w));
         let capped_post = raw_post.min(POST_ARGUS_CAP);
 
-        // If cap hit, scale ONLY post-ARGUS finding weights proportionally.
-        // ARGUS base findings (indices 0.._base_findings_count) are untouched.
+        // R4-CV4: cap enforcement was previously *proportional scaling*
+        // (each finding × ratio, round). With a flood of weight-1 findings
+        // (ratio ≈ 0.4) every finding rounded to 0 → the entire post-ARGUS
+        // signal was suppressed. An attacker could **dilute** a strong
+        // weight-30 ADS finding by attaching dozens of weight-1 noise
+        // findings, dragging the strong evidence down to 0 too.
         //
-        // Two-pass scaling for exact cap enforcement:
-        //   Pass 1: proportional scaling (no .max(1) floor — allow zero).
-        //   Pass 2: if rounding pushed sum over cap, zero out smallest findings.
+        // New strategy: priority-truncation. Sort post-additions DESCENDING
+        // by original_weight, keep them at full weight until the cap is
+        // hit, then truncate / zero the remainder. Preserves the strongest
+        // evidence intact; weakest noise is what gets dropped.
         if raw_post > POST_ARGUS_CAP && raw_post > 0 {
-            let ratio = capped_post as f64 / raw_post as f64;
+            // Sort indices by original weight DESC, then by source order for
+            // determinism.
+            let mut order: Vec<usize> = (0..self.post_additions.len()).collect();
+            order.sort_by(|&a, &b| {
+                self.post_additions[b]
+                    .original_weight
+                    .cmp(&self.post_additions[a].original_weight)
+                    .then(a.cmp(&b))
+            });
 
-            // Pass 1: proportional scale.
-            for addition in &self.post_additions {
-                if let Some(f) = self.findings.get_mut(addition.finding_index) {
-                    if f.weight > 0 {
-                        f.weight = (f.weight as f64 * ratio).round() as u32;
+            let mut remaining = POST_ARGUS_CAP;
+            for pos in &order {
+                let add = &self.post_additions[*pos];
+                let idx = add.finding_index;
+                if let Some(f) = self.findings.get_mut(idx) {
+                    if remaining == 0 {
+                        f.weight = 0;
+                    } else if f.weight <= remaining {
+                        remaining -= f.weight;
+                        // weight unchanged.
+                    } else {
+                        f.weight = remaining;
+                        remaining = 0;
                     }
                 }
             }
 
-            // Pass 2: verify sum ≤ cap. If rounding pushed over, trim smallest.
-            let mut scaled_sum: u32 = self
-                .post_additions
-                .iter()
-                .filter_map(|a| self.findings.get(a.finding_index))
-                .map(|f| f.weight)
-                .sum();
-
-            if scaled_sum > POST_ARGUS_CAP {
-                // Sort post-addition indices by weight ascending (trim smallest first).
-                let mut trim_order: Vec<usize> = self
-                    .post_additions
-                    .iter()
-                    .map(|a| a.finding_index)
-                    .collect();
-                trim_order
-                    .sort_by_key(|&idx| self.findings.get(idx).map(|f| f.weight).unwrap_or(0));
-
-                for idx in trim_order {
-                    if scaled_sum <= POST_ARGUS_CAP {
-                        break;
-                    }
-                    if let Some(f) = self.findings.get_mut(idx) {
-                        let reduce = f.weight.min(scaled_sum - POST_ARGUS_CAP);
-                        f.weight -= reduce;
-                        scaled_sum -= reduce;
-                    }
-                }
-            }
-
-            // Use actual scaled sum for score calculation (not raw capped_post).
+            let scaled_sum = POST_ARGUS_CAP - remaining;
             let actual_post = scaled_sum.min(POST_ARGUS_CAP);
             let before_trust = self.base_score.saturating_add(actual_post);
-            let final_score = before_trust.saturating_sub(self.trust_discount).min(100);
+            let final_score = before_trust.saturating_sub(self.trust_discount).min(MAX_VALID_SCORE);
             let verdict = argus::verdict::Verdict::from_score(final_score);
             let explanation = self.build_explanation(final_score, &verdict);
             return (final_score, verdict, explanation);
@@ -191,7 +235,7 @@ impl ConvergenceLedger {
 
         // Final score = base + capped_post - trust_discount, clamped [0, 100].
         let before_trust = self.base_score.saturating_add(capped_post);
-        let final_score = before_trust.saturating_sub(self.trust_discount).min(100);
+        let final_score = before_trust.saturating_sub(self.trust_discount).min(MAX_VALID_SCORE);
 
         let verdict = argus::verdict::Verdict::from_score(final_score);
         let explanation = self.build_explanation(final_score, &verdict);
@@ -246,10 +290,24 @@ impl ConvergenceLedger {
         explanation: &mut argus::verdict::VerdictExplanation,
         final_score: u32,
     ) {
-        const LEDGER_PREFIX: &str = "\u{200B}"; // Zero-width space marks ledger entries.
+        // R4-CV14: a single zero-width space is trivially smuggled inside
+        // attacker-influenced strings (YARA rule descriptions, persistence
+        // names, etc.) and would then be misidentified as a ledger entry
+        // and wiped on the next patch_explanation call — letting an
+        // attacker erase their own evidence trail from the verdict
+        // display. Use a longer, structured sentinel that combines an
+        // unlikely zero-width-joiner pair with an ASCII tag so any
+        // collision requires the attacker to deliberately stage this
+        // exact sequence (and even then we strip it on output).
+        const LEDGER_PREFIX: &str = "\u{200B}\u{200D}LDG\u{200D}\u{200B}";
 
         // raw_score = base + uncapped post (total evidence weight before discount).
-        let raw_post: u32 = self.post_additions.iter().map(|a| a.original_weight).sum();
+        // R4-CV7: saturating accumulation to prevent overflow.
+        let raw_post: u32 = self
+            .post_additions
+            .iter()
+            .map(|a| a.original_weight)
+            .fold(0u32, |acc, w| acc.saturating_add(w));
         explanation.raw_score = self.base_score.saturating_add(raw_post);
         explanation.final_score = final_score;
 
@@ -301,9 +359,17 @@ impl ConvergenceLedger {
         eco_esc: u32,
         recurrence: u32,
     ) -> crate::ecosystem::ConvergenceAttribution {
+        // R4-CV8: `-(u32 as i32)` panics in debug if the u32 sits above
+        // i32::MAX (negation of i32::MIN). Convert via i64 then clamp so
+        // the result always fits a signed 32-bit slot. Trust discount is
+        // also already capped to MAX_VALID_SCORE in apply_trust_discount,
+        // but defence in depth.
+        let trust_adjustment: i32 = -((self.trust_discount.min(MAX_VALID_SCORE) as i64)
+            .min(i32::MAX as i64) as i32);
+
         crate::ecosystem::ConvergenceAttribution {
             base_argus: self.base_score,
-            trust_adjustment: -(self.trust_discount as i32),
+            trust_adjustment,
             drift_escalation: drift_esc,
             ecosystem_escalation: eco_esc,
             recurrence_bonus: recurrence,
@@ -698,5 +764,95 @@ mod tests {
         let post_sum: u32 = ledger.findings[1..].iter().map(|f| f.weight).sum();
         assert!(post_sum <= POST_ARGUS_CAP, "post sum {post_sum} > cap");
         assert!(final_score <= 90);
+    }
+
+    // ── R4 round 2 regression tests ──────────────────────────
+
+    #[test]
+    fn r4_cv5_single_finding_weight_clamped() {
+        // u32::MAX weight on one finding would overflow raw_post sum.
+        // add_evidence must clamp to MAX_SINGLE_POST_WEIGHT.
+        let verdict = make_verdict(50, vec![]);
+        let mut ledger = ConvergenceLedger::new(&verdict, false);
+        ledger.add_evidence(
+            "ROGUE",
+            post_finding(Layer::Persistence, u32::MAX, "huge"),
+        );
+        // The stored finding's weight must be clamped, not u32::MAX.
+        assert!(
+            ledger.findings[0].weight <= POST_ARGUS_CAP,
+            "rogue weight not clamped: {}",
+            ledger.findings[0].weight
+        );
+        let (final_score, _, _) = ledger.finalize();
+        // Final score must not overflow past 100.
+        assert!(final_score <= 100, "score {final_score} > 100");
+    }
+
+    #[test]
+    fn r4_cv6_many_findings_no_overflow_panic() {
+        // Many findings each at the per-finding cap should not panic
+        // when summed (saturating_add).
+        let verdict = make_verdict(0, vec![]);
+        let mut ledger = ConvergenceLedger::new(&verdict, false);
+        for i in 0..1000 {
+            ledger.add_evidence(
+                "flood",
+                post_finding(Layer::Context, POST_ARGUS_CAP, &format!("f{i}")),
+            );
+        }
+        // Must not panic.
+        let (final_score, _, _) = ledger.finalize();
+        assert!(final_score <= 100);
+    }
+
+    #[test]
+    fn r4_cv9_base_score_clamped_to_100() {
+        // If ARGUS hands us a score > 100 (engine bug), clamp to 100.
+        let verdict = make_verdict(999, vec![]);
+        let ledger = ConvergenceLedger::new(&verdict, false);
+        assert_eq!(ledger.base_score, 100, "base_score not clamped");
+    }
+
+    #[test]
+    fn r4_cv11_trust_finding_dropped_when_clamav_positive() {
+        let verdict = make_verdict(80, vec![]);
+        let mut ledger = ConvergenceLedger::new(&verdict, true);
+        let trust_f = post_finding(Layer::Context, 0, "trusted, no action");
+        ledger.apply_trust_discount(10, Some(trust_f));
+        // ClamAV positive → trust finding must NOT appear in findings.
+        assert!(
+            ledger.findings.is_empty(),
+            "trust finding leaked into clamav-positive verdict"
+        );
+        assert_eq!(ledger.trust_discount, 0, "discount applied despite ClamAV");
+    }
+
+    #[test]
+    fn r4_cv8_attribution_no_panic_on_max_discount() {
+        // Even with a maxed-out (clamped to 100) trust discount the
+        // i32 negation must not panic.
+        let verdict = make_verdict(50, vec![]);
+        let mut ledger = ConvergenceLedger::new(&verdict, false);
+        ledger.apply_trust_discount(u32::MAX, None);
+        let attr = ledger.attribution(0, 0, 0, 0);
+        assert!(
+            attr.trust_adjustment <= 0,
+            "trust_adjustment should be non-positive"
+        );
+        assert!(
+            attr.trust_adjustment >= -(MAX_VALID_SCORE as i32),
+            "trust_adjustment beyond clamp: {}",
+            attr.trust_adjustment
+        );
+    }
+
+    #[test]
+    fn r4_cv1_late_zero_discount_does_not_clear_earlier() {
+        let verdict = make_verdict(50, vec![]);
+        let mut ledger = ConvergenceLedger::new(&verdict, false);
+        ledger.apply_trust_discount(8, None);
+        ledger.apply_trust_discount(0, None); // adversary-controlled later call
+        assert_eq!(ledger.trust_discount, 8, "earlier discount was overwritten");
     }
 }

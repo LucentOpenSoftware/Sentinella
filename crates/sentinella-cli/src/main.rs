@@ -197,7 +197,7 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&resp)?);
         }
         Commands::Quarantine { path, virus } => {
-            let token = request_challenge_token().await?;
+            let token = request_challenge_token("quarantine.add").await?;
             let params = serde_json::json!({"path": path, "virus_name": virus, "scan_id": "", "token": token});
             let resp = send_request("quarantine.add", params).await?;
             println!("{}", serde_json::to_string_pretty(&resp)?);
@@ -207,7 +207,7 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&resp)?);
         }
         Commands::QuarantineRestore { id } => {
-            let token = request_challenge_token().await?;
+            let token = request_challenge_token("quarantine.restore").await?;
             let resp = send_request(
                 "quarantine.restore",
                 serde_json::json!({"id": id, "token": token}),
@@ -216,7 +216,7 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&resp)?);
         }
         Commands::QuarantineDelete { id } => {
-            let token = request_challenge_token().await?;
+            let token = request_challenge_token("quarantine.delete").await?;
             let resp = send_request(
                 "quarantine.delete",
                 serde_json::json!({"id": id, "token": token}),
@@ -322,7 +322,7 @@ async fn main() -> Result<()> {
             println!("  License: GPLv2");
         }
         Commands::DisableRealtime => {
-            let token = request_challenge_token().await?;
+            let token = request_challenge_token("protection.set_critical").await?;
             let resp = send_request(
                 "protection.set_critical",
                 serde_json::json!({
@@ -347,7 +347,7 @@ async fn main() -> Result<()> {
             }
         }
         Commands::EnableRealtime => {
-            let token = request_challenge_token().await?;
+            let token = request_challenge_token("protection.set_critical").await?;
             let resp = send_request(
                 "protection.set_critical",
                 serde_json::json!({
@@ -372,7 +372,7 @@ async fn main() -> Result<()> {
             }
         }
         Commands::PauseProtection => {
-            let token = request_challenge_token().await?;
+            let token = request_challenge_token("protection.disable").await?;
             let resp =
                 send_request("protection.disable", serde_json::json!({"token": token})).await?;
             if resp
@@ -392,7 +392,7 @@ async fn main() -> Result<()> {
             }
         }
         Commands::ResumeProtection => {
-            let token = request_challenge_token().await?;
+            let token = request_challenge_token("protection.enable").await?;
             let resp =
                 send_request("protection.enable", serde_json::json!({"token": token})).await?;
             if resp
@@ -489,8 +489,15 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn request_challenge_token() -> Result<String> {
-    let resp = send_request("security.challenge", ipc_auth_params()?).await?;
+async fn request_challenge_token(method: &str) -> Result<String> {
+    // Adversary A2: tokens are method-scoped. Callers MUST declare the
+    // dangerous method the token is for; the daemon will reject any later
+    // presentation of the same token against a different method.
+    let mut params = ipc_auth_params()?;
+    if let Some(obj) = params.as_object_mut() {
+        obj.insert("method".into(), serde_json::Value::String(method.to_string()));
+    }
+    let resp = send_request("security.challenge", params).await?;
     let token = resp
         .get("result")
         .and_then(|v| v.get("token"))

@@ -247,27 +247,69 @@ impl MpoolResidencyManager {
 
     fn save_metadata(&self, meta: &CacheMetadata) -> Result<(), String> {
         let json = serde_json::to_string_pretty(meta).map_err(|e| format!("serialize: {e}"))?;
-        std::fs::write(&self.meta_path, json).map_err(|e| format!("write: {e}"))?;
+        // Atomic-rename + fsync: a torn mpool meta makes the cache appear
+        // corrupt next start → full engine recompile (10s+ scan-blind window).
+        let tmp = self.meta_path.with_extension("json.tmp");
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp)
+                .map_err(|e| format!("open temp meta: {e}"))?;
+            f.write_all(json.as_bytes())
+                .map_err(|e| format!("write meta: {e}"))?;
+            f.sync_all().map_err(|e| format!("sync meta: {e}"))?;
+        }
+        std::fs::rename(&tmp, &self.meta_path).map_err(|e| format!("rename meta: {e}"))?;
         Ok(())
     }
 
     fn compute_meta_hash(&self, meta: &CacheMetadata) -> String {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
 
-        let mut hasher = DefaultHasher::new();
-        meta.schema_version.hash(&mut hasher);
-        meta.db_version.hash(&mut hasher);
-        meta.db_timestamp.hash(&mut hasher);
-        meta.provider_fingerprint.hash(&mut hasher);
-        meta.mapped_bytes.hash(&mut hasher);
-        meta.region_count.hash(&mut hasher);
-        meta.signature_count.hash(&mut hasher);
-        // Mix in vault key if available.
+        // CRYPTO FIX: previously DefaultHasher (SipHash → 64-bit output mixed
+        // with vault key as a hash-input, not a MAC key). That gives no formal
+        // MAC security; an attacker with mpool-cache write access could craft
+        // a poisoned meta whose SipHash matches → daemon loads a stale or
+        // attacker-shaped mpool image without detection. Real HMAC-SHA256
+        // with the same vault key gives EUF-CMA security and 256-bit output
+        // (64 hex chars in the same `integrity_hash` String field).
+        //
+        // Backward compat: existing .meta files have 16-char hashes → all
+        // appear "tampered" on first verify post-upgrade → forced cache
+        // recompile, which is the SAFE outcome (the old hash was not
+        // trustworthy anyway).
         let vault_key_path = crate::paths::paths().vault_integrity_key();
-        if let Ok(key) = std::fs::read(&vault_key_path) {
-            key.hash(&mut hasher);
+        let key = std::fs::read(&vault_key_path).unwrap_or_default();
+        let mut mac = match <Hmac<Sha256> as Mac>::new_from_slice(&key) {
+            Ok(m) => m,
+            Err(_) => {
+                // new_from_slice only fails on zero-length keys for HMAC; if
+                // the vault key isn't readable yet, fall back to an empty
+                // (deterministic) key — the meta is still single-use per
+                // daemon and the failure mode is "treated as tampered next
+                // load" which forces a recompile.
+                <Hmac<Sha256> as Mac>::new_from_slice(&[0u8; 32])
+                    .expect("HMAC-SHA256 accepts any key length")
+            }
+        };
+        mac.update(&meta.schema_version.to_le_bytes());
+        mac.update(&meta.db_version.to_le_bytes());
+        mac.update(&meta.db_timestamp.to_le_bytes());
+        mac.update(meta.provider_fingerprint.as_bytes());
+        mac.update(&meta.mapped_bytes.to_le_bytes());
+        mac.update(&meta.region_count.to_le_bytes());
+        mac.update(&meta.signature_count.to_le_bytes());
+
+        let tag = mac.finalize().into_bytes();
+        let mut hex = String::with_capacity(tag.len() * 2);
+        for b in tag.iter() {
+            use std::fmt::Write as _;
+            let _ = write!(hex, "{:02x}", b);
         }
-        format!("{:016x}", hasher.finish())
+        hex
     }
 }

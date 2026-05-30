@@ -50,12 +50,33 @@ pub fn is_excluded(path: &Path, excluded_paths: &[String], excluded_extensions: 
     let path_str = path.to_string_lossy().to_lowercase();
 
     // Check path exclusions.
+    // R4-LETHAL-2: previous version used raw `starts_with` with no path
+    // boundary. Excluding "C:\Users\Me" would also exclude "C:\Users\Mexico\"
+    // and "C:\Users\MeOwner\..." — an attacker (or a typo) could trick a
+    // user into excluding a benign-looking prefix and unlock scanning of
+    // an unrelated sibling directory whose name shares that prefix.
+    //
+    // Fix: enforce that after the prefix match, the next char must be a
+    // path separator (or end-of-string for exact match), so that
+    // "C:\Users\Me\..." matches but "C:\Users\Mexico\..." does NOT.
     for excl in excluded_paths {
-        let excl_lower = excl.to_lowercase();
-        // C2 fix: prefix matching only — prevents overly broad substring matches
-        // (e.g. excluded_paths = ["user"] matching every path containing "user").
+        let mut excl_lower = excl.to_lowercase();
+        // Normalize: strip trailing separators so the boundary check below
+        // works uniformly whether the user wrote "C:\Users\Me" or
+        // "C:\Users\Me\".
+        while excl_lower.ends_with('\\') || excl_lower.ends_with('/') {
+            excl_lower.pop();
+        }
+        if excl_lower.is_empty() {
+            continue;
+        }
         if path_str.starts_with(&excl_lower) {
-            return true;
+            let rest = &path_str[excl_lower.len()..];
+            if rest.is_empty() || rest.starts_with('\\') || rest.starts_with('/') {
+                return true;
+            }
+            // Prefix matched but next char is not a separator — e.g.
+            // excl="c:\\users\\me", path="c:\\users\\mexico\\..." — NOT a match.
         }
     }
 
@@ -70,6 +91,29 @@ pub fn is_excluded(path: &Path, excluded_paths: &[String], excluded_extensions: 
     }
 
     false
+}
+
+/// True if `path` is a reparse point — a symlink OR an NTFS junction /
+/// mount point. `Path::is_symlink()` only flags true symlinks (reparse tag
+/// `IO_REPARSE_TAG_SYMLINK`), NOT junctions (`IO_REPARSE_TAG_MOUNT_POINT`), so
+/// directory walkers that guard with `is_symlink` alone can still be lured into
+/// traversing a junction into an unintended tree (loops, scope-creep into
+/// another user's profile under SYSTEM). Recursive walkers should guard with
+/// THIS instead. Uses `symlink_metadata` so it inspects the link, not the
+/// target; returns false on any stat error (treat as a normal entry).
+pub fn is_reparse_point(path: &Path) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        std::fs::symlink_metadata(path)
+            .map(|m| m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        path.is_symlink()
+    }
 }
 
 /// Check if a directory should be skipped during recursive file collection.
@@ -184,11 +228,13 @@ pub fn is_sentinella_path(path: &Path) -> bool {
     // Now, only Sentinella's own installed directories are skipped.
 
     // Sentinel quarantine/runtime dirs — only under Sentinella's own install tree.
-    // Use the daemon directory as anchor, not global substring.
-    if let Ok(daemon_dir) = std::env::current_dir() {
-        let daemon_lower = daemon_dir.to_string_lossy().to_lowercase();
+    // R9-LETHAL pattern: anchor to the daemon's data root (PathManager), NOT
+    // CWD. CWD drift would silently invalidate this guard → AV scans its own
+    // signatures/quarantine recursively → storm + self-quarantine risk.
+    {
+        let daemon_lower = crate::paths::paths().root().to_string_lossy().to_lowercase();
         let p = path.to_string_lossy().to_lowercase();
-        if p.starts_with(&daemon_lower) {
+        if !daemon_lower.is_empty() && p.starts_with(&daemon_lower) {
             // Inside daemon directory — skip runtime artifacts.
             if p.contains("\\quarantine\\")
                 || p.contains("/quarantine/")
@@ -475,4 +521,84 @@ pub fn is_transient_build_artifact(path: &Path) -> bool {
     }
 
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_reparse_point_negatives() {
+        // A real (non-reparse) directory and a regular file are not reparse
+        // points; a nonexistent path is false (no panic). Junction/symlink
+        // positives need privileged setup, so they're covered by manual/field
+        // testing — this locks the safe negatives + no-panic contract.
+        let dir = std::env::temp_dir();
+        assert!(!is_reparse_point(&dir), "temp dir must not be a reparse point");
+        assert!(!is_reparse_point(Path::new(
+            "C:\\__sentinella_nonexistent_reparse_probe__"
+        )));
+
+        let f = dir.join("sentinella_reparse_probe.txt");
+        std::fs::write(&f, b"x").unwrap();
+        assert!(!is_reparse_point(&f), "regular file must not be a reparse point");
+        let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn r4_lethal2_exclusion_boundary_no_prefix_collision() {
+        // Exclusion of "C:\Users\Me" must NOT exclude "C:\Users\Mexico\..."
+        // or "C:\Users\MeOwner\..." — prefix-only match was the bug.
+        let excl = vec!["C:\\Users\\Me".to_string()];
+        let exts: Vec<String> = vec![];
+
+        // Legit exclusion target.
+        assert!(
+            is_excluded(Path::new("C:\\Users\\Me\\Downloads\\evil.exe"), &excl, &exts),
+            "real Me\\... path should be excluded"
+        );
+        // Path that previously was falsely excluded due to prefix collision.
+        assert!(
+            !is_excluded(
+                Path::new("C:\\Users\\Mexico\\Downloads\\evil.exe"),
+                &excl,
+                &exts
+            ),
+            "BUG: Mexico\\... falsely excluded by Me prefix"
+        );
+        assert!(
+            !is_excluded(
+                Path::new("C:\\Users\\MeOwner\\file.exe"),
+                &excl,
+                &exts
+            ),
+            "BUG: MeOwner\\... falsely excluded by Me prefix"
+        );
+    }
+
+    #[test]
+    fn r4_lethal2_exclusion_exact_match_works() {
+        // Exclusion exactly equal to the path (without trailing separator)
+        // should still match.
+        let excl = vec!["C:\\Temp\\sandbox".to_string()];
+        let exts: Vec<String> = vec![];
+        assert!(is_excluded(Path::new("C:\\Temp\\sandbox"), &excl, &exts));
+        assert!(is_excluded(
+            Path::new("C:\\Temp\\sandbox\\file.bin"),
+            &excl,
+            &exts
+        ));
+    }
+
+    #[test]
+    fn r4_lethal2_trailing_separator_normalized() {
+        // Both "C:\Foo" and "C:\Foo\" should behave identically.
+        let a = vec!["C:\\Foo".to_string()];
+        let b = vec!["C:\\Foo\\".to_string()];
+        let exts: Vec<String> = vec![];
+        for excl in [&a, &b] {
+            assert!(is_excluded(Path::new("C:\\Foo\\bar.exe"), excl, &exts));
+            assert!(!is_excluded(Path::new("C:\\FooBar\\bar.exe"), excl, &exts));
+        }
+    }
 }

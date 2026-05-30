@@ -46,11 +46,49 @@ pub struct ScanResult {
 }
 
 impl ClamEngine {
+    /// Restrict DLL search order to System32 + explicit `dll_dir` only.
+    /// Excludes CWD and PATH from the search before any libclamav transitive
+    /// dependency is resolved.
+    #[cfg(target_os = "windows")]
+    fn harden_dll_search(dll_dir: &Path) {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::Win32::System::LibraryLoader::{
+            AddDllDirectory, SetDefaultDllDirectories, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+            LOAD_LIBRARY_SEARCH_SYSTEM32, LOAD_LIBRARY_SEARCH_USER_DIRS,
+        };
+        use windows::core::PCWSTR;
+
+        let flags = LOAD_LIBRARY_SEARCH_SYSTEM32
+            | LOAD_LIBRARY_SEARCH_USER_DIRS
+            | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS;
+        let _ = unsafe { SetDefaultDllDirectories(flags) };
+
+        if let Ok(canon) = dll_dir.canonicalize() {
+            let wide: Vec<u16> = canon
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            let _ = unsafe { AddDllDirectory(PCWSTR(wide.as_ptr())) };
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn harden_dll_search(_dll_dir: &Path) {}
+
     /// Load libclamav.dll, initialize, load signatures, compile.
     ///
     /// `dll_dir`: directory containing libclamav.dll and its dependencies.
     /// `db_dir`: directory containing .cvd signature files.
     pub fn load(dll_dir: &Path, db_dir: &Path) -> Result<Self, String> {
+        // ☠️ DLL hijack hardening: before loading libclamav.dll (and its
+        // transitive deps — libssl, libcrypto, zlib, libxml2 …), restrict the
+        // search path to System32 + the explicit dll_dir. Daemon runs as
+        // SYSTEM; without this an attacker with write access next to the exe,
+        // in CWD, or in any user-writable PATH entry, gets arbitrary code
+        // execution inside the daemon process.
+        Self::harden_dll_search(dll_dir);
+
         // ── Load the DLL ────────────────────────────────
         let dll_path = dll_dir.join("libclamav.dll");
         let lib = unsafe {
@@ -266,6 +304,55 @@ impl ClamEngine {
         let compile_ms = compile_start.elapsed().as_millis();
         info!(compile_ms, "Engine compiled and ready");
 
+        // ── Phase 2Z: post-compile working set trim ─────────
+        // R10 (HIGH): this MUST run regardless of whether `mpool_getstats`
+        // is available. Previously the trim was nested inside the
+        // `if let Some(getstats) … if ret == 0` block, so any DLL build
+        // lacking mpool_getstats (or a non-zero stats return) skipped the
+        // trim entirely and left ~970 MB resident — exactly the heavyweight
+        // footprint the file-backed design exists to avoid.
+        #[cfg(target_os = "windows")]
+        {
+            use windows::Win32::System::Threading::GetCurrentProcess;
+
+            let ws_before = {
+                use windows::Win32::System::ProcessStatus::{
+                    GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+                };
+                let mut c: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+                c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+                unsafe {
+                    let _ = GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb);
+                }
+                c.WorkingSetSize as u64 / (1024 * 1024)
+            };
+            let trim_result = unsafe {
+                use windows::Win32::System::Threading::SetProcessWorkingSetSize;
+                SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX).is_ok()
+            };
+            let ws_after = {
+                use windows::Win32::System::ProcessStatus::{
+                    GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+                };
+                let mut c: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+                c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+                unsafe {
+                    let _ = GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb);
+                }
+                c.WorkingSetSize as u64 / (1024 * 1024)
+            };
+            info!(
+                ws_before_mb = ws_before,
+                ws_after_mb = ws_after,
+                reduction_mb = ws_before.saturating_sub(ws_after),
+                trim_success = trim_result,
+                "Phase 2Z: post-compile working set trim"
+            );
+        }
+
+        // Detect file-backed residency once (used by both branches below).
+        let cache_exists = cache_path.exists();
+
         // ── Phase 2A: mpool diagnostics ────────────────────
         // Log memory pool statistics after compile to establish baseline.
         let fn_mpool_getstats: Option<FnMpoolGetstats> = unsafe {
@@ -297,10 +384,6 @@ impl ClamEngine {
                     efficiency
                 );
 
-                // Record compile metadata for residency lifecycle.
-                // Detect file-backed residency: if cache file exists after compile,
-                // the mpool is file-backed. If not, we're using vanilla anonymous pages.
-                let cache_exists = cache_path.exists();
                 let cache_size_mb = if cache_exists {
                     std::fs::metadata(&cache_path)
                         .map(|m| m.len() / (1024 * 1024))
@@ -308,58 +391,6 @@ impl ClamEngine {
                 } else {
                     0
                 };
-
-                // Phase 2Z: Working set trim after compile.
-                // Most mpool pages were just written during compile but won't be
-                // read again until a file is scanned. Tell the OS to evict them
-                // from the working set — file-backed pages can be re-faulted cheaply.
-                #[cfg(target_os = "windows")]
-                {
-                    use windows::Win32::System::Threading::GetCurrentProcess;
-
-                    let ws_before = {
-                        use windows::Win32::System::ProcessStatus::{
-                            GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
-                        };
-                        let mut c: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
-                        c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
-                        unsafe {
-                            let _ = GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb);
-                        }
-                        c.WorkingSetSize as u64 / (1024 * 1024)
-                    };
-
-                    // EmptyWorkingSet: tells the memory manager to trim ALL pages.
-                    // For file-backed pages, this is very cheap — they just get
-                    // moved to standby and re-faulted on next access.
-                    let trim_result = unsafe {
-                        // SetProcessWorkingSetSize with -1, -1 trims the working set.
-                        // This is the documented way to empty the working set.
-                        use windows::Win32::System::Threading::SetProcessWorkingSetSize;
-                        SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX)
-                            .is_ok()
-                    };
-
-                    let ws_after = {
-                        use windows::Win32::System::ProcessStatus::{
-                            GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
-                        };
-                        let mut c: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
-                        c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
-                        unsafe {
-                            let _ = GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb);
-                        }
-                        c.WorkingSetSize as u64 / (1024 * 1024)
-                    };
-
-                    info!(
-                        ws_before_mb = ws_before,
-                        ws_after_mb = ws_after,
-                        reduction_mb = ws_before.saturating_sub(ws_after),
-                        trim_success = trim_result,
-                        "Phase 2Z: post-compile working set trim"
-                    );
-                }
 
                 if !cache_exists {
                     warn!(
