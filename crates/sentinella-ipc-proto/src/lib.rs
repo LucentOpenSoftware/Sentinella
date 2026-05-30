@@ -15,6 +15,7 @@
 //! `protocol_version` field. Breaking changes bump the major version.
 
 pub mod engine;
+pub mod full_config;
 pub mod quarantine;
 pub mod scan;
 pub mod settings;

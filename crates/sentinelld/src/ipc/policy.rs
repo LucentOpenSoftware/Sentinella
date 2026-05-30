@@ -248,6 +248,14 @@ pub fn method_registry() -> HashMap<&'static str, MethodPolicy> {
         auth_read(1024, RateBucket::MemoryScan),
     );
     m.insert("settings.get", auth_read(512, RateBucket::Status));
+    // v0.1.8 FullConfig surface — larger payload than settings.get because
+    // the response includes every TOML knob, but still a read-only listing.
+    m.insert("settings.get_full", auth_read(16384, RateBucket::Status));
+    m.insert("settings.get_defaults", auth_read(8192, RateBucket::Status));
+    m.insert(
+        "settings.restart_requirements",
+        auth_read(8192, RateBucket::Status),
+    );
     m.insert("dev.status", auth_read(512, RateBucket::Status));
 
     // ── Authenticated actions ──────────────────────────
@@ -330,9 +338,21 @@ pub fn method_registry() -> HashMap<&'static str, MethodPolicy> {
         "settings.set",
         priv_mutation(16384, RateBucket::ConfigMutation),
     );
+    // v0.1.8: full-config write. Larger payload (~30 KB worst case with full
+    // exclusion/hash lists), same defence-in-depth as settings.set —
+    // ConfigMutation rate bucket + challenge token gating + kill-vector pin
+    // in the handler. NOTE: actually NEVER mutates critical fields itself;
+    // it just refuses the request if any critical field differs from current.
+    m.insert(
+        "settings.set_full",
+        priv_mutation(32768, RateBucket::ConfigMutation),
+    );
     m.insert(
         "protection.set_critical",
-        priv_mutation(4096, RateBucket::ConfigMutation),
+        // v0.1.8 expansion: now accepts list fields (excluded_paths,
+        // trusted_hashes, realtime_roots, etc.). Worst-case payload is 64
+        // entries × ~256 bytes/entry = ~16 KB, plus envelope overhead.
+        priv_mutation(32768, RateBucket::ConfigMutation),
     );
     m.insert(
         "protection.disable",

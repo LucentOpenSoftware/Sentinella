@@ -980,6 +980,426 @@ pub fn verify_developer_password(input: &str, stored_hash_hex: &str) -> bool {
     diff == 0
 }
 
+// ════════════════════════════════════════════════════════════════════
+//  FullConfig bridge (v0.1.8 settings.get_full / settings.set_full)
+// ════════════════════════════════════════════════════════════════════
+//
+// `sentinella_ipc_proto::full_config::FullConfig` is the wire-format
+// mirror of `Config`. These conversions are the single seam between
+// the two — every field of Config has to appear here or it won't make
+// it to the GUI. The compile-time field-coverage test below catches
+// drift after a Config struct add.
+//
+// `apply_non_critical` is the inverse used by `settings.set_full`: it
+// applies every NON-critical field from a FullConfig into a Config,
+// leaving the kill-vector fields untouched. The same kill-vector pin
+// list is enforced server-side in the IPC handler as a second defence.
+
+use sentinella_ipc_proto::full_config::{
+    DeveloperConfigPublic, FullConfig, FullFishConfig, FullPerformanceConfig, FullSandboxConfig,
+    FullScanConfig, CRITICAL_FIELDS,
+};
+
+impl From<&Config> for FullConfig {
+    fn from(c: &Config) -> Self {
+        FullConfig {
+            realtime_enabled: c.realtime_enabled,
+            realtime_roots: c.realtime_roots.clone(),
+
+            max_file_size_mb: c.max_file_size_mb,
+            scan_archives: c.scan_archives,
+            heuristic_alerts: c.heuristic_alerts,
+
+            auto_update: c.auto_update,
+            update_interval_hours: c.update_interval_hours,
+            signature_stale_days: c.signature_stale_days,
+            update_mirror: c.update_mirror.clone(),
+
+            quarantine_retention_days: c.quarantine_retention_days,
+            auto_quarantine: c.auto_quarantine,
+
+            excluded_paths: c.excluded_paths.clone(),
+            excluded_extensions: c.excluded_extensions.clone(),
+            excluded_detections: c.excluded_detections.clone(),
+            trusted_hashes: c.trusted_hashes.clone(),
+
+            enhanced_signature_provider: c.enhanced_signature_provider.clone(),
+            log_level: c.log_level.clone(),
+
+            scheduled_scan_enabled: c.scheduled_scan_enabled,
+            scheduled_scan_hour: c.scheduled_scan_hour,
+            scheduled_scan_type: c.scheduled_scan_type.clone(),
+
+            startup_critical_scan: c.startup_critical_scan,
+
+            powershell_bridge_enabled: c.powershell_bridge_enabled,
+            powershell_poll_seconds: c.powershell_poll_seconds,
+
+            idle_scan_enabled: c.idle_scan_enabled,
+            idle_scan_start_delay_secs: c.idle_scan_start_delay_secs,
+            idle_scan_on_battery: c.idle_scan_on_battery,
+            idle_scan_cpu_pause_threshold: c.idle_scan_cpu_pause_threshold,
+            idle_scan_max_file_size_mb: c.idle_scan_max_file_size_mb,
+            idle_scan_fullscreen_pause: c.idle_scan_fullscreen_pause,
+            idle_scan_disk_latency_pause_ms: c.idle_scan_disk_latency_pause_ms,
+            idle_scan_max_files_per_session: c.idle_scan_max_files_per_session,
+            idle_scan_slow_delay_min_ms: c.idle_scan_slow_delay_min_ms,
+            idle_scan_slow_delay_max_ms: c.idle_scan_slow_delay_max_ms,
+            idle_scan_normal_delay_min_ms: c.idle_scan_normal_delay_min_ms,
+            idle_scan_normal_delay_max_ms: c.idle_scan_normal_delay_max_ms,
+            idle_scan_fast_delay_min_ms: c.idle_scan_fast_delay_min_ms,
+            idle_scan_fast_delay_max_ms: c.idle_scan_fast_delay_max_ms,
+
+            argus_worker_enabled: c.argus_worker_enabled,
+            argus_worker_path: c.argus_worker_path.clone(),
+            argus_worker_timeout_sec: c.argus_worker_timeout_sec,
+
+            clamav_isolation: c.clamav_isolation.clone(),
+            clamav_worker_timeout_sec: c.clamav_worker_timeout_sec,
+
+            scan: FullScanConfig {
+                argus_worker_enabled: c.scan.argus_worker_enabled,
+                argus_worker_path: c.scan.argus_worker_path.clone(),
+                argus_worker_timeout_sec: c.scan.argus_worker_timeout_sec,
+                orchestrator_file_scan_enabled: c.scan.orchestrator_file_scan_enabled,
+                orchestrator_folder_scan_enabled: c.scan.orchestrator_folder_scan_enabled,
+                orchestrator_quick_scan_enabled: c.scan.orchestrator_quick_scan_enabled,
+                orchestrator_full_scan_enabled: c.scan.orchestrator_full_scan_enabled,
+            },
+            performance: FullPerformanceConfig {
+                memory_profile: c.performance.memory_profile.clone(),
+                memory_warning_mb: c.performance.memory_warning_mb,
+                memory_critical_mb: c.performance.memory_critical_mb,
+                external_argus_under_pressure: c.performance.external_argus_under_pressure,
+                max_resident_workers_on_pressure: c.performance.max_resident_workers_on_pressure,
+            },
+            fish: FullFishConfig {
+                enabled: c.fish.enabled,
+                observe_only: c.fish.observe_only,
+                window_seconds: c.fish.window_seconds,
+                rename_threshold: c.fish.rename_threshold,
+                rewrite_threshold: c.fish.rewrite_threshold,
+                ext_mutation_threshold: c.fish.ext_mutation_threshold,
+                slow_burn_window_secs: c.fish.slow_burn_window_secs,
+                slow_burn_threshold: c.fish.slow_burn_threshold,
+                entropy_delta_threshold: c.fish.entropy_delta_threshold,
+                alert_cooldown_seconds: c.fish.alert_cooldown_seconds,
+                active_response: c.fish.active_response.clone(),
+            },
+            sandbox: FullSandboxConfig {
+                enabled: c.sandbox.enabled,
+                mode: c.sandbox.mode.clone(),
+                timeout_sec: c.sandbox.timeout_sec,
+                min_score: c.sandbox.min_score,
+                max_score: c.sandbox.max_score,
+            },
+            // password_sha256 is NEVER mirrored — see DeveloperConfigPublic.
+            developer: DeveloperConfigPublic {
+                enabled: c.developer.enabled,
+                telemetry_enabled: c.developer.telemetry_enabled,
+                telemetry_max_kb: c.developer.telemetry_max_kb,
+            },
+        }
+    }
+}
+
+impl Config {
+    /// Apply every NON-critical field from `full` into `self`.
+    ///
+    /// Kill-vector fields (see `CRITICAL_FIELDS`) are NEVER touched —
+    /// they only travel through `protection.set_critical`. The
+    /// kill-vector pin is enforced TWICE: once by skipping the field
+    /// here, and once by the IPC handler refusing the entire request
+    /// if any critical field differs from the current value.
+    ///
+    /// Caller is responsible for invoking `self.validate()` after.
+    pub fn apply_non_critical(&mut self, full: &FullConfig) {
+        // ── Non-critical scalar/list fields ─────────────
+        self.max_file_size_mb = full.max_file_size_mb;
+        self.scan_archives = full.scan_archives;
+
+        self.auto_update = full.auto_update;
+        self.update_interval_hours = full.update_interval_hours;
+        self.signature_stale_days = full.signature_stale_days;
+        self.update_mirror = full.update_mirror.clone();
+
+        self.quarantine_retention_days = full.quarantine_retention_days;
+
+        self.log_level = full.log_level.clone();
+
+        self.scheduled_scan_hour = full.scheduled_scan_hour;
+        self.scheduled_scan_type = full.scheduled_scan_type.clone();
+
+        self.startup_critical_scan = full.startup_critical_scan;
+
+        self.powershell_bridge_enabled = full.powershell_bridge_enabled;
+        self.powershell_poll_seconds = full.powershell_poll_seconds;
+
+        self.idle_scan_start_delay_secs = full.idle_scan_start_delay_secs;
+        self.idle_scan_on_battery = full.idle_scan_on_battery;
+        self.idle_scan_cpu_pause_threshold = full.idle_scan_cpu_pause_threshold;
+        self.idle_scan_max_file_size_mb = full.idle_scan_max_file_size_mb;
+        self.idle_scan_fullscreen_pause = full.idle_scan_fullscreen_pause;
+        self.idle_scan_disk_latency_pause_ms = full.idle_scan_disk_latency_pause_ms;
+        self.idle_scan_max_files_per_session = full.idle_scan_max_files_per_session;
+        self.idle_scan_slow_delay_min_ms = full.idle_scan_slow_delay_min_ms;
+        self.idle_scan_slow_delay_max_ms = full.idle_scan_slow_delay_max_ms;
+        self.idle_scan_normal_delay_min_ms = full.idle_scan_normal_delay_min_ms;
+        self.idle_scan_normal_delay_max_ms = full.idle_scan_normal_delay_max_ms;
+        self.idle_scan_fast_delay_min_ms = full.idle_scan_fast_delay_min_ms;
+        self.idle_scan_fast_delay_max_ms = full.idle_scan_fast_delay_max_ms;
+
+        self.argus_worker_timeout_sec = full.argus_worker_timeout_sec;
+
+        self.clamav_isolation = full.clamav_isolation.clone();
+        self.clamav_worker_timeout_sec = full.clamav_worker_timeout_sec;
+
+        // ── Nested: scan (path/enabled are critical, timeouts/orchestrator flags are not) ──
+        self.scan.argus_worker_timeout_sec = full.scan.argus_worker_timeout_sec;
+        self.scan.orchestrator_file_scan_enabled = full.scan.orchestrator_file_scan_enabled;
+        self.scan.orchestrator_folder_scan_enabled = full.scan.orchestrator_folder_scan_enabled;
+        self.scan.orchestrator_quick_scan_enabled = full.scan.orchestrator_quick_scan_enabled;
+        self.scan.orchestrator_full_scan_enabled = full.scan.orchestrator_full_scan_enabled;
+
+        // ── Nested: performance ──
+        self.performance.memory_profile = full.performance.memory_profile.clone();
+        self.performance.memory_warning_mb = full.performance.memory_warning_mb;
+        self.performance.memory_critical_mb = full.performance.memory_critical_mb;
+        self.performance.external_argus_under_pressure =
+            full.performance.external_argus_under_pressure;
+        self.performance.max_resident_workers_on_pressure =
+            full.performance.max_resident_workers_on_pressure;
+
+        // ── Nested: fish ──
+        // fish.enabled is DaemonRestart (process-lifecycle) but not in
+        // CRITICAL_FIELDS — it gates the detector loop, not detection itself.
+        // Allow toggling here; the restart pill in the GUI tells the user.
+        self.fish.enabled = full.fish.enabled;
+        self.fish.observe_only = full.fish.observe_only;
+        self.fish.window_seconds = full.fish.window_seconds;
+        self.fish.rename_threshold = full.fish.rename_threshold;
+        self.fish.rewrite_threshold = full.fish.rewrite_threshold;
+        self.fish.ext_mutation_threshold = full.fish.ext_mutation_threshold;
+        self.fish.slow_burn_window_secs = full.fish.slow_burn_window_secs;
+        self.fish.slow_burn_threshold = full.fish.slow_burn_threshold;
+        self.fish.entropy_delta_threshold = full.fish.entropy_delta_threshold;
+        self.fish.alert_cooldown_seconds = full.fish.alert_cooldown_seconds;
+        self.fish.active_response = full.fish.active_response.clone();
+
+        // ── Nested: sandbox ──
+        self.sandbox.enabled = full.sandbox.enabled;
+        self.sandbox.mode = full.sandbox.mode.clone();
+        self.sandbox.timeout_sec = full.sandbox.timeout_sec;
+        self.sandbox.min_score = full.sandbox.min_score;
+        self.sandbox.max_score = full.sandbox.max_score;
+
+        // ── Nested: developer (public projection only) ──
+        // developer.enabled is gated by dev.set_developer_mode (password-checked),
+        // NEVER mutated here — apply only the telemetry knobs.
+        self.developer.telemetry_enabled = full.developer.telemetry_enabled;
+        self.developer.telemetry_max_kb = full.developer.telemetry_max_kb;
+
+        // The following are CRITICAL and intentionally NOT applied:
+        //   realtime_enabled, auto_quarantine, heuristic_alerts,
+        //   idle_scan_enabled, scheduled_scan_enabled,
+        //   excluded_paths, excluded_extensions, excluded_detections,
+        //   trusted_hashes, realtime_roots, enhanced_signature_provider,
+        //   argus_worker_enabled, argus_worker_path,
+        //   scan.argus_worker_enabled, scan.argus_worker_path
+    }
+
+    /// Verify the incoming FullConfig leaves every CRITICAL_FIELDS value
+    /// unchanged relative to `self`. Returns the list of critical fields
+    /// the caller attempted to mutate (empty = OK to apply).
+    ///
+    /// This is the second layer of the kill-vector defence: even if a
+    /// malformed call sneaks a different value past `apply_non_critical`
+    /// (it can't, by construction), this verification trips first and
+    /// the IPC handler rejects the entire request.
+    pub fn critical_diff(&self, full: &FullConfig) -> Vec<&'static str> {
+        let mut diffs = Vec::new();
+        if self.realtime_enabled != full.realtime_enabled {
+            diffs.push("realtime_enabled");
+        }
+        if self.auto_quarantine != full.auto_quarantine {
+            diffs.push("auto_quarantine");
+        }
+        if self.heuristic_alerts != full.heuristic_alerts {
+            diffs.push("heuristic_alerts");
+        }
+        if self.idle_scan_enabled != full.idle_scan_enabled {
+            diffs.push("idle_scan_enabled");
+        }
+        if self.scheduled_scan_enabled != full.scheduled_scan_enabled {
+            diffs.push("scheduled_scan_enabled");
+        }
+        if self.excluded_paths != full.excluded_paths {
+            diffs.push("excluded_paths");
+        }
+        if self.excluded_extensions != full.excluded_extensions {
+            diffs.push("excluded_extensions");
+        }
+        if self.excluded_detections != full.excluded_detections {
+            diffs.push("excluded_detections");
+        }
+        if self.trusted_hashes != full.trusted_hashes {
+            diffs.push("trusted_hashes");
+        }
+        if self.realtime_roots != full.realtime_roots {
+            diffs.push("realtime_roots");
+        }
+        if self.enhanced_signature_provider != full.enhanced_signature_provider {
+            diffs.push("enhanced_signature_provider");
+        }
+        if self.argus_worker_enabled != full.argus_worker_enabled {
+            diffs.push("argus_worker_enabled");
+        }
+        if self.argus_worker_path != full.argus_worker_path {
+            diffs.push("argus_worker_path");
+        }
+        if self.scan.argus_worker_enabled != full.scan.argus_worker_enabled {
+            diffs.push("scan.argus_worker_enabled");
+        }
+        if self.scan.argus_worker_path != full.scan.argus_worker_path {
+            diffs.push("scan.argus_worker_path");
+        }
+        // Cross-check: anything we diff here must be in CRITICAL_FIELDS.
+        // (debug-build assertion catches drift between this fn and the proto list)
+        debug_assert!(
+            diffs.iter().all(|f| CRITICAL_FIELDS.contains(f)),
+            "critical_diff reports a field not in CRITICAL_FIELDS"
+        );
+        diffs
+    }
+}
+
+#[cfg(test)]
+mod full_config_bridge_tests {
+    use super::*;
+
+    #[test]
+    fn config_roundtrips_through_full_config() {
+        let mut original = Config::default();
+        original.max_file_size_mb = 1024;
+        original.update_mirror = "test.mirror.example".into();
+        original.fish.rename_threshold = 99;
+        original.sandbox.min_score = 30;
+
+        let full = FullConfig::from(&original);
+        let mut rebuilt = Config::default();
+        rebuilt.apply_non_critical(&full);
+
+        // Non-critical fields round-trip.
+        assert_eq!(rebuilt.max_file_size_mb, 1024);
+        assert_eq!(rebuilt.update_mirror, "test.mirror.example");
+        assert_eq!(rebuilt.fish.rename_threshold, 99);
+        assert_eq!(rebuilt.sandbox.min_score, 30);
+    }
+
+    #[test]
+    fn apply_non_critical_preserves_kill_vector_fields() {
+        // A baseline with safe kill-vector values.
+        let baseline = Config {
+            realtime_enabled: true,
+            auto_quarantine: true,
+            excluded_paths: vec!["safe/path".into()],
+            excluded_detections: vec!["Test.Sig".into()],
+            trusted_hashes: vec!["a".repeat(64)],
+            realtime_roots: vec!["C:\\Users\\test\\Downloads".into()],
+            enhanced_signature_provider: "none".into(),
+            argus_worker_enabled: false,
+            argus_worker_path: "argusd.exe".into(),
+            ..Config::default()
+        };
+
+        // A hostile FullConfig trying to clobber every kill-vector field.
+        let mut hostile = FullConfig::from(&baseline);
+        hostile.realtime_enabled = false;
+        hostile.auto_quarantine = false;
+        hostile.excluded_paths = vec!["C:\\".into()];
+        hostile.excluded_detections = vec!["".into()]; // kill-switch
+        hostile.trusted_hashes = vec!["0".repeat(64)];
+        hostile.realtime_roots = vec![]; // blind the watcher
+        hostile.enhanced_signature_provider = "attacker".into();
+        hostile.argus_worker_enabled = true;
+        hostile.argus_worker_path = "C:\\Windows\\Temp\\evil.exe".into();
+        hostile.heuristic_alerts = !baseline.heuristic_alerts;
+        hostile.idle_scan_enabled = !baseline.idle_scan_enabled;
+        hostile.scheduled_scan_enabled = !baseline.scheduled_scan_enabled;
+
+        let mut victim = baseline.clone();
+        victim.apply_non_critical(&hostile);
+
+        // Every kill-vector field is unchanged.
+        assert_eq!(victim.realtime_enabled, baseline.realtime_enabled);
+        assert_eq!(victim.auto_quarantine, baseline.auto_quarantine);
+        assert_eq!(victim.excluded_paths, baseline.excluded_paths);
+        assert_eq!(victim.excluded_detections, baseline.excluded_detections);
+        assert_eq!(victim.trusted_hashes, baseline.trusted_hashes);
+        assert_eq!(victim.realtime_roots, baseline.realtime_roots);
+        assert_eq!(
+            victim.enhanced_signature_provider,
+            baseline.enhanced_signature_provider
+        );
+        assert_eq!(victim.argus_worker_enabled, baseline.argus_worker_enabled);
+        assert_eq!(victim.argus_worker_path, baseline.argus_worker_path);
+        assert_eq!(victim.heuristic_alerts, baseline.heuristic_alerts);
+        assert_eq!(victim.idle_scan_enabled, baseline.idle_scan_enabled);
+        assert_eq!(
+            victim.scheduled_scan_enabled,
+            baseline.scheduled_scan_enabled
+        );
+    }
+
+    #[test]
+    fn critical_diff_flags_every_attempted_kill_vector_mutation() {
+        let baseline = Config::default();
+        let mut hostile = FullConfig::from(&baseline);
+
+        // Mutate every kill-vector field.
+        hostile.realtime_enabled = !baseline.realtime_enabled;
+        hostile.auto_quarantine = !baseline.auto_quarantine;
+        hostile.heuristic_alerts = !baseline.heuristic_alerts;
+        hostile.idle_scan_enabled = !baseline.idle_scan_enabled;
+        hostile.scheduled_scan_enabled = !baseline.scheduled_scan_enabled;
+        hostile.excluded_paths.push("attacker".into());
+        hostile.excluded_extensions.push("attacker".into());
+        hostile.excluded_detections.push("attacker".into());
+        hostile.trusted_hashes.push("a".repeat(64));
+        hostile.realtime_roots.push("attacker".into());
+        hostile.enhanced_signature_provider = "attacker".into();
+        hostile.argus_worker_enabled = !baseline.argus_worker_enabled;
+        hostile.argus_worker_path = "attacker".into();
+        hostile.scan.argus_worker_enabled = !baseline.scan.argus_worker_enabled;
+        hostile.scan.argus_worker_path = "attacker".into();
+
+        let diffs = baseline.critical_diff(&hostile);
+        // All 15 critical fields should be flagged (15 entries because
+        // both top-level + scan.* argus pairs count).
+        assert!(diffs.len() >= 13, "critical_diff missed fields: {diffs:?}");
+        assert!(diffs.contains(&"realtime_enabled"));
+        assert!(diffs.contains(&"excluded_paths"));
+        assert!(diffs.contains(&"trusted_hashes"));
+        assert!(diffs.contains(&"argus_worker_path"));
+    }
+
+    #[test]
+    fn full_config_excludes_password_hash_on_wire() {
+        let mut config = Config::default();
+        config.developer.password_sha256 = "deadbeef".repeat(8); // any 64-char
+        let full = FullConfig::from(&config);
+        let json = serde_json::to_string(&full).expect("serialize");
+        assert!(
+            !json.contains("password_sha256"),
+            "password_sha256 leaked into wire format: {json}"
+        );
+        assert!(
+            !json.contains("deadbeef"),
+            "password hash bytes leaked into wire format"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

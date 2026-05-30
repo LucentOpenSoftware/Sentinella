@@ -386,6 +386,7 @@ fn is_challengeable_method(method: &str) -> bool {
         "engine.reload"
             | "argus.reload"
             | "settings.set"
+            | "settings.set_full"
             | "sources.set"
             | "sources.update"
             | "sources.rollback"
@@ -1816,9 +1817,172 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
             "config_drift": state.config_drift(),
         })),
 
+        // ── v0.1.8 FullConfig surface ─────────────────────
+        // Full config mirror (every TOML knob). Returns FullConfig with
+        // developer.password_sha256 already redacted (the type doesn't carry it).
+        "settings.get_full" => {
+            let auth = req
+                .params
+                .get("auth")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !state.validate_ipc_auth(auth) {
+                return serde_json::to_vec(&RpcErrorResponse::err(
+                    req.id,
+                    error_codes::INVALID_PARAMS,
+                    "authenticated IPC settings read required".to_string(),
+                ))
+                .unwrap_or_default();
+            }
+            let config = crate::config::Config::load(None).unwrap_or_default();
+            let full = sentinella_ipc_proto::full_config::FullConfig::from(&config);
+            ok_json(full)
+        }
+
+        // Defaults for "reset to default" buttons in the GUI. Same auth as get_full.
+        "settings.get_defaults" => {
+            let auth = req
+                .params
+                .get("auth")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !state.validate_ipc_auth(auth) {
+                return serde_json::to_vec(&RpcErrorResponse::err(
+                    req.id,
+                    error_codes::INVALID_PARAMS,
+                    "authenticated IPC settings read required".to_string(),
+                ))
+                .unwrap_or_default();
+            }
+            ok_json(sentinella_ipc_proto::full_config::FullConfig::default())
+        }
+
+        // Restart-requirement map: which fields need engine reload vs full daemon restart.
+        // Computed from the proto's static table; never touches disk or config.
+        "settings.restart_requirements" => {
+            let auth = req
+                .params
+                .get("auth")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !state.validate_ipc_auth(auth) {
+                return serde_json::to_vec(&RpcErrorResponse::err(
+                    req.id,
+                    error_codes::INVALID_PARAMS,
+                    "authenticated IPC settings read required".to_string(),
+                ))
+                .unwrap_or_default();
+            }
+            let map = sentinella_ipc_proto::full_config::RestartRequirementMap::build();
+            ok_json(map)
+        }
+
+        // Apply NON-critical fields from a FullConfig. Kill-vector fields are
+        // pinned to current values by `apply_non_critical`, AND additionally
+        // verified via `critical_diff` — the request is REJECTED entirely if
+        // any kill-vector field differs. Token-gated like settings.set.
+        "settings.set_full" => {
+            let auth = req
+                .params
+                .get("auth")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !state.validate_ipc_auth(auth) {
+                return serde_json::to_vec(&RpcErrorResponse::err(
+                    req.id,
+                    error_codes::INVALID_PARAMS,
+                    "authenticated IPC settings update required".to_string(),
+                ))
+                .unwrap_or_default();
+            }
+            let token = req
+                .params
+                .get("token")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !state.validate_challenge_token(token, "settings.set_full") {
+                return serde_json::to_vec(&RpcErrorResponse::err(
+                    req.id,
+                    error_codes::INVALID_PARAMS,
+                    "challenge token required for settings update".to_string(),
+                ))
+                .unwrap_or_default();
+            }
+            // Strip the IPC envelope fields before deserializing into FullConfig
+            // (they are not part of the config schema and would fail serde even
+            // with #[serde(default)] because of deny_unknown_fields elsewhere).
+            let mut params = req.params.clone();
+            if let Some(obj) = params.as_object_mut() {
+                obj.remove("auth");
+                obj.remove("token");
+            }
+            match serde_json::from_value::<sentinella_ipc_proto::full_config::FullConfig>(params) {
+                Ok(full) => {
+                    let mut config = crate::config::Config::load(None).unwrap_or_default();
+                    let diffs = config.critical_diff(&full);
+                    if !diffs.is_empty() {
+                        // SECOND-LAYER DEFENCE: even though apply_non_critical
+                        // would silently ignore these, REJECTING the request
+                        // surfaces the violation to the GUI so a misbehaving
+                        // client doesn't think it succeeded. Also a clear
+                        // audit-log signal of attempted kill-vector tampering.
+                        state.log_activity(
+                            "warning",
+                            "settings",
+                            &format!(
+                                "settings.set_full rejected — kill-vector mutation: {}",
+                                diffs.join(", ")
+                            ),
+                            "Use protection.set_critical (requires UAC) for these fields",
+                            None,
+                        );
+                        return serde_json::to_vec(&RpcErrorResponse::err(
+                            req.id,
+                            error_codes::INSUFFICIENT_PRIVILEGE,
+                            format!(
+                                "rejected: kill-vector fields can only be changed via protection.set_critical: {}",
+                                diffs.join(", ")
+                            ),
+                        ))
+                        .unwrap_or_default();
+                    }
+                    config.apply_non_critical(&full);
+                    config.validate();
+                    let path = crate::paths::paths().config_file();
+                    match config.save(&path) {
+                        Ok(()) => {
+                            state.log_activity(
+                                "info",
+                                "settings",
+                                "Configuration updated via settings.set_full",
+                                "",
+                                None,
+                            );
+                            Ok(serde_json::json!({"ok": true}))
+                        }
+                        Err(e) => Ok(serde_json::json!({"ok": false, "error": e})),
+                    }
+                }
+                Err(e) => Ok(
+                    serde_json::json!({"ok": false, "error": format!("invalid FullConfig: {e}")}),
+                ),
+            }
+        }
+
         // ── Protection critical settings (requires challenge token) ──
-        // Changes realtime_enabled, auto_quarantine, or pauses protection.
+        // Mutates kill-vector fields (CRITICAL_FIELDS in proto::full_config).
         // GUI must request UAC elevation before calling this.
+        //
+        // v0.1.8 expansion: previously this handled only realtime_enabled +
+        // auto_quarantine. The other 10 kill-vector fields had no IPC mutation
+        // path at all — they could ONLY be changed by editing the TOML file
+        // directly. v0.1.8 fills that gap so the Settings UI can edit
+        // exclusions, watched roots, trusted hashes, etc., still gated behind
+        // the challenge-token-plus-UAC defence.
+        //
+        // Validation here is STRICT: anything that smells malformed gets
+        // rejected with an explicit reason rather than silently coerced. The
+        // GUI surfaces the reason inline next to the field.
         "protection.set_critical" => {
             let token = req
                 .params
@@ -1836,12 +2000,61 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
 
             let mut config = crate::config::Config::load(None).unwrap_or_default();
             let mut changes = Vec::new();
+            let mut errors: Vec<String> = Vec::new();
 
+            // ── Validation helpers (inline; v0.1.9 can refactor to mod::validation) ──
+            const MAX_LIST_ENTRIES: usize = 64;
+            const MAX_PATH_LEN: usize = 4096;
+            // Hard-blocked paths: protect users from accidentally
+            // excluding the world or feeding the watcher a path that
+            // hangs the recursion.
+            fn is_dangerous_path(p: &str) -> bool {
+                let lower = p.trim().to_lowercase();
+                let stripped = lower.trim_end_matches('\\');
+                matches!(
+                    stripped,
+                    "" | "c:" | "c:/" | "/" | "\\" | "c:\\windows"
+                        | "c:\\windows\\system32" | "c:\\program files"
+                        | "c:\\program files (x86)"
+                ) || stripped.contains("..")
+            }
+            fn is_hex64_lower(s: &str) -> bool {
+                s.len() == 64
+                    && s.bytes()
+                        .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            }
+            fn validate_string_list<F: Fn(&str) -> Result<(), String>>(
+                key: &str,
+                v: &serde_json::Value,
+                check: F,
+                errors: &mut Vec<String>,
+            ) -> Option<Vec<String>> {
+                let arr = v.as_array()?;
+                if arr.len() > MAX_LIST_ENTRIES {
+                    errors.push(format!(
+                        "{key}: too many entries ({} > {MAX_LIST_ENTRIES})",
+                        arr.len()
+                    ));
+                    return None;
+                }
+                let mut out = Vec::with_capacity(arr.len());
+                for (i, item) in arr.iter().enumerate() {
+                    match item.as_str() {
+                        Some(s) => match check(s) {
+                            Ok(()) => out.push(s.to_string()),
+                            Err(why) => errors.push(format!("{key}[{i}]: {why}")),
+                        },
+                        None => errors.push(format!("{key}[{i}]: not a string")),
+                    }
+                }
+                Some(out)
+            }
+
+            // ── Existing fields (v0.1.7) ───────────────────
             if let Some(v) = req.params.get("realtime_enabled").and_then(|v| v.as_bool()) {
                 config.realtime_enabled = v;
                 changes.push(format!("realtime_enabled={v}"));
                 if !v {
-                    // Stop watcher immediately.
                     state.disable_protection();
                 } else if !state.is_user_disabled() {
                     state.enable_protection();
@@ -1852,16 +2065,233 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
                 changes.push(format!("auto_quarantine={v}"));
             }
 
+            // ── New bool kill-vector toggles (v0.1.8) ──────
+            if let Some(v) = req.params.get("heuristic_alerts").and_then(|v| v.as_bool()) {
+                config.heuristic_alerts = v;
+                changes.push(format!("heuristic_alerts={v}"));
+            }
+            if let Some(v) = req.params.get("idle_scan_enabled").and_then(|v| v.as_bool()) {
+                config.idle_scan_enabled = v;
+                changes.push(format!("idle_scan_enabled={v}"));
+            }
+            if let Some(v) = req.params
+                .get("scheduled_scan_enabled")
+                .and_then(|v| v.as_bool())
+            {
+                config.scheduled_scan_enabled = v;
+                changes.push(format!("scheduled_scan_enabled={v}"));
+            }
+            if let Some(v) = req.params
+                .get("argus_worker_enabled")
+                .and_then(|v| v.as_bool())
+            {
+                config.argus_worker_enabled = v;
+                // Keep the [scan] mirror in sync — orchestrator reads both.
+                config.scan.argus_worker_enabled = v;
+                changes.push(format!("argus_worker_enabled={v}"));
+            }
+
+            // ── String kill-vectors with validation ────────
+            if let Some(v) = req.params
+                .get("enhanced_signature_provider")
+                .and_then(|v| v.as_str())
+            {
+                // Strict allowlist — anything else is an engine-swap kill vector.
+                if matches!(v, "none" | "enhanced" | "community") {
+                    config.enhanced_signature_provider = v.to_string();
+                    changes.push(format!("enhanced_signature_provider={v}"));
+                } else {
+                    errors.push(format!(
+                        "enhanced_signature_provider={v:?} not in allowlist (none|enhanced|community)"
+                    ));
+                }
+            }
+            if let Some(v) = req.params.get("argus_worker_path").and_then(|v| v.as_str()) {
+                // Must look like a plausible executable path.
+                let trimmed = v.trim();
+                if trimmed.is_empty() || trimmed.len() > MAX_PATH_LEN {
+                    errors.push("argus_worker_path: empty or too long".into());
+                } else if is_dangerous_path(trimmed) || trimmed.contains("..") {
+                    errors.push(format!(
+                        "argus_worker_path={trimmed:?} rejected (dangerous or traversal)"
+                    ));
+                } else if !trimmed.to_lowercase().ends_with(".exe") {
+                    errors.push(format!(
+                        "argus_worker_path={trimmed:?} must end with .exe"
+                    ));
+                } else {
+                    config.argus_worker_path = trimmed.into();
+                    config.scan.argus_worker_path = trimmed.into();
+                    changes.push(format!("argus_worker_path={trimmed}"));
+                }
+            }
+
+            // ── List kill-vectors with validation ──────────
+            if let Some(v) = req.params.get("excluded_paths") {
+                if let Some(list) = validate_string_list(
+                    "excluded_paths",
+                    v,
+                    |s| {
+                        let t = s.trim();
+                        if t.is_empty() {
+                            Err("empty entry".into())
+                        } else if t.len() > MAX_PATH_LEN {
+                            Err("path too long".into())
+                        } else if is_dangerous_path(t) {
+                            Err(format!("{t:?} would exclude critical system area"))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    &mut errors,
+                ) {
+                    config.excluded_paths = list;
+                    changes.push(format!("excluded_paths=[{}]", config.excluded_paths.len()));
+                }
+            }
+            if let Some(v) = req.params.get("excluded_extensions") {
+                if let Some(list) = validate_string_list(
+                    "excluded_extensions",
+                    v,
+                    |s| {
+                        let t = s.trim().trim_start_matches('.');
+                        if t.is_empty() {
+                            Err("empty entry".into())
+                        } else if t.len() > 16 {
+                            Err("extension too long".into())
+                        } else if t.contains('*') || t.contains('?') || t.contains('\\') || t.contains('/') {
+                            Err("globs and path separators rejected".into())
+                        } else if !t.chars().all(|c| c.is_ascii_alphanumeric()) {
+                            Err("extension must be ASCII alphanumeric".into())
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    &mut errors,
+                ) {
+                    // Normalize: strip dots, lowercase.
+                    let norm: Vec<String> = list
+                        .into_iter()
+                        .map(|s| s.trim().trim_start_matches('.').to_lowercase())
+                        .collect();
+                    config.excluded_extensions = norm;
+                    changes.push(format!(
+                        "excluded_extensions=[{}]",
+                        config.excluded_extensions.len()
+                    ));
+                }
+            }
+            if let Some(v) = req.params.get("excluded_detections") {
+                if let Some(list) = validate_string_list(
+                    "excluded_detections",
+                    v,
+                    |s| {
+                        let t = s.trim();
+                        if t.is_empty() {
+                            // R4-C1: empty entry would suppress ALL detections — kill switch.
+                            Err("empty entry rejected (would silence ALL detections)".into())
+                        } else if t.len() > 256 {
+                            Err("detection name too long".into())
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    &mut errors,
+                ) {
+                    config.excluded_detections = list;
+                    changes.push(format!(
+                        "excluded_detections=[{}]",
+                        config.excluded_detections.len()
+                    ));
+                }
+            }
+            if let Some(v) = req.params.get("trusted_hashes") {
+                if let Some(list) = validate_string_list(
+                    "trusted_hashes",
+                    v,
+                    |s| {
+                        let t = s.trim().to_lowercase();
+                        if !is_hex64_lower(&t) {
+                            Err("must be 64-char lowercase hex SHA-256".into())
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    &mut errors,
+                ) {
+                    let norm: Vec<String> = list.into_iter().map(|s| s.trim().to_lowercase()).collect();
+                    config.trusted_hashes = norm;
+                    changes.push(format!(
+                        "trusted_hashes=[{}]",
+                        config.trusted_hashes.len()
+                    ));
+                }
+            }
+            if let Some(v) = req.params.get("realtime_roots") {
+                if let Some(list) = validate_string_list(
+                    "realtime_roots",
+                    v,
+                    |s| {
+                        let t = s.trim();
+                        if t.is_empty() {
+                            Err("empty entry".into())
+                        } else if t.len() > MAX_PATH_LEN {
+                            Err("path too long".into())
+                        } else if is_dangerous_path(t) {
+                            Err(format!(
+                                "{t:?} is too broad — would hang the watcher in reparse loops"
+                            ))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    &mut errors,
+                ) {
+                    config.realtime_roots = list;
+                    changes.push(format!(
+                        "realtime_roots=[{}]",
+                        config.realtime_roots.len()
+                    ));
+                }
+            }
+
+            // Hard-fail if any field had a validation error — partial success
+            // would leave the user wondering which field actually got applied.
+            if !errors.is_empty() {
+                state.log_activity(
+                    "warning",
+                    "protection",
+                    &format!("protection.set_critical rejected: {}", errors.join("; ")),
+                    "",
+                    None,
+                );
+                return serde_json::to_vec(&RpcErrorResponse::err(
+                    req.id,
+                    error_codes::INVALID_PARAMS,
+                    format!("validation failed: {}", errors.join("; ")),
+                ))
+                .unwrap_or_default();
+            }
+
+            // Re-validate the whole config — catches any cross-field invariants
+            // (e.g. cleaning glob extensions, refusing reserved system paths
+            // already enforced by Config::validate, etc.).
+            config.validate();
+
             let path = crate::paths::paths().config_file();
             match config.save(&path) {
                 Ok(()) => {
                     state.log_activity(
                         "warning",
                         "protection",
-                        &format!("Critical setting changed: {}", changes.join(", ")),
+                        &format!("Critical settings changed: {}", changes.join(", ")),
                         "Requires administrator elevation",
                         None,
                     );
+                    // Reload exclusions immediately — the scanner reads these
+                    // through state.load_detection_exclusions, which is the
+                    // cache mirrors of the on-disk excluded_detections list.
+                    state.load_detection_exclusions(config.excluded_detections.clone());
                     Ok(serde_json::json!({"ok": true, "changes": changes}))
                 }
                 Err(e) => Ok(serde_json::json!({"ok": false, "error": e})),
