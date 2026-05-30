@@ -27,6 +27,52 @@ import {
   type SettingsWriteResult,
 } from "../../../types/sentinella";
 
+// ─── Session-level caches ───────────────────────────────────────
+//
+// `defaults` and `restartReqs` are STATIC per daemon version — they
+// never change while the GUI is running. Caching them at module scope
+// means we fetch them exactly ONCE per app session instead of on every
+// Settings mount. That matters because the daemon's `Status` rate
+// bucket is shared with the dashboard's 9-endpoint poll loop; three
+// extra parallel reads on every Settings open were tipping it into
+// "rate limited" (-32020) on busy systems.
+//
+// Promises are kept so concurrent callers share the in-flight fetch
+// instead of racing to start three more.
+
+let defaultsCache: FullConfig | null = null;
+let defaultsPromise: Promise<FullConfig> | null = null;
+let restartReqsCache: RestartRequirementMap | null = null;
+let restartReqsPromise: Promise<RestartRequirementMap> | null = null;
+
+function fetchDefaultsOnce(): Promise<FullConfig> {
+  if (defaultsCache) return Promise.resolve(defaultsCache);
+  if (defaultsPromise) return defaultsPromise;
+  defaultsPromise = getDefaultSettings()
+    .then((d) => {
+      defaultsCache = d;
+      return d;
+    })
+    .finally(() => {
+      defaultsPromise = null;
+    });
+  return defaultsPromise;
+}
+
+function fetchRestartReqsOnce(): Promise<RestartRequirementMap> {
+  if (restartReqsCache) return Promise.resolve(restartReqsCache);
+  if (restartReqsPromise) return restartReqsPromise;
+  restartReqsPromise = getRestartRequirements()
+    .then((r) => {
+      restartReqsCache = r;
+      return r;
+    })
+    .finally(() => {
+      restartReqsPromise = null;
+    });
+  return restartReqsPromise;
+}
+
 /** Get the value of a possibly-nested path like "fish.window_seconds". */
 function getPath(obj: unknown, path: string): unknown {
   const parts = path.split(".");
@@ -91,21 +137,47 @@ export function useFullConfig(): UseFullConfigResult {
   const reload = useCallback(async () => {
     setStatus({ kind: "loading" });
     try {
-      const [cfg, def, rr] = await Promise.all([
-        getFullSettings(),
-        getDefaultSettings(),
-        getRestartRequirements(),
-      ]);
+      // Defaults + restart_requirements are session-immutable — served
+      // from cache after the first fetch ever. Only getFullSettings
+      // actually hits the daemon on subsequent Settings opens.
+      // Sequence the calls (not Promise.all) so the daemon's Status
+      // rate bucket sees them one at a time, sharing budget with the
+      // dashboard poll instead of competing in a burst.
+      const cfg = await getFullSettings();
+      const def = await fetchDefaultsOnce();
+      const rr = await fetchRestartReqsOnce();
       setBaseline(cfg);
       setDraft(structuredClone(cfg));
       setDefaults(def);
       setRestartReqs(rr);
       setStatus({ kind: "ready" });
     } catch (e) {
-      setStatus({
-        kind: "error",
-        message: e instanceof Error ? e.message : String(e),
-      });
+      const msg = e instanceof Error ? e.message : String(e);
+      // If the error is the daemon's rate-limit response, retry once
+      // after a brief wait — the bucket refills quickly. Avoids a
+      // hard error on busy systems where the user opened Settings
+      // mid-dashboard-poll.
+      if (msg.includes("-32020") || msg.toLowerCase().includes("rate limit")) {
+        await new Promise((r) => setTimeout(r, 1200));
+        try {
+          const cfg = await getFullSettings();
+          const def = await fetchDefaultsOnce();
+          const rr = await fetchRestartReqsOnce();
+          setBaseline(cfg);
+          setDraft(structuredClone(cfg));
+          setDefaults(def);
+          setRestartReqs(rr);
+          setStatus({ kind: "ready" });
+          return;
+        } catch (e2) {
+          setStatus({
+            kind: "error",
+            message: e2 instanceof Error ? e2.message : String(e2),
+          });
+          return;
+        }
+      }
+      setStatus({ kind: "error", message: msg });
     }
   }, []);
 

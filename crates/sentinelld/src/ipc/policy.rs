@@ -64,7 +64,15 @@ impl BucketConfig {
 
 fn bucket_config(bucket: RateBucket) -> BucketConfig {
     match bucket {
-        RateBucket::Status => BucketConfig::new(120, 20),
+        // v0.1.8: bumped 120/20 -> 300/40 to absorb v0.1.8 Settings page
+        // bursts (3 extra reads on every Settings open: settings.get_full,
+        // settings.get_defaults, settings.restart_requirements). The
+        // dashboard already polls 9 status endpoints every 5s (~108/min
+        // steady), so the old 120/min cap with 2/sec refill gave only a
+        // 12/min cushion for everything else. New 300/min cushion is
+        // 192/min above dashboard baseline, plenty for Settings + ad-hoc
+        // user-driven status queries from other pages.
+        RateBucket::Status => BucketConfig::new(300, 40),
         RateBucket::ScanControl => BucketConfig::new(10, 3),
         RateBucket::QuarantineOps => BucketConfig::new(30, 5),
         RateBucket::ConfigMutation => BucketConfig::new(10, 2),
