@@ -11,6 +11,7 @@ import { ShieldIcon } from "../components/ShieldIcon";
 import { t, getLocale } from "../i18n";
 import { check } from "@tauri-apps/plugin-updater";
 import { topicContentFor, type HelpTopic } from "./aboutContent";
+import { APP_VERSION_TAG } from "../app-version";
 import aboutBanner from "../../../assets/about1.png";
 
 // ── Topic cards shown on Overview ────────────────────────
@@ -51,7 +52,7 @@ export function AboutPage() {
           <ShieldIcon icon="sentinelAlt" size={48} className="brightness-0 invert opacity-80" />
           <div>
             <p className="text-[20px] font-bold text-white/90 leading-none">Sentinella</p>
-            <p className="text-[12px] text-white/50 mt-1.5">{t("app.subtitle")} v0.1.5</p>
+            <p className="text-[12px] text-white/50 mt-1.5">{t("app.subtitle")} {APP_VERSION_TAG}</p>
           </div>
         </div>
       </Card>

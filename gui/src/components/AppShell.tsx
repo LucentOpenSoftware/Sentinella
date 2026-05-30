@@ -1,6 +1,7 @@
 import { Sidebar, type Page } from "./Sidebar";
 import { TopBar } from "./TopBar";
 import { t } from "../i18n";
+import { APP_VERSION_TAG } from "../app-version";
 
 /** [title i18n key, subtitle string] per page. */
 const metaKeys: Record<Page, [string, string]> = {
@@ -12,7 +13,7 @@ const metaKeys: Record<Page, [string, string]> = {
   intelligence: ["nav.intelligence", "ASTRA adaptive analysis"],
   update: ["nav.update", "Signature database"],
   settings: ["nav.settings", "Configure Sentinella"],
-  about: ["nav.about", "Sentinella v0.1.5"],
+  about: ["nav.about", `Sentinella ${APP_VERSION_TAG}`],
 };
 
 export function AppShell({ currentPage, onNavigate, connected, onRefresh, notices, children }: {

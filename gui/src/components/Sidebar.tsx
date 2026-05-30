@@ -1,6 +1,7 @@
 import { Shield, Search, Archive, Clock, Settings, Info, RefreshCw, Bell, Activity } from "lucide-react";
 import { ShieldIcon } from "./ShieldIcon";
 import { t } from "../i18n";
+import { APP_VERSION_TAG } from "../app-version";
 
 export type Page = "dashboard" | "scan" | "quarantine" | "history" | "notifications" | "intelligence" | "update" | "settings" | "about";
 
@@ -65,7 +66,7 @@ export function Sidebar({ current, onNavigate }: { current: Page; onNavigate: (p
 
       {/* Footer */}
       <div className="px-6 py-6 text-[10px] text-[rgb(var(--t3))]/20">
-        v0.1.5 · GPLv2
+        {APP_VERSION_TAG} · GPLv2
       </div>
     </aside>
   );
