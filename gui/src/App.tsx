@@ -126,6 +126,16 @@ function App() {
     const notices: React.ReactNode[] = [];
 
     // Priority 1: connection/protection state (max 1).
+    //
+    // v0.1.8: the disconnect notice is driven SOLELY by the supervisor's
+    // connectionState now. Previously a parallel `!daemon.connected`
+    // branch fired the same notice from a different signal (engine.state
+    // === "error" + signature_count === 0), and the two could disagree
+    // when IPC was busy under heavy trust_graph / FISH load — the user
+    // saw "Daemon disconnected" flicker every few seconds even though
+    // the daemon was healthy. Supervisor escalates Recovering →
+    // Degraded → Disconnected on its own after sustained failure, which
+    // is what we want for this notice anyway.
     const cs = daemon.connectionState;
     if (cs === "recovering") {
       notices.push(<TopBarNotice key="recovering" variant="info" message={t("notice.recovering")} dismissKey="recovering" />);
@@ -133,7 +143,7 @@ function App() {
       notices.push(<TopBarNotice key="degraded-recovery" variant="warning" message={t("notice.degraded_recovery")} dismissKey="degraded-recovery" />);
     } else if (cs === "user_disabled") {
       notices.push(<TopBarNotice key="user-disabled" variant="error" message={t("notice.user_disabled")} dismissKey="user-disabled" />);
-    } else if (!daemon.connected) {
+    } else if (cs === "disconnected") {
       notices.push(<TopBarNotice key="disconnected" variant="warning" message={t("notice.disconnected")} dismissKey="disconnected" />);
     } else {
       const recoveryAudit = daemon.data?.stats && (daemon.data.stats as any).daemon_mode === "audit";

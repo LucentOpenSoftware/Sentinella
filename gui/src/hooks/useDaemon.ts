@@ -10,7 +10,18 @@ import {
 } from "../notifications";
 
 const POLL_INTERVAL = 5000; // 5 seconds
-const DISCONNECT_THRESHOLD = 3; // Require 3 consecutive failures before showing disconnected
+// v0.1.8: bumped 3 -> 6 to absorb heavier daemon work bursts
+// (trust_graph integrity checks + FISH detector + idle scanner all
+// firing concurrently on busy systems can briefly starve the IPC
+// thread). 6 × 5s ≈ 30 s of failure before flipping the badge.
+const DISCONNECT_THRESHOLD = 6;
+// Debounce isConnected (the engine-status-based check) the same way.
+// Without this, ONE engine.status timeout flipped connected=false
+// instantly because each call has its own .catch fallback that returns
+// engine.state="error"+signature_count=0 — the negative case bypassed
+// failCountRef entirely. Now isConnected only flips false after
+// CONNECTED_DEBOUNCE consecutive engine-status failures.
+const CONNECTED_DEBOUNCE = 3;
 
 export interface DaemonState {
   data: DashboardData | null;
@@ -32,6 +43,10 @@ export function useDaemon(): DaemonState {
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const failCountRef = useRef(0);
+  // v0.1.8: separate counter for engine-status-based "connected" flag.
+  // Bumped on each poll where engine.state==="error" + signature_count===0;
+  // reset on any healthy poll. UI flips false only when ≥ CONNECTED_DEBOUNCE.
+  const disconnectCountRef = useRef(0);
   // Monotonic refresh id. Each refresh() call bumps it and captures the value;
   // state writes only commit if the captured id is still the latest. Closes a
   // race where two overlapping refreshes (e.g. quick visibility toggle, or a
@@ -65,16 +80,26 @@ export function useDaemon(): DaemonState {
     try {
       const result = await fetchDashboard();
       if (!isLatest()) return; // A newer refresh already landed — drop ours.
-      const isConnected = result.engine.state !== "error" || result.engine.signature_count > 0;
+      const healthyThisPoll =
+        result.engine.state !== "error" || result.engine.signature_count > 0;
+      // Debounce the disconnect flip — see CONNECTED_DEBOUNCE comment.
+      if (healthyThisPoll) {
+        disconnectCountRef.current = 0;
+        setConnected(true);
+      } else {
+        disconnectCountRef.current += 1;
+        if (disconnectCountRef.current >= CONNECTED_DEBOUNCE) {
+          setConnected(false);
+        }
+      }
       setData(result);
-      setConnected(isConnected);
       setError(null);
       setLastRefresh(new Date());
-      failCountRef.current = 0; // Reset on success.
+      failCountRef.current = 0; // Reset hard-failure counter on any successful fetchDashboard.
 
       // ── Detect transitions → fire notifications ───────
       const prev = prevRef.current;
-      if (prev && isConnected) {
+      if (prev && healthyThisPoll) {
         // Scan completed with threats.
         if (prev.scanRunning && !result.scan.running && result.scan.state === "completed") {
           notifyScanComplete(
@@ -128,7 +153,7 @@ export function useDaemon(): DaemonState {
       // tray toast as if freshly caught. Preserving the last-good snapshot
       // across the reload blip stops the phantom flash (and likewise keeps
       // scan/update/protection transitions measured against real state).
-      if (isConnected) {
+      if (healthyThisPoll) {
         // Preserve the last-good quarantine set when the list looks like a
         // transient empty-blip (see qReliable above), so the dedup survives the
         // reload churn instead of re-flagging old items as new on recovery.
