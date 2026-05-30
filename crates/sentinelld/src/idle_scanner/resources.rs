@@ -94,28 +94,149 @@ pub fn on_battery() -> bool {
     }
 }
 
-/// Check if a fullscreen/busy/game/presentation app is active.
-/// Uses SHQueryUserNotificationState — returns true if user should not be disturbed.
+/// Check if a true-fullscreen / game / presentation app is active.
+///
+/// v0.1.8 tightening: the v0.1.7 implementation trusted `QUNS_BUSY (2)`
+/// from `SHQueryUserNotificationState`, but that code fires for far more
+/// than just games — any app that calls `ITaskbarList3::SetProgressState`,
+/// any DirectComposition/DWM hardware-accelerated window when maximized,
+/// and notoriously WebView2 (Tauri's GUI runtime) when its main window is
+/// merely maximized. Result: the user's idle scanner sat in
+/// "Pausado · fullscreen" forever while they had Sentinella itself open
+/// maximized, even though no real game was running.
+///
+/// Layered detector now:
+///   1. SHQueryUserNotificationState — ONLY trust the unambiguous game
+///      codes: QUNS_RUNNING_D3D_FULL_SCREEN (3), QUNS_PRESENTATION_MODE
+///      (4), QUNS_APP (7 — Windows 8+ Modern fullscreen). Drop
+///      QUNS_BUSY (2) entirely; it's too broad.
+///   2. Foreground-window heuristic — if SHQuery says clear, double-check
+///      by asking Windows for the foreground window: a true fullscreen
+///      game covers the entire monitor AND has no caption/border. A
+///      maximized normal app HAS a caption. Skip the entire check if the
+///      foreground window belongs to OUR own process (Sentinella GUI or
+///      sentinelld), since those obviously aren't games.
+///   3. Conservative on errors — every Win32 call falls back to "not
+///      fullscreen" rather than "yes pause" to avoid sticky pauses on
+///      systems where the APIs misbehave.
 pub fn fullscreen_or_busy() -> bool {
     #[cfg(target_os = "windows")]
     {
-        use windows::Win32::UI::Shell::SHQueryUserNotificationState;
-
-        let state = unsafe { SHQueryUserNotificationState() };
-        match state {
-            Ok(s) => {
-                // QUNS_BUSY(2) = fullscreen app
-                // QUNS_RUNNING_D3D_FULL_SCREEN(3) = game
-                // QUNS_PRESENTATION_MODE(4) = presentation
-                matches!(s.0, 2 | 3 | 4)
-            }
-            Err(_) => false,
+        // Layer 1: shell notification state — trust ONLY the game codes.
+        if shell_says_definitely_game() {
+            return true;
         }
+        // Layer 2: foreground window check — covers cases where SHQuery
+        // doesn't pick up legacy D3D fullscreen but the window is one.
+        foreground_is_true_fullscreen()
     }
 
     #[cfg(not(target_os = "windows"))]
     {
         false
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn shell_says_definitely_game() -> bool {
+    use windows::Win32::UI::Shell::SHQueryUserNotificationState;
+    match unsafe { SHQueryUserNotificationState() } {
+        // QUNS_RUNNING_D3D_FULL_SCREEN (3) = D3D fullscreen game
+        // QUNS_PRESENTATION_MODE (4) = explicit "I'm presenting" mode
+        // QUNS_APP (7) = Windows 8+ Modern app fullscreen
+        // NOTE: deliberately NOT matching QUNS_BUSY (2) — too many
+        // false-positives from regular maximized apps (see fn doc).
+        Ok(s) => matches!(s.0, 3 | 4 | 7),
+        Err(_) => false,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn foreground_is_true_fullscreen() -> bool {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId,
+        GWL_STYLE, WS_BORDER, WS_CAPTION, WS_DLGFRAME,
+    };
+
+    unsafe {
+        let hwnd: HWND = GetForegroundWindow();
+        if hwnd.0.is_null() {
+            return false;
+        }
+
+        // Whose process owns this window?
+        let mut pid: u32 = 0;
+        let _ = GetWindowThreadProcessId(hwnd, Some(&mut pid as *mut u32));
+        if pid != 0 {
+            // Skip our own GUI / daemon — they're never games.
+            if process_id_is_ours(pid) {
+                return false;
+            }
+        }
+
+        // Get window style. A true fullscreen game has NO caption / border
+        // (it's a borderless rect covering the whole monitor). A merely
+        // maximized normal app has WS_CAPTION + WS_BORDER + WS_DLGFRAME
+        // — that's the case we wrongly flagged in v0.1.7.
+        let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+        let has_caption = (style & WS_CAPTION.0) != 0;
+        let has_border = (style & WS_BORDER.0) != 0;
+        let has_dlgframe = (style & WS_DLGFRAME.0) != 0;
+        if has_caption || has_border || has_dlgframe {
+            return false; // normal windowed/maximized app
+        }
+
+        // Borderless — check if it covers the entire monitor.
+        let mut wr = windows::Win32::Foundation::RECT::default();
+        if GetWindowRect(hwnd, &mut wr as *mut _).is_err() {
+            return false;
+        }
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut mi: MONITORINFO = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(monitor, &mut mi as *mut _).as_bool() {
+            return false;
+        }
+        wr.left == mi.rcMonitor.left
+            && wr.top == mi.rcMonitor.top
+            && wr.right == mi.rcMonitor.right
+            && wr.bottom == mi.rcMonitor.bottom
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn process_id_is_ours(pid: u32) -> bool {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE};
+    use windows::Win32::System::ProcessStatus::GetModuleFileNameExW;
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    unsafe {
+        let handle: HANDLE = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+            Ok(h) => h,
+            Err(_) => return false,
+        };
+        let mut buf = [0u16; 1024];
+        // windows 0.58: pass HANDLE (not Option) for the process and the
+        // null HMODULE for "main executable".
+        let len = GetModuleFileNameExW(handle, HMODULE::default(), &mut buf);
+        let _ = CloseHandle(handle);
+        if len == 0 {
+            return false;
+        }
+        let path = String::from_utf16_lossy(&buf[..len as usize]).to_lowercase();
+        // Match either the GUI or the daemon — both are "ours".
+        path.ends_with("sentinella.exe")
+            || path.ends_with("sentinelld.exe")
+            || path.ends_with("sentinella-cli.exe")
+            || path.ends_with("argusd.exe")
     }
 }
 

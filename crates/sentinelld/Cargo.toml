@@ -58,6 +58,12 @@ windows = { version = "0.58", features = [
     "Win32_System_Pipes",
     "Win32_System_RemoteDesktop",
     "Win32_System_SystemInformation",
+    # v0.1.8: idle scanner's fullscreen-detection layer needs window
+    # geometry, style flags, and monitor info to distinguish a true
+    # fullscreen game from a regular maximized app (Tauri's WebView2
+    # was tripping the old detector).
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
 ] }
 
 [dev-dependencies]
