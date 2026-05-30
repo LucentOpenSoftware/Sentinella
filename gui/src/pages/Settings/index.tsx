@@ -29,6 +29,11 @@ import * as i18n from "../../i18n";
 import { invoke } from "@tauri-apps/api/core";
 import { LegacySettingsPage } from "./legacy";
 import { ProtectionTab } from "./tabs/Protection";
+import { UpdatesTab } from "./tabs/Updates";
+import { EngineTab } from "./tabs/Engine";
+import { ScheduleTab } from "./tabs/Schedule";
+import { RansomwareTab } from "./tabs/Ransomware";
+import { SandboxTab } from "./tabs/Sandbox";
 import { TabStub } from "./tabs/Stubs";
 import { useFullConfig } from "./hooks/useFullConfig";
 
@@ -208,36 +213,24 @@ export function SettingsPage() {
                 onRestartAsAdmin={onRestartAsAdmin}
               />
             )}
-            {active === "updates" && (
-              <TabStub
-                title={i18n.t("settings.tab_updates")}
-                phase={activeTab.phase}
-              />
-            )}
+            {active === "updates" && <UpdatesTab ctx={ctx} />}
             {active === "engine" && (
-              <TabStub
-                title={i18n.t("settings.tab_engine")}
-                phase={activeTab.phase}
+              <EngineTab
+                ctx={ctx}
+                isElevated={isElevated}
+                onRestartAsAdmin={onRestartAsAdmin}
               />
             )}
             {active === "schedule" && (
-              <TabStub
-                title={i18n.t("settings.tab_schedule")}
-                phase={activeTab.phase}
+              <ScheduleTab
+                ctx={ctx}
+                isElevated={isElevated}
+                onRestartAsAdmin={onRestartAsAdmin}
               />
             )}
-            {active === "ransomware" && (
-              <TabStub
-                title={i18n.t("settings.tab_ransomware")}
-                phase={activeTab.phase}
-              />
-            )}
-            {active === "sandbox" && (
-              <TabStub
-                title={i18n.t("settings.tab_sandbox")}
-                phase={activeTab.phase}
-              />
-            )}
+            {active === "ransomware" && <RansomwareTab ctx={ctx} />}
+            {active === "sandbox" && <SandboxTab ctx={ctx} />}
+            {/* Notifications + Advanced still live in legacy until phase 5 */}
             {active === "notifications" && (
               <TabStub
                 title={i18n.t("settings.tab_notifications")}
