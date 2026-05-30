@@ -1,5 +1,161 @@
 # Changelog
 
+## [0.1.7] - 2026-05-30
+
+Engine-reload UX hardening release. Focused on the three problems
+users reported during signature reloads in v0.1.6: ghost console
+windows flashing, the protection shield briefly flipping to
+"degraded", and a transient "outdated definitions" banner. Plus an
+internal dev-console tool, locale-parser fixes, and a complete
+audit pass on the new lock-free engine slot.
+
+### Engine reload — UX series (the headliner)
+
+**Phase 1 — Kill all ghost CMD/console windows.**
+Eight `Command::spawn` sites in `sentinelld` were missing
+`CREATE_NO_WINDOW` (0x08000000) on Windows — freshclam, sibling
+worker binaries (`clamavd`, `argusd`, `sandboxd`), `wevtutil` for
+PowerShell event polling, `icacls` in `runtime_integrity.rs`, and
+`reg` for startup-key enumeration. The other 4 sites had the flag
+inline as a literal; nothing centralised it. Added a single
+`crate::win_process::QuietCommand` trait with a `quiet_windows()`
+builder method. Audit at end of commit: every `Command::new` in
+`crates/sentinelld/src/` is now flagged. Builder pattern means a
+future spawn that forgets the flag is a one-line lint risk, not a
+ghost-window bug.
+
+**Phase 2 — Decouple `engine.status` from the in-flight reload.**
+`engine.status` was reading the live engine slot directly, so
+during a freshclam-then-reload window the GUI's poll could see
+`(signature_count = old, db_timestamp = new)` — exactly the
+inconsistency that trips "outdated definitions" client-side. Added
+a committed-state mirror in `AppState`:
+
+  - `committed_db_version: AtomicU32`
+  - `committed_db_timestamp: AtomicI64` (i64::MIN sentinel = unset)
+  - `reload_phase: AtomicU8` (Idle / Compiling / Activating / Failed)
+
+`signature_count` (already AtomicU64) is the LAST committed write
+of every successful reload via a new `commit_engine_state(sigs)`
+helper. The Release/Acquire pair guarantees that any reader
+observing the new signature_count also observes the new db_version
++ db_timestamp. `engine.status` now reads from the mirror with a
+`read_cvd_version()` fallback only when the i64::MIN sentinel is
+still in place (initial boot before the first commit).
+
+`EngineStatus` JSON gains one optional field `reload_phase` with
+`#[serde(default)]` so older clients keep working. GUI Dashboard
+renders two new pills next to the engine/watcher chips when
+relevant — "Updating signatures…" on Compiling/Activating and
+"Update failed" on Failed. Neither flips the protection shield
+away from green — that's the whole point.
+
+**Phase 3 — Lock-free A/B engine swap via `ArcSwap`.**
+`engine: RwLock<Option<Arc<ClamEngine>>>` becomes
+`engine_state: arc_swap::ArcSwap<EngineSnapshot>`. Scans clone the
+inner `Arc<ClamEngine>` via a relaxed atomic load + one refcount
+increment — no read lock, never blocks on a reload. A reload
+publishes a freshly-built `EngineSnapshot` into the slot
+atomically — no write lock.
+
+Net effect:
+
+  - Scans never block on a reload, not even microseconds during
+    the swap moment.
+  - Two engines coexist briefly: the new one freshly compiled,
+    the old one held by Arcs in any in-flight scans. The old
+    drops naturally when the last in-flight scan releases its Arc.
+  - Reload is fail-closed: compile the new engine into a local
+    first, then publish. A compile error leaves the slot
+    untouched (an RCU update bumps `last_error` only).
+
+**Phase 3 audit — combined atomic snapshot, off-handler drop.**
+A 2-agent triage of Phase 3 found a real memory-ordering hole:
+`engine` (ArcSwap) and `engine_error` (`RwLock<Option<String>>`)
+were separate primitives, so `ArcSwap::swap`'s Release synchronizes-
+with `load_full` ONLY on the engine slot. A reader that observed
+the new engine had no happens-before edge with the writer's prior
+`engine_error` clear; on a weakly-ordered platform it could observe
+`(engine = new, last_error = stale-old)`. On x86_64 TSO this never
+reproduced; per the Rust memory model and on AArch64 it's broken.
+
+Fix: fold both fields into one `EngineSnapshot { engine, last_error }`
+value held in a single `ArcSwap<EngineSnapshot>`. Publish delivers
+both fields together; a load takes a self-consistent pair. The
+cross-primitive ordering hole is structurally impossible.
+
+Also from the audit:
+
+  - `drop(prev)` after a swap previously ran `cl_engine_free` on
+    the IPC handler / freshclam thread. Now moved onto a dedicated
+    `engine-snap-drop` `std::thread` so the handler returns
+    immediately. cl_engine_free walks deep AC/BM trie nodes and on
+    pathological signature sets has been observed at >512 KB stack
+    — running it off the hot path is the right default.
+  - The original Phase 3 regression tests were single-threaded.
+    Replaced the second one (which was a tautology on x86_64 TSO)
+    with a real multi-threaded stress test that publishes 2 000
+    snapshots from one thread while another asserts every snapshot
+    with `engine ≥ 2` has `last_error = None`. With the pre-audit
+    two-primitive design this could fail on AArch64; with the
+    combined snapshot it cannot fail on any platform.
+
+### Added
+
+- **`sentinella-dev-console`** — internal native GUI tool for the
+  Sentinella developer center, NOT shipped in the public installer.
+  Single-binary `eframe` + `egui` app (~5 MB release exe) with two
+  tabs:
+
+    * **Setup** — detects the installed `SentinellaDaemon`, mirrors
+      the live `[developer]` config section, takes a plaintext
+      password with live SHA-256 preview, writes the hash into
+      `sentinelld.toml` via `toml_edit` (preserves comments + formatting),
+      atomic write (.tmp → fsync → rename), `sc stop` + `sc start`
+      with poll-until-state and 15 s timeout. Provision / Enable /
+      Disable / Revoke flows. One-click `🛡 Restart as Admin`
+      footer button when not elevated (ShellExecuteW `runas`
+      verb).
+    * **Benchmark** — discovers `argusd.exe` dev-first (workspace
+      `target/release/argusd.exe` → workspace `target/debug/` →
+      installed copy), spawns `argusd benchmark --json --passes N`
+      with `CREATE_NO_WINDOW`, parses the nested JSON schema
+      (`corpus`, `per_file_us`, `system`), renders Performance
+      Index colour-coded by tier + throughput + latency
+      percentiles + SIMD flags. "Save raw JSON…" exports to
+      `%TEMP%`.
+
+  Builds with `cargo build --release -p sentinella-dev-console`.
+
+- **`crate::win_process::QuietCommand`** — single source of truth
+  for `CREATE_NO_WINDOW`. Builder-pattern extension on
+  `std::process::Command`. No-op on non-Windows.
+
+- **`EngineSnapshot`** type — atomic publish vehicle for the
+  Phase 3 engine slot (engine + last_error siblings).
+
+### Fixed
+
+- **`sc query` locale parser bug.** On Spanish Windows
+  (`TIPO : 10  WIN32_OWN_PROCESS / ESTADO : 4  RUNNING`) the
+  previous "first line where a digit is followed by whitespace
+  + a letter" rule was returning TIPO=10 instead of ESTADO=4
+  → daemon reported "installed, stopped" even while running.
+  SERVICE_TYPE codes are >= 10 and STATE codes are 1..=7;
+  constraining the candidate range fixes it on every locale.
+  Same bug in both the dev-console parser and the production
+  GUI supervisor — both patched.
+- **GUI hardcoded "v0.1.5" strings** (22 sites across 14 files)
+  — promoted to a single `APP_VERSION_TAG` constant in
+  `gui/src/app-version.ts` for the three JSX hardcodes
+  (AppShell, Sidebar, About). i18n strings still bumped per
+  release until the loader gains placeholder interpolation.
+
+### Tests
+
+- +4 tests (sentinelld 285 → 287; 2 ArcSwap regressions for
+  Phase 3 + Phase 3 audit). **All 287 pass.**
+
 ## [0.1.6] - 2026-05-30
 
 Hardening release. **~200 fixes** across security, correctness, and
