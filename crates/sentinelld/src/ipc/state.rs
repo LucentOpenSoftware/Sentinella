@@ -200,7 +200,7 @@ fn load_or_create_ipc_secret() -> Option<String> {
 /// trusts logged-in users on the same machine.
 #[cfg(target_os = "windows")]
 fn restrict_ipc_secret_permissions(path: &Path) {
-    use std::os::windows::process::CommandExt;
+    use crate::win_process::QuietCommand;
     use std::process::Command;
     let path_str = path.to_string_lossy();
     let _ = Command::new("icacls")
@@ -214,7 +214,7 @@ fn restrict_ipc_secret_permissions(path: &Path) {
             "/grant:r",
             "*S-1-5-32-545:(R)",  // BUILTIN\Users — needed for unelevated GUI
         ])
-        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+        .quiet_windows()
         .output();
 }
 

@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 
 use crate::config::SandboxConfig;
+use crate::win_process::QuietCommand;
 
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_CONCURRENT: usize = 1; // Only 1 detonation at a time.
@@ -94,6 +95,7 @@ pub fn detonate(
         .arg("--json")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .quiet_windows()
         .spawn()
         .map_err(|e| format!("sandboxd spawn: {e}"))?;
 

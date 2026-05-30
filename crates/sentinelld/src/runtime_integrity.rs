@@ -542,6 +542,7 @@ fn save_key(path: &Path, key: &[u8; KEY_LEN]) -> Result<(), String> {
     // "BUILTIN" prefix translates), leaving the integrity key world-readable.
     #[cfg(target_os = "windows")]
     {
+        use crate::win_process::QuietCommand;
         let path_str = path.to_string_lossy();
         let _ = std::process::Command::new("icacls")
             .args([
@@ -552,6 +553,7 @@ fn save_key(path: &Path, key: &[u8; KEY_LEN]) -> Result<(), String> {
                 "/grant:r",
                 "*S-1-5-32-544:(R)", // BUILTIN\Administrators
             ])
+            .quiet_windows()
             .output();
     }
     #[cfg(not(target_os = "windows"))]

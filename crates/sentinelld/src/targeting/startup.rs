@@ -147,8 +147,12 @@ fn collect_run_key_targets(targets: &mut Vec<PathBuf>) {
         r"HKLM\Software\Microsoft\Windows\CurrentVersion\RunOnce",
     ];
 
+    use crate::win_process::QuietCommand;
     for key in &keys {
-        let output = Command::new("reg").args(["query", key]).output();
+        let output = Command::new("reg")
+            .args(["query", key])
+            .quiet_windows()
+            .output();
 
         if let Ok(out) = output {
             let text = String::from_utf8_lossy(&out.stdout);

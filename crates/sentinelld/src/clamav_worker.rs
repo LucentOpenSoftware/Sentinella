@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::win_process::QuietCommand;
+
 use serde::Deserialize;
 
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024; // 1 MB max stdout
@@ -78,6 +80,7 @@ pub fn scan_file(
         .arg("--json")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .quiet_windows()
         .spawn()
         .map_err(|e| format!("clamavd spawn failed: {e}"))?;
 

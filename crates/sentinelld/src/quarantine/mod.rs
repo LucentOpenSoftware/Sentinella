@@ -148,7 +148,7 @@ fn restrict_file_permissions(path: &Path) {
 
     #[cfg(not(test))]
     {
-        use std::os::windows::process::CommandExt;
+        use crate::win_process::QuietCommand;
         use std::process::Command;
         let path_str = path.to_string_lossy();
         let _ = Command::new("icacls")
@@ -161,7 +161,7 @@ fn restrict_file_permissions(path: &Path) {
                 "*S-1-5-32-544:(R)",  // BUILTIN\Administrators
                 // Intentionally NO BUILTIN\Users grant.
             ])
-            .creation_flags(0x08000000) // CREATE_NO_WINDOW
+            .quiet_windows()
             .output();
     }
 }

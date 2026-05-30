@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{error, info, warn};
 
+use crate::win_process::QuietCommand;
+
 /// Run freshclam to update the signature database.
 /// Returns (success, output_message).
 #[allow(dead_code)]
@@ -86,11 +88,15 @@ where
     let config_arg = effective_config.as_deref().unwrap_or(config_path);
 
     // Spawn with piped stdout/stderr for real-time reading.
+    // v0.1.7 Phase 1: `.quiet_windows()` adds CREATE_NO_WINDOW so the
+    // freshclam console no longer flashes on every signature reload —
+    // the primary "ghost CMD window" source the user reported.
     let mut child = match Command::new(freshclam_path)
         .arg("--config-file")
         .arg(config_arg)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .quiet_windows()
         .spawn()
     {
         Ok(c) => c,
@@ -235,7 +241,7 @@ pub fn find_freshclam() -> Option<PathBuf> {
 
     // PATH fallback is acceptable: PATH for a Windows service is
     // %SystemRoot%\system32 etc. — directories ordinary users cannot write to.
-    if let Ok(output) = Command::new("where").arg("freshclam.exe").output() {
+    if let Ok(output) = Command::new("where").arg("freshclam.exe").quiet_windows().output() {
         let path = String::from_utf8_lossy(&output.stdout);
         let first = path.lines().next().unwrap_or("").trim();
         if !first.is_empty() && Path::new(first).exists() {

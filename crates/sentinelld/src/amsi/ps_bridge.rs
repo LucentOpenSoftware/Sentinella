@@ -320,17 +320,21 @@ fn read_new_script_blocks(after_record_id: u64) -> Result<Vec<ScriptBlockEvent>,
 
     // Use wevtutil to read events — no COM/WinAPI complexity.
     // Filter: Event ID 4104, most recent 20 events.
-    let output = Command::new("wevtutil")
-        .args([
-            "qe",
-            "Microsoft-Windows-PowerShell/Operational",
-            "/q:*[System[EventID=4104]]",
-            "/c:20",
-            "/rd:true", // Reverse direction (newest first).
-            "/f:text",
-        ])
-        .output()
-        .map_err(|e| format!("wevtutil failed: {e}"))?;
+    let output = {
+        use crate::win_process::QuietCommand;
+        Command::new("wevtutil")
+            .args([
+                "qe",
+                "Microsoft-Windows-PowerShell/Operational",
+                "/q:*[System[EventID=4104]]",
+                "/c:20",
+                "/rd:true", // Reverse direction (newest first).
+                "/f:text",
+            ])
+            .quiet_windows()
+            .output()
+            .map_err(|e| format!("wevtutil failed: {e}"))?
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

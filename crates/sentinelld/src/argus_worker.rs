@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
+use crate::win_process::QuietCommand;
+
 const MAX_WORKER_JSON_BYTES: usize = 16 * 1024 * 1024;
 const MAX_WORKER_STDERR_BYTES: usize = 64 * 1024;
 
@@ -74,6 +76,7 @@ pub fn scan_file(
         .arg("--json")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .quiet_windows()
         .spawn()
         .map_err(|e| format!("ARGUS worker spawn failed ({}): {e}", worker.display()))?;
 
@@ -178,6 +181,7 @@ pub fn run_benchmark(
         .arg(passes.to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .quiet_windows()
         .spawn()
         .map_err(|e| format!("ARGUS benchmark spawn failed ({}): {e}", worker.display()))?;
 

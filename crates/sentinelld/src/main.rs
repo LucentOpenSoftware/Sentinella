@@ -35,6 +35,7 @@ mod targeting;
 pub mod trust_graph;
 mod updater;
 mod watcher;
+mod win_process;
 
 use clap::Parser;
 use std::path::PathBuf;
