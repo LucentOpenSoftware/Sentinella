@@ -191,7 +191,7 @@ export const fr: Record<string, string> = {
   "dash.reloading": "Mise a jour des signatures",
   "dash.reloading_hint": "Compilation de la nouvelle base de signatures. La protection actuelle est inchangee.",
   "dash.reload_failed": "Echec de la mise a jour",
-  "dash.reload_failed_hint": "La derniere mise a jour des signatures a echoue. La protection actuelle est inchangee."
+  "dash.reload_failed_hint": "La derniere mise a jour des signatures a echoue. La protection actuelle est inchangee.",
   "dash.events_per_sec_suffix": "événements/s",
   "dash.files_suffix": "fichiers",
   "dash.files_checked": "fichiers vérifiés",

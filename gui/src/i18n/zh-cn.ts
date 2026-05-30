@@ -191,7 +191,7 @@ export const zh_cn: Record<string, string> = {
   "dash.reloading": "正在更新签名",
   "dash.reloading_hint": "正在编译新的签名数据库。当前保护不变。",
   "dash.reload_failed": "更新失败",
-  "dash.reload_failed_hint": "上次签名更新失败。当前保护不变。"
+  "dash.reload_failed_hint": "上次签名更新失败。当前保护不变。",
   "dash.events_per_sec_suffix": "事件/秒",
   "dash.files_suffix": "个文件",
   "dash.files_checked": "个文件已检查",

@@ -191,7 +191,7 @@ export const pt_br: Record<string, string> = {
   "dash.reloading": "Atualizando assinaturas",
   "dash.reloading_hint": "Compilando nova base de dados de assinaturas. A protecao atual permanece inalterada.",
   "dash.reload_failed": "Falha na atualizacao",
-  "dash.reload_failed_hint": "A ultima atualizacao de assinaturas falhou. A protecao atual permanece inalterada."
+  "dash.reload_failed_hint": "A ultima atualizacao de assinaturas falhou. A protecao atual permanece inalterada.",
   "dash.events_per_sec_suffix": "eventos/seg",
   "dash.files_suffix": "arquivos",
   "dash.files_checked": "arquivos verificados",

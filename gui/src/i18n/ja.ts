@@ -191,7 +191,7 @@ export const ja: Record<string, string> = {
   "dash.reloading": "シグネチャを更新中",
   "dash.reloading_hint": "新しいシグネチャデータベースをコンパイルしています。現在の保護は変更されません。",
   "dash.reload_failed": "更新に失敗しました",
-  "dash.reload_failed_hint": "最新のシグネチャ更新に失敗しました。現在の保護は変更されません。"
+  "dash.reload_failed_hint": "最新のシグネチャ更新に失敗しました。現在の保護は変更されません。",
   "dash.events_per_sec_suffix": "イベント/秒",
   "dash.files_suffix": "ファイル",
   "dash.files_checked": "件のファイルを確認",
