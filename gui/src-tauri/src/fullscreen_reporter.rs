@@ -38,8 +38,17 @@ const INITIAL_GRACE: Duration = Duration::from_secs(2);
 
 /// Spawn the background poll-and-push loop. Called once from
 /// `lib.rs::setup` after the daemon-client is initialised.
+///
+/// IMPORTANT: uses `tauri::async_runtime::spawn` (not `tokio::spawn`)
+/// because Tauri's `setup` callback runs in the main thread BEFORE the
+/// Tokio runtime is established. `tokio::spawn` from that context
+/// panics with `there is no reactor running` and the GUI never paints.
+/// (v0.1.9 first-shipped bug — caught by the user on the first install,
+/// fixed in the same release before public upload.)
+/// `tauri::async_runtime::spawn` lazily initialises the runtime if
+/// nothing else has, and shares it with every other Tauri command.
 pub fn spawn() {
-    tokio::spawn(async {
+    tauri::async_runtime::spawn(async {
         // Give the daemon-client a moment to discover the named pipe
         // and read the IPC secret. If the pipe isn't ready yet, the
         // first push just fails silently and the next 5s iteration
