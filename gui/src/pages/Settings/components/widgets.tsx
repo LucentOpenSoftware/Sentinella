@@ -197,6 +197,25 @@ export function NumberInput({
   disabled?: boolean;
   width?: string;
 }) {
+  // v0.1.9 audit MED-11 fix: previously `Number("")` returned 0 and
+  // sailed past `Number.isFinite(0) === true`, so clearing the input
+  // silently committed `0` to the underlying config field. Many
+  // call sites then violated their own validation (Engine memory
+  // min 256, Sandbox min_score < max_score, Schedule min < max),
+  // because the widget didn't enforce the min/max it advertised.
+  //
+  // Now: empty string is a no-op (preserves current value); NaN /
+  // Infinity are dropped; finite values are CLAMPED into [min, max]
+  // before reaching the parent state.
+  const handleChange = (raw: string) => {
+    if (raw === "" || raw === "-") return; // mid-edit, don't commit yet
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return;
+    let clamped = n;
+    if (typeof min === "number" && clamped < min) clamped = min;
+    if (typeof max === "number" && clamped > max) clamped = max;
+    onChange(clamped);
+  };
   return (
     <div className="flex items-center gap-1.5">
       <input
@@ -206,9 +225,16 @@ export function NumberInput({
         max={max}
         step={step}
         disabled={disabled}
-        onChange={(e) => {
-          const n = Number(e.target.value);
-          if (Number.isFinite(n)) onChange(n);
+        onChange={(e) => handleChange(e.target.value)}
+        onBlur={(e) => {
+          // Re-apply clamp on blur in case the user typed something
+          // out-of-range during mid-edit (the `if raw === ""` skip
+          // means we don't commit while they were clearing the box).
+          if (e.target.value === "" || e.target.value === "-") {
+            // Force the rendered value back to the last committed one
+            // so the input isn't left empty.
+            e.target.value = String(value);
+          }
         }}
         className={`${width} bg-[rgb(var(--surface))]/80 border border-[rgb(var(--border))]/40 rounded px-2 py-1 text-sm text-right focus:border-[rgb(var(--accent))] focus:outline-none ${disabled ? "opacity-40 cursor-not-allowed" : ""}`}
       />

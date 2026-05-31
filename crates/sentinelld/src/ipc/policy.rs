@@ -138,6 +138,17 @@ impl RateLimiter {
         // → token went back up, request was effectively free → rate limit
         // weakened under load). `fetch_update` retries until it observes the
         // latest value, so concurrent consumes are never overwritten.
+        //
+        // v0.1.9 Phase 5 (audit MED-12): the float-to-u64 cast on `refill`
+        // truncated fractional tokens, AND the unconditional
+        // `*last = Instant::now()` discarded the elapsed remainder.
+        // Worked example: ConfigMutation = 10/min = 1 token per 6s. A
+        // request at t=6.5s got +1 token but lost 0.5s of progress; the
+        // next refill needed another full 6s instead of 5.5s. Sustained
+        // effective rate drifted to ~half the declared cap. Fix: advance
+        // `last_refill` by EXACTLY the time the integer-truncated refill
+        // accounts for (`refill * 60s / max_per_minute`), preserving the
+        // fractional remainder for the next call.
         {
             let mut last = state.last_refill.lock().unwrap_or_else(|e| e.into_inner());
             let elapsed = last.elapsed();
@@ -149,7 +160,14 @@ impl RateLimiter {
                     Ordering::Relaxed,
                     |cur| Some(cur.saturating_add(refill).min(burst)),
                 );
-                *last = Instant::now();
+                // Advance by the EXACT time those `refill` whole tokens
+                // represent (not `now()`), so the unconsumed fractional
+                // remainder rolls into the next refill window. max_per_minute
+                // is non-zero in every defined bucket; the `.max(1)` guard
+                // keeps a configuration typo from panicking on Duration::from_secs_f64.
+                let mpm = state.config.max_per_minute.max(1) as f64;
+                let consumed_secs = refill as f64 * 60.0 / mpm;
+                *last += std::time::Duration::from_secs_f64(consumed_secs);
             }
         }
 
@@ -538,6 +556,59 @@ mod tests {
         for _ in 0..100 {
             assert!(limiter.check(RateBucket::Unlimited).is_ok());
         }
+    }
+
+    #[test]
+    fn rate_limiter_preserves_sub_token_remainder() {
+        // v0.1.9 audit MED-12 regression test.
+        //
+        // Pre-fix: every refill that produced N whole tokens reset
+        // `last_refill` to `Instant::now()`, discarding the fractional
+        // elapsed time. For ConfigMutation (10/min = 1 token per 6s),
+        // a probe at t=6.5s would mint 1 token and lose 0.5s of
+        // progress — the next refill needed another full 6s instead
+        // of 5.5s. Sustained effective rate drifted to ~half the
+        // declared cap.
+        //
+        // Post-fix: `last_refill` advances by EXACTLY the time the
+        // integer-truncated refill accounts for, so the unconsumed
+        // fractional remainder rolls forward.
+        //
+        // White-box assertion: after a fake elapsed of 6.5s on a 10/min
+        // bucket (6s per token), exactly 1 token should be added and
+        // `last_refill` should be exactly 0.5s in the past — NOT
+        // `now()`. We verify by reading the post-refill `last_refill`
+        // and computing the remaining elapsed.
+        let limiter = RateLimiter::new();
+        let bucket = limiter.buckets.get(&RateBucket::ConfigMutation).unwrap();
+        // Drain initial tokens so the first refill is observable.
+        for _ in 0..10 {
+            let _ = limiter.check(RateBucket::ConfigMutation);
+        }
+        // Set last_refill to 6.5s ago via the only mutable backdoor:
+        // the lock guard.
+        {
+            let mut last = bucket.last_refill.lock().unwrap();
+            *last = std::time::Instant::now() - std::time::Duration::from_millis(6_500);
+        }
+        // Trigger a refill check.
+        let _ = limiter.check(RateBucket::ConfigMutation);
+        // After: should have minted 1 token (6.5s / 6s per token = 1
+        // whole) and rolled last_refill forward by exactly 6s, leaving
+        // ~0.5s of remainder.
+        let last_after = *bucket.last_refill.lock().unwrap();
+        let remainder = last_after.elapsed();
+        // Allow generous slack for test-host scheduling jitter. The
+        // critical property is `remainder > 0.2s` — pre-fix this would
+        // be near-zero because last_refill was reset to now().
+        assert!(
+            remainder >= std::time::Duration::from_millis(200),
+            "sub-token remainder lost: got {remainder:?}, expected ~500ms"
+        );
+        assert!(
+            remainder <= std::time::Duration::from_millis(1500),
+            "remainder unexpectedly large: got {remainder:?}, expected ~500ms"
+        );
     }
 
     #[test]

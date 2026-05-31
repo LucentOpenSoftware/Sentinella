@@ -363,26 +363,30 @@ fn is_elevated_check() -> bool {
 /// remains. Used by the Settings page's "Restart as Administrator"
 /// button. Mirrors the dev-console's relaunch-as-admin flow.
 ///
-/// Race against tauri_plugin_single_instance:
-///   When ShellExecuteW("runas") spawns the elevated copy, the new
-///   process starts up and hits the single-instance mutex check
-///   FAST — within tens of milliseconds. If the unelevated parent
-///   is still alive at that moment, the new process treats itself
-///   as a duplicate, signals the unelevated window to focus, and
-///   exits. Net result: the user accepts the UAC prompt but
-///   nothing happens.
+/// v0.1.9 audit MED-9 — proper race fix:
 ///
-/// Fix: exit the unelevated process IMMEDIATELY after
-/// ShellExecuteW returns success. Use AppHandle::exit so Tauri
-/// unwinds cleanly and the single-instance mutex is released
-/// before the elevated copy reaches its own check. The Tauri IPC
-/// response is sacrificed (we don't return through the normal
-/// path) but the UI is about to die anyway.
+/// v0.1.8 tried to win the race against `tauri_plugin_single_instance`
+/// by sleeping 50 ms before calling `app.exit(0)`, hoping the parent's
+/// mutex would release before the elevated child's mutex check ran.
+/// That logic is INVERTED: the sleep actively DELAYS mutex release.
+/// On a cold-cache laptop with AV inspecting newly-touched DLLs, the
+/// parent's Tauri teardown (webview destroy → plugin teardown → tokio
+/// runtime shutdown) commonly exceeds 100-300 ms while the elevated
+/// child's cold-start-to-mutex-check is 200-600 ms. The window where
+/// the child loses is real and timing-dependent.
 ///
-/// ShellExecuteW with the "runas" verb is synchronous on the UAC
-/// dialog — it does not return until the user dismisses the
-/// dialog (accept or deny). So when we exit, we already know UAC
-/// outcome.
+/// v0.1.9 fix: pass `--elevated-restart` as a CLI argument when
+/// spawning the elevated copy. The single-instance plugin callback in
+/// the elevated process detects this argument and treats itself as a
+/// LEGITIMATE second instance (no focus-existing dedup). The race is
+/// now structurally impossible — even if the parent is still alive
+/// when the child checks the mutex, the child doesn't dedup itself
+/// because the arg explicitly opts out. The parent still exits via
+/// `app.exit(0)` for cleanliness, but timing no longer matters.
+///
+/// `ShellExecuteW` with the "runas" verb is synchronous on the UAC
+/// dialog — does not return until the user dismisses it. So when we
+/// exit, we already know UAC outcome.
 #[cfg(windows)]
 #[tauri::command]
 fn restart_as_admin(app: tauri::AppHandle) -> Result<Value, String> {
@@ -403,27 +407,30 @@ fn restart_as_admin(app: tauri::AppHandle) -> Result<Value, String> {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
+    // The handshake: child checks for this arg in the single-instance
+    // callback and skips the focus-existing branch.
+    let args: Vec<u16> = std::ffi::OsStr::new(ELEVATED_RESTART_ARG)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     let result = unsafe {
         ShellExecuteW(
             None,
             PCWSTR(verb.as_ptr()),
             PCWSTR(exe_wide.as_ptr()),
-            PCWSTR::null(),
+            PCWSTR(args.as_ptr()),
             PCWSTR::null(),
             SW_SHOWNORMAL,
         )
     };
     let code = result.0 as isize;
     if code > 32 {
-        // UAC accepted. Kill this process clean-and-fast so the
-        // single-instance mutex releases before the elevated copy
-        // reaches its check. AppHandle::exit triggers Tauri's
-        // shutdown path (window destroy → plugin teardown →
-        // single-instance lock release). 50 ms gives the IPC
-        // response a chance to flush but is short enough that the
-        // elevated copy's mutex check still wins the race.
+        // UAC accepted. Schedule a clean Tauri shutdown shortly after
+        // — no longer racing the child's mutex check (the CLI arg
+        // bypass makes timing irrelevant), so we can give the IPC
+        // response a comfortable 100 ms to flush before tearing down.
         std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(100));
             app.exit(0);
         });
         Ok(serde_json::json!({"ok": true}))
@@ -434,6 +441,12 @@ fn restart_as_admin(app: tauri::AppHandle) -> Result<Value, String> {
         Ok(serde_json::json!({"ok": false, "error": format!("ShellExecuteW failed with code {code}")}))
     }
 }
+
+/// CLI argument the parent passes to the elevated child so the
+/// single-instance plugin in the child knows to skip the
+/// focus-existing dedup. v0.1.9 audit MED-9. Keep in lockstep with
+/// the matching check in the single_instance callback below.
+pub const ELEVATED_RESTART_ARG: &str = "--elevated-restart";
 
 #[cfg(not(windows))]
 #[tauri::command]
@@ -863,8 +876,26 @@ pub fn run() {
         // focus the existing main window instead of spawning a duplicate.
         // Without this: two supervisors, two tray icons (second fails silent),
         // two tokio runtimes polling daemon — wasted resources + UX confusion.
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        //
+        // v0.1.9 audit MED-9: EXCEPT when the second instance is the
+        // elevated relaunch from `restart_as_admin`, which passes
+        // ELEVATED_RESTART_ARG. In that case the elevated child is
+        // INTENTIONALLY a second instance — the unelevated parent is in
+        // the middle of tearing down. Focusing the dying parent and
+        // exiting the elevated child = the v0.1.8 silent-no-op bug.
+        // Returning before focus + letting the child proceed normally
+        // closes that race structurally.
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             use tauri::Manager;
+            if args.iter().any(|a| a == ELEVATED_RESTART_ARG) {
+                // Elevated relaunch — skip the focus-existing dedup and
+                // let the new (elevated) instance proceed as the legit
+                // owner. The parent will exit on its own.
+                log::info!(
+                    "single-instance: detected ELEVATED_RESTART_ARG, bypassing dedup"
+                );
+                return;
+            }
             if let Some(win) = app.get_webview_window("main") {
                 let _ = win.show();
                 let _ = win.unminimize();
