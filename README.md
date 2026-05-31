@@ -4,7 +4,7 @@
 
 A modern, open-source antivirus suite built on the [ClamAV](https://www.clamav.net) scanning engine and the ARGUS heuristic engine.
 
-**Status: alpha (0.1.8-alpha).** Core scanning, real-time protection, and quarantine are functional on Windows.
+**Status: alpha (0.1.9-alpha).** Core scanning, real-time protection, and quarantine are functional on Windows.
 
 ## What is this?
 
