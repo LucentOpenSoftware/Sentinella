@@ -9,6 +9,7 @@ import {
 } from "lucide-react";
 import * as i18n from "../../../i18n";
 import {
+  ElevationBanner,
   NumberInput,
   SelectInput,
   Section,
@@ -17,11 +18,22 @@ import {
 } from "../components/widgets";
 import type { UseFullConfigResult } from "../hooks/useFullConfig";
 
-export function RansomwareTab({ ctx }: { ctx: UseFullConfigResult }) {
+export function RansomwareTab({
+  ctx,
+  isElevated,
+  onRestartAsAdmin,
+}: {
+  ctx: UseFullConfigResult;
+  isElevated: boolean;
+  onRestartAsAdmin?: () => void;
+}) {
   const { draft, restartReqs, updatePath, resetField, isDefault } = ctx;
   const [thresholdsOpen, setThresholdsOpen] = useState(false);
   if (!draft || !restartReqs) return null;
   const rr = (p: string) => restartReqs.fields[p];
+  // v0.1.9: fish.enabled, fish.observe_only, fish.active_response moved
+  // into CRITICAL_FIELDS — daemon refuses them from unelevated callers.
+  const critDisabled = !isElevated;
 
   const responseOpts: Array<{ value: string; label: string }> = [
     { value: "observe", label: i18n.t("settings.fish_response_observe") },
@@ -31,6 +43,8 @@ export function RansomwareTab({ ctx }: { ctx: UseFullConfigResult }) {
 
   return (
     <div>
+      {!isElevated && <ElevationBanner onRestartAsAdmin={onRestartAsAdmin} />}
+
       {/* ── Master toggle + response ───────────────── */}
       <Section
         icon={<ShieldAlert className="w-5 h-5" />}
@@ -40,6 +54,7 @@ export function RansomwareTab({ ctx }: { ctx: UseFullConfigResult }) {
         <SettingRow
           label={i18n.t("settings.fish_enabled")}
           description={i18n.t("settings.fish_enabled_desc")}
+          locked
           restartRequirement={rr("fish.enabled")}
           isDefault={isDefault("fish.enabled")}
           onReset={() => resetField("fish.enabled")}
@@ -47,12 +62,14 @@ export function RansomwareTab({ ctx }: { ctx: UseFullConfigResult }) {
             <Toggle
               checked={draft.fish.enabled}
               onChange={(v) => updatePath("fish.enabled", v)}
+              disabled={critDisabled}
             />
           }
         />
         <SettingRow
           label={i18n.t("settings.fish_observe_only")}
           description={i18n.t("settings.fish_observe_only_desc")}
+          locked
           isDefault={isDefault("fish.observe_only")}
           onReset={() => resetField("fish.observe_only")}
           warning={
@@ -64,13 +81,14 @@ export function RansomwareTab({ ctx }: { ctx: UseFullConfigResult }) {
             <Toggle
               checked={draft.fish.observe_only}
               onChange={(v) => updatePath("fish.observe_only", v)}
-              disabled={!draft.fish.enabled}
+              disabled={!draft.fish.enabled || critDisabled}
             />
           }
         />
         <SettingRow
           label={i18n.t("settings.fish_active_response")}
           description={i18n.t("settings.fish_active_response_desc")}
+          locked
           isDefault={isDefault("fish.active_response")}
           onReset={() => resetField("fish.active_response")}
           control={
@@ -78,7 +96,7 @@ export function RansomwareTab({ ctx }: { ctx: UseFullConfigResult }) {
               value={draft.fish.active_response}
               onChange={(v) => updatePath("fish.active_response", v)}
               options={responseOpts}
-              disabled={!draft.fish.enabled || draft.fish.observe_only}
+              disabled={!draft.fish.enabled || draft.fish.observe_only || critDisabled}
             />
           }
         />

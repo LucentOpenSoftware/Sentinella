@@ -51,6 +51,7 @@ export function EngineTab({
         <SettingRow
           label={i18n.t("settings.clamav_isolation")}
           description={i18n.t("settings.clamav_isolation_desc")}
+          locked
           restartRequirement={rr("clamav_isolation")}
           isDefault={isDefault("clamav_isolation")}
           onReset={() => resetField("clamav_isolation")}
@@ -64,6 +65,7 @@ export function EngineTab({
               value={draft.clamav_isolation}
               onChange={(v) => updatePath("clamav_isolation", v)}
               options={isolationOpts}
+              disabled={!isElevated}
             />
           }
         />

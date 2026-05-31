@@ -218,21 +218,45 @@ impl Server {
             // shared secret (which is world-readable for GUI compat). Rejects
             // anonymous and cross-user/non-console unprivileged callers. Runs
             // AFTER the next listener is ready so a reject can't starve the
-            // pipe. Fail-open inside `authorize_pipe_client` on any resolution
-            // error, so an API quirk never bricks a legit GUI. Env kill-switch
-            // for field debugging.
+            // pipe. Fail-open inside `authorize_and_resolve_pipe_client` on any
+            // resolution error, so an API quirk never bricks a legit GUI.
+            //
+            // v0.1.9: we now ALSO keep the resolved `ClientIdentity` and pass
+            // it through to the dispatcher so kill-vector handlers can apply
+            // a daemon-side elevation gate (closing the UAC-bypass hole flagged
+            // by the v0.1.8 audit — see client_auth::require_elevation).
+            //
+            // Env kill-switch for field debugging.
+            let peer_identity: Option<client_auth::ClientIdentity>;
             #[cfg(target_os = "windows")]
             {
                 use std::os::windows::io::AsRawHandle;
                 let bypass = std::env::var("SENTINELLA_DISABLE_CLIENT_SID_CHECK")
                     .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                     .unwrap_or(false);
-                if !bypass && !client_auth::authorize_pipe_client(connected_pipe.as_raw_handle()) {
-                    // Unauthorized — close without serving; next listener is ready.
-                    drop(connected_pipe);
-                    self.state.record_ipc_error();
-                    continue;
+                if bypass {
+                    // Kill-switch active — also disables the v0.1.9 elevation
+                    // gate by forwarding `None` identity, which fails-open.
+                    peer_identity = None;
+                } else {
+                    match client_auth::authorize_and_resolve_pipe_client(
+                        connected_pipe.as_raw_handle(),
+                    ) {
+                        client_auth::PipeAuth::Allow { identity } => {
+                            peer_identity = identity;
+                        }
+                        client_auth::PipeAuth::Deny => {
+                            // Unauthorized — close without serving; next listener is ready.
+                            drop(connected_pipe);
+                            self.state.record_ipc_error();
+                            continue;
+                        }
+                    }
                 }
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                peer_identity = None;
             }
 
             // Spawn handler for connected client. Single spawn site regardless
@@ -240,7 +264,7 @@ impl Server {
             debug!("client connected");
             let st = Arc::clone(&self.state);
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(connected_pipe, st).await {
+                if let Err(e) = handle_connection(connected_pipe, st, peer_identity).await {
                     warn!(%e, "client session error");
                 }
             });
@@ -262,7 +286,10 @@ impl Server {
             debug!("client connected");
             let st = Arc::clone(&self.state);
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(stream, st).await {
+                // Unix has no equivalent ClientIdentity plumbing today; the
+                // elevation gate fails-open on None (matching the Windows
+                // unresolved-identity path).
+                if let Err(e) = handle_connection(stream, st, None).await {
                     warn!(%e, "client session error");
                 }
             });
@@ -275,7 +302,11 @@ const CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6
 /// Per-read timeout — prevent slow-read attacks.
 const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-async fn handle_connection<S>(mut stream: S, state: Arc<AppState>) -> Result<()>
+async fn handle_connection<S>(
+    mut stream: S,
+    state: Arc<AppState>,
+    peer: Option<client_auth::ClientIdentity>,
+) -> Result<()>
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin,
 {
@@ -331,10 +362,14 @@ where
                     .unwrap_or_default()
                 } else {
                     // Catch panics in dispatch to prevent daemon crash.
+                    // peer is the per-connection ClientIdentity resolved at
+                    // accept time (or None on fail-open); dispatch uses it
+                    // for the v0.1.9 elevation gate on kill-vector methods.
+                    let peer_ref = peer.as_ref();
                     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         // We can't use async inside catch_unwind easily,
                         // so dispatch is sync-safe (all our handlers are sync anyway).
-                        dispatch_sync(req, &state)
+                        dispatch_sync(req, &state, peer_ref)
                     })) {
                         Ok(resp) => resp,
                         Err(_) => {
@@ -401,9 +436,70 @@ fn is_challengeable_method(method: &str) -> bool {
 }
 
 /// Synchronous dispatch — all handlers are sync (no async needed).
-fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
+///
+/// `peer` is the per-connection caller identity resolved at accept time
+/// (Windows: from the named-pipe handle's process token). It threads
+/// through dispatch only so the v0.1.9 elevation gate on kill-vector
+/// methods can use it; per-handler logic that doesn't touch elevation
+/// can keep ignoring it.
+fn dispatch_sync(
+    req: &RpcRequest,
+    state: &Arc<AppState>,
+    peer: Option<&client_auth::ClientIdentity>,
+) -> Vec<u8> {
     debug!(method = %req.method, id = req.id, "dispatch");
     state.record_request();
+
+    // ── v0.1.9 elevation gate ──────────────────────────
+    //
+    // Audit finding (HIGH): the v0.1.8 protection.set_critical /
+    // settings.set_full / sources.* / engine.reload / quarantine.*
+    // handlers all gated solely on the challenge token + IPC secret.
+    // The IPC secret is BUILTIN\Users:(R) for unelevated-GUI compat,
+    // so the secret alone is NOT an elevation boundary. Any unelevated
+    // user-mode process could read the secret, request a token, and
+    // mutate kill-vector fields without UAC — defeating the entire
+    // "Restart as Administrator" affordance the v0.1.8 changelog
+    // claimed.
+    //
+    // Fix: every method on `is_challengeable_method`'s allowlist also
+    // requires the caller's process token to be elevated or SYSTEM.
+    // Fail-open on unresolved identity (None peer) preserves the
+    // WORKING_STATE invariant that an OS API quirk on a legit elevated
+    // GUI doesn't brick the channel — only positively-resolved
+    // unelevated callers are rejected.
+    if is_challengeable_method(&req.method) {
+        if let client_auth::Decision::Deny(reason) =
+            client_auth::require_elevation(peer)
+        {
+            tracing::warn!(
+                method = %req.method,
+                sid = peer.map(|p| p.sid.as_str()).unwrap_or("?"),
+                session = peer.map(|p| p.session_id).unwrap_or(u32::MAX),
+                reason,
+                "IPC: rejected privileged-mutation method from unelevated caller"
+            );
+            state.log_activity(
+                "warning",
+                "security",
+                &format!(
+                    "Rejected privileged method '{}' from unelevated caller",
+                    req.method
+                ),
+                reason,
+                None,
+            );
+            return serde_json::to_vec(&RpcErrorResponse::err(
+                req.id,
+                error_codes::INSUFFICIENT_PRIVILEGE,
+                format!(
+                    "method '{}' requires an elevated caller (run Sentinella as administrator)",
+                    req.method
+                ),
+            ))
+            .unwrap_or_default();
+        }
+    }
 
     // ── Policy enforcement (phases 1-3, 7) ─────────────
     {
@@ -1688,6 +1784,30 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
                 ))
                 .unwrap_or_default();
             }
+            // v0.1.9: every challengeable method is privileged-mutation.
+            // Refuse token issuance to unelevated callers up front so they
+            // get a clean error instead of issue-then-reject churn; this
+            // also stops the unelevated-token-spam audit-log noise primitive.
+            // The dispatch-level gate above is the actual security boundary
+            // (defence in depth — this is just early/cleaner refusal).
+            if let client_auth::Decision::Deny(reason) =
+                client_auth::require_elevation(peer)
+            {
+                tracing::warn!(
+                    requested_method = method,
+                    sid = peer.map(|p| p.sid.as_str()).unwrap_or("?"),
+                    reason,
+                    "IPC: refused to issue challenge token to unelevated caller"
+                );
+                return serde_json::to_vec(&RpcErrorResponse::err(
+                    req.id,
+                    error_codes::INSUFFICIENT_PRIVILEGE,
+                    format!(
+                        "challenge token for '{method}' requires an elevated caller (run Sentinella as administrator)"
+                    ),
+                ))
+                .unwrap_or_default();
+            }
             let token = state.generate_challenge_token(method);
             Ok(serde_json::json!({"token": token, "method": method}))
         }
@@ -2123,6 +2243,51 @@ fn dispatch_sync(req: &RpcRequest, state: &Arc<AppState>) -> Vec<u8> {
                     config.argus_worker_path = trimmed.into();
                     config.scan.argus_worker_path = trimmed.into();
                     changes.push(format!("argus_worker_path={trimmed}"));
+                }
+            }
+
+            // ── v0.1.9 newly-critical fields (audit HIGH-2 / LOW-19) ──
+            //
+            // fish.enabled / fish.observe_only / fish.active_response /
+            // sandbox.enabled / clamav_isolation moved into CRITICAL_FIELDS;
+            // they now travel through this handler with the same elevated-
+            // caller + challenge-token gate as the other kill-vectors.
+            if let Some(v) = req.params.get("fish.enabled").and_then(|v| v.as_bool()) {
+                config.fish.enabled = v;
+                changes.push(format!("fish.enabled={v}"));
+            }
+            if let Some(v) = req.params.get("fish.observe_only").and_then(|v| v.as_bool()) {
+                config.fish.observe_only = v;
+                changes.push(format!("fish.observe_only={v}"));
+            }
+            if let Some(v) = req.params.get("fish.active_response").and_then(|v| v.as_str()) {
+                // Strict allowlist — anything else would be a kill primitive
+                // (terminate / unknown values that fall back to observe and
+                // silently disable enforcement).
+                if matches!(v, "observe" | "suspend" | "terminate") {
+                    config.fish.active_response = v.to_string();
+                    changes.push(format!("fish.active_response={v}"));
+                } else {
+                    errors.push(format!(
+                        "fish.active_response={v:?} not in allowlist (observe|suspend|terminate)"
+                    ));
+                }
+            }
+            if let Some(v) = req.params.get("sandbox.enabled").and_then(|v| v.as_bool()) {
+                config.sandbox.enabled = v;
+                changes.push(format!("sandbox.enabled={v}"));
+            }
+            if let Some(v) = req.params.get("clamav_isolation").and_then(|v| v.as_str()) {
+                // Strict allowlist (also enforced in Config::validate, but
+                // surfacing the error here gives the GUI a clear rejection
+                // instead of a silent reset to "in_process").
+                if matches!(v, "in_process" | "subprocess") {
+                    config.clamav_isolation = v.to_string();
+                    changes.push(format!("clamav_isolation={v}"));
+                } else {
+                    errors.push(format!(
+                        "clamav_isolation={v:?} not in allowlist (in_process|subprocess)"
+                    ));
                 }
             }
 

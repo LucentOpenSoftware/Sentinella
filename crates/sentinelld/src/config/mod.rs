@@ -1151,7 +1151,11 @@ impl Config {
 
         self.argus_worker_timeout_sec = full.argus_worker_timeout_sec;
 
-        self.clamav_isolation = full.clamav_isolation.clone();
+        // clamav_isolation is CRITICAL in v0.1.9 (audit LOW-19) — downgrading
+        // 'subprocess' -> 'in_process' re-exposes the daemon to in-engine
+        // memory-corruption CVEs. Mutation must travel via
+        // protection.set_critical with an elevated caller.
+        // self.clamav_isolation = full.clamav_isolation.clone();
         self.clamav_worker_timeout_sec = full.clamav_worker_timeout_sec;
 
         // ── Nested: scan (path/enabled are critical, timeouts/orchestrator flags are not) ──
@@ -1171,11 +1175,14 @@ impl Config {
             full.performance.max_resident_workers_on_pressure;
 
         // ── Nested: fish ──
-        // fish.enabled is DaemonRestart (process-lifecycle) but not in
-        // CRITICAL_FIELDS — it gates the detector loop, not detection itself.
-        // Allow toggling here; the restart pill in the GUI tells the user.
-        self.fish.enabled = full.fish.enabled;
-        self.fish.observe_only = full.fish.observe_only;
+        // v0.1.9 audit fix (HIGH-2): fish.enabled, fish.observe_only,
+        // fish.active_response are CRITICAL — flipping any of them silently
+        // disables ransomware enforcement. They must travel via
+        // protection.set_critical with an elevated caller. The numeric
+        // thresholds remain non-critical (tuning is legitimate).
+        // self.fish.enabled = full.fish.enabled;          // CRITICAL
+        // self.fish.observe_only = full.fish.observe_only; // CRITICAL
+        // self.fish.active_response = ...;                 // CRITICAL
         self.fish.window_seconds = full.fish.window_seconds;
         self.fish.rename_threshold = full.fish.rename_threshold;
         self.fish.rewrite_threshold = full.fish.rewrite_threshold;
@@ -1184,10 +1191,11 @@ impl Config {
         self.fish.slow_burn_threshold = full.fish.slow_burn_threshold;
         self.fish.entropy_delta_threshold = full.fish.entropy_delta_threshold;
         self.fish.alert_cooldown_seconds = full.fish.alert_cooldown_seconds;
-        self.fish.active_response = full.fish.active_response.clone();
 
         // ── Nested: sandbox ──
-        self.sandbox.enabled = full.sandbox.enabled;
+        // v0.1.9 audit fix (HIGH-2): sandbox.enabled is CRITICAL — disables
+        // behavioural detonation. The other sandbox knobs remain non-critical.
+        // self.sandbox.enabled = full.sandbox.enabled;    // CRITICAL
         self.sandbox.mode = full.sandbox.mode.clone();
         self.sandbox.timeout_sec = full.sandbox.timeout_sec;
         self.sandbox.min_score = full.sandbox.min_score;
@@ -1262,6 +1270,22 @@ impl Config {
         }
         if self.scan.argus_worker_path != full.scan.argus_worker_path {
             diffs.push("scan.argus_worker_path");
+        }
+        // v0.1.9 audit fix (HIGH-2 / LOW-19) — newly-critical fields.
+        if self.fish.enabled != full.fish.enabled {
+            diffs.push("fish.enabled");
+        }
+        if self.fish.observe_only != full.fish.observe_only {
+            diffs.push("fish.observe_only");
+        }
+        if self.fish.active_response != full.fish.active_response {
+            diffs.push("fish.active_response");
+        }
+        if self.sandbox.enabled != full.sandbox.enabled {
+            diffs.push("sandbox.enabled");
+        }
+        if self.clamav_isolation != full.clamav_isolation {
+            diffs.push("clamav_isolation");
         }
         // Cross-check: anything we diff here must be in CRITICAL_FIELDS.
         // (debug-build assertion catches drift between this fn and the proto list)

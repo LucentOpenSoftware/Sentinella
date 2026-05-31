@@ -570,6 +570,13 @@ export const CRITICAL_FIELDS: ReadonlySet<string> = new Set([
   "idle_scan_enabled",
   "scheduled_scan_enabled",
   "enhanced_signature_provider",
+  // v0.1.9 audit additions (HIGH-2 / LOW-19) — keep in lockstep with
+  // sentinella-ipc-proto::full_config::CRITICAL_FIELDS.
+  "fish.enabled",
+  "fish.observe_only",
+  "fish.active_response",
+  "sandbox.enabled",
+  "clamav_isolation",
 ]);
 
 /** Response shape for save_full_settings / set_critical_settings. */

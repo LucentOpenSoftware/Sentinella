@@ -8,6 +8,7 @@ import { useState } from "react";
 import { AlertTriangle, FlaskConical, Gauge } from "lucide-react";
 import * as i18n from "../../../i18n";
 import {
+  ElevationBanner,
   NumberInput,
   SelectInput,
   Section,
@@ -16,11 +17,21 @@ import {
 } from "../components/widgets";
 import type { UseFullConfigResult } from "../hooks/useFullConfig";
 
-export function SandboxTab({ ctx }: { ctx: UseFullConfigResult }) {
+export function SandboxTab({
+  ctx,
+  isElevated,
+  onRestartAsAdmin,
+}: {
+  ctx: UseFullConfigResult;
+  isElevated: boolean;
+  onRestartAsAdmin?: () => void;
+}) {
   const { draft, restartReqs, updatePath, resetField, isDefault } = ctx;
   const [acknowledged, setAcknowledged] = useState(false);
   if (!draft || !restartReqs) return null;
   const rr = (p: string) => restartReqs.fields[p];
+  // v0.1.9: sandbox.enabled moved into CRITICAL_FIELDS.
+  const critDisabled = !isElevated;
 
   // Once sandbox is already enabled in the saved config, no need to
   // re-acknowledge — the user clearly understood the implications
@@ -34,6 +45,8 @@ export function SandboxTab({ ctx }: { ctx: UseFullConfigResult }) {
 
   return (
     <div>
+      {!isElevated && <ElevationBanner onRestartAsAdmin={onRestartAsAdmin} />}
+
       {/* ── Experimental banner ────────────────────── */}
       <div className="mb-4 p-3 rounded-lg bg-amber-500/10 border border-amber-500/30 text-sm">
         <div className="flex items-center gap-2 mb-2 text-amber-300">
@@ -65,6 +78,7 @@ export function SandboxTab({ ctx }: { ctx: UseFullConfigResult }) {
         <SettingRow
           label={i18n.t("settings.sandbox_enabled")}
           description={i18n.t("settings.sandbox_enabled_desc")}
+          locked
           restartRequirement={rr("sandbox.enabled")}
           isDefault={isDefault("sandbox.enabled")}
           onReset={() => resetField("sandbox.enabled")}
@@ -72,7 +86,7 @@ export function SandboxTab({ ctx }: { ctx: UseFullConfigResult }) {
             <Toggle
               checked={draft.sandbox.enabled}
               onChange={(v) => updatePath("sandbox.enabled", v)}
-              disabled={gateLocked}
+              disabled={gateLocked || critDisabled}
             />
           }
         />

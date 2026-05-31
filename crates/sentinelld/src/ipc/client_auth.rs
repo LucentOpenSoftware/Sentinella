@@ -63,6 +63,96 @@ pub fn decide(id: &ClientIdentity, active_console: Option<u32>) -> Decision {
     }
 }
 
+/// Stricter policy for **privileged-mutation methods** (everything on the
+/// `is_challengeable_method` allowlist — protection.set_critical,
+/// protection.disable/enable, settings.set, settings.set_full, sources.*,
+/// engine.reload, argus.reload, quarantine.*).
+///
+/// v0.1.9 audit finding: the v0.1.8 connection-level [`decide`] allows
+/// any unelevated interactive console user (rule 3 above) because the
+/// `ipc_secret` file is intentionally `BUILTIN\Users:(R)` so the
+/// unelevated GUI can do reads + status polling. That's fine for reads,
+/// but for kill-vector mutations the GUI is supposed to bounce the user
+/// through UAC first — and v0.1.7→v0.1.8 forgot to enforce that on the
+/// daemon side. Any unelevated process running as the console user
+/// (CLI, LOLBin, Office macro) could request a challenge token for
+/// `protection.set_critical` and disable realtime / blank
+/// `realtime_roots` without ever triggering UAC.
+///
+/// This function is the daemon-side gate that closes that hole.
+/// Returns Allow only if the caller is elevated or SYSTEM.
+///
+/// Fail-open behaviour on `None`: if pipe-identity resolution failed at
+/// connect time (`resolve_client` returned `None` and the WORKING_STATE
+/// invariant kept the connection alive), we still allow — punishing a
+/// legitimate elevated GUI for an OS API quirk would brick the only way
+/// the user has to manage the daemon. The Deny path is for
+/// *positively-resolved* unelevated callers only.
+pub fn require_elevation(id: Option<&ClientIdentity>) -> Decision {
+    match id {
+        Some(i) if i.well_known_untrusted => Decision::Deny("anonymous/null SID"),
+        Some(i) if i.is_system || i.is_elevated => Decision::Allow,
+        Some(_) => Decision::Deny("kill-vector method requires elevated caller"),
+        None => Decision::Allow, // pipe identity unresolved → fail-open
+    }
+}
+
+// ─── New v0.1.9 entry point: authorize + return identity ───────────
+//
+// The original `authorize_pipe_client` returns `bool` and drops the
+// resolved `ClientIdentity` — which is exactly the problem the audit
+// flagged. This new entry point lets the caller plumb the identity
+// through to the dispatcher so handler-level elevation checks
+// (`require_elevation`) can run for every challengeable method.
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PipeAuth {
+    /// Connection allowed. `identity` is `Some` when resolution
+    /// succeeded, `None` when it failed (fail-open path).
+    Allow { identity: Option<ClientIdentity> },
+    /// Positively-resolved unauthorized caller — connection must be
+    /// closed without serving any requests.
+    Deny,
+}
+
+/// Resolve + decide for a connected named-pipe handle, returning the
+/// resolved [`ClientIdentity`] on Allow so the dispatcher can run
+/// per-method elevation gates.
+#[cfg(target_os = "windows")]
+pub fn authorize_and_resolve_pipe_client(
+    pipe: std::os::windows::io::RawHandle,
+) -> PipeAuth {
+    match resolve_client(pipe) {
+        Some(id) => match decide(&id, active_console_session()) {
+            Decision::Allow => PipeAuth::Allow {
+                identity: Some(id),
+            },
+            Decision::Deny(reason) => {
+                tracing::warn!(
+                    sid = id.sid.as_str(),
+                    session = id.session_id,
+                    reason,
+                    "IPC: rejected pipe client (per-connection SID check)"
+                );
+                PipeAuth::Deny
+            }
+        },
+        None => {
+            tracing::warn!(
+                "IPC: could not resolve pipe client identity — allowing (fail-open), elevation gates will also fail-open for this connection"
+            );
+            PipeAuth::Allow { identity: None }
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn authorize_and_resolve_pipe_client(
+    _pipe: std::os::unix::io::RawFd,
+) -> PipeAuth {
+    PipeAuth::Allow { identity: None }
+}
+
 /// Resolve + decide for a connected named-pipe handle. Returns `true` to allow
 /// the connection. On any resolution failure, fail-OPEN (allow + warn) so an
 /// API quirk never bricks a legitimate GUI; only a positively-resolved Deny
@@ -281,5 +371,60 @@ mod tests {
             decide(&id("S-1-5-21-1-2-3-1001", 3, false), None),
             Decision::Allow
         );
+    }
+
+    // ── v0.1.9: require_elevation gate for privileged mutations ──
+
+    #[test]
+    fn require_elevation_denies_unelevated_console_user() {
+        // The exact case the audit flagged: a non-elevated process running
+        // as the interactive console user has read the ipc_secret, opened
+        // the pipe, and requested a protection.set_critical challenge
+        // token. v0.1.7→v0.1.8 allowed this. v0.1.9 must reject it.
+        let console_user = id("S-1-5-21-1-2-3-1001", 1, false);
+        match require_elevation(Some(&console_user)) {
+            Decision::Deny(_) => {} // expected
+            Decision::Allow => panic!(
+                "unelevated console user must be denied for kill-vector \
+                 mutations; this is the v0.1.8 UAC-bypass regression"
+            ),
+        }
+    }
+
+    #[test]
+    fn require_elevation_allows_elevated_admin_and_system() {
+        let elevated_admin = id("S-1-5-21-1-2-3-1001", 1, true);
+        let system = id("S-1-5-18", 0, false);
+        assert_eq!(require_elevation(Some(&elevated_admin)), Decision::Allow);
+        assert_eq!(require_elevation(Some(&system)), Decision::Allow);
+    }
+
+    #[test]
+    fn require_elevation_denies_anonymous_even_if_marked_elevated() {
+        // Anonymous SID is rejected ahead of the elevation check —
+        // defence in depth against any future test/mock that constructs
+        // an anonymous identity with is_elevated=true (impossible in
+        // practice but the check should still hold).
+        let anon = ClientIdentity {
+            sid: "S-1-5-7".into(),
+            session_id: 1,
+            is_elevated: true,
+            is_system: false,
+            well_known_untrusted: true,
+        };
+        assert_eq!(
+            require_elevation(Some(&anon)),
+            Decision::Deny("anonymous/null SID")
+        );
+    }
+
+    #[test]
+    fn require_elevation_fails_open_on_unresolved_identity() {
+        // OS API quirk swallowed the peer identity at connect time.
+        // We can't punish a legitimate elevated GUI for that — the
+        // alternative is bricking the GUI↔daemon channel on hardware
+        // where some token call misbehaves. Fail-open here matches the
+        // WORKING_STATE invariant the rest of the module already follows.
+        assert_eq!(require_elevation(None), Decision::Allow);
     }
 }

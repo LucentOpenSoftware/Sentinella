@@ -191,8 +191,20 @@ export function SettingsPage() {
                 onRestartAsAdmin={onRestartAsAdmin}
               />
             )}
-            {active === "ransomware" && <RansomwareTab ctx={ctx} />}
-            {active === "sandbox" && <SandboxTab ctx={ctx} />}
+            {active === "ransomware" && (
+              <RansomwareTab
+                ctx={ctx}
+                isElevated={isElevated}
+                onRestartAsAdmin={onRestartAsAdmin}
+              />
+            )}
+            {active === "sandbox" && (
+              <SandboxTab
+                ctx={ctx}
+                isElevated={isElevated}
+                onRestartAsAdmin={onRestartAsAdmin}
+              />
+            )}
             {active === "advanced" && <AdvancedTab ctx={ctx} />}
           </>
         )}

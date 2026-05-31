@@ -112,6 +112,18 @@ pub const CRITICAL_FIELDS: &[&str] = &[
     "idle_scan_enabled",
     "scheduled_scan_enabled",
     "enhanced_signature_provider",
+    // ── v0.1.9 additions (audit finding HIGH-2 / LOW-19) ──
+    // Ransomware shield + behavioural sandbox + ClamAV isolation
+    // are kill-vector knobs too. Flipping fish.active_response to
+    // "observe" silently disables ransomware enforcement; flipping
+    // sandbox.enabled disables behavioural detonation; downgrading
+    // clamav_isolation from "subprocess" to "in_process" re-exposes
+    // the daemon to in-engine memory-corruption CVEs.
+    "fish.enabled",
+    "fish.observe_only",
+    "fish.active_response",
+    "sandbox.enabled",
+    "clamav_isolation",
 ];
 
 /// True if the given field path is in [`CRITICAL_FIELDS`].
@@ -565,6 +577,26 @@ mod tests {
             assert!(
                 is_critical(field),
                 "{field} must be in CRITICAL_FIELDS — kill-vector regression"
+            );
+        }
+    }
+
+    #[test]
+    fn v019_audit_fields_added_to_critical() {
+        // v0.1.9 audit fix (HIGH-2 / LOW-19): ransomware shield, behavioural
+        // sandbox, and ClamAV isolation are kill-vector knobs. Each
+        // explicitly named here so a careless future edit that drops them
+        // back to non-critical fails the test and re-opens the audit hole.
+        for field in [
+            "fish.enabled",
+            "fish.observe_only",
+            "fish.active_response",
+            "sandbox.enabled",
+            "clamav_isolation",
+        ] {
+            assert!(
+                is_critical(field),
+                "{field} must stay in CRITICAL_FIELDS — v0.1.9 ransomware-shield / sandbox / isolation regression"
             );
         }
     }
