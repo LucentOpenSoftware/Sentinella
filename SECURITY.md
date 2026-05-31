@@ -3,13 +3,11 @@
 ## Reporting Security Issues
 
 If you discover a security vulnerability in Sentinella, please report it
-responsibly. **Do NOT open a public GitHub issue for security vulnerabilities.**
+responsibly.
 
 ### How to Report
 
-Email: *(add private security contact email here)*
-
-Or use GitHub's private vulnerability reporting feature if available.
+Use GitHub's private vulnerability reporting feature if available.
 
 ### What to Include
 
