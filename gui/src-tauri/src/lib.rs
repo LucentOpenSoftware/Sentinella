@@ -425,13 +425,30 @@ fn restart_as_admin(app: tauri::AppHandle) -> Result<Value, String> {
     };
     let code = result.0 as isize;
     if code > 32 {
-        // UAC accepted. Schedule a clean Tauri shutdown shortly after
-        // — no longer racing the child's mutex check (the CLI arg
-        // bypass makes timing irrelevant), so we can give the IPC
-        // response a comfortable 100 ms to flush before tearing down.
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            app.exit(0);
+        // UAC accepted. Parent must die FAST so the OS releases its
+        // single_instance named mutex before the elevated child
+        // hits its check. The previous app.exit(0) approach triggered
+        // a graceful Tauri unwind (webview destroy → plugin teardown
+        // → tokio shutdown) that held the mutex for hundreds of ms;
+        // the elevated child reached its dedup check first and
+        // exited as a duplicate.
+        //
+        // std::process::exit terminates immediately — OS reaps all
+        // handles (incl. the mutex) within microseconds. The IPC
+        // response is sacrificed but the UI is dying anyway.
+        //
+        // Defence in depth: the elevated child ALSO skips the
+        // single_instance plugin entirely at its main() entry (see
+        // lib.rs::run), so even if the OS were slow at releasing,
+        // the child can't dedup itself against the parent.
+        let _ = app; // keep param for future use; not needed for the exit path
+        std::thread::spawn(|| {
+            // 50 ms to give ShellExecuteW callers a moment to dispatch
+            // before the response is truncated. Empirically reliable
+            // even on cold-cache disks since std::process::exit doesn't
+            // block on Tauri teardown.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::process::exit(0);
         });
         Ok(serde_json::json!({"ok": true}))
     } else if code == 5 {
@@ -870,38 +887,43 @@ pub fn run() {
     // Detect --minimized flag (autostart at login → tray only, no UI).
     let start_minimized = std::env::args().any(|a| a == "--minimized");
 
-    tauri::Builder::default()
-        // Single-instance: if a second Sentinella.exe launches (e.g. user
-        // double-clicks Start Menu shortcut after autostart already ran),
-        // focus the existing main window instead of spawning a duplicate.
-        // Without this: two supervisors, two tray icons (second fails silent),
-        // two tokio runtimes polling daemon — wasted resources + UX confusion.
-        //
-        // v0.1.9 audit MED-9: EXCEPT when the second instance is the
-        // elevated relaunch from `restart_as_admin`, which passes
-        // ELEVATED_RESTART_ARG. In that case the elevated child is
-        // INTENTIONALLY a second instance — the unelevated parent is in
-        // the middle of tearing down. Focusing the dying parent and
-        // exiting the elevated child = the v0.1.8 silent-no-op bug.
-        // Returning before focus + letting the child proceed normally
-        // closes that race structurally.
-        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+    // v0.1.9 user-reported fix (replaces the broken v0.1.9 init-time
+    // single-instance bypass): the elevated child has to skip the
+    // single_instance plugin at ITS OWN startup, not in the parent's
+    // callback. The plugin's dedup logic kills the second instance
+    // BEFORE the parent's callback fires — checking args in the
+    // callback (the v0.1.9 first attempt) only informed the parent,
+    // too late for the child which had already exited.
+    //
+    // Correct fix: detect --elevated-restart at the child's main()
+    // entry and conditionally skip the single_instance plugin
+    // registration. The child becomes its own canonical instance.
+    let elevated_restart =
+        std::env::args().any(|a| a == ELEVATED_RESTART_ARG);
+
+    let mut builder = tauri::Builder::default();
+    if !elevated_restart {
+        // Normal startup: register single-instance dedup as before.
+        // If a second Sentinella.exe launches (e.g. user double-clicks
+        // Start Menu shortcut after autostart already ran), focus the
+        // existing main window instead of spawning a duplicate.
+        // Without this: two supervisors, two tray icons (second fails
+        // silent), two tokio runtimes polling daemon — wasted resources
+        // + UX confusion.
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             use tauri::Manager;
-            if args.iter().any(|a| a == ELEVATED_RESTART_ARG) {
-                // Elevated relaunch — skip the focus-existing dedup and
-                // let the new (elevated) instance proceed as the legit
-                // owner. The parent will exit on its own.
-                log::info!(
-                    "single-instance: detected ELEVATED_RESTART_ARG, bypassing dedup"
-                );
-                return;
-            }
             if let Some(win) = app.get_webview_window("main") {
                 let _ = win.show();
                 let _ = win.unminimize();
                 let _ = win.set_focus();
             }
-        }))
+        }));
+    } else {
+        log::info!(
+            "elevated restart detected (CLI arg present) — single_instance plugin SKIPPED for this process"
+        );
+    }
+    builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
