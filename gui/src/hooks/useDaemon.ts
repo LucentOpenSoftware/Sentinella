@@ -8,6 +8,12 @@ import {
   notifyRealtimeUnavailable,
   notifyQuarantined,
 } from "../notifications";
+// v0.1.9 audit HIGH-3 fix: invalidate the Settings page's module-scope
+// defaults + restart_requirements caches whenever the daemon goes from
+// disconnected back to connected — the daemon binary may have changed
+// across the gap (tray restart, service auto-restart, scheduled
+// update reload), and the cached schema metadata could be stale.
+import { invalidateSettingsCache } from "../pages/Settings/hooks/useFullConfig";
 
 const POLL_INTERVAL = 5000; // 5 seconds
 // v0.1.8: bumped 3 -> 6 to absorb heavier daemon work bursts
@@ -80,12 +86,37 @@ export function useDaemon(): DaemonState {
     try {
       const result = await fetchDashboard();
       if (!isLatest()) return; // A newer refresh already landed — drop ours.
-      const healthyThisPoll =
+      // v0.1.9 audit MED-7: half-dead detection.
+      //
+      // fetchDashboard wraps each of 9 IPC calls in its own .catch()
+      // returning a synthetic fallback, so Promise.all never throws.
+      // Previously healthyThisPoll was just the engine signal, which
+      // meant: if getEngineStatus succeeded (cached/fast) but every
+      // OTHER endpoint silently fell back (uptime=0, watcher=false,
+      // quarantine=[]), connected stayed TRUE and the UI rendered a
+      // green badge over a zeroed dashboard. The author's own
+      // `statsAreReal = stats.uptime_secs > 0` guard later in this
+      // file is the smoking gun that this fallback shape is known to
+      // happen in practice. Now we require BOTH signals — engine OK
+      // AND stats are real — before calling the connection healthy.
+      const engineHealthy =
         result.engine.state !== "error" || result.engine.signature_count > 0;
+      const statsAreReal = (result.stats?.uptime_secs ?? 0) > 0;
+      const healthyThisPoll = engineHealthy && statsAreReal;
       // Debounce the disconnect flip — see CONNECTED_DEBOUNCE comment.
       if (healthyThisPoll) {
+        // v0.1.9 audit HIGH-3: if we just transitioned from
+        // disconnected→connected, the daemon may have hot-restarted with
+        // a new binary — invalidate the Settings cache so the next mount
+        // re-fetches defaults + restart_requirements against the new
+        // schema. Cheap no-op if the cache was already empty.
+        setConnected((prev) => {
+          if (!prev) {
+            invalidateSettingsCache();
+          }
+          return true;
+        });
         disconnectCountRef.current = 0;
-        setConnected(true);
       } else {
         disconnectCountRef.current += 1;
         if (disconnectCountRef.current >= CONNECTED_DEBOUNCE) {

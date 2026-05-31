@@ -376,12 +376,45 @@ export function ListEditor({
         directory: pathPickerOptions?.directory ?? true,
         multiple: pathPickerOptions?.multiple ?? false,
       });
-      if (picked) {
-        if (Array.isArray(picked)) {
-          for (const p of picked) tryAdd(p);
-        } else {
-          tryAdd(picked);
+      if (!picked) return;
+      const paths = Array.isArray(picked) ? picked : [picked];
+      // v0.1.9 audit HIGH-3 fix: previously `for (const p of paths) tryAdd(p)`
+      // closed over the SAME stale `items` prop on every iteration — React
+      // state updates don't propagate through a synchronous for-loop, so
+      // each tryAdd onChange wrote `[...items, lastPath]` and overwrote
+      // the previous call. Result: shift-clicking N folders only added the
+      // LAST one. Fix: build the next array LOCALLY, validate intra-batch
+      // duplicates against the in-progress list, single onChange at end.
+      const next = [...items];
+      const intraBatch = new Set(items);
+      const errs: string[] = [];
+      for (const raw of paths) {
+        const v = raw.trim();
+        if (!v) continue;
+        if (intraBatch.has(v)) continue;
+        if (validator) {
+          const msg = validator(v);
+          if (msg) {
+            errs.push(`${v}: ${msg}`);
+            continue;
+          }
         }
+        if (next.length >= cap) {
+          errs.push(i18n.t("settings.list_full") || "list full");
+          break;
+        }
+        next.push(v);
+        intraBatch.add(v);
+      }
+      if (next.length !== items.length) {
+        onChange(next);
+      }
+      if (errs.length > 0) {
+        // Surface the FIRST error inline; the rest are usually variants
+        // of the same root cause (e.g. all dupes).
+        setError(errs[0]);
+      } else {
+        setError(null);
       }
     } catch {
       // user cancelled

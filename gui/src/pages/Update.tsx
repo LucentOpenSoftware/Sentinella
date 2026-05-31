@@ -331,17 +331,52 @@ const PACK_CATEGORY_COLORS: Record<string, string> = {
 };
 
 function ArgusPacksSection() {
+  // v0.1.9 audit MED-10 fix: this section was the root cause of the
+  // long-standing "0 reglas conductuales en 0 paquetes" cosmetic bug.
+  //
+  // Daemon-side is fine — argus.packs returns a populated manifest list
+  // (verified by raw named-pipe round-trip). GUI-side, the v0.1.7
+  // version of this component did `useEffect(..., [])` with `.catch(() => {})`
+  // — one-shot fetch on mount, errors swallowed, no refetch on
+  // connectivity change. So when the section mounted during one of
+  // the brief windows where the named-pipe call failed (daemon not
+  // yet started, supervisor mid-respawn, transient PIPE_BUSY,
+  // disconnect-debounce gap), packs stayed at [] forever and the
+  // UI rendered the alarming-looking 0/0 indefinitely. The peer
+  // tiles on the same page recovered because they come from the
+  // continuously-polled DaemonContext.
+  //
+  // Fix: re-fetch on every disconnect→reconnect transition by keying
+  // the effect on daemon.connected. The component now self-heals
+  // without requiring the user to click "Reload rules" or navigate
+  // away and back.
+  const { connected } = useDaemonContext();
   const [packs, setPacks] = useState<ArgusPackInfo[]>([]);
   const [totalRules, setTotalRules] = useState(0);
   const [reloading, setReloading] = useState(false);
   const [reloadResult, setReloadResult] = useState<string | null>(null);
 
   useEffect(() => {
-    getArgusPacks().then((r) => {
-      setPacks(r.packs);
-      setTotalRules(r.total_yara_rules);
-    }).catch(() => {});
-  }, []);
+    if (!connected) return;
+    let cancelled = false;
+    getArgusPacks()
+      .then((r) => {
+        if (cancelled) return;
+        setPacks(r.packs);
+        setTotalRules(r.total_yara_rules);
+      })
+      .catch((e) => {
+        // Keep the catch — transient failures during reconnect are
+        // expected — but log so the same class of "silent 0/0" bug
+        // stops hiding in future regressions.
+        if (!cancelled) {
+          console.warn("[ArgusPacksSection] getArgusPacks failed:", e);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [connected]);
 
   const handleReload = async () => {
     setReloading(true);

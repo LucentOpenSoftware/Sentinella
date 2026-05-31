@@ -29,13 +29,26 @@ import {
 
 // ─── Session-level caches ───────────────────────────────────────
 //
-// `defaults` and `restartReqs` are STATIC per daemon version — they
-// never change while the GUI is running. Caching them at module scope
-// means we fetch them exactly ONCE per app session instead of on every
-// Settings mount. That matters because the daemon's `Status` rate
-// bucket is shared with the dashboard's 9-endpoint poll loop; three
-// extra parallel reads on every Settings open were tipping it into
-// "rate limited" (-32020) on busy systems.
+// `defaults` and `restartReqs` are STATIC for the lifetime of a
+// connected daemon — they only change when the daemon binary itself
+// changes (new fields, restart-classification shifts). Caching at
+// module scope means we fetch them exactly ONCE per daemon session
+// instead of on every Settings mount. That matters because the
+// daemon's `Status` rate bucket is shared with the dashboard's
+// 9-endpoint poll loop; three extra parallel reads on every Settings
+// open were tipping it into "rate limited" (-32020) on busy systems.
+//
+// v0.1.9 audit HIGH-3 fix: the v0.1.8 version of this comment claimed
+// "STATIC per daemon version — they never change while the GUI is
+// running". That's false if the daemon hot-restarts (tray restart,
+// service auto-restart, scheduled-update reload). After such a
+// restart the cached defaults / restart_requirements could be stale
+// against a new daemon binary — isDefault() would return wrong
+// booleans, resetField() would write old defaults into new schemas,
+// dirtyFlags would iterate the stale field set and miss newly-added
+// fields entirely. Fix: expose `invalidateSettingsCache()` and call
+// it from the daemon-disconnected→reconnected transition (see
+// useDaemon.ts).
 //
 // Promises are kept so concurrent callers share the in-flight fetch
 // instead of racing to start three more.
@@ -44,6 +57,18 @@ let defaultsCache: FullConfig | null = null;
 let defaultsPromise: Promise<FullConfig> | null = null;
 let restartReqsCache: RestartRequirementMap | null = null;
 let restartReqsPromise: Promise<RestartRequirementMap> | null = null;
+
+/**
+ * Drop the module-scope defaults + restart-requirements caches so the
+ * next mount of useFullConfig re-fetches both. Called from useDaemon
+ * on a disconnect→reconnect transition (daemon binary may have changed).
+ */
+export function invalidateSettingsCache(): void {
+  defaultsCache = null;
+  defaultsPromise = null;
+  restartReqsCache = null;
+  restartReqsPromise = null;
+}
 
 function fetchDefaultsOnce(): Promise<FullConfig> {
   if (defaultsCache) return Promise.resolve(defaultsCache);
