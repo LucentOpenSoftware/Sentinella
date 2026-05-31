@@ -3,7 +3,7 @@ export const en: Record<string, string> = {
   // ── App / Global ────────────────────────────────────
   "app.name": "Sentinella",
   "app.subtitle": "Antivirus Suite",
-  "app.version": "v0.1.8",
+  "app.version": "v0.1.9",
 
   // ── Sidebar ─────────────────────────────────────────
   "nav.dashboard": "Dashboard",
@@ -26,7 +26,7 @@ export const en: Record<string, string> = {
   "meta.notifications_sub": "Alert history",
   "meta.update_sub": "Signature database",
   "meta.settings_sub": "Configure Sentinella",
-  "meta.about_sub": "Sentinella v0.1.8",
+  "meta.about_sub": "Sentinella v0.1.9",
 
   // ── Dashboard ───────────────────────────────────────
   "dash.protected": "Your System is Protected",
@@ -510,6 +510,7 @@ export const en: Record<string, string> = {
   "update.format_value": "ClamAV CVD",
   "update.tool": "Update Tool",
   "update.tool_value": "freshclam (ClamAV)",
+  "update.section_app_updates": "Sentinella app updates",
   "update.step_download": "Download",
   "update.step_download_desc": "Fetch latest signatures from ClamAV mirrors.",
   "update.step_verify": "Verify & Apply",
@@ -835,7 +836,7 @@ export const en: Record<string, string> = {
   "about.back": "Back to About",
   "about.coming_soon": "Coming soon",
 
-  // ── v0.1.8 Settings page (tab shell + Protection tab) ────
+  // ── v0.1.9 Settings page (tab shell + Protection tab) ────
   "settings.title": "Settings",
   "settings.subtitle": "Configure protection, scanning, updates, and advanced behaviour.",
   "settings.loading": "Loading configuration…",

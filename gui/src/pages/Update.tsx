@@ -11,6 +11,7 @@ import {
   XCircle,
 } from "lucide-react";
 import { Card } from "../components/Card";
+import { AppUpdater } from "../components/AppUpdater";
 import { useDaemonContext } from "../hooks/DaemonContext";
 import { startSignatureUpdate, getUpdateStatus, getArgusPacks, reloadArgus } from "../api/sentinella";
 import type { ArgusPackInfo } from "../types/sentinella";
@@ -286,6 +287,17 @@ export function UpdatePage() {
         </Card>
 
         <ArgusPacksSection />
+      </div>
+
+      {/* v0.1.9: Sentinella app updates (Tauri updater for the GUI +
+          shipped daemon binaries). Distinct from the signature updates
+          above. Moved here from About so all "anything that updates"
+          lives in one page. */}
+      <div className="px-1">
+        <h4 className="text-[13px] font-medium text-[rgb(var(--t3))] mb-2">
+          {t("update.section_app_updates")}
+        </h4>
+        <AppUpdater />
       </div>
 
       {/* How updates work */}

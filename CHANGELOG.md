@@ -1,5 +1,199 @@
 # Changelog
 
+## [0.1.9] - 2026-05-30
+
+Security + correctness release. Closes a real privilege-
+escalation hole in v0.1.8's kill-vector IPC handlers, fixes
+13 audit findings across daemon and GUI, makes idle-scanner
+fullscreen detection actually work in production (it was
+dead code under the Windows service context since v0.1.7),
+and consolidates the two "update" UX paths into one page.
+
+### Security (the headline)
+
+- **Daemon-side elevation gate on every kill-vector IPC
+  method.** Audit found that `protection.set_critical`,
+  `settings.set_full`, `sources.*`, `engine.reload`, and
+  `quarantine.*` all gated solely on a challenge token. The
+  IPC secret file is `BUILTIN\Users:(R)` for unelevated-GUI
+  compatibility, so the secret alone is not an elevation
+  boundary. Any unelevated user-mode process running as the
+  console user (CLI, LOLBin, Office macro) could read the
+  secret, request a token, and disable realtime / blank
+  watched roots / push exclusions covering the user profile —
+  silently, no UAC. v0.1.8's "Restart as Administrator"
+  flow was purely cosmetic from the daemon's perspective.
+
+  v0.1.9 plumbs the resolved `ClientIdentity` from the pipe-
+  accept layer through to `dispatch_sync` and gates every
+  challengeable method on `is_elevated || is_system`. Gated
+  twice (at `security.challenge` token issuance + at handler
+  entry) for defence in depth. Fail-open on unresolved peer
+  identity preserves the WORKING_STATE invariant. Five new
+  fields added to `CRITICAL_FIELDS` (`fish.enabled`,
+  `fish.observe_only`, `fish.active_response`, `sandbox.
+  enabled`, `clamav_isolation`) so ransomware-shield +
+  behavioural-sandbox + ClamAV-isolation toggles also travel
+  through the elevated-only channel.
+
+### Idle scanner — fullscreen detection works for the first time in production
+
+- v0.1.7→v0.1.8 wrote a layered fullscreen detector in the
+  daemon (foreground-window geometry + style + own-process
+  skip). But the daemon runs as a Windows SERVICE in session
+  0; `GetForegroundWindow` returns NULL from session 0, so
+  the entire foreground-window layer was dead code in
+  production. Only the narrow `SHQueryUserNotificationState`
+  fallback ran, and even that's session-aware and frequently
+  degenerate from session 0. Net result: `pause_on_fullscreen`
+  rarely engaged for real games — idle scans could resume on
+  top of running titles and steal CPU/disk.
+
+- v0.1.9 fix: the GUI lives in the user session and CAN call
+  the API correctly. New `gui/src-tauri/fullscreen_reporter.rs`
+  polls every 5 s and pushes the verdict via new IPC method
+  `system.fullscreen_report`. Daemon caches the verdict with
+  a 15 s freshness window; idle scanner reads the cache and
+  only falls back to the session-0 detector if no fresh GUI
+  report exists (e.g. GUI closed).
+
+### Config persistence
+
+- **Comment-preserving save.** `Config::save` switched from
+  `toml::to_string_pretty` (strips comments + reorders keys
+  + drops unknown forward-compat fields) to a load-modify-
+  write through `toml_edit::DocumentMut`. Mirrors the
+  dev-console's existing approach. Hand-edited comments
+  survive every Settings save now. Unknown forward-compat
+  keys (e.g. a future daemon's keys the current schema
+  doesn't yet deserialise) also survive a round-trip
+  instead of being silently dropped.
+
+- **Config write lock.** Every IPC handler that does
+  `Config::load → mutate → config.save` (settings.set,
+  settings.set_full, protection.set_critical, sources.set,
+  dev.set_developer_mode) now holds an `AppState.
+  config_write_lock` across the entire read-modify-write
+  window — two concurrent writers can no longer clobber
+  each other via last-writer-wins on the atomic rename.
+
+### GUI state correctness
+
+- **Settings cache invalidation on daemon reconnect.** The
+  v0.1.8 module-scope caches for `defaults` and
+  `restart_requirements` never invalidated; after a daemon
+  hot-restart with a new build, `isDefault()` returned wrong
+  booleans, `resetField()` wrote old defaults into new
+  schemas, and `dirtyFlags` missed newly-added fields. Now
+  `useDaemon` calls `invalidateSettingsCache()` on every
+  disconnect→reconnect transition.
+
+- **`ListEditor.browse()` multi-pick bug.** The synchronous
+  for-loop closed over stale `items` props; each `tryAdd`
+  overwrote the previous one. Shift-clicking 3 folders for
+  `realtime_roots` → only the last one survived. Now builds
+  the next array locally, validates intra-batch duplicates,
+  single `onChange` at end.
+
+- **Daemon half-dead detection.** `useDaemon` flipped
+  `connected=true` whenever `getEngineStatus` succeeded —
+  even if every other endpoint silently fell back to zeros.
+  Now requires both `engine OK` AND `stats.uptime_secs > 0`
+  before calling the connection healthy.
+
+- **ARGUS packs 0/0 cosmetic bug** (long-standing since
+  v0.1.7). Root cause: `ArgusPacksSection` had
+  `useEffect(..., [])` with swallowed catch — one-shot
+  fetch on mount, no refetch on connectivity change. If
+  the section mounted during a brief pipe-failure window,
+  packs stayed at `[]` forever. Now keyed on `connected`;
+  self-heals on every reconnect.
+
+### Smaller fixes
+
+- **`restart_as_admin` race fix (proper).** v0.1.8 used a
+  50 ms `std::thread::sleep` before `app.exit(0)`, hoping the
+  parent's mutex would release before the elevated child's
+  check ran. The sleep ACTIVELY DELAYED mutex release;
+  comment logic was inverted. Now the parent passes
+  `--elevated-restart` as the `lpParameters` arg to
+  `ShellExecuteW`; the elevated child's single-instance
+  plugin callback detects the arg and skips the focus-
+  existing dedup. Race is structurally impossible —
+  timing no longer matters.
+
+- **NumberInput clamp.** Empty string used to silently
+  commit `0` (because `Number("") === 0`), violating
+  every call site's declared min/max. Now empty/`-` is a
+  no-op; finite values are clamped into `[min, max]`
+  before reaching parent state; onBlur re-shows last
+  committed value if box was left empty.
+
+- **RateLimiter sub-token remainder preserved.** The float
+  refill was truncated to whole tokens AND `last_refill`
+  was reset to `now()`, discarding the fractional elapsed
+  time. ConfigMutation (10/min) probed at t=6.5 s minted 1
+  token and lost 0.5 s of progress; sustained effective
+  rate drifted to ~half the declared cap. Fix: advance
+  `last_refill` by EXACTLY the time the integer-truncated
+  refill represents, preserving the fractional remainder.
+
+- **Banner-translation false-positive.** v0.1.8's
+  "Signatures never updated" guard suppressed the banner
+  whenever `signature_count > 0` — but the GUI still
+  rendered the alarming-looking text if a stale
+  `db_stale=true` reached the GUI for one poll. Already
+  fixed in v0.1.8 daemon-side; v0.1.9 audit confirmed no
+  remaining trigger paths.
+
+### Consolidation
+
+- **"Software updates" card moved from About → Update page.**
+  The page that already owned "anything that updates"
+  (signature DB freshness, ARGUS pack reload, freshclam
+  status) now also hosts the Tauri-updater check for
+  `sentinella.exe` itself. About becomes purely
+  informational (banner + tech stack + license + topic
+  cards). `AppUpdater` extracted to `components/AppUpdater.tsx`
+  so it can be reused; the inline `UpdateChecker` function
+  in About.tsx and its now-unused imports are gone.
+
+### Internals
+
+- New IPC method `system.fullscreen_report` (Status bucket,
+  authenticated, no challenge token — flipping a bool that
+  affects only whether the daemon DOES LESS work has no
+  privilege-escalation surface).
+- New file `crates/sentinelld/src/ipc/client_auth.rs::PipeAuth`
+  enum + `authorize_and_resolve_pipe_client()`; old
+  `authorize_pipe_client()` kept for back-compat but
+  unused.
+- `Config::save` now depends on `toml_edit = "0.22"`.
+- GUI Cargo adds `Win32_Graphics_Gdi` +
+  `Win32_System_ProcessStatus` features for the
+  fullscreen_reporter's Win32 calls.
+- `Settings/tabs/Ransomware.tsx`, `Sandbox.tsx`, `Engine.tsx`
+  now render the `locked` lock icon and disabled controls
+  on the newly-critical fish/sandbox/clamav_isolation
+  fields.
+
+### Tests
+
+- proto: 6 → 7 (v019_audit_fields_added_to_critical
+  regression for the new CRITICAL_FIELDS entries).
+- daemon: 291 → 301 (4 client_auth elevation-gate truth
+  table, 5 toml-preservation, 1 rate-limiter remainder).
+- **301/301 pass.**
+
+### Known gaps
+
+- de/fr/it/ja/pt-br/ru/zh-cn translations of new Settings
+  strings still fall back to English (Spanish-only
+  translation pass).
+- `argusd.exe` and `sentinella-cli.exe` still don't embed
+  PE FileVersion metadata; preflight version-check falls
+  back to mtime-only for them.
+
 ## [0.1.8] - 2026-05-30
 
 Configuration parity release. The Settings page goes from 12
