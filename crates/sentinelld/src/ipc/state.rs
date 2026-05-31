@@ -387,6 +387,14 @@ pub struct AppState {
     /// Developer-mode state (gates local perf telemetry). Mutable at runtime via
     /// `load_developer_config` when the mode is toggled.
     developer_config: std::sync::Mutex<crate::config::DeveloperConfig>,
+    /// v0.1.9 Phase 2 (audit MED-6): serialises every config load→mutate→save
+    /// sequence so two concurrent IPC handlers (e.g. settings.set_full racing
+    /// dev.set_developer_mode) can't clobber each other's changes via
+    /// last-writer-wins-on-rename. Acquired with `with_config_write` /
+    /// `lock_config_write`; held across the whole read-modify-write window,
+    /// NOT just the disk write. Tokio runtime is multi-threaded so two
+    /// handlers genuinely can run in parallel.
+    config_write_lock: std::sync::Mutex<()>,
     /// Signature-staleness warning threshold (hours), from config.signature_stale_days.
     signature_stale_hours: u64,
     // ── ClamAV isolation config (cached) ───────────────
@@ -682,6 +690,30 @@ fn reserve_active_scan(inner: &mut Inner, job: ScanJob) -> Result<(), ScanStartR
 }
 
 impl AppState {
+    /// v0.1.9 Phase 2 — guard for the config read-modify-write window.
+    /// IPC handlers that mutate `sentinelld.toml` must wrap their entire
+    /// `Config::load → mutate → config.save` sequence in:
+    ///
+    /// ```ignore
+    /// let _guard = state.lock_config_write();
+    /// let mut config = Config::load(None).unwrap_or_default();
+    /// // ...mutate...
+    /// config.save(&path)?;
+    /// drop(_guard); // explicit if you need to log after the write
+    /// ```
+    ///
+    /// Returns a `MutexGuard` so the borrow checker enforces the lifetime
+    /// match: you can't accidentally drop the guard mid-sequence.
+    /// `Result::unwrap_or_else(|e| e.into_inner())` recovers from a
+    /// poisoned lock — the previous panicking handler already lost its
+    /// own write; we don't want a single panicked thread to permanently
+    /// brick every future settings save.
+    pub fn lock_config_write(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.config_write_lock
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
     pub fn new(
         dll_dir: Option<PathBuf>,
         db_dir: Option<PathBuf>,
@@ -919,6 +951,7 @@ impl AppState {
                 }
                 pc
             },
+            config_write_lock: std::sync::Mutex::new(()),
             developer_config: std::sync::Mutex::new(
                 crate::config::Config::load(None)
                     .map(|c| c.developer)

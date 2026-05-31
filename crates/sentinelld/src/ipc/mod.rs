@@ -1404,11 +1404,15 @@ fn dispatch_sync(
                 .unwrap_or_default();
             }
 
-            // Save to config.
+            // Save to config (v0.1.9 Phase 2: serialise the load-modify-write
+            // window against other config-saving handlers — see
+            // AppState::lock_config_write doc).
+            let _cfg_guard = state.lock_config_write();
             let mut config = crate::config::Config::load(None).unwrap_or_default();
             config.enhanced_signature_provider = provider_id.to_string();
             let config_path = crate::paths::paths().config_file();
             let _ = config.save(&config_path);
+            drop(_cfg_guard);
 
             // Invalidate mpool cache — force rebuild with new provider.
             let cache_path = crate::paths::paths().mpool_cache();
@@ -1857,6 +1861,12 @@ fn dispatch_sync(
                     // APT kill vector: attacker with IPC secret calls settings.set
                     // to inject exclusions that suppress all detection. Protecting
                     // these fields forces the attacker to have admin + challenge token.
+                    //
+                    // v0.1.9 Phase 2: hold the config write lock for the entire
+                    // load-current → merge → save window so a parallel
+                    // settings.set_full / protection.set_critical can't clobber
+                    // our save (or have us clobber theirs).
+                    let _cfg_guard = state.lock_config_write();
                     let current = crate::config::Config::load(None).unwrap_or_default();
 
                     // Protection state (existing).
@@ -2038,6 +2048,10 @@ fn dispatch_sync(
             }
             match serde_json::from_value::<sentinella_ipc_proto::full_config::FullConfig>(params) {
                 Ok(full) => {
+                    // v0.1.9 Phase 2: serialise the read-modify-write window
+                    // against parallel config writers (settings.set /
+                    // protection.set_critical / sources.set / dev.set_developer_mode).
+                    let _cfg_guard = state.lock_config_write();
                     let mut config = crate::config::Config::load(None).unwrap_or_default();
                     let diffs = config.critical_diff(&full);
                     if !diffs.is_empty() {
@@ -2118,6 +2132,9 @@ fn dispatch_sync(
                 .unwrap_or_default();
             }
 
+            // v0.1.9 Phase 2: serialise the read-modify-write window against
+            // parallel config writers (see AppState::lock_config_write).
+            let _cfg_guard = state.lock_config_write();
             let mut config = crate::config::Config::load(None).unwrap_or_default();
             let mut changes = Vec::new();
             let mut errors: Vec<String> = Vec::new();
@@ -2670,6 +2687,9 @@ fn dispatch_sync(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
+            // v0.1.9 Phase 2: serialise the read-modify-write window against
+            // parallel config writers (see AppState::lock_config_write).
+            let _cfg_guard = state.lock_config_write();
             let mut config = crate::config::Config::load(None).unwrap_or_default();
 
             // Verify against the provisioned hash. Empty hash = unprovisioned →

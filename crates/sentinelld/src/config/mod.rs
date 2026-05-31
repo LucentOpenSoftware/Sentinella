@@ -319,7 +319,23 @@ impl Config {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
         }
-        let content = toml::to_string_pretty(self).map_err(|e| format!("serialize: {e}"))?;
+
+        // v0.1.9 Phase 2 (audit MED-5): comment-preserving save.
+        //
+        // Old behaviour: `toml::to_string_pretty(self)` serialised the
+        // struct from scratch, stripping every user comment, reordering
+        // keys, dropping inline-table style, and silently dropping any
+        // unknown forward-compat keys (since `serde(deny_unknown_fields)`
+        // is OFF). Every IPC mutation that triggered a save wiped the
+        // user's hand-edited annotations.
+        //
+        // New behaviour: if the existing file parses as a toml_edit
+        // DocumentMut, MERGE the new values into it leaf-by-leaf,
+        // preserving comments + formatting + unknown keys. If parsing
+        // fails (new file / corrupted), fall back to to_string_pretty —
+        // nothing to preserve in those cases anyway.
+        let content = render_preserving_existing(self, path)?;
+
         // R4-C18: atomic write — write to .tmp then rename. A crash mid-write
         // previously left a truncated config that load() would treat as parse
         // error and silently reset to defaults (losing user settings).
@@ -981,6 +997,113 @@ pub fn verify_developer_password(input: &str, stored_hash_hex: &str) -> bool {
 }
 
 // ════════════════════════════════════════════════════════════════════
+//  Comment-preserving TOML save (v0.1.9 Phase 2, audit MED-5)
+// ════════════════════════════════════════════════════════════════════
+
+/// Render the canonical TOML for `cfg`, preserving comments + formatting
+/// + unknown keys from the existing file at `path` if one is present.
+///
+/// Strategy:
+///   1. Read the existing file (if any) and parse as `DocumentMut`.
+///   2. Serialise `cfg` via `toml::to_string_pretty` to a fresh
+///      `DocumentMut` — this is the AUTHORITATIVE shape for known keys.
+///   3. Walk the fresh doc; for each leaf key, OVERWRITE the value in
+///      the existing doc, leaving the existing key's decor (leading
+///      blank lines, trailing `# comment`, etc.) untouched.
+///   4. For keys present in `cfg` but NOT in the existing doc, INSERT
+///      them at the appropriate position with no decor (new fields
+///      added by a daemon upgrade).
+///   5. Keys present in the existing doc but NOT in `cfg` are LEFT
+///      ALONE — that's how forward-compat unknown keys survive a save.
+///   6. If parsing the existing file fails (corrupted / first run), the
+///      fresh doc is the output — nothing to preserve.
+fn render_preserving_existing(cfg: &Config, path: &Path) -> Result<String, String> {
+    use toml_edit::DocumentMut;
+
+    // Authoritative serialization of the current Config struct.
+    let fresh_str = toml::to_string_pretty(cfg).map_err(|e| format!("serialize: {e}"))?;
+    let fresh_doc: DocumentMut = fresh_str
+        .parse()
+        .map_err(|e| format!("reparse own output as toml_edit: {e}"))?;
+
+    // Try to load existing for comment preservation. Any failure path
+    // falls back to the canonical fresh serialization.
+    let existing_text = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => return Ok(fresh_doc.to_string()),
+    };
+    let mut existing_doc: DocumentMut = match existing_text.parse() {
+        Ok(d) => d,
+        Err(_) => return Ok(fresh_doc.to_string()),
+    };
+
+    merge_table_into(existing_doc.as_table_mut(), fresh_doc.as_table());
+
+    Ok(existing_doc.to_string())
+}
+
+/// Recursive walker: for every key in `fresh`, update the corresponding
+/// entry in `target` (preserving decor), recursing into sub-tables.
+/// Keys present in `target` but not in `fresh` are left untouched —
+/// that's the forward-compat "unknown keys survive" property.
+fn merge_table_into(target: &mut toml_edit::Table, fresh: &toml_edit::Table) {
+    for (key, fresh_item) in fresh.iter() {
+        match fresh_item {
+            toml_edit::Item::Table(fresh_inner) => {
+                // Nested table: recurse if the target already has the
+                // same key as a table; replace wholesale otherwise.
+                let existing_is_table = target
+                    .get(key)
+                    .map(|i| i.is_table())
+                    .unwrap_or(false);
+                if existing_is_table {
+                    if let Some(toml_edit::Item::Table(target_inner)) =
+                        target.get_mut(key)
+                    {
+                        merge_table_into(target_inner, fresh_inner);
+                    }
+                } else {
+                    // Whole subtable is new (or was a value before — unusual,
+                    // but the canonical form wins): insert/overwrite.
+                    target.insert(key, fresh_item.clone());
+                }
+            }
+            toml_edit::Item::ArrayOfTables(fresh_aot) => {
+                // No comment-merge semantics for array-of-tables in
+                // our config schema today; overwrite wholesale.
+                target.insert(key, toml_edit::Item::ArrayOfTables(fresh_aot.clone()));
+            }
+            toml_edit::Item::Value(fresh_val) => {
+                // Leaf: overwrite value only, preserving the key's decor
+                // (leading blank lines, trailing `# comment`) when the
+                // key already exists. `Table::insert` retains the
+                // existing entry's KEY decor; we copy the value's prefix/
+                // suffix from the existing slot so e.g. `key = 5  # five`
+                // -> `key = 6  # five` (the comment moves with the value
+                // slot).
+                if let Some(existing_item) = target.get_mut(key) {
+                    if let toml_edit::Item::Value(existing_val) = existing_item {
+                        // Preserve the value's surrounding whitespace + trailing comment.
+                        let decor = existing_val.decor().clone();
+                        let mut new_val = fresh_val.clone();
+                        *new_val.decor_mut() = decor;
+                        *existing_item = toml_edit::Item::Value(new_val);
+                    } else {
+                        // Existing slot is a table/AoT but fresh is a value
+                        // — schema reshape, overwrite wholesale.
+                        target.insert(key, fresh_item.clone());
+                    }
+                } else {
+                    // New key (added by daemon upgrade) — insert plain.
+                    target.insert(key, fresh_item.clone());
+                }
+            }
+            toml_edit::Item::None => { /* skip */ }
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════
 //  FullConfig bridge (v0.1.8 settings.get_full / settings.set_full)
 // ════════════════════════════════════════════════════════════════════
 //
@@ -1421,6 +1544,117 @@ mod full_config_bridge_tests {
             !json.contains("deadbeef"),
             "password hash bytes leaked into wire format"
         );
+    }
+}
+
+#[cfg(test)]
+mod toml_preservation_tests {
+    use super::*;
+
+    /// Re-render `cfg` through `render_preserving_existing` against a
+    /// hand-crafted existing TOML, asserting key invariants from the
+    /// audit MED-5 fix: comments stay, leaf values update, unknown
+    /// forward-compat keys survive.
+    fn render_against_existing(cfg: &Config, existing: &str) -> String {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sentinelld.toml");
+        std::fs::write(&path, existing).expect("write existing");
+        render_preserving_existing(cfg, &path).expect("render")
+    }
+
+    #[test]
+    fn comments_survive_a_value_mutation() {
+        // Existing file: leaf value with a trailing comment.
+        let existing = "\
+# Top-of-file rationale: user tuned this for a low-RAM laptop.
+max_file_size_mb = 64  # was 512 — laptop only has 8GB
+update_interval_hours = 6
+";
+        let mut cfg = Config::default();
+        cfg.max_file_size_mb = 96; // bumped via GUI
+
+        let out = render_against_existing(&cfg, existing);
+        assert!(
+            out.contains("Top-of-file rationale"),
+            "leading file comment must survive a save"
+        );
+        assert!(
+            out.contains("# was 512"),
+            "trailing inline comment must move with the value slot, not get stripped"
+        );
+        assert!(
+            out.contains("max_file_size_mb = 96"),
+            "leaf value must update to the new struct value"
+        );
+        assert!(
+            !out.contains("max_file_size_mb = 64"),
+            "old value must be gone (got: {out})"
+        );
+    }
+
+    #[test]
+    fn unknown_forward_compat_keys_survive() {
+        // Imagine a future daemon version added `experimental_widget`
+        // and the user is currently running an older daemon. v0.1.7's
+        // toml::to_string_pretty would have silently dropped it on the
+        // next save. v0.1.9 must preserve it.
+        let existing = "\
+max_file_size_mb = 128
+experimental_widget = \"someday\"  # ship in v0.2.0
+";
+        let cfg = Config::default();
+        let out = render_against_existing(&cfg, existing);
+        assert!(
+            out.contains("experimental_widget"),
+            "unknown forward-compat key must survive a save"
+        );
+        assert!(
+            out.contains("ship in v0.2.0"),
+            "unknown-key trailing comment must survive too"
+        );
+    }
+
+    #[test]
+    fn nested_table_comments_survive() {
+        let existing = "\
+[fish]
+# rename burst threshold tuned to suppress Firefox cache noise
+rename_threshold = 75
+window_seconds = 30
+";
+        let mut cfg = Config::default();
+        cfg.fish.rename_threshold = 80; // bumped
+        let out = render_against_existing(&cfg, existing);
+        assert!(
+            out.contains("tuned to suppress Firefox cache noise"),
+            "in-table comment must survive a fish.* mutation"
+        );
+        assert!(out.contains("rename_threshold = 80"));
+        assert!(!out.contains("rename_threshold = 75"));
+    }
+
+    #[test]
+    fn fresh_file_falls_back_to_canonical() {
+        // No existing file — render should equal toml::to_string_pretty.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nope.toml");
+        let cfg = Config::default();
+        let out = render_preserving_existing(&cfg, &path).expect("render");
+        let canonical = toml::to_string_pretty(&cfg).expect("canonical");
+        assert_eq!(
+            out, canonical,
+            "first-write path must produce the canonical serialization"
+        );
+    }
+
+    #[test]
+    fn corrupt_existing_falls_back_to_canonical() {
+        let existing = "this is not valid TOML at all }}}";
+        let cfg = Config::default();
+        let out = render_against_existing(&cfg, existing);
+        // Should be parseable as TOML — i.e. the corrupt file didn't
+        // break us; we recovered with the canonical fresh serialization.
+        let _: toml::Value = toml::from_str(&out).expect("output must be valid TOML");
     }
 }
 
