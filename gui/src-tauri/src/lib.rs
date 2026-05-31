@@ -4,6 +4,7 @@
 //! No command returns hardcoded data — everything comes from the daemon.
 
 mod daemon_client;
+mod fullscreen_reporter;
 mod ipc_auth;
 mod supervisor;
 
@@ -879,6 +880,13 @@ pub fn run() {
             let supervisor_state = std::sync::Arc::new(supervisor::SupervisorState::new());
             app.manage(supervisor_state.clone());
             supervisor::start(supervisor_state);
+
+            // ── v0.1.9 Phase 4: GUI-session fullscreen reporter ──
+            // Daemon is in session 0 and can't see foreground windows;
+            // we are in the user session and can. Push the verdict every
+            // 5s so the idle scanner's pause-on-fullscreen actually
+            // works for real games. Fully fail-safe — see module docs.
+            fullscreen_reporter::spawn();
 
             // Build tray menu — NO quit option. Protection shutdown requires
             // Settings → Advanced → explicit confirmation flow.

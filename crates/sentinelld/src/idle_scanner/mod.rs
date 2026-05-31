@@ -498,7 +498,12 @@ fn idle_scanner_loop(
             }
 
             let scan_active = app_state.is_scan_active();
-            match check_resources(&res_config, scan_active) {
+            // v0.1.9 Phase 4: prefer the GUI-pushed fullscreen verdict (the
+            // GUI lives in the user session and can see foreground windows
+            // the daemon's session-0 service context cannot). Stale-after-15s
+            // so a closed/frozen GUI doesn't pin the scanner indefinitely.
+            let gui_fs_hint = app_state.fresh_gui_fullscreen(15);
+            match check_resources(&res_config, scan_active, gui_fs_hint) {
                 Some(reason) => {
                     let pause_state = match reason {
                         PauseReason::Battery => IdleScannerState::PausedBattery,
@@ -561,7 +566,8 @@ fn idle_scanner_loop(
                     break;
                 }
                 let scan_active = app_state.is_scan_active();
-                if let Some(reason) = check_resources(&res_config, scan_active) {
+                let gui_fs_hint = app_state.fresh_gui_fullscreen(15);
+                if let Some(reason) = check_resources(&res_config, scan_active, gui_fs_hint) {
                     let pause_state = match reason {
                         PauseReason::Battery => IdleScannerState::PausedBattery,
                         PauseReason::Fullscreen => IdleScannerState::PausedFullscreen,

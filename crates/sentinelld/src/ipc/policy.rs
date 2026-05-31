@@ -256,6 +256,12 @@ pub fn method_registry() -> HashMap<&'static str, MethodPolicy> {
         auth_read(1024, RateBucket::MemoryScan),
     );
     m.insert("settings.get", auth_read(512, RateBucket::Status));
+    // v0.1.9 Phase 4 (audit MED-8): GUI pushes fullscreen verdict every
+    // ~5s. Small payload (one bool), Status bucket is fine (300/min).
+    m.insert(
+        "system.fullscreen_report",
+        auth_action(256, RateBucket::Status, false),
+    );
     // v0.1.8 FullConfig surface — larger payload than settings.get because
     // the response includes every TOML knob, but still a read-only listing.
     m.insert("settings.get_full", auth_read(16384, RateBucket::Status));

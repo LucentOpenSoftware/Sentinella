@@ -1932,6 +1932,43 @@ fn dispatch_sync(
             }
         }
 
+        // ── v0.1.9 Phase 4: GUI-pushed fullscreen verdict ─────────
+        //
+        // Audit MED-8: the daemon runs as a Windows service (session 0)
+        // and its `GetForegroundWindow` returns NULL, so the v0.1.8
+        // foreground-window-style check in idle_scanner/resources.rs was
+        // dead code in production. The GUI lives in the user session and
+        // CAN call the API correctly; this method lets it push its
+        // verdict so the idle scanner's pause-on-fullscreen actually
+        // works for real games.
+        //
+        // Cheap auth: same as other status-bucket writes — IPC secret
+        // check, no challenge token, no elevation. There's no
+        // privilege-escalation primitive in flipping a bool that only
+        // affects whether we DO LESS work (skip an idle scan tick).
+        "system.fullscreen_report" => {
+            let auth = req
+                .params
+                .get("auth")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !state.validate_ipc_auth(auth) {
+                return serde_json::to_vec(&RpcErrorResponse::err(
+                    req.id,
+                    error_codes::INVALID_PARAMS,
+                    "authenticated IPC required".to_string(),
+                ))
+                .unwrap_or_default();
+            }
+            let active = req
+                .params
+                .get("active")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            state.record_gui_fullscreen(active);
+            ok_json(serde_json::json!({"ok": true}))
+        }
+
         "health" => Ok(serde_json::json!({
             "status": "ok",
             "version": sentinella_common::PRODUCT_VERSION,

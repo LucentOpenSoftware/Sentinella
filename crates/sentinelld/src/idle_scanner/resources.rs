@@ -310,12 +310,28 @@ pub struct ResourceConfig {
 }
 
 /// Check system resources. Returns None if idle enough, Some(reason) if should pause.
-pub fn check_resources(config: &ResourceConfig, scan_running: bool) -> Option<PauseReason> {
+///
+/// `gui_fullscreen_hint`: v0.1.9 Phase 4 addition. The GUI runs in the
+/// user session and can call `GetForegroundWindow` correctly; the daemon
+/// runs in session 0 (it's a Windows service) and cannot. The GUI pushes
+/// its verdict via `system.fullscreen_report` and the caller consults
+/// `AppState::fresh_gui_fullscreen(...)` before invoking us. Passing
+/// `Some(true|false)` here trusts the GUI verdict; passing `None` (no
+/// fresh GUI report, or no GUI connected) falls back to the session-0
+/// SHQuery-only detector — better than nothing but blind to most games.
+pub fn check_resources(
+    config: &ResourceConfig,
+    scan_running: bool,
+    gui_fullscreen_hint: Option<bool>,
+) -> Option<PauseReason> {
     if !config.allow_on_battery && on_battery() {
         return Some(PauseReason::Battery);
     }
-    if config.pause_on_fullscreen && fullscreen_or_busy() {
-        return Some(PauseReason::Fullscreen);
+    if config.pause_on_fullscreen {
+        let fs = gui_fullscreen_hint.unwrap_or_else(fullscreen_or_busy);
+        if fs {
+            return Some(PauseReason::Fullscreen);
+        }
     }
     if scan_running {
         return Some(PauseReason::ScanRunning);

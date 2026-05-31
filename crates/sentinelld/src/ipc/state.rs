@@ -14,7 +14,7 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex, MutexGuard,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -395,6 +395,20 @@ pub struct AppState {
     /// NOT just the disk write. Tokio runtime is multi-threaded so two
     /// handlers genuinely can run in parallel.
     config_write_lock: std::sync::Mutex<()>,
+    /// v0.1.9 Phase 4 (audit MED-8): GUI-reported foreground-window
+    /// fullscreen verdict. The daemon runs in Windows session 0 (it's a
+    /// service), so its `GetForegroundWindow` returns NULL and the v0.1.8
+    /// foreground-window check was dead code in production. Now the GUI
+    /// (which runs in the user session) polls the foreground every ~5s
+    /// and pushes the verdict here via `system.fullscreen_report`. The
+    /// idle scanner consults this cache first; if no recent push (>15s
+    /// old), falls back to the session-0 SHQuery-only detector.
+    ///
+    /// `gui_fullscreen_ts` is the unix-seconds timestamp of the last
+    /// report; 0 = never reported. Stored as i64 (not u64) so a future
+    /// before-epoch test doesn't underflow into "fresh".
+    gui_fullscreen_active: AtomicBool,
+    gui_fullscreen_ts: AtomicI64,
     /// Signature-staleness warning threshold (hours), from config.signature_stale_days.
     signature_stale_hours: u64,
     // ── ClamAV isolation config (cached) ───────────────
@@ -714,6 +728,36 @@ impl AppState {
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
+    // ── v0.1.9 Phase 4: GUI-reported fullscreen cache ─────────────
+    //
+    // The GUI runs in the user session and can call GetForegroundWindow
+    // correctly; the daemon runs in session 0 and cannot. The GUI polls
+    // every ~5s and pushes its verdict here so the idle scanner can
+    // honour true-fullscreen pauses for real games.
+
+    /// Update the GUI-reported foreground fullscreen verdict.
+    /// Called by the `system.fullscreen_report` IPC handler.
+    pub fn record_gui_fullscreen(&self, active: bool) {
+        self.gui_fullscreen_active.store(active, Ordering::Relaxed);
+        self.gui_fullscreen_ts
+            .store(chrono::Utc::now().timestamp(), Ordering::Relaxed);
+    }
+
+    /// Returns `Some(active)` if a GUI report arrived within `max_age_secs`,
+    /// `None` if no report has ever arrived or the last one is too old to
+    /// trust (caller should fall back to the session-0 SHQuery-only path).
+    pub fn fresh_gui_fullscreen(&self, max_age_secs: i64) -> Option<bool> {
+        let ts = self.gui_fullscreen_ts.load(Ordering::Relaxed);
+        if ts == 0 {
+            return None;
+        }
+        let age = chrono::Utc::now().timestamp().saturating_sub(ts);
+        if age > max_age_secs {
+            return None;
+        }
+        Some(self.gui_fullscreen_active.load(Ordering::Relaxed))
+    }
+
     pub fn new(
         dll_dir: Option<PathBuf>,
         db_dir: Option<PathBuf>,
@@ -952,6 +996,8 @@ impl AppState {
                 pc
             },
             config_write_lock: std::sync::Mutex::new(()),
+            gui_fullscreen_active: AtomicBool::new(false),
+            gui_fullscreen_ts: AtomicI64::new(0),
             developer_config: std::sync::Mutex::new(
                 crate::config::Config::load(None)
                     .map(|c| c.developer)
