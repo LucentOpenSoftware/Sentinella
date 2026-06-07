@@ -75,6 +75,53 @@ const TRUSTED_SIGNERS: &[(&str, u32)] = &[
     ("Kaspersky", 18),
 ];
 
+/// Coarse Authenticode verdict suitable for callers that only need to
+/// classify a module as trusted / untrusted / unknown — e.g. the
+/// WeedHack ImageLoad signer verifier (sentinelld). Does NOT change the
+/// score-discount semantics of `analyze` / `signature_discount`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthenticodeStatus {
+    /// Valid Authenticode chain rooted at a known trusted publisher
+    /// (one of `TRUSTED_SIGNERS`) — drop before lineage.
+    Trusted,
+    /// Either unsigned, an explicitly distrusted / revoked signature,
+    /// or a broken / tampered signature — eligible for the WeedHack
+    /// browser-injection gate.
+    Untrusted,
+    /// WinTrust API failure, unsupported file type, or any case the
+    /// verifier cannot classify with confidence — caller falls back to
+    /// the existing path + lineage check before emitting a signal.
+    Unknown,
+}
+
+/// Coarse verdict for the WeedHack signer verifier path.
+///
+/// On non-Windows builds always returns `Unknown` — there is no
+/// equivalent of Authenticode chain validation, and the caller's
+/// path+lineage gate continues to govern.
+pub fn verify_for_signer_verdict(path: &Path) -> AuthenticodeStatus {
+    #[cfg(target_os = "windows")]
+    {
+        match verify_trust(path).0 {
+            TrustResult::ValidTrusted(_) => AuthenticodeStatus::Trusted,
+            TrustResult::ValidUnknown => {
+                // A valid signature whose publisher isn't on the curated
+                // trusted list is NOT trusted enough to drop the load
+                // pre-lineage — promote to Unknown so the path+lineage
+                // gate runs. This is intentionally conservative.
+                AuthenticodeStatus::Unknown
+            }
+            TrustResult::Invalid | TrustResult::Unsigned => AuthenticodeStatus::Untrusted,
+            TrustResult::Error => AuthenticodeStatus::Unknown,
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = path;
+        AuthenticodeStatus::Unknown
+    }
+}
+
 /// Analyze a PE file's Authenticode signature.
 /// Returns findings that affect the ARGUS score.
 pub fn analyze(path: &Path) -> Vec<Finding> {

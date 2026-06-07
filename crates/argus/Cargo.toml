@@ -32,6 +32,13 @@ hex = "0.4"
 aho-corasick = "1"
 once_cell = "1"
 
+# ZIP archive parsing for JAR/WAR/EAR layer (Java malware family, e.g. WeedHack).
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# PDF parsing for the PDF action/JS layer (malicious-pdf family detection).
+# Pure-Rust, mature, single-purpose — no Rust→C FFI surface.
+lopdf = { version = "0.34", default-features = false, features = ["nom_parser"] }
+
 # YARA-X rule engine (pure Rust, BSD-3-Clause)
 yara-x = "1.16"
 

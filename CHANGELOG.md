@@ -1,5 +1,244 @@
 # Changelog
 
+## [0.1.10] - 2026-06-07
+
+WeedHack release. Adds end-to-end detection for the WeedHack
+Minecraft-themed Malware-as-a-Service campaign — static
+attribution on disk, behavioural correlation at runtime, and
+a privacy-safe diagnostics surface that names the family
+explicitly. Also adds a defensive PDF analysis layer and a
+JAR family-attribution layer reusable by future Java threats.
+
+### WeedHack family on disk
+
+- **JAR layer** (`argus::layers::jar`). New ARGUS analyzer
+  for Java archives. Routes via ZIP magic + manifest/class
+  presence. Detects WeedHack Stage 1/2/3 strings (init
+  markers, handler classes, EtherHiding function selector
+  `0xce6d41de`, embedded UUIDs, the JNIC-obfuscated
+  namespaces `dev/jnic/{lXpXvp,BSOMwJ,fwcMeR}`), the v0.2
+  hardcoded fallback IP `45.141.119.34`, and the dropped-
+  artifact path family (`Microsoft\SecurityUpdates`,
+  `Updater.vbs`, `Pjibf.exe`). Signals are distributed
+  across distinct `BehaviorTag`s so dedup-collapse cannot
+  flatten Stage 3's evidence — synthetic test corpus scores
+  Stage 1 = 100, Stage 2 = 100, Stage 3 = 100, obfuscated
+  build = 86, all Malicious.
+
+- **PDF layer** (`argus::layers::pdf`). New analyzer covering
+  the `jonaslejon/malicious-pdf` generator family. Detects
+  `/Launch`, `/GoToE+UNC`, `/URI`, JavaScript triggers
+  (`app.launchURL`, `SOAP.connect`, `XMLHttpRequest`,
+  `fetch`, `submitForm`), embedded executables, XFA
+  submission, and obfuscation-level-4 `eval(atob(...))`
+  wrappers via `lopdf 0.34` (`nom_parser` feature — `pom_parser`
+  has a compile error in the published crate).
+
+- **IOC list expansion**. Four confirmed WeedHack SHA-256
+  samples from MalwareBazaar and Triage added to
+  `runtime/rules/ioc_hashes.txt` with documented section
+  header citing McAfee Labs research and the 0xresetti
+  technical writeup.
+
+### WeedHack runtime stack
+
+A new `weedhack_*` family of modules under `crates/sentinelld/
+src/plm/` implements behavioural correlation across the three
+WeedHack stages. Eight detection pumps share a single
+`WeedHackCampaignTracker` that consolidates signals by process-
+tree root into one of three confidence tiers.
+
+#### Campaign correlator (Wave 1+2)
+
+- **`WeedHackCampaignTracker`**. Aggregates signals across
+  PID lineage and time. Three-tier confidence model:
+  Suspicious → HighConfidence → Confirmed. Pathognomonic
+  signals (Pjibf binary, JavaSecurityUpdater scheduled task,
+  EtherHiding selector) escalate faster than corroborators.
+  Window: 20 min. Cap: 64 concurrent campaigns
+  (~16 KiB worst case). PID-reuse safe — campaign key
+  includes process creation timestamp.
+- **`LineageGraphResolver`** plugs the tracker into PLM's
+  existing `LineageGraph` — campaign root is the topmost
+  `javaw.exe` / `java.exe` ancestor. Orphan signals key on
+  the emitting PID.
+- **Scan-site integration**. Three existing PLM scan sites
+  (watcher, IPC scan, idle scanner) now also call
+  `observe_chain_for_weedhack()` and merge tier-advancement
+  findings into the existing `ConvergenceLedger` — no
+  bypass, no parallel verdict path.
+- **Finding routing**. Suspicious → `Layer::Context` /
+  Medium / weight 10 → observe-only LowSuspicion floor.
+  HighConfidence → Context / High / weight 20 → needs
+  corroboration. Confirmed → `Layer::IocCorrelation`
+  (uncapped) / Critical with the cumulative campaign score
+  → eligible for quarantine through the existing convergence
+  policy.
+
+#### ImageLoad ETW pump (Wave 3+4)
+
+- **Shared `SentinellaPLM` kernel session** extended with
+  `EVENT_TRACE_FLAG_IMAGE_LOAD` — single session, single
+  callback, dispatched by provider+opcode. The existing PLM
+  process-create path is bit-for-bit unchanged.
+- **`BrowserImageLoadFilter`** orchestrates cheap-reject →
+  rate-limit → dedup → signer check → lineage check →
+  canonical detector. 256 events/sec cap, 60s `(pid, module)`
+  dedup window, 1024-entry LRU dedup table.
+- **`weedhack_browser_injection`** detector emits
+  `BrowserInjectionFromJava` when an unsigned DLL is loaded
+  into Chrome/Edge/Brave/Firefox/Opera/Vivaldi from
+  `%TEMP%`/`%APPDATA%`/`Microsoft\SecurityUpdates` under a
+  `javaw.exe` ancestor.
+
+#### WinTrust signer verifier (Wave 5)
+
+- **`WinTrustModuleSignerVerifier`** replaces the Wave 3
+  `NullSignerVerifier`. Backed by a new
+  `argus::layers::authenticode::verify_for_signer_verdict`
+  public API that coarsens the existing 5-state `TrustResult`
+  into Trusted / Untrusted / Unknown. Trusted modules drop
+  pre-lineage; Unknown signers (ValidUnknown publishers, API
+  errors) still go through the path+lineage gate.
+- **Bounded LRU cache** keyed by `(path, size, mtime)`. Cap
+  4096 entries, TTL 1 hour. Diagnostics expose `trusted` /
+  `untrusted` / `unknown` / `cache_hits` / `cache_misses` /
+  `cache_evictions` / `cache_ttl_expirations` / `verify_errors`.
+  Steady-state cost trends to "0 verifier calls" on a healthy
+  box as the cache warms.
+
+#### FileIO wallet-harvest ETW pump (Wave 6)
+
+- Shared session extended with `EVENT_TRACE_FLAG_FILE_IO_INIT`
+  for FileIo_Create events. Path is carried inline in the
+  event body; FileIo_Read intentionally NOT enabled (it only
+  carries FileObject pointers, which would double the event
+  volume).
+- **Aggressive callback-side filter**: 18 wallet/credential
+  path substrings (`\user data\`, `\local extension settings\`,
+  `\exodus\`, `\electrum\wallets\`, `\bitcoin\wallet.dat`,
+  `\discord\local storage\leveldb`, `\telegram desktop\tdata\`,
+  Minecraft session files, etc.). 99%+ of file opens drop
+  here before any expensive work.
+- **`WalletHarvestDetector`** counts distinct canonical store
+  keys per PID. Canonical keys (`chromium:login-data`,
+  `discord:leveldb`, `ext-wallet:metamask`, ...) collapse
+  Chrome/Edge/Brave/Opera Login Data into one slot so the
+  stealer can't game the threshold by reading every browser
+  fork. Emits `WalletHarvestBurst` on >=3 distinct stores
+  within 10s. One-shot per PID — after firing, the PID is
+  marked and further reads silenced.
+- **Privacy invariant** (test-enforced): full paths never
+  appear in any diagnostics surface. Diagnostics carry only
+  canonical key strings.
+
+#### EtherHiding HTTP intake (Wave 7)
+
+- **`weedhack_http_intake`** ships the full orchestration
+  pipeline for detecting Java-originated Ethereum RPC POSTs
+  containing the WeedHack `getRPCUrl()` selector
+  (`0xce6d41de`). Aggressive filter: Java lineage gate, JSON-
+  RPC body shape check, selector match, 60s `(pid, selector)`
+  dedup. 4 KiB body cap.
+- **Honest dormancy**. The Microsoft-Windows-WinHTTP and
+  WinINet ETW providers expose URLs and methods but **not**
+  request bodies for HTTPS traffic — by design. v0.1.10 ships
+  the Rust pipeline ready to consume events from any source
+  that can supply bodies; the `body_unavailable` counter
+  advances when a source observes a Java→Eth-RPC POST it
+  cannot inspect, surfacing the coverage gap to operators
+  rather than faking detection.
+- **Public ingestion API** `PlmMonitor::ingest_http_post()`
+  is the single entry point any future source calls (Java
+  JNI agent, Detours hook, PowerShell harness, test
+  fixtures).
+- **Privacy invariant** (test-enforced): no body, no URL,
+  no wallet address, no token ever appears in diagnostics
+  or finding narratives.
+
+### Diagnostics + UI
+
+- **`runtime.status.weedhack_campaigns`** new top-level
+  block. Surfaces `active`, `confirmed_total`, `high_confidence_
+  total`, `suspicious_total`, `last_confirmed_unix`,
+  `recent_findings[]` (ring buffer, 16 entries), plus
+  per-pump sub-blocks: `image_load_filter`, `image_load_etw`
+  (incl. `signer` sub-block), `fileio_etw`, `http_intake`.
+- **`diagnostics.export`** mirrors the same block for
+  offline analysis.
+- **`health`** (public, no auth) gains two lightweight
+  integers: `weedhack_active` and `weedhack_last_confirmed_
+  unix` — under the 512-byte policy cap.
+- **Intelligence page UI** gains a WeedHack Campaigns panel.
+  Hidden when no data. Tier badges colour-coded: Suspicious
+  neutral, HighConfidence amber, **Confirmed red**. Per-
+  finding row shows root image, signal count, top-2 signal
+  labels truncated, last-seen timestamp. i18n in en/es/fr/de.
+- **`scripts/collect-weedhack-runtime-diagnostics.ps1`**.
+  PowerShell tool for capturing a sanitized JSON snapshot
+  from a running daemon. Auto-discovers IPC secret from
+  `ProgramData` or repo `runtime/state/`. Defense-in-depth
+  scrubber removes paths/URLs/bodies/command-lines/narratives
+  by field name and by content shape — counters and canonical
+  keys preserved.
+- **`docs/WEEDHACK_LIVE_VALIDATION.md`** operator runbook.
+  Phase-by-phase procedure for admin/non-admin behaviour
+  validation, 30-60 min baseline acceptance criteria,
+  synthetic-positive injection recipe, FP tuning workflow
+  (with one-PR-per-FP regression-test discipline), residual-
+  risk inventory.
+
+### Constraints honored across the WeedHack stack
+
+- **No bypass of `ConvergenceLedger`**. Every signal — static,
+  ETW-driven, or campaign-tier — flows through the existing
+  finding-emission pathway. No second verdict path exists.
+- **No auto-quarantine on ETW-only signals**. Suspicious tier
+  maps to Medium severity / weight 10 in `Layer::Context`
+  → LowSuspicion verdict floor — operator-surfaced only.
+  Confirmed tier requires 3 distinct signals OR
+  pathognomonic + corroborator.
+- **No detector behaviour change between waves**. A
+  regression test (`integration_no_detector_behavior_
+  regression`) asserts `weedhack_runtime::evaluate_chain`
+  output is identical before and after the campaign tracker
+  drives. Verified across all 8 waves.
+
+### Numbers
+
+- 870 tests across the workspace (was 312 at v0.1.9 entry),
+  including 457 in sentinelld alone (was 312). 14 new
+  weedhack-specific modules under `plm/`. 14 new GUI i18n
+  keys across 4 locales.
+- Static synthetic corpus: Stage 1/2/3 WeedHack JAR samples
+  score Malicious purely from the JAR + IOC layers, before
+  any runtime evidence accumulates.
+- Memory footprint: campaign tracker capped at 16 KiB,
+  ImageLoad dedup at 150 KiB, FileIO detector at 256 PIDs.
+- Privacy invariants tested at the diagnostics-output layer
+  (`full_body_never_appears_in_diagnostics`,
+  `full_url_never_appears_in_diagnostics`,
+  `full_path_never_appears_in_diagnostics`).
+
+### Honest limitations
+
+- **WinHTTP/WinINet body capture is dormant**. The providers
+  exist but do not surface HTTPS request bodies — by design.
+  The EtherHiding pipeline is wired but produces signals
+  only when an upstream source (future Java JNI agent or
+  user-mode hook) supplies bodies. Operators see this gap
+  as `http_intake.body_unavailable` counter advancing on
+  every Java→Eth-RPC POST when a body source is connected.
+- **Live 30-60 minute baseline numbers** must be captured
+  by the operator following the runbook —
+  `cargo test` exercises every code path but cannot
+  measure real-world CPU/memory/event-volume.
+- **No Java JNI agent and no Detours hook ship in this
+  release**. The architectural decision was to lock down
+  the defensive surface (detectors, tracker, diagnostics,
+  privacy) and ship — instrumentation surfaces are a future
+  release.
+
 ## [0.1.9] - 2026-05-30
 
 Security + correctness release. Closes a real privilege-

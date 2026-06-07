@@ -42,6 +42,12 @@ pub struct ArgusConfig {
 
     /// Enable file deception detection (extension tricks, RTLO, etc.).
     pub file_deception: bool,
+
+    /// Enable JAR / Java-archive structural analysis (WeedHack family etc.).
+    pub jar_analysis: bool,
+
+    /// Enable PDF structural / action / JavaScript analysis (malicious-pdf family etc.).
+    pub pdf_analysis: bool,
 }
 
 impl Default for ArgusConfig {
@@ -54,6 +60,8 @@ impl Default for ArgusConfig {
             pattern_detection: true,
             mime_validation: true,
             file_deception: true,
+            jar_analysis: true,
+            pdf_analysis: true,
         }
     }
 }
@@ -142,6 +150,8 @@ impl ArgusEngine {
             self.config.script_analysis,
             self.config.pattern_detection,
             self.config.file_deception,
+            self.config.jar_analysis,
+            self.config.pdf_analysis,
             true,           // IOC (always active)
             yara_count > 0, // YARA (active if rules loaded)
         ]
@@ -377,6 +387,20 @@ impl ArgusEngine {
             if is_script {
                 findings.extend(layers::script::analyze(&path_str, &data));
             }
+        }
+
+        // Layer: JAR / Java-archive structural analysis (WeedHack family etc.).
+        // Layer routes itself: returns empty findings if `data` isn't a ZIP or
+        // if the ZIP doesn't look like a Java archive (no manifest, no .class).
+        if self.config.jar_analysis {
+            findings.extend(layers::jar::analyze(&path_str, &data));
+        }
+
+        // Layer: PDF structural / action / JavaScript analysis (malicious-pdf
+        // family, etc.). Layer routes itself via the `%PDF-` header check;
+        // returns empty findings on non-PDF input or on unparseable PDFs.
+        if self.config.pdf_analysis {
+            findings.extend(layers::pdf::analyze(&path_str, &data));
         }
 
         // Layer: Pattern detection (works on raw bytes).
@@ -623,6 +647,14 @@ impl ArgusEngine {
 
         if self.config.script_analysis {
             findings.extend(layers::script::analyze(name, data));
+        }
+
+        if self.config.jar_analysis {
+            findings.extend(layers::jar::analyze(name, data));
+        }
+
+        if self.config.pdf_analysis {
+            findings.extend(layers::pdf::analyze(name, data));
         }
 
         if self.config.pattern_detection {

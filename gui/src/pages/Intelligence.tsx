@@ -36,6 +36,15 @@ export function IntelligencePage() {
   const ps = ri?.powershell;
   const eco = (ri as any)?.ecosystem;
   const drifts = ts?.recent_drift_events ?? [];
+  const wh = ri?.weedhack_campaigns;
+  // Hide WeedHack panel entirely when there's nothing to say — keeps the
+  // page calm. Show only if there's a live campaign, recorded history,
+  // or a past confirmed event.
+  const whHasData =
+    !!wh &&
+    (wh.active > 0 ||
+      (wh.recent_findings?.length ?? 0) > 0 ||
+      wh.last_confirmed_unix > 0);
 
   return (
     <div className="page-stack">
@@ -136,6 +145,80 @@ export function IntelligencePage() {
               <EcosystemCard key={i} eco={e} />
             ))}
           </div>
+        </Card>
+      )}
+
+      {/* WeedHack campaigns panel — hidden when no data; calm by default */}
+      {whHasData && wh && (
+        <Card>
+          <SectionHead icon={<GitBranch size={14} />} title={t("intel.weedhack.title")} />
+          <p className="text-[10px] text-[rgb(var(--t3))]/60 mt-1">
+            {t("intel.weedhack.description")}
+          </p>
+          <div className="grid grid-cols-4 gap-4 mt-3">
+            <Stat
+              label={t("intel.weedhack.active")}
+              value={wh.active}
+              color={wh.active > 0 ? "amber" : undefined}
+            />
+            <Stat label={t("intel.weedhack.capacity")} value={wh.max_campaigns} />
+            <Stat
+              label={t("intel.weedhack.confirmed")}
+              value={wh.confirmed_total}
+              color={wh.confirmed_total > 0 ? "red" : undefined}
+            />
+            <Stat
+              label={t("intel.weedhack.highConfidence")}
+              value={wh.high_confidence_total}
+              color={wh.high_confidence_total > 0 ? "amber" : undefined}
+            />
+          </div>
+          {wh.last_confirmed_unix > 0 && (
+            <p className="text-[10px] text-[rgb(var(--red))]/70 mt-3">
+              {t("intel.weedhack.lastConfirmed")}: {new Date(wh.last_confirmed_unix * 1000).toLocaleString()}
+            </p>
+          )}
+          {(wh.recent_findings?.length ?? 0) > 0 && (
+            <div className="space-y-2 mt-4">
+              {wh.recent_findings
+                .slice()
+                .reverse()
+                .slice(0, 8)
+                .map((f, i) => (
+                  <div
+                    key={`${f.root_pid}-${f.last_seen_unix}-${i}`}
+                    className="flex items-start gap-3 py-2 px-3 rounded-lg bg-[rgb(var(--raised))]/10"
+                  >
+                    <WeedHackTierBadge tier={f.tier} />
+                    <div className="min-w-0 flex-1">
+                      <p className="text-[11px] text-[rgb(var(--t1))]">
+                        {f.root_image ?? "pid:" + f.root_pid}
+                        <span className="text-[10px] text-[rgb(var(--t3))]/50 ml-2">
+                          ({f.signal_count}{" "}
+                          {f.signal_count === 1
+                            ? t("intel.weedhack.signalsLabel")
+                            : t("intel.weedhack.signalsLabelPlural")}
+                          )
+                        </span>
+                      </p>
+                      <p
+                        className="text-[10px] text-[rgb(var(--t3))]/60 mt-0.5 truncate"
+                        title={f.signals.join(" | ")}
+                      >
+                        {f.signals.slice(0, 2).join(" | ")}
+                        {f.signals.length > 2 && " · …"}
+                      </p>
+                    </div>
+                    <span className="text-[9px] text-[rgb(var(--t3))]/40 flex-shrink-0">
+                      {new Date(f.last_seen_unix * 1000).toLocaleTimeString()}
+                    </span>
+                  </div>
+                ))}
+            </div>
+          )}
+          {wh.active === 0 && (wh.recent_findings?.length ?? 0) === 0 && (
+            <EmptyState message={t("intel.weedhack.noData")} />
+          )}
         </Card>
       )}
 
@@ -325,6 +408,29 @@ function SeverityBadge({ severity }: { severity: string }) {
       style={{ color: `rgb(${c})`, background: `rgb(${c} / 0.1)` }}
     >
       {severity}
+    </span>
+  );
+}
+
+function WeedHackTierBadge({
+  tier,
+}: {
+  tier: "suspicious" | "high_confidence" | "confirmed";
+}) {
+  // Red only on Confirmed — Suspicious and HighConfidence stay calm so the
+  // panel doesn't fire alarms on observe-only signals.
+  const styling: Record<typeof tier, { color: string; label: string }> = {
+    suspicious: { color: "var(--t2)", label: "Suspicious" },
+    high_confidence: { color: "var(--amber)", label: "High Conf." },
+    confirmed: { color: "var(--red)", label: "Confirmed" },
+  };
+  const s = styling[tier];
+  return (
+    <span
+      className="text-[9px] font-bold px-2 py-0.5 rounded-full flex-shrink-0 whitespace-nowrap"
+      style={{ color: `rgb(${s.color})`, background: `rgb(${s.color} / 0.1)` }}
+    >
+      {s.label}
     </span>
   );
 }

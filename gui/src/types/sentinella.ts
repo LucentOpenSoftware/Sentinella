@@ -288,6 +288,29 @@ export interface RuntimeIntelligenceStatus {
     enabled: boolean;
     note?: string;
   };
+  weedhack_campaigns?: WeedHackCampaignsStatus;
+}
+
+export interface WeedHackCampaignFinding {
+  tier: "suspicious" | "high_confidence" | "confirmed";
+  root_pid: number;
+  root_image: string | null;
+  signal_count: number;
+  signals: string[];
+  narrative: string;
+  first_seen_unix: number;
+  last_seen_unix: number;
+}
+
+export interface WeedHackCampaignsStatus {
+  active: number;
+  max_campaigns: number;
+  expired: number;
+  confirmed_total: number;
+  high_confidence_total: number;
+  suspicious_total: number;
+  last_confirmed_unix: number;
+  recent_findings: WeedHackCampaignFinding[];
 }
 
 export interface RuntimeRecentEvent {

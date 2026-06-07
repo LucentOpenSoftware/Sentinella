@@ -4477,12 +4477,31 @@ impl AppState {
             .as_ref()
             .map(|tg| tg.diagnostics())
             .unwrap_or(serde_json::json!({"enabled": false}));
+        // WeedHack campaign correlator diagnostics. Hidden block when the
+        // PLM monitor isn't running. The UI hides the panel further when
+        // `active==0 && recent_findings empty && last_confirmed_unix==0`.
+        let weedhack_diag = if let Some(ref plm) = self.plm {
+            plm.weedhack_diagnostics_json()
+        } else {
+            serde_json::json!({
+                "active": 0,
+                "max_campaigns": 0,
+                "expired": 0,
+                "confirmed_total": 0,
+                "high_confidence_total": 0,
+                "suspicious_total": 0,
+                "last_confirmed_unix": 0,
+                "recent_findings": [],
+            })
+        };
+
         serde_json::json!({
             "plm": plm_diag,
             "powershell": ps_diag,
             "trust_graph": trust_diag,
             "ecosystem": self.ecosystem.diagnostics(),
             "amsi": {"enabled": false, "note": "AMSI provider not yet registered"},
+            "weedhack_campaigns": weedhack_diag,
         })
     }
 
@@ -5424,6 +5443,14 @@ fn folder_scan_worker_inner(
                     if let Some(chain) = plm.query_by_image_path(file) {
                         if let Some(finding) = crate::plm::lineage_finding(&chain) {
                             ledger.add_evidence("PLM", finding);
+                        }
+                        // WeedHack campaign tracker — opt-in correlation
+                        // through ConvergenceLedger; Suspicious is observe-only,
+                        // tier dedupe avoids repeat-scan spam.
+                        if let Some(leaf) = chain.nodes.last() {
+                            for f in plm.observe_chain_for_weedhack(leaf.pid) {
+                                ledger.add_evidence("WeedHack", f);
+                            }
                         }
                     }
                 }

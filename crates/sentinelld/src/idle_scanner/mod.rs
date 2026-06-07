@@ -710,6 +710,14 @@ fn idle_scanner_loop(
                         if let Some(finding) = crate::plm::lineage_finding(&chain) {
                             ledger.add_evidence("PLM", finding);
                         }
+                        // WeedHack campaign correlation. Dedupe-by-tier means
+                        // re-scanning during the same chain's lifetime is
+                        // safe — only tier advancements create new evidence.
+                        if let Some(leaf) = chain.nodes.last() {
+                            for f in plm.observe_chain_for_weedhack(leaf.pid) {
+                                ledger.add_evidence("WeedHack", f);
+                            }
+                        }
                     }
                 }
 

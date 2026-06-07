@@ -18,6 +18,17 @@
 
 #[cfg(target_os = "windows")]
 pub mod etw_intake;
+pub mod etw_file_io;
+pub mod etw_image_load;
+pub mod weedhack_browser_injection;
+pub mod weedhack_campaign;
+pub mod weedhack_etherhiding;
+pub mod weedhack_etw_adapters;
+pub mod weedhack_http_intake;
+pub mod weedhack_image_load;
+pub mod weedhack_runtime;
+pub mod weedhack_wallet_harvest;
+pub mod wintrust_verifier;
 
 use serde::Serialize;
 use std::collections::HashMap;
@@ -162,6 +173,18 @@ impl LineageGraph {
         self.nodes.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
+    /// Look up a single process node by PID. Returns a clone so the
+    /// caller never holds the internal lock. Used by the WeedHack
+    /// campaign integration to resolve a campaign-root PID back to its
+    /// image name for diagnostics.
+    pub fn get_node(&self, pid: u32) -> Option<ProcessNode> {
+        self.nodes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&pid)
+            .cloned()
+    }
+
     /// Evict expired nodes.
     pub fn evict_expired(&self) {
         let mut map = self.nodes.lock().unwrap_or_else(|e| e.into_inner());
@@ -172,9 +195,19 @@ impl LineageGraph {
 
 /// Compute suspicion score for a process chain.
 /// LOLBin chains and Office macro chains get high scores.
+///
+/// Generic-chain weight is capped at 30 (convergence contribution, not a
+/// standalone verdict). Family-specific runtime signals (WeedHack) are
+/// ADDED on top of that base — they represent confirmed family attribution
+/// at runtime, equivalent to an IOC hit, and are NOT subject to the 30 cap.
+/// The combined score is hard-capped at 100 to align with the verdict scale.
 fn compute_chain_suspicion(chain: &[ProcessNode]) -> u32 {
+    // WeedHack signals can fire on a single node (e.g. Pjibf.exe running by
+    // itself) so evaluate them first, independent of chain depth.
+    let weedhack = weedhack_runtime::chain_score(chain);
+
     if chain.len() <= 1 {
-        return 0;
+        return weedhack.min(100);
     }
 
     let mut suspicion: u32 = 0;
@@ -191,8 +224,8 @@ fn compute_chain_suspicion(chain: &[ProcessNode]) -> u32 {
         suspicion += 5;
     }
 
-    // Cap at 30 (convergence contribution, not standalone verdict).
-    suspicion.min(30)
+    let base = suspicion.min(30);
+    base.saturating_add(weedhack).min(100)
 }
 
 /// Weight for a specific parent→child transition.
@@ -293,9 +326,35 @@ fn describe_chain(chain: &[ProcessNode]) -> String {
 }
 
 /// Create an ARGUS finding from process lineage analysis.
+///
+/// When WeedHack runtime signals fire, the finding is routed to
+/// `Layer::IocCorrelation` (uncapped) at `Critical` severity and the
+/// description names the specific signals — sysadmins reading the
+/// quarantine report see exactly which behaviour triggered the kill,
+/// not just "chain looked weird".
+///
+/// Without WeedHack signals the existing generic-chain semantics are
+/// preserved: routed to `Layer::Context` (cap 15) with tiered severity.
 pub fn lineage_finding(chain: &ProcessChain) -> Option<argus::Finding> {
     if chain.chain_suspicion == 0 {
         return None;
+    }
+
+    let weedhack_hits = weedhack_runtime::evaluate_chain(&chain.nodes);
+
+    if !weedhack_hits.is_empty() {
+        return Some(argus::Finding {
+            layer: argus::verdict::Layer::IocCorrelation,
+            severity: argus::verdict::Severity::Critical,
+            weight: chain.chain_suspicion,
+            description: format!(
+                "WeedHack runtime detection in process lineage (depth {}): {} — {}",
+                chain.depth,
+                chain.description,
+                weedhack_runtime::describe_signals(&weedhack_hits),
+            ),
+            technical_detail: Some(serde_json::to_string(chain).unwrap_or_default()),
+        });
     }
 
     let severity = if chain.chain_suspicion >= 15 {
@@ -370,6 +429,39 @@ pub struct PlmMonitor {
     pub graph: Arc<LineageGraph>,
     pub diagnostics: Arc<PlmDiagnostics>,
     pub mode: PlmMode,
+    /// WeedHack campaign correlator. Stays bounded by `MAX_CAMPAIGNS`,
+    /// evicted alongside the lineage graph by the maintenance loop.
+    pub weedhack_tracker: Arc<weedhack_campaign::WeedHackCampaignTracker>,
+    /// Diagnostics for the campaign subsystem (atomic counters + ring
+    /// buffer of recent findings). Exposed in the daemon's status JSON.
+    pub weedhack_diagnostics: Arc<weedhack_campaign::WeedHackCampaignDiagnostics>,
+    /// Wave 3 — ImageLoad ETW filter. Orchestration layer between the
+    /// Windows ETW callback (when implemented) and the canonical
+    /// `weedhack_browser_injection` detector. Always present; the
+    /// Windows-only ETW provider source feeds it when running.
+    pub weedhack_image_load_filter: Arc<weedhack_image_load::BrowserImageLoadFilter>,
+    /// Wave 4 — ImageLoad kernel ETW pump diagnostics. Counters track the
+    /// kernel-side hot path (events seen, parse errors, forwards, drops).
+    /// Surfaced under `image_load_etw` in the campaign diagnostics JSON.
+    pub image_load_etw_diagnostics: Arc<etw_image_load::ImageLoadEtwDiagnostics>,
+    /// Wave 5 — WinTrust-backed signer verifier. Replaces the Wave 3
+    /// NullSignerVerifier with a real Authenticode chain check (via
+    /// argus). Diagnostics counters surfaced under
+    /// `image_load_etw.signer`.
+    pub weedhack_signer_verifier: Arc<wintrust_verifier::WinTrustModuleSignerVerifier>,
+    /// Wave 6 — WalletHarvestDetector that the FileIO ETW worker feeds.
+    /// Shared via Arc; per-PID state and threshold/dedup live inside.
+    pub weedhack_wallet_detector: Arc<weedhack_wallet_harvest::WalletHarvestDetector>,
+    /// Wave 6 — FileIO ETW pump diagnostics. Counters surface under
+    /// `fileio_etw` in the campaign diagnostics JSON.
+    pub file_io_etw_diagnostics: Arc<etw_file_io::FileIoEtwDiagnostics>,
+    /// Wave 7 — HTTP intake diagnostics. Counters surface under
+    /// `http_intake` in the campaign diagnostics JSON. The actual
+    /// WinHTTP / WinINet ETW listener is intentionally NOT shipped —
+    /// see weedhack_http_intake module docs for the body-visibility
+    /// reasoning. The pipeline is reachable via
+    /// `PlmMonitor::ingest_http_post()`.
+    pub http_intake_diagnostics: Arc<weedhack_http_intake::HttpIntakeDiagnostics>,
     running: Arc<AtomicBool>,
     _snapshot_thread: Option<std::thread::JoinHandle<()>>,
     #[cfg(target_os = "windows")]
@@ -384,6 +476,65 @@ impl PlmMonitor {
         let graph = Arc::new(LineageGraph::new());
         let diagnostics = Arc::new(PlmDiagnostics::new());
         let running = Arc::new(AtomicBool::new(true));
+
+        // WeedHack campaign correlator — backed by a resolver wrapping
+        // the lineage graph above.
+        let resolver: Arc<dyn weedhack_campaign::LineageResolver> = Arc::new(
+            weedhack_campaign::LineageGraphResolver::new(Arc::clone(&graph)),
+        );
+        let weedhack_tracker = Arc::new(
+            weedhack_campaign::WeedHackCampaignTracker::new(resolver),
+        );
+        let weedhack_diagnostics =
+            Arc::new(weedhack_campaign::WeedHackCampaignDiagnostics::new());
+        let weedhack_image_load_filter =
+            Arc::new(weedhack_image_load::BrowserImageLoadFilter::new());
+
+        // Wave 5: WinTrust-backed signer verifier. The Arc<dyn> object
+        // hands to the worker thread; the strongly-typed Arc on
+        // PlmMonitor is kept so diagnostics can be surfaced.
+        let weedhack_signer_verifier =
+            Arc::new(wintrust_verifier::WinTrustModuleSignerVerifier::new());
+        let signer_verifier_dyn: Arc<dyn weedhack_image_load::ModuleSignerVerifier> =
+            Arc::clone(&weedhack_signer_verifier)
+                as Arc<dyn weedhack_image_load::ModuleSignerVerifier>;
+
+        // Wave 4: start the ImageLoad ETW worker thread. The worker is
+        // OS-agnostic — on Windows it receives events from the kernel
+        // pump; on other platforms it idles (no events ever arrive).
+        let (image_load_etw_diagnostics, _image_load_thread) =
+            etw_image_load::start_image_load_worker(
+                Arc::clone(&weedhack_image_load_filter),
+                Arc::clone(&weedhack_tracker),
+                Arc::clone(&weedhack_diagnostics),
+                Arc::clone(&graph),
+                Arc::clone(&running),
+                signer_verifier_dyn,
+            );
+
+        // Wave 6: WalletHarvestDetector + FileIO ETW worker. The detector
+        // lives on PlmMonitor so it's reachable from non-ETW callers
+        // (e.g. tests, future tools); the worker feeds it from the
+        // bounded channel attached to the shared SentinellaPLM session.
+        let weedhack_wallet_detector =
+            Arc::new(weedhack_wallet_harvest::WalletHarvestDetector::new());
+        let (file_io_etw_diagnostics, _file_io_thread) = etw_file_io::start_file_io_worker(
+            Arc::clone(&weedhack_wallet_detector),
+            Arc::clone(&weedhack_tracker),
+            Arc::clone(&weedhack_diagnostics),
+            Arc::clone(&graph),
+            Arc::clone(&running),
+        );
+
+        // Wave 7: HTTP intake worker. Spawned ready-to-receive; the
+        // public ingest entry point is PlmMonitor::ingest_http_post().
+        let (http_intake_diagnostics, _http_dedup, _http_thread) =
+            weedhack_http_intake::start_http_intake_worker(
+                Arc::clone(&weedhack_tracker),
+                Arc::clone(&weedhack_diagnostics),
+                Arc::clone(&graph),
+                Arc::clone(&running),
+            );
 
         // Try ETW first (requires admin).
         #[cfg(target_os = "windows")]
@@ -421,11 +572,13 @@ impl PlmMonitor {
         let d = Arc::clone(&diagnostics);
         let r = Arc::clone(&running);
         let si = Arc::clone(&snapshot_interval);
+        let wh_tracker = Arc::clone(&weedhack_tracker);
+        let wh_diag = Arc::clone(&weedhack_diagnostics);
 
         let snapshot_thread = std::thread::Builder::new()
             .name("plm-snapshot".into())
             .spawn(move || {
-                plm_loop(g, d, r, si);
+                plm_loop(g, d, r, si, wh_tracker, wh_diag);
             })
             .ok();
 
@@ -462,6 +615,14 @@ impl PlmMonitor {
             graph,
             diagnostics,
             mode,
+            weedhack_tracker,
+            weedhack_diagnostics,
+            weedhack_image_load_filter,
+            image_load_etw_diagnostics,
+            weedhack_signer_verifier,
+            weedhack_wallet_detector,
+            file_io_etw_diagnostics,
+            http_intake_diagnostics,
             running,
             _snapshot_thread: snapshot_thread,
             #[cfg(target_os = "windows")]
@@ -469,6 +630,174 @@ impl PlmMonitor {
             #[cfg(target_os = "windows")]
             etw_diagnostics: etw_diag,
         }
+    }
+
+    // ── WeedHack campaign integration (Phase 3) ─────────────────────
+
+    /// Ingest one WeedHack runtime signal for `emitting_pid`. Returns
+    /// an `argus::Finding` ONLY when the campaign's confidence tier
+    /// advances — never when a signal is a no-op duplicate or doesn't
+    /// move the needle.
+    ///
+    /// Suspicious tier maps to Layer::Context / Medium / weight 10 →
+    /// observe-only, will not push verdict to Malicious by itself.
+    /// HighConfidence is Layer::Context / High / weight 20 → capped at
+    /// 15 by the layer, still needs corroboration. Confirmed routes to
+    /// the uncapped Layer::IocCorrelation / Critical with the cumulative
+    /// campaign score, eligible for the existing quarantine pipeline via
+    /// the ConvergenceLedger.
+    pub fn ingest_weedhack_signal(
+        &self,
+        emitting_pid: u32,
+        signal: weedhack_runtime::WeedHackSignal,
+    ) -> Option<argus::Finding> {
+        let finding = self.weedhack_tracker.ingest_signal(emitting_pid, signal)?;
+        let root_image = self
+            .graph
+            .get_node(finding.root.pid)
+            .map(|n| n.image_name);
+        let now_unix = chrono::Utc::now().timestamp();
+        self.weedhack_diagnostics
+            .record(&finding, root_image.clone(), now_unix);
+        self.weedhack_diagnostics
+            .note_active(self.weedhack_tracker.active_campaign_count());
+        Some(finding.to_argus_finding(root_image))
+    }
+
+    /// Evaluate the lineage chain ending at `leaf_pid` for WeedHack
+    /// runtime signals and feed each one through the campaign tracker.
+    /// Returns the campaign-tier ARGUS findings emitted (if any) — one
+    /// per tier advancement during this call.
+    ///
+    /// This is OPT-IN: callers explicitly ask for campaign observation
+    /// when they think a scanned file lives under a process tree worth
+    /// correlating. Existing `lineage_finding()` behaviour is unchanged.
+    pub fn observe_chain_for_weedhack(&self, leaf_pid: u32) -> Vec<argus::Finding> {
+        let chain = self.graph.get_chain(leaf_pid);
+        let signals = weedhack_runtime::evaluate_chain(&chain.nodes);
+        let mut out = Vec::new();
+        for sig in signals {
+            if let Some(f) = self.ingest_weedhack_signal(leaf_pid, sig) {
+                out.push(f);
+            }
+        }
+        out
+    }
+
+    /// Serialize the WeedHack campaign subsystem's diagnostics view.
+    /// Includes the ImageLoad filter counters under `image_load_filter`
+    /// and the kernel ETW pump counters under `image_load_etw`. PLM
+    /// session lifecycle (running/access_denied/gave_up/reconnects) is
+    /// mirrored from `etw_diagnostics` into the ETW block — these
+    /// describe the SHARED session that drives both PLM and ImageLoad.
+    pub fn weedhack_diagnostics_json(&self) -> serde_json::Value {
+        let mut base = self
+            .weedhack_diagnostics
+            .to_json(self.weedhack_tracker.active_campaign_count());
+
+        // Reflect shared-session state into BOTH ImageLoad and FileIO ETW
+        // diagnostics — they share the SentinellaPLM session, so a single
+        // PLM ETW health value drives both views.
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(ref etw) = self.etw_diagnostics {
+                use std::sync::atomic::Ordering;
+                let running = etw.etw_running.load(Ordering::Relaxed);
+                let gave_up = etw.etw_gave_up.load(Ordering::Relaxed);
+                let reconnects = etw.reconnects.load(Ordering::Relaxed);
+
+                self.image_load_etw_diagnostics
+                    .running
+                    .store(running, Ordering::Relaxed);
+                self.image_load_etw_diagnostics
+                    .access_denied
+                    .store(gave_up, Ordering::Relaxed);
+                self.image_load_etw_diagnostics
+                    .gave_up
+                    .store(gave_up, Ordering::Relaxed);
+                self.image_load_etw_diagnostics
+                    .reconnects
+                    .store(reconnects, Ordering::Relaxed);
+
+                self.file_io_etw_diagnostics
+                    .running
+                    .store(running, Ordering::Relaxed);
+                self.file_io_etw_diagnostics
+                    .access_denied
+                    .store(gave_up, Ordering::Relaxed);
+                self.file_io_etw_diagnostics
+                    .gave_up
+                    .store(gave_up, Ordering::Relaxed);
+                self.file_io_etw_diagnostics
+                    .reconnects
+                    .store(reconnects, Ordering::Relaxed);
+            }
+        }
+
+        if let Some(obj) = base.as_object_mut() {
+            obj.insert(
+                "image_load_filter".into(),
+                self.weedhack_image_load_filter.diagnostics_json(),
+            );
+            // image_load_etw now carries the signer sub-block per Wave 5 spec.
+            let mut etw_json = self.image_load_etw_diagnostics.to_json();
+            if let Some(etw_obj) = etw_json.as_object_mut() {
+                etw_obj.insert(
+                    "signer".into(),
+                    self.weedhack_signer_verifier.diagnostics_json(),
+                );
+            }
+            obj.insert("image_load_etw".into(), etw_json);
+
+            // Wave 6: FileIO pump diagnostics, sibling block to image_load_etw.
+            obj.insert(
+                "fileio_etw".into(),
+                self.file_io_etw_diagnostics.to_json(),
+            );
+
+            // Wave 7: HTTP intake diagnostics. Body capture is dormant
+            // by design (see weedhack_http_intake docs) — the counters
+            // show exactly what the pipeline could see.
+            obj.insert(
+                "http_intake".into(),
+                self.http_intake_diagnostics.to_json(),
+            );
+        }
+        base
+    }
+
+    /// Wave 7 public ingestion entry point. Any source that can supply
+    /// HTTP request data — current and future — calls this to feed the
+    /// EtherHiding detection pipeline. The path is a no-op when the
+    /// worker hasn't been started.
+    pub fn ingest_http_post(
+        &self,
+        event: weedhack_http_intake::HttpPostRawEvent,
+    ) -> Result<(), ()> {
+        weedhack_http_intake::ingest(event)
+    }
+
+    /// Ingest a raw ImageLoad event from the Windows ETW provider.
+    /// Returns `Some(argus::Finding)` ONLY when the canonical detector
+    /// emits AND the campaign tracker's tier advances. Otherwise the
+    /// caller (ETW thread) simply discards `None` and the next scan-site
+    /// hook surfaces accumulated state when it runs.
+    ///
+    /// Production lineage / signer probes are built from the PLM
+    /// LineageGraph + NullSignerVerifier. Tests can call the underlying
+    /// `weedhack_image_load_filter.process_event` directly with mocks.
+    pub fn ingest_image_load(
+        &self,
+        event: weedhack_image_load::ImageLoadRawEvent,
+    ) -> Option<argus::Finding> {
+        // The lineage checker is built per-call to capture the graph's
+        // current Arc — cheap; the inner graph lookup is the only work.
+        let lineage = weedhack_image_load::LineageGraphJavaChecker::new(Arc::clone(&self.graph));
+        let verifier = weedhack_image_load::NullSignerVerifier;
+        let signal = self
+            .weedhack_image_load_filter
+            .process_event(event.clone(), &verifier, &lineage)?;
+        self.ingest_weedhack_signal(event.target_pid, signal)
     }
 
     /// Query lineage for a file path — find recent processes matching this image.
@@ -517,6 +846,8 @@ fn plm_loop(
     diagnostics: Arc<PlmDiagnostics>,
     running: Arc<AtomicBool>,
     interval: Arc<AtomicU64>,
+    weedhack_tracker: Arc<weedhack_campaign::WeedHackCampaignTracker>,
+    weedhack_diagnostics: Arc<weedhack_campaign::WeedHackCampaignDiagnostics>,
 ) {
     let initial = interval.load(Ordering::Relaxed);
     tracing::info!("PLM monitor started (interval={}s)", initial);
@@ -533,8 +864,11 @@ fn plm_loop(
 
         snapshot_processes(&graph, &diagnostics);
 
-        // Periodic eviction.
+        // Periodic eviction of stale lineage nodes and stale campaigns.
         graph.evict_expired();
+        let evicted = weedhack_tracker.evict_expired();
+        weedhack_diagnostics.note_evicted(evicted);
+        weedhack_diagnostics.note_active(weedhack_tracker.active_campaign_count());
     }
 
     tracing::info!("PLM monitor stopped");
@@ -756,5 +1090,500 @@ mod tests {
         }
         // Graph should be roughly MAX_NODES (eviction may not remove fresh nodes).
         assert!(graph.node_count() <= MAX_NODES + 200);
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    //  Phase 6 — Integration tests
+    //
+    //  Build a PlmMonitor-shaped subsystem without starting threads
+    //  (we test the ingestion + diagnostics + finding-mapping path,
+    //  not the snapshot loop). The thread loop is exercised by the
+    //  existing PLM tests; here we focus on the campaign wiring.
+    // ──────────────────────────────────────────────────────────────
+
+    use crate::plm::weedhack_campaign::{
+        LineageGraphResolver, LineageResolver, WeedHackCampaignDiagnostics,
+        WeedHackCampaignTracker,
+    };
+    use crate::plm::weedhack_runtime::WeedHackSignal;
+
+    /// Mini test harness mirroring PlmMonitor's WeedHack wiring without
+    /// spawning the snapshot thread.
+    struct TestHarness {
+        graph: Arc<LineageGraph>,
+        tracker: Arc<WeedHackCampaignTracker>,
+        diagnostics: Arc<WeedHackCampaignDiagnostics>,
+    }
+
+    impl TestHarness {
+        fn new() -> Self {
+            let graph = Arc::new(LineageGraph::new());
+            let resolver: Arc<dyn LineageResolver> =
+                Arc::new(LineageGraphResolver::new(Arc::clone(&graph)));
+            Self {
+                tracker: Arc::new(WeedHackCampaignTracker::new(resolver)),
+                diagnostics: Arc::new(WeedHackCampaignDiagnostics::new()),
+                graph,
+            }
+        }
+
+        /// Mirror of PlmMonitor::ingest_weedhack_signal — same logic.
+        fn ingest(
+            &self,
+            pid: u32,
+            sig: WeedHackSignal,
+        ) -> Option<argus::Finding> {
+            let cf = self.tracker.ingest_signal(pid, sig)?;
+            let root_image = self.graph.get_node(cf.root.pid).map(|n| n.image_name);
+            self.diagnostics.record(&cf, root_image.clone(), 1_700_000_000);
+            self.diagnostics
+                .note_active(self.tracker.active_campaign_count());
+            Some(cf.to_argus_finding(root_image))
+        }
+    }
+
+    #[test]
+    fn integration_runtime_signal_flows_into_tracker() {
+        let h = TestHarness::new();
+        h.graph
+            .record_process(make_node(100, 0, "javaw.exe"));
+        h.graph
+            .record_process(make_node(200, 100, "powershell.exe"));
+        // First signal under javaw root: tracker emits Suspicious.
+        let f = h.ingest(200, WeedHackSignal::UnnaturalJavaChild)
+            .expect("Suspicious must emit");
+        assert!(matches!(f.severity, argus::verdict::Severity::Medium));
+        assert!(f.description.contains("Suspicious"));
+        assert!(f.description.contains("image=javaw.exe"));
+    }
+
+    #[test]
+    fn integration_weak_signal_remains_observe_only() {
+        let h = TestHarness::new();
+        h.graph.record_process(make_node(100, 0, "javaw.exe"));
+        let f = h
+            .ingest(100, WeedHackSignal::UnnaturalJavaChild)
+            .unwrap();
+        // weight=10 in Context (cap 15) — verdict will be LowSuspicion.
+        assert_eq!(f.weight, 10);
+        assert!(matches!(f.layer, argus::verdict::Layer::Context));
+        // No re-emission on same-signal repeat.
+        assert!(h.ingest(100, WeedHackSignal::UnnaturalJavaChild).is_none());
+    }
+
+    #[test]
+    fn integration_pathognomonic_plus_corroborator_emits_confirmed() {
+        let h = TestHarness::new();
+        h.graph.record_process(make_node(100, 0, "javaw.exe"));
+        // Pjibf alone → HighConfidence.
+        let f1 = h.ingest(100, WeedHackSignal::Pjibf).unwrap();
+        assert!(matches!(f1.severity, argus::verdict::Severity::High));
+        // Corroborator advances campaign to Confirmed.
+        let f2 = h.ingest(100, WeedHackSignal::UnnaturalJavaChild).unwrap();
+        assert!(matches!(f2.severity, argus::verdict::Severity::Critical));
+        assert!(matches!(f2.layer, argus::verdict::Layer::IocCorrelation));
+        // Weight = cumulative campaign score (uncapped IOC layer).
+        assert!(f2.weight >= 60, "confirmed weight must carry campaign score");
+    }
+
+    #[test]
+    fn integration_repeated_same_signal_dedupes() {
+        let h = TestHarness::new();
+        h.graph.record_process(make_node(100, 0, "javaw.exe"));
+        let _ = h.ingest(100, WeedHackSignal::Pjibf).unwrap();
+        assert!(
+            h.ingest(100, WeedHackSignal::Pjibf).is_none(),
+            "same-signal repeat must not emit"
+        );
+        assert!(
+            h.ingest(100, WeedHackSignal::Pjibf).is_none(),
+            "stays silent on further repeats"
+        );
+    }
+
+    #[test]
+    fn integration_tracker_eviction_works_from_maintenance() {
+        let h = TestHarness::new();
+        h.graph.record_process(make_node(100, 0, "javaw.exe"));
+        // Establish campaign at t0.
+        let t0 = Instant::now();
+        let _ = h
+            .tracker
+            .ingest_signal_at(100, WeedHackSignal::UnnaturalJavaChild, t0);
+        assert_eq!(h.tracker.active_campaign_count(), 1);
+
+        // Simulate maintenance pass 21 minutes later.
+        let t1 = t0 + Duration::from_secs(21 * 60);
+        let evicted = h.tracker.evict_expired_at(t1);
+        h.diagnostics.note_evicted(evicted);
+        h.diagnostics
+            .note_active(h.tracker.active_campaign_count());
+
+        assert_eq!(evicted, 1);
+        assert_eq!(h.tracker.active_campaign_count(), 0);
+        let j = h.diagnostics.to_json(0);
+        assert_eq!(j["expired"], 1);
+        assert_eq!(j["active"], 0);
+    }
+
+    #[test]
+    fn integration_confirmed_finding_maps_to_critical_ioc() {
+        let h = TestHarness::new();
+        h.graph.record_process(make_node(100, 0, "javaw.exe"));
+        // Three distinct signals → Confirmed at the third.
+        let _ = h.ingest(100, WeedHackSignal::UnnaturalJavaChild).unwrap();
+        let _ = h.ingest(100, WeedHackSignal::DefenderDisableUnderJava).unwrap();
+        let f = h
+            .ingest(100, WeedHackSignal::WalletHarvestBurst)
+            .unwrap();
+        assert!(matches!(f.layer, argus::verdict::Layer::IocCorrelation));
+        assert!(matches!(f.severity, argus::verdict::Severity::Critical));
+    }
+
+    #[test]
+    fn integration_diagnostics_payload_shape_matches_spec() {
+        let h = TestHarness::new();
+        h.graph.record_process(make_node(100, 0, "javaw.exe"));
+        h.graph.record_process(make_node(200, 100, "powershell.exe"));
+        let _ = h.ingest(200, WeedHackSignal::UnnaturalJavaChild).unwrap();
+        let _ = h
+            .ingest(200, WeedHackSignal::DefenderDisableUnderJava)
+            .unwrap();
+
+        let j = h
+            .diagnostics
+            .to_json(h.tracker.active_campaign_count());
+        // All required keys present.
+        for key in [
+            "active",
+            "max_campaigns",
+            "expired",
+            "last_confirmed_unix",
+            "recent_findings",
+        ] {
+            assert!(j.get(key).is_some(), "missing diagnostics key: {key}");
+        }
+        let recent = j["recent_findings"].as_array().unwrap();
+        // Two findings recorded (Suspicious → HighConfidence advance).
+        assert_eq!(recent.len(), 2);
+        let last = &recent[1];
+        for key in [
+            "tier",
+            "root_pid",
+            "root_image",
+            "signal_count",
+            "signals",
+            "narrative",
+            "first_seen_unix",
+            "last_seen_unix",
+        ] {
+            assert!(last.get(key).is_some(), "missing record key: {key}");
+        }
+        assert_eq!(last["root_pid"], 100, "campaign root is the javaw ancestor");
+        assert_eq!(last["root_image"], "javaw.exe");
+    }
+
+    #[test]
+    fn integration_scan_site_hook_dedupes_on_repeat() {
+        // Simulate the scan-site pattern from watcher/idle_scanner/scan_buffer:
+        // build a process chain and call `observe_chain_for_weedhack` twice.
+        // The second pass must return no NEW findings — tracker dedupes by
+        // (campaign-root, signal-type) so a re-scan of the same chain doesn't
+        // spam ConvergenceLedger with stale evidence.
+        let harness = TestHarness::new();
+        harness.graph.record_process(make_node(1, 0, "explorer.exe"));
+        harness.graph.record_process(make_node(2, 1, "javaw.exe"));
+        harness.graph.record_process(make_node(3, 2, "schtasks.exe"));
+
+        // Mimic PlmMonitor::observe_chain_for_weedhack inline (we can't
+        // build a PlmMonitor without thread spawn here, but the path is
+        // identical: chain → evaluate → ingest per signal).
+        let scan_pass = |h: &TestHarness, leaf_pid: u32| -> Vec<argus::Finding> {
+            let chain = h.graph.get_chain(leaf_pid);
+            let sigs = crate::plm::weedhack_runtime::evaluate_chain(&chain.nodes);
+            sigs.into_iter()
+                .filter_map(|s| h.ingest(leaf_pid, s))
+                .collect()
+        };
+
+        let first = scan_pass(&harness, 3);
+        assert!(!first.is_empty(), "first scan must emit at least one finding");
+        let second = scan_pass(&harness, 3);
+        assert!(
+            second.is_empty(),
+            "repeat scan of same chain must yield zero new findings"
+        );
+        let third = scan_pass(&harness, 3);
+        assert!(third.is_empty(), "no drift on Nth re-scan");
+    }
+
+    #[test]
+    fn integration_diagnostics_json_empty_when_no_signals() {
+        // Fresh tracker → all counters zero, recent_findings empty.
+        // The UI keys on this shape to hide the panel entirely.
+        let harness = TestHarness::new();
+        let j = harness
+            .diagnostics
+            .to_json(harness.tracker.active_campaign_count());
+        assert_eq!(j["active"], 0);
+        assert_eq!(j["expired"], 0);
+        assert_eq!(j["confirmed_total"], 0);
+        assert_eq!(j["high_confidence_total"], 0);
+        assert_eq!(j["suspicious_total"], 0);
+        assert_eq!(j["last_confirmed_unix"], 0);
+        assert_eq!(j["recent_findings"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn integration_diagnostics_json_has_required_keys_after_confirmed() {
+        let harness = TestHarness::new();
+        harness.graph.record_process(make_node(100, 0, "javaw.exe"));
+        // Escalate through the full ladder.
+        let _ = harness.ingest(100, WeedHackSignal::UnnaturalJavaChild);
+        let _ = harness.ingest(100, WeedHackSignal::DefenderDisableUnderJava);
+        let _ = harness.ingest(100, WeedHackSignal::WalletHarvestBurst);
+        let j = harness
+            .diagnostics
+            .to_json(harness.tracker.active_campaign_count());
+        // Top-level shape contract.
+        for k in [
+            "active",
+            "max_campaigns",
+            "expired",
+            "confirmed_total",
+            "high_confidence_total",
+            "suspicious_total",
+            "last_confirmed_unix",
+            "recent_findings",
+        ] {
+            assert!(j.get(k).is_some(), "missing diagnostics field: {k}");
+        }
+        assert_eq!(j["confirmed_total"], 1);
+        // last_confirmed_unix stamped by record() — non-zero now.
+        assert!(j["last_confirmed_unix"].as_i64().unwrap() > 0);
+        // recent_findings contains entries with the spec-required keys.
+        let arr = j["recent_findings"].as_array().unwrap();
+        assert!(!arr.is_empty());
+        for k in [
+            "tier",
+            "root_pid",
+            "root_image",
+            "signal_count",
+            "signals",
+            "narrative",
+            "first_seen_unix",
+            "last_seen_unix",
+        ] {
+            assert!(
+                arr[0].get(k).is_some(),
+                "recent_findings[0] missing key: {k}"
+            );
+        }
+    }
+
+    #[test]
+    fn integration_image_load_pipeline_emits_into_campaign_tracker() {
+        // Full Wave 3 pipeline:
+        //   raw ImageLoad event
+        //   → BrowserImageLoadFilter::process_event (cheap filters + dedup)
+        //   → weedhack_browser_injection::evaluate (canonical gate)
+        //   → WeedHackCampaignTracker.ingest_signal
+        //   → Suspicious finding emitted (observe-only)
+        let harness = TestHarness::new();
+        // Populate lineage so Java ancestor check passes.
+        harness.graph.record_process(make_node(1, 0, "explorer.exe"));
+        harness.graph.record_process(make_node(2, 1, "javaw.exe"));
+        harness.graph.record_process(make_node(3, 2, "chrome.exe"));
+
+        let filter = crate::plm::weedhack_image_load::BrowserImageLoadFilter::new();
+        let verifier = crate::plm::weedhack_image_load::NullSignerVerifier;
+        let lineage = crate::plm::weedhack_image_load::LineageGraphJavaChecker::new(
+            Arc::clone(&harness.graph),
+        );
+
+        let event = crate::plm::weedhack_image_load::ImageLoadRawEvent {
+            target_pid: 3,
+            target_image_name: "chrome.exe".into(),
+            loaded_module_path:
+                "C:\\Users\\t\\AppData\\Local\\Temp\\krxz.dll".into(),
+            timestamp_unix: 1_700_000_000,
+        };
+        let sig = filter
+            .process_event(event, &verifier, &lineage)
+            .expect("pipeline must emit signal");
+        // Now feed through campaign tracker (same path as PlmMonitor would).
+        let finding = harness.ingest(3, sig).expect("campaign tracker emits");
+        // Suspicious tier — observe only.
+        assert!(matches!(finding.severity, argus::verdict::Severity::Medium));
+        assert!(matches!(finding.layer, argus::verdict::Layer::Context));
+        assert_eq!(finding.weight, 10, "weight 10 = LowSuspicion floor");
+    }
+
+    #[test]
+    fn integration_image_load_suspicious_stays_observe_only_without_corroboration() {
+        // ImageLoad alone (BrowserInjectionFromJava) is a non-pathognomonic
+        // signal of weight 50. Per Wave 1 tier rules, a single non-path
+        // signal lands at Suspicious — NOT Confirmed. Wave 3 must respect
+        // this: ETW path produces the same tier as a hand-fed signal.
+        let harness = TestHarness::new();
+        harness.graph.record_process(make_node(1, 0, "javaw.exe"));
+        harness.graph.record_process(make_node(2, 1, "chrome.exe"));
+
+        let f = harness
+            .ingest(2, WeedHackSignal::BrowserInjectionFromJava)
+            .expect("first signal emits");
+        assert!(matches!(f.layer, argus::verdict::Layer::Context));
+        assert!(matches!(f.severity, argus::verdict::Severity::Medium));
+        // Re-feeding the same signal: deduped, no emit.
+        assert!(harness
+            .ingest(2, WeedHackSignal::BrowserInjectionFromJava)
+            .is_none());
+        // Only a SECOND distinct signal can advance the tier.
+        let f2 = harness
+            .ingest(2, WeedHackSignal::UnnaturalJavaChild)
+            .expect("second distinct signal emits");
+        assert!(matches!(f2.severity, argus::verdict::Severity::High));
+    }
+
+    #[test]
+    fn integration_no_detector_behavior_regression() {
+        // Confirm the existing chain analysis still produces identical
+        // output: the tracker is a SEPARATE pathway, not a rewrite of
+        // weedhack_runtime::evaluate_chain. Tracker is not consulted by
+        // the detector — calling it does not influence subsequent
+        // detector output.
+        let h = TestHarness::new();
+        h.graph.record_process(make_node(100, 0, "javaw.exe"));
+        h.graph.record_process(make_node(200, 100, "schtasks.exe"));
+        let chain_before = h.graph.get_chain(200);
+        let sigs_before = crate::plm::weedhack_runtime::evaluate_chain(&chain_before.nodes);
+
+        // Drive the tracker.
+        let _ = h.ingest(200, WeedHackSignal::UnnaturalJavaChild);
+        let _ = h.ingest(200, WeedHackSignal::DefenderDisableUnderJava);
+
+        // Detector re-evaluated post-ingest must yield the same signals.
+        let chain_after = h.graph.get_chain(200);
+        let sigs_after = crate::plm::weedhack_runtime::evaluate_chain(&chain_after.nodes);
+        assert_eq!(sigs_before, sigs_after, "detector output must be untouched");
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    //  Wave 8 — Live-pattern regression tests
+    //
+    //  These tests simulate realistic non-WeedHack workloads and
+    //  assert ZERO campaign findings. They're the synthetic stand-in
+    //  for Phase 1/2 live validation runs; every false positive the
+    //  user observes during real runs should be memorialized here
+    //  via the same pattern (Phase 6 — "no untested tuning").
+    // ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn live_pattern_minecraft_launcher_produces_no_signal() {
+        // Pattern: explorer → MinecraftLauncher → javaw -jar minecraft.jar.
+        // The Wave 1 detector specifically excludes "vanilla Minecraft" chains
+        // via the `clean_minecraft_no_signals` test but we re-assert here
+        // through the FULL Wave 1+2 integration layer.
+        let h = TestHarness::new();
+        h.graph.record_process(make_node(1, 0, "explorer.exe"));
+        h.graph.record_process(make_node(2, 1, "MinecraftLauncher.exe"));
+        h.graph.record_process(make_node(3, 2, "javaw.exe"));
+        let findings = {
+            let chain = h.graph.get_chain(3);
+            let sigs = crate::plm::weedhack_runtime::evaluate_chain(&chain.nodes);
+            sigs.into_iter().filter_map(|s| h.ingest(3, s)).collect::<Vec<_>>()
+        };
+        assert!(
+            findings.is_empty(),
+            "vanilla Minecraft chain must produce zero campaign findings; got {findings:?}"
+        );
+        assert_eq!(h.tracker.active_campaign_count(), 0);
+    }
+
+    #[test]
+    fn live_pattern_intellij_running_java_test_does_not_confirm() {
+        // Pattern: IntelliJ runs a Gradle build then javaw to execute a
+        // JUnit test that happens to spawn cmd.exe to chmod/run a helper.
+        // This trips the `UnnaturalJavaChild` signal (powershell from
+        // javaw) but ALONE should stay at Suspicious — never escalate
+        // to HighConfidence or Confirmed.
+        let h = TestHarness::new();
+        h.graph.record_process(make_node(1, 0, "explorer.exe"));
+        h.graph.record_process(make_node(2, 1, "idea64.exe"));
+        h.graph.record_process(make_node(3, 2, "javaw.exe"));
+        h.graph.record_process(make_node(4, 3, "powershell.exe"));
+        let chain = h.graph.get_chain(4);
+        let sigs = crate::plm::weedhack_runtime::evaluate_chain(&chain.nodes);
+        let mut last_tier = None;
+        for s in sigs {
+            if let Some(f) = h.ingest(4, s) {
+                last_tier = Some(f.severity);
+            }
+        }
+        // Maximum allowed tier here is Suspicious → severity Medium.
+        // Anything stronger would auto-quarantine on a benign chain.
+        if let Some(sev) = last_tier {
+            assert!(
+                matches!(sev, argus::verdict::Severity::Medium),
+                "IntelliJ-like java→powershell must stay at Medium severity; got {sev:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn live_pattern_jenkins_agent_does_not_fire() {
+        // Pattern: services.exe → java.exe (Jenkins agent) → cmd.exe → mvn.
+        // cmd.exe is NOT in the unnatural-java-child list (build tools
+        // legitimately spawn cmd), so the chain produces zero signals.
+        let h = TestHarness::new();
+        h.graph.record_process(make_node(1, 0, "services.exe"));
+        h.graph.record_process(make_node(2, 1, "java.exe"));
+        h.graph.record_process(make_node(3, 2, "cmd.exe"));
+        h.graph.record_process(make_node(4, 3, "mvn.cmd"));
+        let chain = h.graph.get_chain(4);
+        let sigs = crate::plm::weedhack_runtime::evaluate_chain(&chain.nodes);
+        let findings: Vec<_> = sigs
+            .into_iter()
+            .filter_map(|s| h.ingest(4, s))
+            .collect();
+        assert!(
+            findings.is_empty(),
+            "Jenkins-like java→cmd→mvn must produce zero campaign findings; got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn live_pattern_synthetic_image_load_alone_stays_suspicious() {
+        // Wave 4 path: ImageLoad of an unsigned DLL into Chrome under a
+        // javaw ancestor → Suspicious tier. ALONE (no other signal)
+        // this must not advance past Suspicious.
+        let h = TestHarness::new();
+        h.graph.record_process(make_node(1, 0, "explorer.exe"));
+        h.graph.record_process(make_node(2, 1, "javaw.exe"));
+        h.graph.record_process(make_node(3, 2, "chrome.exe"));
+        let f = h.ingest(3, WeedHackSignal::BrowserInjectionFromJava).unwrap();
+        assert!(matches!(f.severity, argus::verdict::Severity::Medium));
+        assert_eq!(h.tracker.active_campaign_count(), 1);
+    }
+
+    #[test]
+    fn live_pattern_synthetic_full_chain_reaches_confirmed() {
+        // Synthetic positive (Phase 3): three distinct WeedHack signals
+        // → Confirmed tier through the same code path live ETW would
+        // exercise. This is the test we'd run after a synthetic
+        // injection in production to confirm "the path is alive".
+        let h = TestHarness::new();
+        h.graph.record_process(make_node(1, 0, "explorer.exe"));
+        h.graph.record_process(make_node(2, 1, "javaw.exe"));
+        // Suspicious → emitted
+        let f1 = h.ingest(2, WeedHackSignal::BrowserInjectionFromJava).unwrap();
+        assert!(matches!(f1.severity, argus::verdict::Severity::Medium));
+        // HighConfidence → emitted
+        let f2 = h.ingest(2, WeedHackSignal::WalletHarvestBurst).unwrap();
+        assert!(matches!(f2.severity, argus::verdict::Severity::High));
+        // Confirmed → emitted, Critical severity, IocCorrelation layer.
+        let f3 = h.ingest(2, WeedHackSignal::EtherHidingFromJava).unwrap();
+        assert!(matches!(f3.severity, argus::verdict::Severity::Critical));
+        assert!(matches!(f3.layer, argus::verdict::Layer::IocCorrelation));
     }
 }

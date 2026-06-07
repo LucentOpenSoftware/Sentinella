@@ -1969,20 +1969,41 @@ fn dispatch_sync(
             ok_json(serde_json::json!({"ok": true}))
         }
 
-        "health" => Ok(serde_json::json!({
-            "status": "ok",
-            "version": sentinella_common::PRODUCT_VERSION,
-            "uptime_secs": state.uptime_secs(),
-            "user_disabled": state.is_user_disabled(),
-            "daemon_mode": state.daemon_mode(),
-            "audit_mode": state.is_audit_mode(),
-            "memory_pressure": state.pressure_state(),
-            "working_set": state.residency_diagnostics(),
-            // Tamper-detection signals (fail-loud: daemon keeps running,
-            // operator sees the drift via this health endpoint).
-            "binary_integrity_drift": state.binary_integrity_drift(),
-            "config_drift": state.config_drift(),
-        })),
+        "health" => {
+            // Lightweight WeedHack hint — two integers only so the 512-byte
+            // policy cap stays comfortable. Operators polling /health can
+            // notice a confirmed campaign without hitting authenticated
+            // runtime.status. `last_confirmed_unix=0` means never.
+            let (wh_active, wh_last_confirmed) = state
+                .plm()
+                .map(|p| {
+                    (
+                        p.weedhack_tracker.active_campaign_count() as u64,
+                        p.weedhack_diagnostics
+                            .to_json(p.weedhack_tracker.active_campaign_count())
+                            ["last_confirmed_unix"]
+                            .as_i64()
+                            .unwrap_or(0),
+                    )
+                })
+                .unwrap_or((0, 0));
+            Ok(serde_json::json!({
+                "status": "ok",
+                "version": sentinella_common::PRODUCT_VERSION,
+                "uptime_secs": state.uptime_secs(),
+                "user_disabled": state.is_user_disabled(),
+                "daemon_mode": state.daemon_mode(),
+                "audit_mode": state.is_audit_mode(),
+                "memory_pressure": state.pressure_state(),
+                "working_set": state.residency_diagnostics(),
+                // Tamper-detection signals (fail-loud: daemon keeps running,
+                // operator sees the drift via this health endpoint).
+                "binary_integrity_drift": state.binary_integrity_drift(),
+                "config_drift": state.config_drift(),
+                "weedhack_active": wh_active,
+                "weedhack_last_confirmed_unix": wh_last_confirmed,
+            }))
+        },
 
         // ── v0.1.8 FullConfig surface ─────────────────────
         // Full config mirror (every TOML knob). Returns FullConfig with
@@ -2662,6 +2683,10 @@ fn dispatch_sync(
                 "resilience": state.resilience_diagnostics(),
                 "memory_pressure": state.pressure_policy(),
                 "residency": state.residency_diagnostics(),
+                "weedhack_campaigns": state
+                    .plm()
+                    .map(|p| p.weedhack_diagnostics_json())
+                    .unwrap_or_else(|| serde_json::json!({"active": 0})),
                 "generated_at": chrono::Utc::now().to_rfc3339(),
             }))
         }

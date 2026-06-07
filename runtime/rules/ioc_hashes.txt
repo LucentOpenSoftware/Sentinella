@@ -24,6 +24,18 @@ d261d8e19a2165642060a815b8b482b1b56190109cae0c693ef5be82e4df733e
 6efcd8ccae49e020e5d34d14b8d31b6b059037ab65cb648676c36a8466d26a6b
 2be8fdbbe2a69da8142fd378683ccbc7701b90ff37cfda63d6391bfd43c9cca1
 #
+# ── WeedHack Minecraft MaaS (Java infostealer + RAT) ──
+# Active since 2026-01. ~116k confirmed infections per McAfee Labs.
+# DonutDupe.jar dropper → Elevator.jar stealer → Component.jar RAT.
+# EtherHiding C2 (current C2 fetched from Ethereum blockchain storage).
+# Distributed via SEO-poisoned Minecraft mod sites + YouTube tutorials.
+# Sources: MalwareBazaar (abuse.ch), Triage (tria.ge), McAfee research,
+# 0xresetti technical analysis (github.io/weedhack.html).
+4c7ab766875cbaa5c8ab9bb3547b7d000dc793765825c35c6db01f5c73db9ab6
+5cdcf8ad07effa91dec699c83fdd01837138a9fb61693bdd7fa5df457928b05b
+d0644119a24a007c7eee5554d30e88024eb09522d5fdf108c45de0e16e9034ab
+7246a9d4dc9ad098ad83d16f8bd42e758cb67c6ce298958f780ab89f1c00df82
+#
 # Additional hashes can be added manually or via automated feeds.
 # The file is checked at daemon startup and can be reloaded via
 # the update.start IPC command.

@@ -166,8 +166,13 @@ fn run_etw_session(
     props.Wnode.Flags = 0x00020000; // WNODE_FLAG_TRACED_GUID
     props.LogFileMode = 0x00000100; // EVENT_TRACE_REAL_TIME_MODE
     props.LoggerNameOffset = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
-    // Process events only (flag 0x00000001 = EVENT_TRACE_FLAG_PROCESS).
-    props.EnableFlags = EVENT_TRACE_FLAG(0x00000001);
+    // Process events (0x00000001 = EVENT_TRACE_FLAG_PROCESS) + image-load
+    // events (0x00000004 = EVENT_TRACE_FLAG_IMAGE_LOAD) + file-IO initiator
+    // events (0x04000000 = EVENT_TRACE_FLAG_FILE_IO_INIT). The shared
+    // session dispatcher in `etw_event_callback` routes by provider+opcode
+    // so the existing PLM process-create path is bit-for-bit unchanged.
+    // ImageLoad → `etw_image_load`; FileIo Create → `etw_file_io`.
+    props.EnableFlags = EVENT_TRACE_FLAG(0x00000001 | 0x00000004 | 0x04000000);
 
     let name_offset = props.LoggerNameOffset as usize;
     if name_offset + name_bytes.len() <= props_buf.len() {
@@ -306,6 +311,28 @@ unsafe extern "system" fn etw_event_callback(record: *mut EVENT_RECORD) {
             let provider = event.EventHeader.ProviderId;
             let opcode = event.EventHeader.EventDescriptor.Opcode;
 
+            // Wave 4: dispatcher — ImageLoad events route to the dedicated
+            // handler. Return early so we don't fall through into the
+            // process-start path (which would mis-parse Image data).
+            if provider == super::etw_image_load::IMAGE_LOAD_GUID
+                && opcode == super::etw_image_load::OPCODE_IMAGE_LOAD
+            {
+                super::etw_image_load::handle_image_load_event(event);
+                return;
+            }
+
+            // Wave 6: dispatcher — FileIo Create events route to the wallet
+            // harvest handler. Callback-side aggressive substring filter
+            // drops 99%+ of file opens before they reach the bounded
+            // channel; non-wallet paths never leave the kernel dispatch
+            // thread.
+            if provider == super::etw_file_io::FILE_IO_GUID
+                && opcode == super::etw_file_io::OPCODE_FILE_CREATE
+            {
+                super::etw_file_io::handle_file_io_event(event);
+                return;
+            }
+
             // Only process start events (opcode 1).
             if provider != PROCESS_GUID || opcode != 1 {
                 return;
@@ -395,6 +422,16 @@ unsafe extern "system" fn etw_event_callback(record: *mut EVENT_RECORD) {
             }
         }
     }
+}
+
+/// Try to extract image path from ETW process start event data.
+///
+/// Wave 4 visibility bump: the ImageLoad ETW callback reuses this exact
+/// wide-string scanner to extract the loaded-module path. The same shape
+/// — drive-letter-prefixed WCHAR path embedded in opaque event data —
+/// applies to both event types, so the parser is shared.
+pub(crate) fn extract_image_from_event_pub(data: &[u8]) -> Option<String> {
+    extract_image_from_event(data)
 }
 
 /// Try to extract image path from ETW process start event data.
