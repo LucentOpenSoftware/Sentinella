@@ -39,6 +39,11 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # Pure-Rust, mature, single-purpose — no Rust→C FFI surface.
 lopdf = { version = "0.34", default-features = false, features = ["nom_parser"] }
 
+# Bounded FlateDecode for the PDF layer: lopdf's decompressed_content() has no
+# output cap (decompression-bomb DoS), so we inflate the common sole-Flate case
+# ourselves with a take()-bounded reader. Already in the lock tree via zip+lopdf.
+flate2 = "1"
+
 # YARA-X rule engine (pure Rust, BSD-3-Clause)
 yara-x = "1.16"
 

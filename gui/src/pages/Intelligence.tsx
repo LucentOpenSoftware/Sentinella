@@ -203,10 +203,10 @@ export function IntelligencePage() {
                       </p>
                       <p
                         className="text-[10px] text-[rgb(var(--t3))]/60 mt-0.5 truncate"
-                        title={f.signals.join(" | ")}
+                        title={(f.signals ?? []).join(" | ")}
                       >
-                        {f.signals.slice(0, 2).join(" | ")}
-                        {f.signals.length > 2 && " · …"}
+                        {(f.signals ?? []).slice(0, 2).join(" | ")}
+                        {(f.signals?.length ?? 0) > 2 && " · …"}
                       </p>
                     </div>
                     <span className="text-[9px] text-[rgb(var(--t3))]/40 flex-shrink-0">
@@ -419,12 +419,14 @@ function WeedHackTierBadge({
 }) {
   // Red only on Confirmed — Suspicious and HighConfidence stay calm so the
   // panel doesn't fire alarms on observe-only signals.
-  const styling: Record<typeof tier, { color: string; label: string }> = {
+  const styling: Record<string, { color: string; label: string }> = {
     suspicious: { color: "var(--t2)", label: "Suspicious" },
     high_confidence: { color: "var(--amber)", label: "High Conf." },
     confirmed: { color: "var(--red)", label: "Confirmed" },
   };
-  const s = styling[tier];
+  // Defensive fallback: a malformed/partial daemon payload with an
+  // unexpected tier value must not throw and blank the whole page.
+  const s = styling[tier] ?? { color: "var(--t3)", label: String(tier ?? "unknown") };
   return (
     <span
       className="text-[9px] font-bold px-2 py-0.5 rounded-full flex-shrink-0 whitespace-nowrap"

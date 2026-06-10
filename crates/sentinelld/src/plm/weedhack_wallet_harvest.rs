@@ -36,7 +36,7 @@
 #![allow(dead_code)]
 
 use super::weedhack_runtime::WeedHackSignal;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -48,21 +48,28 @@ const WINDOW: Duration = Duration::from_secs(10);
 const MAX_TRACKED_PIDS: usize = 256;
 
 /// Per-PID accumulator.
+///
+/// True sliding window: each distinct store key carries its own last-seen
+/// timestamp, and we prune keys older than `now - WINDOW` before counting.
+/// The previous implementation reset ALL state at a fixed boundary
+/// (tumbling), which let a stealer pace its reads across the boundary
+/// (2 stores per window, repeating) and never accumulate 3 in one window.
 #[derive(Debug)]
 struct PidState {
-    /// When the FIRST wallet-path read for this PID was observed.
-    started_at: Instant,
-    /// Distinct canonical wallet keys read so far.
-    seen_keys: HashSet<&'static str>,
-    /// Once the threshold fires we suppress further reads.
+    /// Per-store last-seen timestamps. Distinct keys still within WINDOW,
+    /// counted after pruning, are the burst signal.
+    key_times: HashMap<&'static str, Instant>,
+    /// Most recent activity for this PID — drives outer (per-PID) eviction.
+    last_activity: Instant,
+    /// Once the threshold fires we suppress further reads (one-shot per PID).
     fired: bool,
 }
 
 impl PidState {
     fn new(now: Instant) -> Self {
         Self {
-            started_at: now,
-            seen_keys: HashSet::new(),
+            key_times: HashMap::new(),
+            last_activity: now,
             fired: false,
         }
     }
@@ -107,16 +114,16 @@ impl WalletHarvestDetector {
 
         let mut map = self.state.lock().unwrap_or_else(|e| e.into_inner());
 
-        // Lightweight eviction: drop stale PID entries past their window.
-        map.retain(|_, s| now.duration_since(s.started_at) < WINDOW.saturating_mul(2));
+        // Lightweight eviction: drop PID entries idle past 2× the window.
+        map.retain(|_, s| now.duration_since(s.last_activity) < WINDOW.saturating_mul(2));
 
         // Bounded memory: if at cap and this PID isn't already tracked,
-        // drop the oldest entry to make room. Detection accuracy degrades
-        // gracefully under absurd load instead of leaking memory.
+        // drop the least-recently-active entry to make room. Detection
+        // accuracy degrades gracefully under absurd load, never leaks.
         if map.len() >= MAX_TRACKED_PIDS && !map.contains_key(&pid) {
             if let Some(&oldest_pid) = map
                 .iter()
-                .min_by_key(|(_, s)| s.started_at)
+                .min_by_key(|(_, s)| s.last_activity)
                 .map(|(p, _)| p)
             {
                 map.remove(&oldest_pid);
@@ -124,19 +131,20 @@ impl WalletHarvestDetector {
         }
 
         let entry = map.entry(pid).or_insert_with(|| PidState::new(now));
-
-        // If the window expired for this PID, restart the burst counter.
-        if now.duration_since(entry.started_at) >= WINDOW {
-            *entry = PidState::new(now);
-        }
+        entry.last_activity = now;
 
         if entry.fired {
             return None;
         }
 
-        entry.seen_keys.insert(key);
+        // Sliding window: prune keys whose last-seen is older than WINDOW,
+        // then record this read. Unlike a tumbling reset, this keeps the
+        // window genuinely rolling so paced reads across a boundary still
+        // accumulate toward the threshold.
+        entry.key_times.retain(|_, t| now.duration_since(*t) < WINDOW);
+        entry.key_times.insert(key, now);
 
-        if entry.seen_keys.len() >= THRESHOLD {
+        if entry.key_times.len() >= THRESHOLD {
             entry.fired = true;
             return Some(WeedHackSignal::WalletHarvestBurst);
         }

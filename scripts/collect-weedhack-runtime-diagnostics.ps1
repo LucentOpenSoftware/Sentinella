@@ -300,7 +300,9 @@ if ($null -ne $weedhack) {
     }
 } elseif ($health) {
     Write-Host ""
-    Write-Host "Public health only -- pass -AuthSecretPath for full counters." -ForegroundColor Yellow
-    Write-Host "  weedhack_active:                $($health.weedhack_active)"
-    Write-Host "  weedhack_last_confirmed_unix:   $($health.weedhack_last_confirmed_unix)"
+    Write-Host "Public health only -- WeedHack counters are NOT exposed on the" -ForegroundColor Yellow
+    Write-Host "unauthenticated 'health' endpoint (v0.1.11 security fix: it gave" -ForegroundColor Yellow
+    Write-Host "any local process a detection-status oracle). Re-run with" -ForegroundColor Yellow
+    Write-Host "-AuthSecretPath to read the full weedhack_campaigns block from" -ForegroundColor Yellow
+    Write-Host "the auth-gated runtime.status endpoint." -ForegroundColor Yellow
 }

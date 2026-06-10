@@ -42,6 +42,99 @@ const MAX_OBJECTS: usize = 8192;
 const MAX_STREAM_DECOMPRESSED: usize = 8 * 1024 * 1024;
 const MAX_JS_SCAN_BYTES: usize = 512 * 1024;
 
+/// Raw (compressed) input ceiling for the *non-Flate* decompression path.
+/// We only hand a stream to lopdf's unbounded `decompressed_content()` when
+/// its raw input is this small, so even a high-ratio legacy filter (LZW) can
+/// only ever materialise a bounded amount of memory. Streams above this with
+/// a non-Flate / chained / predictor filter are scanned in raw form instead —
+/// reduced detection on rare legacy encodings, but never an OOM.
+const MAX_NONFLATE_RAW: usize = 64 * 1024;
+
+/// Decompress a PDF stream's content with a hard output bound, defeating
+/// decompression-bomb DoS (a tiny FlateDecode stream that inflates to
+/// multi-GB). lopdf's `decompressed_content()` uses `read_to_end` with no
+/// output cap on both its zlib and LZW paths, so we cannot call it blindly.
+///
+/// Strategy:
+///   * Sole `FlateDecode` (the overwhelmingly common case) **without** a
+///     `/DecodeParms` predictor → inflate ourselves through a `take()`-bounded
+///     reader, mirroring the discipline the JAR layer already uses. A bomb
+///     truncates at the cap instead of exhausting memory.
+///   * Anything else (LZW, ASCII85/Hex, chained filters, or Flate+predictor)
+///     → fall back to lopdf only when the raw input is `<= MAX_NONFLATE_RAW`,
+///     so worst-case expansion stays bounded; otherwise scan the raw bytes.
+///
+/// The returned buffer is always `<= MAX_STREAM_DECOMPRESSED`.
+fn bounded_decompressed(stream: &lopdf::Stream) -> Vec<u8> {
+    use std::io::Read;
+
+    let raw = stream.content.as_slice();
+
+    // Fast path: sole FlateDecode with no DecodeParms predictor.
+    if is_sole_flate_no_parms(&stream.dict) {
+        // PDF FlateDecode is zlib-wrapped (RFC 1950). A few malformed
+        // producers emit raw deflate, so fall back to that on zlib failure.
+        // `.take(cap + 1)` caps the materialised output regardless of the
+        // declared/actual decompressed size — the bomb cannot exceed it.
+        let cap = MAX_STREAM_DECOMPRESSED as u64;
+        let mut out = Vec::new();
+        if flate2::read::ZlibDecoder::new(raw)
+            .take(cap + 1)
+            .read_to_end(&mut out)
+            .is_ok()
+            || !out.is_empty()
+        {
+            out.truncate(MAX_STREAM_DECOMPRESSED);
+            return out;
+        }
+        let mut raw_out = Vec::new();
+        let _ = flate2::read::DeflateDecoder::new(raw)
+            .take(cap + 1)
+            .read_to_end(&mut raw_out);
+        raw_out.truncate(MAX_STREAM_DECOMPRESSED);
+        return raw_out;
+    }
+
+    // Non-Flate / chained / predictor path: only let lopdf's unbounded
+    // decompressor run when the raw input is itself small enough that any
+    // plausible expansion is bounded.
+    if raw.len() <= MAX_NONFLATE_RAW {
+        if let Ok(mut plain) = stream.decompressed_content() {
+            plain.truncate(MAX_STREAM_DECOMPRESSED);
+            return plain;
+        }
+    }
+
+    // Last resort: scan the raw (compressed) bytes, bounded. ASCII-family
+    // filters are already readable here; binary filters lose detection but
+    // never bomb.
+    let n = raw.len().min(MAX_STREAM_DECOMPRESSED);
+    raw[..n].to_vec()
+}
+
+/// True when the stream's `/Filter` is exactly `FlateDecode` (or the `Fl`
+/// abbreviation) with no `/DecodeParms` — the case our manual bounded
+/// inflate reproduces faithfully for JS-string scanning.
+fn is_sole_flate_no_parms(dict: &lopdf::Dictionary) -> bool {
+    if dict.get(b"DecodeParms").is_ok() || dict.get(b"DP").is_ok() {
+        return false;
+    }
+    let Ok(filter) = dict.get(b"Filter") else {
+        return false;
+    };
+    match filter {
+        Object::Name(n) => n.as_slice() == b"FlateDecode" || n.as_slice() == b"Fl",
+        Object::Array(items) => {
+            items.len() == 1
+                && matches!(
+                    items.first().and_then(|o| o.as_name().ok()),
+                    Some(n) if n == b"FlateDecode" || n == b"Fl"
+                )
+        }
+        _ => false,
+    }
+}
+
 /// Analyze a PDF for malicious action / JavaScript / embedded-file content.
 ///
 /// Returns empty findings on non-PDF input. Caller does not need to gate
@@ -313,17 +406,11 @@ fn scan_object(
             // into the (possibly-compressed) content for JS strings.
             scan_dict(&stream.dict, doc, hit, visited, depth);
 
-            // Try to decompress; ignore failures (some streams use unusual
-            // filters we don't need to handle here).
-            if let Ok(plain) = stream.decompressed_content() {
-                let scan = &plain[..plain.len().min(MAX_STREAM_DECOMPRESSED)];
-                scan_js_content(scan, hit);
-            } else {
-                scan_js_content(
-                    &stream.content[..stream.content.len().min(MAX_JS_SCAN_BYTES)],
-                    hit,
-                );
-            }
+            // Decompress with a hard output bound (defeats decompression
+            // bombs — see `bounded_decompressed`). Always returns at most
+            // MAX_STREAM_DECOMPRESSED bytes.
+            let plain = bounded_decompressed(stream);
+            scan_js_content(&plain, hit);
         }
         _ => {}
     }
@@ -476,12 +563,12 @@ fn xfa_content_has_submit(obj: &Object, doc: &Document) -> bool {
             .unwrap_or(false),
         Object::Array(items) => items.iter().any(|it| xfa_content_has_submit(it, doc)),
         Object::Stream(s) => {
-            let content = s.decompressed_content().unwrap_or_else(|_| s.content.clone());
-            let scan = &content[..content.len().min(MAX_STREAM_DECOMPRESSED)];
+            // Bounded decompression — same bomb-safe path as the JS scan.
+            let scan = bounded_decompressed(s);
             // Look for XFA submission event markers.
-            contains_bytes(scan, b"event activity=\"submit")
-                || contains_bytes(scan, b"<submit")
-                || contains_bytes(scan, b"action=\"submit")
+            contains_bytes(&scan, b"event activity=\"submit")
+                || contains_bytes(&scan, b"<submit")
+                || contains_bytes(&scan, b"action=\"submit")
         }
         _ => false,
     }
@@ -701,5 +788,103 @@ mod tests {
         assert!(uri_or_file_looks_unc(&lit("//attacker.example.com/share/foo.pdf"), &doc));
         assert!(!uri_or_file_looks_unc(&lit("local-file.pdf"), &doc));
         assert!(!uri_or_file_looks_unc(&lit("https://example.com"), &doc));
+    }
+
+    /// Build a FlateDecode stream whose decompressed size is `plain_len`
+    /// but whose compressed payload is tiny — a decompression bomb.
+    fn flate_bomb_stream(plain_len: usize) -> lopdf::Stream {
+        use std::io::Write;
+        let plain = vec![0u8; plain_len];
+        let mut enc =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        enc.write_all(&plain).unwrap();
+        let compressed = enc.finish().unwrap();
+        let mut dict = lopdf::Dictionary::new();
+        dict.set("Filter", Object::Name(b"FlateDecode".to_vec()));
+        lopdf::Stream::new(dict, compressed)
+    }
+
+    #[test]
+    fn decompression_bomb_output_is_bounded() {
+        // 64 MiB of zeros compresses to a few KB but would inflate to 64 MiB
+        // (a real bomb is far worse — gigabytes). bounded_decompressed must
+        // cap the materialised output at MAX_STREAM_DECOMPRESSED regardless,
+        // and must do so without first allocating the full 64 MiB.
+        let stream = flate_bomb_stream(64 * 1024 * 1024);
+        assert!(
+            stream.content.len() < 256 * 1024,
+            "bomb payload should be tiny, got {} bytes",
+            stream.content.len()
+        );
+
+        let out = bounded_decompressed(&stream);
+        assert!(
+            out.len() <= MAX_STREAM_DECOMPRESSED,
+            "output must be capped at {MAX_STREAM_DECOMPRESSED}, got {}",
+            out.len()
+        );
+        // It should actually reach the cap (proving it decompressed, just
+        // bounded) rather than bailing to a near-empty raw scan.
+        assert_eq!(out.len(), MAX_STREAM_DECOMPRESSED);
+    }
+
+    #[test]
+    fn analyze_on_bomb_pdf_returns_promptly_and_bounded() {
+        // Embed the bomb stream in a minimal valid PDF and run the full
+        // analyze() path. Pre-fix this OOMed; now it must return with a
+        // bounded allocation. We assert it simply completes (no panic / no
+        // hang / no OOM) — the bomb stream carries no malicious markers, so
+        // findings may be empty; correctness here is "it returns at all".
+        let mut doc = Document::with_version("1.7");
+        let bomb = flate_bomb_stream(64 * 1024 * 1024);
+        let bomb_id = doc.add_object(Object::Stream(bomb));
+
+        let mut catalog = lopdf::Dictionary::new();
+        catalog.set("Type", Object::Name(b"Catalog".to_vec()));
+        // Reference the bomb so the object walker reaches its Stream branch.
+        catalog.set("OpenAction", Object::Reference(bomb_id));
+        let catalog_id = doc.add_object(Object::Dictionary(catalog));
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        let mut buf = Vec::new();
+        doc.save_to(&mut buf).expect("serialize bomb pdf");
+
+        // Must return — the assertion is non-panic / non-hang. A bounded
+        // scan completes in well under a second; a regression to unbounded
+        // decompression would OOM or stall here.
+        let _findings = analyze("bomb.pdf", &buf);
+    }
+
+    #[test]
+    fn is_sole_flate_no_parms_classifier() {
+        // Sole FlateDecode, no parms → fast path.
+        let mut d = lopdf::Dictionary::new();
+        d.set("Filter", Object::Name(b"FlateDecode".to_vec()));
+        assert!(is_sole_flate_no_parms(&d));
+
+        // FlateDecode WITH a predictor → not the fast path (lopdf applies
+        // the predictor; our manual inflate would diverge).
+        let mut dp = lopdf::Dictionary::new();
+        dp.set("Filter", Object::Name(b"FlateDecode".to_vec()));
+        let mut parms = lopdf::Dictionary::new();
+        parms.set("Predictor", Object::Integer(12));
+        dp.set("DecodeParms", Object::Dictionary(parms));
+        assert!(!is_sole_flate_no_parms(&dp));
+
+        // Chained filters → not the fast path.
+        let mut dc = lopdf::Dictionary::new();
+        dc.set(
+            "Filter",
+            Object::Array(vec![
+                Object::Name(b"ASCII85Decode".to_vec()),
+                Object::Name(b"FlateDecode".to_vec()),
+            ]),
+        );
+        assert!(!is_sole_flate_no_parms(&dc));
+
+        // LZW → not the fast path.
+        let mut dl = lopdf::Dictionary::new();
+        dl.set("Filter", Object::Name(b"LZWDecode".to_vec()));
+        assert!(!is_sole_flate_no_parms(&dl));
     }
 }

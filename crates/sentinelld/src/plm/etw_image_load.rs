@@ -302,53 +302,65 @@ pub fn install_callback_endpoints(
 pub fn parse_image_load_body(data: &[u8]) -> Option<String> {
     #[cfg(target_os = "windows")]
     {
-        super::etw_intake::extract_image_from_event_pub(data)
+        // Use the NT+DOS-aware extractor, NOT the process-start extractor:
+        // ImageLoad bodies carry `\Device\HarddiskVolumeN\...` NT paths and
+        // this pump has no ToolHelp fallback. See etw_intake docs.
+        super::etw_intake::extract_path_from_event(data)
     }
     #[cfg(not(target_os = "windows"))]
     {
         // On non-Windows builds the parser is exercised by unit tests
-        // only. Mirror the scanner's logic locally so tests run anywhere.
-        fallback_scan_for_path(data)
+        // only. Mirror the NT+DOS-aware scanner so tests run anywhere.
+        nt_aware_scan_for_path(data)
     }
 }
 
-/// OS-agnostic mirror of the wide-string scanner — used for unit tests
-/// on non-Windows CI. Identical algorithm to `extract_image_from_event`.
-#[allow(dead_code)]
-fn fallback_scan_for_path(data: &[u8]) -> Option<String> {
-    if data.len() < 60 {
+/// OS-agnostic mirror of `etw_intake::extract_path_from_event`. Accepts both
+/// NT device paths (`\Device\...`, `\SystemRoot\...`) and DOS `X:\...` paths.
+/// Used on non-Windows builds / CI where the Windows extractor is absent.
+#[cfg_attr(target_os = "windows", allow(dead_code))]
+fn nt_aware_scan_for_path(data: &[u8]) -> Option<String> {
+    if data.len() < 8 {
         return None;
     }
-    for offset in (40..data.len().saturating_sub(8)).step_by(2) {
-        if offset + 4 > data.len() {
-            break;
-        }
-        let ch = data[offset];
-        let ch_hi = data[offset + 1];
-        let colon = data[offset + 2];
-        let colon_hi = data[offset + 3];
-        if ch_hi == 0 && colon == 0x3A && colon_hi == 0 && ch.is_ascii_uppercase() {
-            let path_start = offset;
-            let mut path_end = path_start;
-            while path_end + 1 < data.len() {
-                let lo = data[path_end];
-                let hi = data[path_end + 1];
-                if lo == 0 && hi == 0 {
-                    break;
+    let max = data.len().saturating_sub(4);
+    let mut offset = 0usize;
+    while offset <= max {
+        let lo = data[offset];
+        let hi = data[offset + 1];
+        if hi == 0 {
+            let dos = lo.is_ascii_alphabetic()
+                && offset + 4 <= data.len()
+                && data[offset + 2] == 0x3A
+                && data[offset + 3] == 0;
+            let nt = lo == b'\\';
+            if dos || nt {
+                let start = offset;
+                let mut end = start;
+                while end + 1 < data.len() {
+                    let l = data[end];
+                    let h = data[end + 1];
+                    if l == 0 && h == 0 {
+                        break;
+                    }
+                    if h == 0 && l < 0x20 {
+                        break;
+                    }
+                    end += 2;
                 }
-                path_end += 2;
-            }
-            if path_end > path_start + 4 {
-                let wide: Vec<u16> = data[path_start..path_end]
-                    .chunks_exact(2)
-                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                    .collect();
-                let s = String::from_utf16_lossy(&wide);
-                if s.contains('\\') && s.len() > 3 {
-                    return Some(s);
+                if end > start + 4 {
+                    let wide: Vec<u16> = data[start..end]
+                        .chunks_exact(2)
+                        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                        .collect();
+                    let s = String::from_utf16_lossy(&wide);
+                    if s.contains('\\') && s.len() > 3 {
+                        return Some(s);
+                    }
                 }
             }
         }
+        offset += 2;
     }
     None
 }
@@ -390,7 +402,11 @@ pub(crate) unsafe fn handle_image_load_event(
         return;
     }
 
-    // Parse the body for the loaded-module path.
+    // Parse the body for the loaded-module path. Guard against a null /
+    // zero-length UserData: `from_raw_parts(null, 0)` is UB even for len 0.
+    if event.UserData.is_null() || event.UserDataLength == 0 {
+        return;
+    }
     let data = unsafe {
         std::slice::from_raw_parts(event.UserData as *const u8, event.UserDataLength as usize)
     };
@@ -529,6 +545,65 @@ mod tests {
         // Lowercase 'c' should not match the uppercase-letter scanner.
         body.extend_from_slice(&[b'c', 0, b':', 0, b'\\', 0]);
         assert!(parse_image_load_body(&body).is_none());
+    }
+
+    /// Build a body carrying an NT device path (what real kernel ImageLoad
+    /// / FileIo events deliver), with no DOS drive letter.
+    fn build_nt_path_body(path: &str) -> Vec<u8> {
+        let mut buf = vec![0u8; 24]; // fixed header bytes before the path
+        for ch in path.encode_utf16() {
+            buf.extend_from_slice(&ch.to_le_bytes());
+        }
+        buf.extend_from_slice(&[0, 0]);
+        while buf.len() < 64 {
+            buf.push(0);
+        }
+        buf
+    }
+
+    #[test]
+    fn parser_extracts_nt_device_path() {
+        // The H1 regression: kernel events carry \Device\... NT paths, not
+        // C:\ DOS paths. Pre-fix the extractor returned None for these and
+        // the detectors were silently dead in production.
+        let body = build_nt_path_body(
+            "\\Device\\HarddiskVolume2\\Users\\t\\AppData\\Local\\Temp\\krxz.dll",
+        );
+        let path = parse_image_load_body(&body).expect("must extract NT path");
+        assert!(path.contains("krxz.dll"), "got: {path}");
+        assert!(path.starts_with("\\Device\\HarddiskVolume2"), "got: {path}");
+    }
+
+    #[test]
+    fn parser_extracts_systemroot_path() {
+        let body = build_nt_path_body("\\SystemRoot\\System32\\evil.dll");
+        let path = parse_image_load_body(&body).expect("must extract \\SystemRoot path");
+        assert!(path.ends_with("evil.dll"), "got: {path}");
+    }
+
+    #[test]
+    fn nt_path_flows_through_user_writable_matcher() {
+        // The downstream matcher is substring-based, so an NT path with a
+        // user-writable foothold segment must still match — proving the H1
+        // fix is sufficient without touching downstream logic.
+        let body = build_nt_path_body(
+            "\\Device\\HarddiskVolume2\\Users\\t\\AppData\\Local\\Temp\\x.dll",
+        );
+        let path = parse_image_load_body(&body).expect("extract");
+        assert!(
+            super::super::weedhack_browser_injection::is_user_writable_path(&path),
+            "NT path must match user-writable substring: {path}"
+        );
+    }
+
+    #[test]
+    fn parser_still_handles_dos_paths() {
+        // DOS paths must keep working (process-start events, some FileIo).
+        let body = build_synthetic_imageload_body(
+            "C:\\Users\\t\\AppData\\Local\\Temp\\krxz.dll",
+        );
+        let path = parse_image_load_body(&body).expect("DOS path still works");
+        assert!(path.contains("krxz.dll"));
     }
 
     #[test]

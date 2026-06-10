@@ -1,5 +1,124 @@
 # Changelog
 
+## [0.1.11] - 2026-06-10
+
+Final release. A bug-fix and hardening pass over the v0.1.10 WeedHack
+stack, driven by a four-front internal audit (memory safety, concurrency,
+IPC/privacy, parser robustness). This is the last planned Sentinella
+release; see "Honest limitations" for what remains unverified and why.
+
+### Security / DoS
+
+- **PDF decompression-bomb DoS (HIGH).** `argus`'s PDF layer called
+  lopdf's `decompressed_content()`, which inflates FlateDecode/LZW
+  streams with no output cap — a few-KB crafted stream could expand to
+  multiple GB and OOM the scan engine on attacker-controlled input. Added
+  `bounded_decompressed()`: the common sole-`FlateDecode` case (no
+  predictor) is now inflated through a `take()`-bounded `flate2` reader
+  that truncates a bomb at the cap, mirroring the discipline the JAR layer
+  already used; other filters go through lopdf only when their raw input
+  is small enough to bound worst-case expansion, else the raw bytes are
+  scanned. New regression tests build a 64 MiB→few-KB bomb and assert
+  bounded output + prompt return through the full `analyze()` path.
+  `flate2` is now a direct dependency (already in the lock tree).
+- **Unauthenticated WeedHack detection-status leak (MEDIUM).** v0.1.10
+  exposed `weedhack_active` + `weedhack_last_confirmed_unix` on the
+  PUBLIC `health` endpoint, handing any local process a yes/no + timestamp
+  oracle for "did Sentinella confirm a WeedHack campaign, and when" —
+  useful for an attacker timing evasion/cleanup, and inconsistent with the
+  auth-gating the same release applied to `runtime.status`. Removed from
+  `health`; the full `weedhack_campaigns` block remains on the auth-gated
+  `runtime.status` / `diagnostics.export` endpoints only.
+- **ETW callback UB guards (LOW).** All three kernel ETW callbacks
+  (process / ImageLoad / FileIo) now reject a null or zero-length
+  `UserData` before `slice::from_raw_parts` — that call is UB with a null
+  pointer even at length 0.
+
+### Detection correctness
+
+- **ImageLoad / FileIO ETW detectors were silently non-functional on real
+  systems (HIGH).** The shared path scanner only recognised DOS `X:\…`
+  paths, but kernel ImageLoad and FileIo_Create events deliver NT device
+  paths (`\Device\HarddiskVolumeN\…`, `\SystemRoot\…`). The process-start
+  path survived via its ToolHelp fallback; the two new pumps had none, so
+  they extracted nothing in production (unit tests passed only because
+  they synthesised `C:\` bodies). Added `extract_path_from_event`, an
+  NT+DOS-aware extractor used by both new pumps; the process-start scanner
+  is left untouched. Downstream wallet/browser matchers are
+  substring-based and already match inside NT paths, so no downstream
+  change was needed. New tests cover `\Device\…`, `\SystemRoot\…`, and the
+  NT-path→user-writable-matcher flow.
+- **Wallet-harvest pacing evasion (MEDIUM).** The burst detector's window
+  was tumbling (it wiped all per-PID state at a fixed boundary) despite
+  documenting a sliding window — letting a stealer pace 2 distinct store
+  reads per window and never trip the 3-store threshold. Rewritten as a
+  true sliding window with per-store timestamps pruned to `now - WINDOW`.
+- **Campaign flush-by-flood (MEDIUM).** The campaign tracker evicted the
+  least-recently-signalled campaign at its 64-campaign cap, so an attacker
+  spawning many short-lived process-tree roots could flush an in-progress
+  Confirmed campaign (a real multi-stage infection pauses between stages
+  and is thus the stalest entry). Eviction now prefers low-value victims
+  (no tier yet, or only Suspicious) and only falls back to oldest-overall
+  when every campaign is already high-tier. New test proves a Confirmed
+  campaign survives a flood.
+- **Authenticode catalog carve-out (LOW).** `verify_for_signer_verdict`
+  mapped `Unsigned` → `Untrusted` unconditionally, so a catalog-signed
+  Windows system DLL (no embedded signature) could be classed as eligible
+  for the browser-injection gate. System-path unsigned binaries now map to
+  `Unknown` (the path+lineage gate still governs); genuinely unsigned
+  files elsewhere stay `Untrusted`.
+
+### Robustness / correctness
+
+- **ETW session leak on `OpenTraceW` failure (LOW).** A failed
+  `OpenTraceW` returned without stopping the session it had just started,
+  orphaning a kernel session until the next run's stale-session cleanup.
+  It now stops the session before bailing.
+- **Access-denied over-match (LOW).** ETW retry logic matched the
+  substring `"failed: 5"`, which also matched error codes 50-59, 500-599
+  (e.g. 53 = `ERROR_BAD_NETPATH`), prematurely tripping the give-up
+  counter. Now matches the exact code.
+- **FileIO `events_parsed` double-count (LOW).** The counter was bumped in
+  both the callback and the worker for a single event; the callback bump
+  was removed (`forwarded` already counts callback successes).
+
+### GUI
+
+- **Defensive rendering on the WeedHack panel.** The tier badge threw
+  (blanking the whole Intelligence page) if the daemon ever returned an
+  unexpected `tier`; it now falls back to a neutral style. The findings
+  list's `signals` access is now null-guarded against a partial/malformed
+  payload.
+
+### Tests
+
+- Workspace test count: argus 188 → 191 (PDF-bomb output bound, bomb-PDF
+  analyze path, sole-flate classifier), sentinelld 457 → 462 (NT-path
+  extraction ×4, flush-by-flood ×1). All green.
+
+### Honest limitations (read before relying on runtime detection)
+
+- **The kernel ETW session is NOT verified to deliver events on a live
+  box.** The shared `SentinellaPLM` session is created as a real-time
+  logger but does not set `SystemTraceControlGuid` /
+  `EVENT_TRACE_SYSTEM_LOGGER_MODE`, which the documented ETW contract
+  requires for a session to honour the kernel `EnableFlags` (PROCESS /
+  IMAGE_LOAD / FILE_IO_INIT). This was deliberately NOT changed in this
+  release because it could not be validated on a live elevated session and
+  a wrong change risked destabilising the shipped PLM. **If you run
+  elevated and `runtime.status → weedhack_campaigns.image_load_etw.
+  events_seen` stays 0, this is the cause** — the fix is to add
+  `EVENT_TRACE_SYSTEM_LOGGER_MODE (0x02000000)` to `LogFileMode` (Win8+)
+  and re-test. Note: the chain-based WeedHack signals still work via the
+  snapshot-populated lineage graph regardless of ETW, and all static
+  detection (JAR, PDF, IOC) is unaffected.
+- **EtherHiding HTTP capture remains dormant** (no HTTPS body source) as
+  in v0.1.10.
+- The global per-pump rate limiters and the orphan-campaign PID-reuse key
+  (`created_at_unix = 0`) are documented known-weaknesses, not fixed here;
+  both require a larger rework than is prudent for an unvalidated final
+  release.
+
 ## [0.1.10] - 2026-06-07
 
 WeedHack release. Adds end-to-end detection for the WeedHack

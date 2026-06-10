@@ -283,16 +283,30 @@ impl WeedHackCampaignTracker {
         // without a background thread.
         map.retain(|_, c| now.duration_since(c.last_signal_at) < WINDOW);
 
-        // Hard memory cap: if at limit and this campaign is new, drop the
-        // single oldest-by-last-signal campaign. Detection accuracy degrades
-        // gracefully under absurd concurrent-infection load.
+        // Hard memory cap with flush-by-flood resistance: if at limit and
+        // this campaign is new, evict a victim. Plain "oldest-by-last-signal"
+        // let an attacker spawn MAX_CAMPAIGNS+ short-lived roots to flush an
+        // in-progress HighConfidence/Confirmed campaign mid-accumulation
+        // (a genuine multi-stage infection pauses between stages and is thus
+        // the stalest entry). So we prefer evicting low-value campaigns —
+        // those with no tier emitted yet or only Suspicious — and fall back
+        // to oldest-overall only when every campaign is already high-tier.
         if map.len() >= MAX_CAMPAIGNS && !map.contains_key(&root) {
-            if let Some(oldest) = map
+            let victim = map
                 .iter()
+                .filter(|(_, c)| {
+                    c.last_tier_emitted
+                        .map_or(true, |t| t.ladder() <= CampaignTier::Suspicious.ladder())
+                })
                 .min_by_key(|(_, c)| c.last_signal_at)
                 .map(|(k, _)| *k)
-            {
-                map.remove(&oldest);
+                .or_else(|| {
+                    map.iter()
+                        .min_by_key(|(_, c)| c.last_signal_at)
+                        .map(|(k, _)| *k)
+                });
+            if let Some(victim) = victim {
+                map.remove(&victim);
             }
         }
 
@@ -879,6 +893,49 @@ mod tests {
         );
         // Memory accounting is sane.
         assert!(t.approx_bytes() <= MAX_CAMPAIGNS * 256);
+    }
+
+    #[test]
+    fn confirmed_campaign_survives_flush_by_flood() {
+        // A real multi-stage infection reaches Confirmed, then pauses
+        // (Stage 2 → Stage 3 can be seconds-to-minutes apart) — making it
+        // the stalest campaign. Pre-fix, an attacker spawning MAX_CAMPAIGNS+
+        // short-lived roots would evict it (oldest-by-last-signal). The
+        // flush-by-flood fix must keep the Confirmed campaign alive by
+        // preferring low-tier eviction victims.
+        let resolver = std::sync::Arc::new(MockResolver::default());
+        // Victim campaign: root pid 1, reaches Confirmed via pathognomonic
+        // + corroborator.
+        resolver.add(10, 1, 1);
+        // Flood roots: pids 100.. each its own root.
+        for i in 0..(MAX_CAMPAIGNS as u32 + 50) {
+            resolver.add(1000 + i, 100 + i, 1);
+        }
+        let t = WeedHackCampaignTracker::new(resolver);
+
+        // Drive the victim to Confirmed (Pjibf pathognomonic + corroborator).
+        let _ = t.ingest_signal(10, WeedHackSignal::Pjibf);
+        let conf = t
+            .ingest_signal(10, WeedHackSignal::UnnaturalJavaChild)
+            .expect("victim should advance");
+        assert_eq!(conf.tier, CampaignTier::Confirmed);
+        let victim_root = conf.root;
+
+        // Now flood far beyond the cap with fresh low-tier campaigns.
+        for i in 0..(MAX_CAMPAIGNS as u32 + 50) {
+            let _ = t.ingest_signal(1000 + i, WeedHackSignal::UnnaturalJavaChild);
+        }
+
+        assert!(t.active_campaign_count() <= MAX_CAMPAIGNS);
+        // The Confirmed campaign must still be present: re-ingesting its
+        // already-seen signal returns None (dedup on a LIVE campaign) rather
+        // than re-emitting Suspicious (which would mean it was evicted and
+        // recreated fresh).
+        let re = t.ingest_signal(10, WeedHackSignal::Pjibf);
+        assert!(
+            re.is_none(),
+            "Confirmed campaign was flushed by the flood (got a fresh emit: {re:?}) — root {victim_root:?}"
+        );
     }
 
     #[test]

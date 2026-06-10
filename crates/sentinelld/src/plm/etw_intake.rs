@@ -105,7 +105,13 @@ fn etw_process_loop(
                     break;
                 }
 
-                let is_access_denied = e.contains("failed: 5");
+                // Match the exact access-denied code, not the substring
+                // "failed: 5" — that also matched 50-59, 500-599, etc.
+                // (e.g. error 53 = ERROR_BAD_NETPATH), prematurely tripping
+                // the give-up counter on unrelated startup failures. The
+                // error string is formatted "StartTraceW failed: {code} (...".
+                let is_access_denied =
+                    e.contains("failed: 5 ") || e.contains("failed: 5(");
                 if is_access_denied {
                     access_denied_count += 1;
                 }
@@ -231,6 +237,23 @@ fn run_etw_session(
 
     let trace_handle = unsafe { OpenTraceW(&mut logfile) };
     if trace_handle.Value == u64::MAX {
+        // Stop the session we just started (line ~183) before bailing —
+        // otherwise it leaks as an orphaned kernel session until the next
+        // run's stale-session cleanup reclaims it.
+        let stop_size = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + 512;
+        let mut stop_buf = vec![0u8; stop_size];
+        let stop_props =
+            unsafe { &mut *(stop_buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES) };
+        stop_props.Wnode.BufferSize = stop_size as u32;
+        stop_props.LoggerNameOffset = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
+        unsafe {
+            let _ = ControlTraceW(
+                CONTROLTRACE_HANDLE::default(),
+                PCWSTR(session_name_wide.as_ptr()),
+                stop_props,
+                EVENT_TRACE_CONTROL_STOP,
+            );
+        }
         return Err("OpenTraceW failed".into());
     }
 
@@ -354,7 +377,12 @@ unsafe extern "system" fn etw_event_callback(record: *mut EVENT_RECORD) {
                 Ordering::Relaxed,
             );
 
-            // Parse process start event data.
+            // Parse process start event data. Guard null/zero-length
+            // UserData — from_raw_parts requires a non-null pointer even
+            // for length 0 (else UB).
+            if event.UserData.is_null() || event.UserDataLength == 0 {
+                return;
+            }
             let data = std::slice::from_raw_parts(
                 event.UserData as *const u8,
                 event.UserDataLength as usize,
@@ -432,6 +460,90 @@ unsafe extern "system" fn etw_event_callback(record: *mut EVENT_RECORD) {
 /// applies to both event types, so the parser is shared.
 pub(crate) fn extract_image_from_event_pub(data: &[u8]) -> Option<String> {
     extract_image_from_event(data)
+}
+
+/// Generalized path extractor for ImageLoad / FileIo event bodies.
+///
+/// CRITICAL DIFFERENCE from `extract_image_from_event`: the process-start
+/// extractor only recognizes DOS `X:\...` paths and is backstopped by a
+/// ToolHelp `get_process_image(pid)` fallback. Kernel **ImageLoad** and
+/// **FileIo_Create** events instead carry the path as an **NT device
+/// path** — `\Device\HarddiskVolumeN\...`, `\SystemRoot\...`, or
+/// `\??\C:\...` — and the two new pumps have NO fallback. A drive-letter-
+/// only scanner therefore returns `None` for essentially every real event,
+/// silently disabling the WeedHack browser-injection and wallet-harvest
+/// detectors in production (unit tests pass only because they synthesize
+/// `C:\` bodies). This extractor accepts both NT and DOS forms.
+///
+/// Downstream matchers (`path_looks_walletish`, `is_user_writable_path`,
+/// `module_is_dll`) are all case-insensitive substring/suffix checks that
+/// already match inside an NT path (e.g. `\Device\HarddiskVolume2\Users\
+/// t\AppData\Local\Google\Chrome\User Data\...` contains `\user data\`),
+/// so fixing extraction is sufficient — no downstream change needed.
+///
+/// Strategy: WCHAR-aligned scan for the first plausible embedded path —
+/// a printable wide-string starting with either a DOS drive anchor
+/// (`[A-Za-z]:`) or a leading backslash (NT path), containing a path
+/// separator and of reasonable length. Bounds-checked; never panics.
+pub(crate) fn extract_path_from_event(data: &[u8]) -> Option<String> {
+    if data.len() < 8 {
+        return None;
+    }
+    let max = data.len().saturating_sub(4);
+    let mut offset = 0usize;
+    while offset <= max {
+        let lo = data[offset];
+        let hi = data[offset + 1];
+        // Only WCHAR-aligned ASCII anchors (high byte zero).
+        if hi == 0 {
+            let dos = lo.is_ascii_alphabetic()
+                && offset + 4 <= data.len()
+                && data[offset + 2] == 0x3A // ':'
+                && data[offset + 3] == 0;
+            let nt = lo == b'\\';
+            if dos || nt {
+                if let Some(s) = read_wide_path(data, offset) {
+                    return Some(s);
+                }
+            }
+        }
+        offset += 2;
+    }
+    None
+}
+
+/// Read a printable UTF-16LE path starting at `start`, stopping at a NUL
+/// pair or a control character. Returns the string only if it looks like
+/// a path (contains a backslash, length > 3). Bounds-checked.
+fn read_wide_path(data: &[u8], start: usize) -> Option<String> {
+    let mut end = start;
+    while end + 1 < data.len() {
+        let lo = data[end];
+        let hi = data[end + 1];
+        if lo == 0 && hi == 0 {
+            break; // NUL terminator
+        }
+        // Stop if we run out of the printable-ASCII wide-string region
+        // (a control char or a non-zero high byte that isn't a normal BMP
+        // path character) — prevents running into adjacent binary fields.
+        if hi == 0 && lo < 0x20 {
+            break;
+        }
+        end += 2;
+    }
+    if end <= start + 4 {
+        return None;
+    }
+    let wide: Vec<u16> = data[start..end]
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    let s = String::from_utf16_lossy(&wide);
+    if s.contains('\\') && s.len() > 3 {
+        Some(s)
+    } else {
+        None
+    }
 }
 
 /// Try to extract image path from ETW process start event data.

@@ -1970,23 +1970,16 @@ fn dispatch_sync(
         }
 
         "health" => {
-            // Lightweight WeedHack hint — two integers only so the 512-byte
-            // policy cap stays comfortable. Operators polling /health can
-            // notice a confirmed campaign without hitting authenticated
-            // runtime.status. `last_confirmed_unix=0` means never.
-            let (wh_active, wh_last_confirmed) = state
-                .plm()
-                .map(|p| {
-                    (
-                        p.weedhack_tracker.active_campaign_count() as u64,
-                        p.weedhack_diagnostics
-                            .to_json(p.weedhack_tracker.active_campaign_count())
-                            ["last_confirmed_unix"]
-                            .as_i64()
-                            .unwrap_or(0),
-                    )
-                })
-                .unwrap_or((0, 0));
+            // NOTE (v0.1.11 security fix): the v0.1.10 build exposed
+            // `weedhack_active` + `weedhack_last_confirmed_unix` here. This
+            // endpoint is PUBLIC / unauthenticated (policy.rs: pub_status),
+            // so those fields handed any local process a yes/no + timestamp
+            // oracle for "did Sentinella confirm a WeedHack campaign, and
+            // when" — useful intel for an attacker timing evasion/cleanup,
+            // and inconsistent with the auth-gating the same release applied
+            // to runtime.status (the "Adversary A1" hardening). The full
+            // weedhack_campaigns block lives on the auth-gated runtime.status
+            // / diagnostics.export endpoints; it does NOT belong on health.
             Ok(serde_json::json!({
                 "status": "ok",
                 "version": sentinella_common::PRODUCT_VERSION,
@@ -2000,8 +1993,6 @@ fn dispatch_sync(
                 // operator sees the drift via this health endpoint).
                 "binary_integrity_drift": state.binary_integrity_drift(),
                 "config_drift": state.config_drift(),
-                "weedhack_active": wh_active,
-                "weedhack_last_confirmed_unix": wh_last_confirmed,
             }))
         },
 

@@ -111,7 +111,21 @@ pub fn verify_for_signer_verdict(path: &Path) -> AuthenticodeStatus {
                 // gate runs. This is intentionally conservative.
                 AuthenticodeStatus::Unknown
             }
-            TrustResult::Invalid | TrustResult::Unsigned => AuthenticodeStatus::Untrusted,
+            // A broken / tampered signature is genuinely Untrusted.
+            TrustResult::Invalid => AuthenticodeStatus::Untrusted,
+            // Unsigned: Windows system binaries are CATALOG-signed (no
+            // embedded sig → TRUST_E_NOSIGNATURE → Unsigned here). Mapping
+            // those to Untrusted would mark a legit catalog-signed system
+            // DLL as eligible for the WeedHack browser-injection gate.
+            // Treat system-path unsigned as Unknown (path+lineage gate still
+            // governs); genuinely unsigned files elsewhere stay Untrusted.
+            TrustResult::Unsigned => {
+                if is_windows_system_path(path) {
+                    AuthenticodeStatus::Unknown
+                } else {
+                    AuthenticodeStatus::Untrusted
+                }
+            }
             TrustResult::Error => AuthenticodeStatus::Unknown,
         }
     }

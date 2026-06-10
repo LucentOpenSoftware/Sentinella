@@ -393,18 +393,25 @@ pub(crate) unsafe fn handle_file_io_event(
         return;
     }
 
-    // Reuse the kernel wide-string scanner.
+    // Guard against null / zero-length UserData (from_raw_parts UB).
+    if event.UserData.is_null() || event.UserDataLength == 0 {
+        return;
+    }
     let data = unsafe {
         std::slice::from_raw_parts(event.UserData as *const u8, event.UserDataLength as usize)
     };
-    let path = match super::etw_intake::extract_image_from_event_pub(data) {
+    // NT+DOS-aware extractor: FileIo_Create carries `\Device\...` NT paths.
+    let path = match super::etw_intake::extract_path_from_event(data) {
         Some(p) => p,
         None => {
             diag.parse_errors.fetch_add(1, Ordering::Relaxed);
             return;
         }
     };
-    diag.events_parsed.fetch_add(1, Ordering::Relaxed);
+    // NOTE: `events_parsed` is incremented once, in the worker's
+    // `process_one` — not here — to avoid double-counting a single event
+    // across the callback + worker stages. `forwarded` counts callback
+    // successes.
 
     // ── Aggressive callback-side filter ──
     // Drops the vast majority of file opens BEFORE rate-limit or
