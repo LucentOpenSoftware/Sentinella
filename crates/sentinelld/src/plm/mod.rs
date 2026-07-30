@@ -58,6 +58,10 @@ pub struct ProcessNode {
     /// counted in `PlmDiagnostics::command_line`. Attacker-controlled
     /// when present — NEVER treated as identity; image path + signer
     /// remain authoritative. See `plm::cmdline` module docs.
+    ///
+    /// PRIVACY: `CommandLineState`'s `Serialize` impl is redacting —
+    /// serializing this node (e.g. into `Finding::technical_detail`)
+    /// emits length + truncated SHA-256, never the raw command line.
     pub command_line: cmdline::CommandLineState,
     /// Whether the binary is signed.
     pub is_signed: Option<bool>,
@@ -482,8 +486,13 @@ pub struct PlmMonitor {
     pub http_intake_diagnostics: Arc<weedhack_http_intake::HttpIntakeDiagnostics>,
     running: Arc<AtomicBool>,
     _snapshot_thread: Option<std::thread::JoinHandle<()>>,
+    /// ETW intake thread handle, behind a Mutex so `shutdown(&self)` can
+    /// join it through the shared reference handed out by
+    /// `AppState::plm()` — `PlmMonitor::Drop` never fires in production
+    /// because AppState is Arc-shared by the IPC server and its tasks, so
+    /// the daemon's orderly shutdown must call `shutdown()` explicitly.
     #[cfg(target_os = "windows")]
-    _etw_thread: Option<std::thread::JoinHandle<()>>,
+    etw_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     #[cfg(target_os = "windows")]
     pub etw_diagnostics: Option<Arc<etw_intake::EtwIntakeDiagnostics>>,
 }
@@ -684,7 +693,7 @@ impl PlmMonitor {
             running,
             _snapshot_thread: snapshot_thread,
             #[cfg(target_os = "windows")]
-            _etw_thread: etw_thread,
+            etw_thread: Mutex::new(etw_thread),
             #[cfg(target_os = "windows")]
             etw_diagnostics: etw_diag,
         }
@@ -890,30 +899,62 @@ impl PlmMonitor {
     pub fn stop(&self) {
         self.running.store(false, Ordering::Relaxed);
     }
+
+    /// Orderly stop that does NOT rely on `Drop`: flips the shared stop
+    /// flag (every PLM thread observes it within its poll slice) and JOINS
+    /// the ETW intake thread so its stop thread's ControlTraceW(STOP)
+    /// actually lands before the daemon exits — an orphaned session burns
+    /// one of the 8 system-logger slots until the next boot's stale
+    /// cleanup.
+    ///
+    /// Why this exists: `PlmMonitor::Drop` never fires in production.
+    /// `AppState` owns the monitor and is itself held in `Arc` by the IPC
+    /// server, the scheduler, and long-lived tasks, so at daemon shutdown
+    /// the last strong reference is still alive when the process exits —
+    /// Drop (and its ETW join) is unreachable. The daemon's orderly
+    /// shutdown path (main.rs cleanup, after `scheduler.stop()`) must call
+    /// this explicitly:
+    ///
+    /// ```ignore
+    /// if let Some(plm) = server.state().plm() {
+    ///     plm.shutdown();
+    /// }
+    /// ```
+    ///
+    /// Idempotent (a second call finds no thread to join) and safe to call
+    /// through the shared `&PlmMonitor` handed out by `AppState::plm()`.
+    /// Bounded: the ETW stop thread polls every 500 ms, ProcessTrace
+    /// returns promptly after STOP, and backoff sleeps are
+    /// shutdown-interruptible — the join completes in roughly a second.
+    /// The snapshot thread is deliberately NOT joined: it sleeps up to
+    /// `interval` seconds per cycle, holds no kernel resources, and
+    /// blocking service shutdown on it risks the SCM stop timeout.
+    pub fn shutdown(&self) {
+        self.running.store(false, Ordering::Relaxed);
+        #[cfg(target_os = "windows")]
+        {
+            let handle = self
+                .etw_thread
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            if let Some(etw) = handle {
+                if etw.join().is_err() {
+                    tracing::warn!("PLM ETW thread panicked during shutdown join");
+                }
+            }
+        }
+    }
 }
 
 impl Drop for PlmMonitor {
+    /// Belt-and-braces: identical to `shutdown()`. In production Drop is
+    /// unreachable (AppState is Arc-shared past process exit — see
+    /// `shutdown()` docs), so the daemon's orderly shutdown calls
+    /// `shutdown()` explicitly; this keeps tests and any future non-Arc
+    /// embedding correct.
     fn drop(&mut self) {
-        self.running.store(false, Ordering::Relaxed);
-        // F-5/C-7 fix: JOIN the ETW thread so its stop thread's
-        // ControlTraceW(STOP) actually lands before the process exits.
-        // Previously Drop only set the flag; a fast service stop beat the
-        // stop thread's 500 ms poll and orphaned the kernel session (next
-        // boot's error-183 stale cleanup reclaimed it). Now that the session
-        // is a real system logger, each orphan also burns one of the 8
-        // system-logger slots, so the join matters more. Bounded: the stop
-        // thread polls every 500 ms, ProcessTrace returns promptly after
-        // STOP, and backoff sleeps are shutdown-interruptible — the join
-        // completes in roughly a second.
-        // The snapshot thread is deliberately NOT joined: it sleeps up to
-        // `interval` seconds per cycle, holds no kernel resources, and
-        // blocking service shutdown on it risks the SCM stop timeout.
-        #[cfg(target_os = "windows")]
-        if let Some(etw) = self._etw_thread.take() {
-            if etw.join().is_err() {
-                tracing::warn!("PLM ETW thread panicked during shutdown join");
-            }
-        }
+        self.shutdown();
     }
 }
 
@@ -1148,6 +1189,38 @@ mod tests {
         let finding = lineage_finding(&chain);
         assert!(finding.is_some());
         assert!(finding.unwrap().weight >= 10);
+    }
+
+    #[test]
+    fn lineage_finding_technical_detail_never_contains_raw_cmdline() {
+        // PRIVACY regression guard (MEDIUM fix): findings are persisted to
+        // the forensic DB and returned over IPC whose auth secret is
+        // world-readable, so a command line carrying credentials must never
+        // reach technical_detail — only its redacted fingerprint.
+        let secret_cmd = "powershell.exe -enc SQBUAEEARwBFAE4AVABfAFMAZQBjAHIAZQB0AFQAbwBrAGUAbgA=";
+        let graph = LineageGraph::new();
+        graph.record_process(make_node(1, 0, "winword.exe"));
+        let mut node = make_node(2, 1, "powershell.exe");
+        node.command_line = cmdline::CommandLineState::Present(secret_cmd.to_string());
+        graph.record_process(node);
+
+        let chain = graph.get_chain(2);
+        let finding = lineage_finding(&chain).expect("suspicious chain yields finding");
+        let detail = finding
+            .technical_detail
+            .expect("lineage finding carries technical_detail");
+        assert!(
+            !detail.contains(secret_cmd),
+            "raw command line leaked into technical_detail: {detail}"
+        );
+        assert!(
+            !detail.contains("SQBUAEEARwBFAE4A"),
+            "raw secret substring leaked into technical_detail: {detail}"
+        );
+        // The redacted correlation form IS present (label + length + hash).
+        assert!(detail.contains("\"state\":\"present\""), "{detail}");
+        assert!(detail.contains("len_utf16"), "{detail}");
+        assert!(detail.contains("sha256_16"), "{detail}");
     }
 
     #[test]

@@ -74,6 +74,7 @@
 #![allow(dead_code)]
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -96,7 +97,7 @@ pub const MAX_COMMAND_LINE_UTF16_UNITS: usize = 32 * 1024;
 /// value — which is how the WeedHack command-line signals ended up dead
 /// with no telemetry explaining why. Every variant maps to exactly one
 /// diagnostics counter.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandLineState {
     /// Collection was never attempted (no querier wired, non-Windows
     /// build, or the process was seen before this collector existed).
@@ -144,6 +145,56 @@ impl CommandLineState {
             CommandLineState::Empty => "empty",
             CommandLineState::Malformed => "malformed",
             CommandLineState::Present(_) => "present",
+        }
+    }
+}
+
+/// Truncated SHA-256 fingerprint (first 8 bytes, 16 lowercase hex chars)
+/// of a command line. Correlation-grade: two findings that saw the same
+/// command line share the fingerprint, but the raw text is unrecoverable.
+fn redacted_fingerprint(s: &str) -> String {
+    let digest = Sha256::digest(s.as_bytes());
+    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// PRIVACY: a raw command line NEVER serializes.
+///
+/// `CommandLineState` reaches JSON in exactly one structural way — as a
+/// field of `ProcessNode`, serialized into `Finding::technical_detail`
+/// (see `plm::lineage_finding`) — and findings are persisted to the
+/// SQLite forensic DB and returned over IPC methods whose auth secret is
+/// world-readable (BUILTIN\Users). Command lines routinely carry
+/// credentials, tokens, and private paths, so the raw text must never
+/// leave the daemon. Implementing `Serialize` MANUALLY (instead of
+/// deriving) makes the redaction a property of the type: any present or
+/// future serialization path — findings, diagnostics JSON, logs that
+/// `{:?}`-free serialize a chain — gets the redacted form automatically.
+///
+/// Wire format:
+///   - `Present(s)`  → `{"state":"present","len_utf16":N,"sha256_16":"…"}`
+///     (length + truncated SHA-256 fingerprint for correlation; the GUI
+///     displays this in place of the old raw string);
+///   - `Failed(code)` → `{"state":"failed","code":N}` (the diagnostic code
+///     is not sensitive and is kept);
+///   - every other variant → its bare `label()` string.
+impl Serialize for CommandLineState {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        match self {
+            CommandLineState::Present(s) => {
+                let mut map = serializer.serialize_map(Some(3))?;
+                map.serialize_entry("state", "present")?;
+                map.serialize_entry("len_utf16", &s.encode_utf16().count())?;
+                map.serialize_entry("sha256_16", &redacted_fingerprint(s))?;
+                map.end()
+            }
+            CommandLineState::Failed(code) => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("state", "failed")?;
+                map.serialize_entry("code", code)?;
+                map.end()
+            }
+            other => serializer.serialize_str(other.label()),
         }
     }
 }
@@ -669,6 +720,68 @@ mod tests {
     fn null_backend_reports_not_collected() {
         let backend = NullBackend;
         assert_eq!(backend.query(1234), CommandLineState::NotCollected);
+    }
+
+    // ── serialization privacy (MEDIUM fix) ──────────────────────
+    //
+    // CommandLineState is serialized into Finding::technical_detail via
+    // ProcessNode → persisted to the forensic DB and returned over IPC.
+    // The raw command line must NEVER appear in any serialized form.
+
+    #[test]
+    fn present_serializes_redacted_never_raw() {
+        let secret = "net use \\\\srv\\c$ /user:admin Sup3rSecretToken=abc123";
+        let state = CommandLineState::Present(secret.to_string());
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(
+            !json.contains("Sup3rSecretToken"),
+            "raw secret leaked into serialized state: {json}"
+        );
+        assert!(!json.contains(secret), "raw cmdline leaked: {json}");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["state"], "present");
+        assert_eq!(
+            v["len_utf16"].as_u64().unwrap() as usize,
+            secret.encode_utf16().count()
+        );
+        let fp = v["sha256_16"].as_str().unwrap();
+        assert_eq!(fp.len(), 16, "truncated SHA-256 must be 8 bytes hex");
+        assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
+        // Correlation property: same input → same fingerprint, different
+        // input → different fingerprint.
+        let again = serde_json::to_string(&CommandLineState::Present(secret.to_string())).unwrap();
+        assert!(again.contains(fp));
+        let other = serde_json::to_string(&CommandLineState::Present("other.exe".into())).unwrap();
+        assert!(!other.contains(fp));
+    }
+
+    #[test]
+    fn non_present_states_serialize_without_content() {
+        // Unit variants: bare label. Failed: label + (non-sensitive) code.
+        assert_eq!(
+            serde_json::to_string(&CommandLineState::NotCollected).unwrap(),
+            "\"not_collected\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CommandLineState::AccessDenied).unwrap(),
+            "\"access_denied\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CommandLineState::ProcessExited).unwrap(),
+            "\"process_exited\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CommandLineState::Empty).unwrap(),
+            "\"empty\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CommandLineState::Malformed).unwrap(),
+            "\"malformed\""
+        );
+        let failed = serde_json::to_string(&CommandLineState::Failed(5)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&failed).unwrap();
+        assert_eq!(v["state"], "failed");
+        assert_eq!(v["code"], 5);
     }
 
     #[test]

@@ -613,6 +613,15 @@ async fn run_daemon(
         s.stop();
     }
 
+    // PLM: PlmMonitor::Drop is unreachable in production (AppState is
+    // Arc-shared by the IPC server and its tasks past process exit), so
+    // the ETW kernel session must be stopped+joined explicitly — otherwise
+    // the session orphans and burns one of the 8 system-logger slots until
+    // the next boot's stale cleanup.
+    if let Some(plm) = server.state().plm() {
+        plm.shutdown();
+    }
+
     if let Err(e) = run_result {
         error!(%e, "daemon shutting down due to error");
         return Err(e);

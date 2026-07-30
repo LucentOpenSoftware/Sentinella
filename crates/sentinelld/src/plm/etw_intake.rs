@@ -23,10 +23,13 @@
 //! Health is a stage machine (EtwStage), not a bare bool: etw_running is
 //! derived CONSERVATIVELY — true only once the consumer is open
 //! (ConsumerOpened and beyond). StartTraceW success alone is NOT reported
-//! as running. Persistent StartTraceW failure (>= MAX_CONSECUTIVE_FAILURES
-//! of any code, or ERROR_INVALID_PARAMETER once) or a zero-event consumer
-//! (~2 min) flips the daemon to snapshot-primary via etw_gave_up / the
-//! zero-event alarm in PlmMonitor's watchdog.
+//! as running. Persistent-class StartTraceW failure (>= MAX_CONSECUTIVE_FAILURES
+//! consecutive: access-denied 5 / invalid-parameter 87 / slot exhaustion
+//! 1450 — conditions that cannot heal on their own) or a zero-event
+//! consumer (~2 min) flips the daemon to snapshot-primary via etw_gave_up /
+//! the zero-event alarm in PlmMonitor's watchdog. Transient-class codes
+//! (everything else) retry forever at capped backoff so a transient outage
+//! never permanently disables ETW.
 //!
 //! There is intentionally NO EnableTraceEx2: kernel MOF process/image-load/
 //! file-io events are enabled via EVENT_TRACE_PROPERTIES.EnableFlags under
@@ -138,7 +141,8 @@ pub enum EtwStage {
     Degraded = 7,
     /// Orderly stop (ProcessTrace returned, handles closed).
     Stopped = 8,
-    /// StartTraceW/OpenTraceW failed; `failed_win32` carries the code.
+    /// StartTraceW/OpenTraceW/ProcessTrace failed; `failed_win32` carries
+    /// the code.
     Failed = 9,
 }
 
@@ -211,41 +215,76 @@ pub fn valid_stage_transition(from: EtwStage, to: EtwStage) -> bool {
 // ── Error classification (give-up semantics) ────────────────────
 
 pub const ERROR_ACCESS_DENIED: u32 = 5;
+pub const ERROR_INVALID_HANDLE: u32 = 6;
 pub const ERROR_INVALID_PARAMETER: u32 = 87;
 pub const ERROR_ALREADY_EXISTS: u32 = 183;
 pub const ERROR_NO_SYSTEM_RESOURCES: u32 = 1450;
 
-/// What a failed StartTraceW/OpenTraceW win32 code means for the retry loop.
+/// What a failed StartTraceW/OpenTraceW/ProcessTrace win32 code means for
+/// the retry loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartErrorDisposition {
     /// ERROR_ALREADY_EXISTS (183): a stale session owns the name — the
-    /// caller stops it and retries. NOT counted toward give-up.
+    /// caller stops it and retries. NOT counted toward give-up, but bounded
+    /// separately (MAX_STALE_SESSION_CLEANUPS) so a name squatted by a LIVE
+    /// session cannot livelock the loop.
     StaleSession,
-    /// ERROR_INVALID_PARAMETER (87): our session config is invalid; retrying
-    /// can never succeed. Give up immediately (fatal).
-    Fatal,
-    /// Everything else — including ERROR_ACCESS_DENIED (5, not elevated) and
-    /// ERROR_NO_SYSTEM_RESOURCES (1450, all 8 system-logger slots taken) —
-    /// is environmental/transient: counted toward the consecutive-failure
-    /// give-up budget. 1450 counts exactly like access-denied per the F-1
-    /// fix design: slot exhaustion must restore snapshot-primary, not spin.
-    Counted,
+    /// A condition that cannot heal without outside intervention:
+    /// ERROR_ACCESS_DENIED (5, not elevated — retrying gains no privileges),
+    /// ERROR_INVALID_PARAMETER (87, our session config bytes are wrong —
+    /// retrying the same bytes can never succeed), ERROR_NO_SYSTEM_RESOURCES
+    /// (1450, all 8 system-logger slots taken — slot exhaustion must restore
+    /// snapshot-primary, not spin). Counted toward the consecutive-failure
+    /// give-up budget.
+    Persistent,
+    /// Everything else (e.g. 53 ERROR_BAD_NETPATH, WMI-ish transient codes):
+    /// may heal on its own. NEVER counted toward give-up — retried with
+    /// long backoff (capped at 30 s) forever. This deliberately preserves
+    /// the pre-give-up-budget behavior for the transient class only: a
+    /// transient outage must not permanently disable ETW until daemon
+    /// restart. The persistent class above exists precisely so that
+    /// retry-forever no longer masks unfixable configurations.
+    Transient,
 }
 
 pub fn classify_start_error(code: u32) -> StartErrorDisposition {
     match code {
         ERROR_ALREADY_EXISTS => StartErrorDisposition::StaleSession,
-        ERROR_INVALID_PARAMETER => StartErrorDisposition::Fatal,
-        _ => StartErrorDisposition::Counted,
+        ERROR_ACCESS_DENIED | ERROR_INVALID_PARAMETER | ERROR_NO_SYSTEM_RESOURCES => {
+            StartErrorDisposition::Persistent
+        }
+        _ => StartErrorDisposition::Transient,
     }
 }
 
-/// Consecutive session-start failures (of ANY counted code) after which ETW
-/// intake gives up and `etw_gave_up` is set so the PLM watchdog restores the
-/// snapshot fallback to primary frequency. Before the F-1 fix only error 5
-/// counted, so a new persistent failure mode would retry forever at 30 s
-/// backoff with the snapshot stuck at supplemental cadence.
+/// Consecutive session-start failures of PERSISTENT-class codes after which
+/// ETW intake gives up and `etw_gave_up` is set so the PLM watchdog restores
+/// the snapshot fallback to primary frequency. Transient-class codes never
+/// reach this budget (see StartErrorDisposition::Transient).
 const MAX_CONSECUTIVE_FAILURES: u32 = 5;
+
+/// Bound on consecutive stale-session (183) stop-by-name + retry cycles.
+/// One or two is the crash-orphan case (session with no consumer: stopped,
+/// gone). Three or more IN A ROW means the name (or the frozen session
+/// GUID) is owned by a LIVE session that refuses ControlTraceW(STOP) or
+/// re-creates itself between our stop and our StartTraceW — retrying then
+/// is a 1-second livelock, not cleanup. Give up with a distinct diagnostic
+/// (failed_win32 = 183) instead of spinning forever.
+const MAX_STALE_SESSION_CLEANUPS: u32 = 3;
+
+/// Give-up decision for one failed start attempt. Persistent-class codes
+/// count toward the budget; transient-class codes never give up (long
+/// backoff retry). Pure so the loop's policy is unit-testable.
+fn should_give_up(disposition: StartErrorDisposition, consecutive_persistent_failures: u32) -> bool {
+    disposition == StartErrorDisposition::Persistent
+        && consecutive_persistent_failures >= MAX_CONSECUTIVE_FAILURES
+}
+
+/// Whether the stale-session cleanup cycle has hit its bound (see
+/// MAX_STALE_SESSION_CLEANUPS).
+fn stale_cleanup_give_up(consecutive_stale_cleanups: u32) -> bool {
+    consecutive_stale_cleanups >= MAX_STALE_SESSION_CLEANUPS
+}
 
 /// degraded_reason code: consumer open, zero events after the grace period.
 pub const DEGRADED_ZERO_EVENTS: u64 = 1;
@@ -265,7 +304,8 @@ pub struct EtwIntakeDiagnostics {
     pub etw_running: AtomicBool,
     pub last_event_ts: AtomicU64,
     /// Set to true when ETW gives up retrying (>= MAX_CONSECUTIVE_FAILURES
-    /// consecutive failures of any code, or a fatal config error).
+    /// consecutive PERSISTENT-class failures, or the stale-session cleanup
+    /// bound was hit — transient-class codes never trigger this).
     /// PlmMonitor can check this to switch to full snapshot mode.
     pub etw_gave_up: AtomicBool,
     /// Current lifecycle stage (`EtwStage as u64`). Single writer: the ETW
@@ -373,13 +413,20 @@ enum SessionError {
     StartTrace { code: u32 },
     /// OpenTraceW failed with this win32 code (session already stopped).
     OpenTrace { code: u32 },
+    /// ProcessTrace returned a win32 error while no shutdown was requested —
+    /// a mid-life stream loss, NOT a clean stop. The session was stopped by
+    /// the stop thread on the way out; the retry loop reconnects with
+    /// backoff instead of declaring "ended cleanly" and going silent.
+    ProcessTrace { code: u32 },
 }
 
 impl SessionError {
     fn win32_code(&self) -> u32 {
         match self {
             Self::Layout(_) | Self::StaleSessionCleaned => 0,
-            Self::StartTrace { code } | Self::OpenTrace { code } => *code,
+            Self::StartTrace { code } | Self::OpenTrace { code } | Self::ProcessTrace { code } => {
+                *code
+            }
         }
     }
 }
@@ -391,6 +438,7 @@ impl std::fmt::Display for SessionError {
             Self::StaleSessionCleaned => write!(f, "stale session cleaned, will retry"),
             Self::StartTrace { code } => write!(f, "StartTraceW failed: win32 {code}"),
             Self::OpenTrace { code } => write!(f, "OpenTraceW failed: win32 {code}"),
+            Self::ProcessTrace { code } => write!(f, "ProcessTrace failed: win32 {code}"),
         }
     }
 }
@@ -413,10 +461,15 @@ fn interruptible_sleep(running: &AtomicBool, secs: u64) {
 }
 
 /// Main ETW processing loop. Retries on failure with backoff.
-/// Gives up after `MAX_CONSECUTIVE_FAILURES` consecutive failures of ANY
-/// counted code (access-denied, 1450 slot exhaustion, …) or immediately on
-/// a fatal config error (87), setting `etw_gave_up` so the snapshot
-/// fallback is restored to primary frequency.
+/// Gives up after `MAX_CONSECUTIVE_FAILURES` consecutive failures of
+/// PERSISTENT-class codes (access-denied 5, invalid-parameter 87, slot
+/// exhaustion 1450, or an internal layout error — none can heal on their
+/// own), setting `etw_gave_up` so the snapshot fallback is restored to
+/// primary frequency. TRANSIENT-class codes (everything else) are retried
+/// forever at capped backoff: a transient outage must not permanently
+/// disable ETW until daemon restart. Stale-session (183) cleanups are
+/// bounded by MAX_STALE_SESSION_CLEANUPS so a live name-squatter cannot
+/// livelock the loop.
 fn etw_process_loop(
     graph: Arc<LineageGraph>,
     diag: Arc<EtwIntakeDiagnostics>,
@@ -428,6 +481,7 @@ fn etw_process_loop(
     let session_name = "SentinellaPLM";
     let mut backoff_secs = 1u64;
     let mut consecutive_failures = 0u32;
+    let mut consecutive_stale_cleanups = 0u32;
 
     diag.set_stage(EtwStage::Starting);
 
@@ -445,14 +499,35 @@ fn etw_process_loop(
                 // Crash-between-StartTrace-and-OpenTrace (or any orphaned
                 // session from a previous run) lands here: the stale session
                 // was already stopped by name inside run_etw_session. Not a
-                // failure — do not count it toward give-up.
+                // failure — but BOUNDED: if stop-by-name keeps not sticking,
+                // a live process owns our session name (or the frozen GUID)
+                // and stop+retry would livelock at 1 s cadence forever.
+                consecutive_stale_cleanups = consecutive_stale_cleanups.saturating_add(1);
                 diag.reconnects.fetch_add(1, Ordering::Relaxed);
+                if stale_cleanup_give_up(consecutive_stale_cleanups) {
+                    tracing::warn!(
+                        attempts = consecutive_stale_cleanups,
+                        "PLM ETW: session name survives stop-by-name — owned by a live \
+                         session (or frozen GUID collision); giving up, snapshot fallback \
+                         becomes primary"
+                    );
+                    diag.note_failed(ERROR_ALREADY_EXISTS);
+                    diag.etw_gave_up.store(true, Ordering::Relaxed);
+                    break;
+                }
                 consecutive_failures = 0;
-                tracing::info!("PLM ETW: stale session cleaned, will retry");
+                tracing::info!(
+                    attempt = consecutive_stale_cleanups,
+                    max = MAX_STALE_SESSION_CLEANUPS,
+                    "PLM ETW: stale session cleaned, will retry"
+                );
                 interruptible_sleep(&running, 1);
                 continue;
             }
             Err(e) => {
+                // A start attempt that failed with a DIFFERENT code got past
+                // the 183 check — the stale-name situation resolved itself.
+                consecutive_stale_cleanups = 0;
                 diag.reconnects.fetch_add(1, Ordering::Relaxed);
 
                 if !running.load(Ordering::Relaxed) {
@@ -460,22 +535,28 @@ fn etw_process_loop(
                 }
 
                 let code = e.win32_code();
-                let disposition = classify_start_error(code);
+                // An internal layout error is our own bug — the same bytes
+                // fail identically forever, so it is persistent-class even
+                // though it carries no win32 code.
+                let disposition = match &e {
+                    SessionError::Layout(_) => StartErrorDisposition::Persistent,
+                    _ => classify_start_error(code),
+                };
                 // A failure after the consumer was open means the config is
                 // fundamentally fine (this is a mid-life stream loss) — reset
-                // the consecutive-start budget; the failure itself still counts.
+                // the consecutive-start budget; a persistent-class failure
+                // itself still counts.
                 let reached_consumer = diag.etw_running.load(Ordering::Relaxed);
                 diag.note_failed(code);
                 consecutive_failures = if reached_consumer {
-                    1
-                } else {
+                    u32::from(disposition == StartErrorDisposition::Persistent)
+                } else if disposition == StartErrorDisposition::Persistent {
                     consecutive_failures.saturating_add(1)
+                } else {
+                    consecutive_failures
                 };
 
-                let fatal = disposition == StartErrorDisposition::Fatal
-                    || consecutive_failures >= MAX_CONSECUTIVE_FAILURES;
-
-                if fatal {
+                if should_give_up(disposition, consecutive_failures) {
                     tracing::warn!(
                         stage = diag.stage_name(),
                         win32 = code,
@@ -678,7 +759,7 @@ fn run_etw_session(
         }
     });
 
-    let _ = unsafe { ProcessTrace(&handles, None, None) };
+    let process_trace_result = unsafe { ProcessTrace(&handles, None, None) }.0;
 
     // R3-10: clear callback context BEFORE releasing handle so any late
     // event delivery sees null pointers and bails out, preventing UAF
@@ -696,7 +777,22 @@ fn run_etw_session(
     // etw_running is re-derived by the caller's set_stage(Stopped) — no
     // direct store here (all health writes go through the stage machine).
 
-    Ok(())
+    // ProcessTrace's return value is authoritative for WHY it returned.
+    // Orderly shutdown (running == false, our stop thread issued the STOP):
+    // any code is a clean stop. ERROR_INVALID_HANDLE on close (the handle
+    // was already torn down externally) is also clean. Anything else while
+    // we are still supposed to be running is a mid-life stream loss — the
+    // old code discarded the return value and the loop above treated it as
+    // "session ended cleanly", permanently killing ETW with stage=stopped
+    // and no reconnect. Surface it as a session failure so the retry loop
+    // applies Failed + reconnect-with-backoff semantics.
+    if !running.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    match process_trace_result {
+        0 | ERROR_INVALID_HANDLE => Ok(()),
+        code => Err(SessionError::ProcessTrace { code }),
+    }
 }
 
 /// Build an aligned stop/cleanup properties buffer for `ControlTraceW`.
@@ -805,30 +901,15 @@ unsafe extern "system" fn etw_event_callback(record: *mut EVENT_RECORD) {
                 event.UserDataLength as usize,
             );
 
-            // PID from the event header (authoritative).
-            let pid = event.EventHeader.ProcessId;
-
-            // Audit fix: the kernel Process_TypeGroup1 layout is
-            //   UniqueProcessKey (pointer-sized: 4 on x86, 8 on x64)
-            //   ProcessId  (u32)
-            //   ParentId   (u32)   ← what we want
-            // The previous code read ParentId from offset 4, which on an
-            // x64 OS is the HIGH DWORD of the 8-byte UniqueProcessKey →
-            // garbage parent PIDs → broken lineage chains. ParentId sits at
-            // `ptr_size + 4`. Sentinella ships x64 and the kernel event
-            // layout follows the OS bitness, so size_of::<usize>() is the
-            // correct pointer width here.
-            let ptr_size = std::mem::size_of::<usize>();
-            let ppid_off = ptr_size + 4;
-            if data.len() < ppid_off + 4 {
+            // Identity comes from the PAYLOAD, not the event header: for
+            // kernel Process_TypeGroup1 START events the header's ProcessId
+            // is the CREATING (parent) process — the new process's PID and
+            // its real parent live in the MOF payload. Using the header PID
+            // here queried the command line of the PARENT and attributed
+            // image + cmdline to the wrong process.
+            let Some((pid, ppid)) = parse_process_start_payload(data) else {
                 return;
-            }
-            let ppid = u32::from_le_bytes([
-                data[ppid_off],
-                data[ppid_off + 1],
-                data[ppid_off + 2],
-                data[ppid_off + 3],
-            ]);
+            };
 
             // Image name resolution for process START events.
             // ETW event data (authoritative, free) → ToolHelp fallback (expensive).
@@ -986,12 +1067,50 @@ fn read_wide_path(data: &[u8], start: usize) -> Option<String> {
     }
 }
 
+/// Parse the kernel Process_TypeGroup1 (opcode 1, START) payload into
+/// `(new_pid, parent_pid)`.
+///
+/// MOF layout (offset in bytes, pointer width follows OS bitness — x64
+/// shipped, x86 shown for reference):
+///   0:                    UniqueProcessKey (pointer-sized: 8 on x64, 4 on x86)
+///   ptr_size:             ProcessId (u32)  — the NEW process
+///   ptr_size + 4:         ParentId  (u32)  — the creator
+///   ptr_size + 8:         SessionId, ExitStatus, DirectoryTableBase, …
+///   variable:             ImageFileName (null-terminated wide string)
+///
+/// The EVENT_HEADER's ProcessId is NOT used: for START events it names the
+/// creating process, so every consumer of process identity (image lookup,
+/// command-line query, lineage record) must key on the payload ProcessId.
+/// Pure + bounds-checked so the mapping is unit-testable without a live
+/// ETW session; never panics on short/corrupt payloads.
+pub(crate) fn parse_process_start_payload(data: &[u8]) -> Option<(u32, u32)> {
+    let ptr_size = std::mem::size_of::<usize>();
+    let pid_off = ptr_size;
+    let ppid_off = ptr_size + 4;
+    if data.len() < ppid_off + 4 {
+        return None;
+    }
+    let pid = u32::from_le_bytes([
+        data[pid_off],
+        data[pid_off + 1],
+        data[pid_off + 2],
+        data[pid_off + 3],
+    ]);
+    let ppid = u32::from_le_bytes([
+        data[ppid_off],
+        data[ppid_off + 1],
+        data[ppid_off + 2],
+        data[ppid_off + 3],
+    ]);
+    Some((pid, ppid))
+}
+
 /// Try to extract image path from ETW process start event data.
 ///
 /// Process start event layout (kernel provider, opcode 1), x64:
 ///   Offset 0:   UniqueProcessKey (pointer-sized: 8 on x64, 4 on x86)
-///   Offset 8:   ProcessId (u32)  — but we use the header PID
-///   Offset 12:  ParentId (u32)
+///   Offset 8:   ProcessId (u32)  — the NEW process (see parse_process_start_payload)
+///   Offset 12:  ParentId (u32)   — the creator
 ///   Offset 16:  SessionId (u32), ExitStatus (i32), DirectoryTableBase, …
 ///   Variable:   ImageFileName as null-terminated wide string after fixed fields
 ///
@@ -1147,31 +1266,189 @@ mod tests {
 
     #[test]
     fn classify_error_codes() {
-        // 183: stale session — stop + retry, never counted.
+        // 183: stale session — stop + retry, never counted (but bounded
+        // separately, see MAX_STALE_SESSION_CLEANUPS).
         assert_eq!(
             classify_start_error(ERROR_ALREADY_EXISTS),
             StartErrorDisposition::StaleSession
         );
-        // 87: invalid config — fatal immediately, retrying is pointless.
-        assert_eq!(
-            classify_start_error(ERROR_INVALID_PARAMETER),
-            StartErrorDisposition::Fatal
+        // Persistent class — conditions that cannot heal on their own:
+        // 5 (not elevated), 87 (our config bytes are wrong), 1450 (all 8
+        // system-logger slots taken). All count toward the give-up budget.
+        for code in [
+            ERROR_ACCESS_DENIED,
+            ERROR_INVALID_PARAMETER,
+            ERROR_NO_SYSTEM_RESOURCES,
+        ] {
+            assert_eq!(
+                classify_start_error(code),
+                StartErrorDisposition::Persistent,
+                "code {code} must be persistent-class"
+            );
+        }
+        // Transient class — everything else (e.g. 53 ERROR_BAD_NETPATH):
+        // retried with long backoff, NEVER counted toward give-up.
+        assert_eq!(classify_start_error(53), StartErrorDisposition::Transient);
+        assert_eq!(classify_start_error(0), StartErrorDisposition::Transient);
+        assert_eq!(classify_start_error(u32::MAX), StartErrorDisposition::Transient);
+    }
+
+    #[test]
+    fn give_up_only_on_persistent_budget_exhaustion() {
+        // Persistent codes give up exactly at the budget.
+        for n in 0..MAX_CONSECUTIVE_FAILURES {
+            assert!(
+                !should_give_up(StartErrorDisposition::Persistent, n),
+                "persistent failure #{n} must still retry"
+            );
+        }
+        assert!(should_give_up(
+            StartErrorDisposition::Persistent,
+            MAX_CONSECUTIVE_FAILURES
+        ));
+        assert!(should_give_up(
+            StartErrorDisposition::Persistent,
+            MAX_CONSECUTIVE_FAILURES + 10
+        ));
+        // Transient codes NEVER give up — a transient outage (e.g. error 53
+        // network) must not permanently disable ETW until daemon restart.
+        // This is the regression guard for the old "any code counts"
+        // give-up that converted transient outages into permanent ETW loss.
+        assert!(!should_give_up(StartErrorDisposition::Transient, 1));
+        assert!(!should_give_up(StartErrorDisposition::Transient, 100));
+        assert!(!should_give_up(StartErrorDisposition::Transient, u32::MAX));
+    }
+
+    #[test]
+    fn stale_session_cleanup_is_bounded() {
+        // The 183 stop-by-name + retry cycle must not livelock when a LIVE
+        // session owns our name (or the frozen GUID): the first attempts
+        // retry, the bound gives up.
+        assert!(!stale_cleanup_give_up(1));
+        assert!(!stale_cleanup_give_up(MAX_STALE_SESSION_CLEANUPS - 1));
+        assert!(stale_cleanup_give_up(MAX_STALE_SESSION_CLEANUPS));
+        assert!(stale_cleanup_give_up(MAX_STALE_SESSION_CLEANUPS + 5));
+    }
+
+    // ── Process start payload identity mapping (HIGH fix) ───────
+    //
+    // For kernel Process_TypeGroup1 START events the event HEADER's
+    // ProcessId is the CREATING process; the payload carries the new
+    // process's PID and its true parent. These tests pin that mapping so
+    // cmdline/image attribution can never silently revert to the header
+    // PID.
+
+    /// Build a synthetic Process_TypeGroup1 payload (x64 layout):
+    /// UniqueProcessKey (ptr-sized) | ProcessId u32 | ParentId u32 | …
+    fn synthetic_start_payload(pid: u32, ppid: u32) -> Vec<u8> {
+        let ptr_size = std::mem::size_of::<usize>();
+        let mut data = vec![0u8; ptr_size + 8];
+        data[ptr_size..ptr_size + 4].copy_from_slice(&pid.to_le_bytes());
+        data[ptr_size + 4..ptr_size + 8].copy_from_slice(&ppid.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn start_payload_yields_new_pid_and_true_parent() {
+        // Header PID (the creator, e.g. 1337) must be IGNORED; identity is
+        // the payload's ProcessId (4242) with parent linkage from the
+        // payload's ParentId (1337).
+        let data = synthetic_start_payload(4242, 1337);
+        assert_eq!(parse_process_start_payload(&data), Some((4242, 1337)));
+    }
+
+    #[test]
+    fn start_payload_short_buffer_is_none_not_panic() {
+        let ptr_size = std::mem::size_of::<usize>();
+        for len in [0, 4, ptr_size, ptr_size + 4, ptr_size + 7] {
+            let data = vec![0xAAu8; len];
+            assert_eq!(parse_process_start_payload(&data), None, "len {len}");
+        }
+    }
+
+    #[test]
+    fn start_event_attributes_cmdline_and_lineage_to_payload_pid() {
+        // End-to-end at the level the callback composes: parse payload →
+        // query cmdline for the PAYLOAD pid → record the node with parent
+        // linkage from the payload ParentId. The scripted querier only
+        // knows the payload pid; if the code keyed on the header (creator)
+        // pid, the cmdline would come back NotCollected and the node would
+        // attach to the wrong process.
+        use super::super::cmdline::CommandLineDiagnostics;
+        use std::collections::HashMap;
+
+        struct FakeBackend {
+            per_pid: HashMap<u32, CommandLineState>,
+        }
+        impl super::super::cmdline::CommandLineBackend for FakeBackend {
+            fn query(&self, pid: u32) -> CommandLineState {
+                self.per_pid
+                    .get(&pid)
+                    .cloned()
+                    .unwrap_or(CommandLineState::NotCollected)
+            }
+        }
+
+        let creator_pid = 1337u32; // what the event header would carry
+        let new_pid = 4242u32; // what the payload carries
+        let data = synthetic_start_payload(new_pid, creator_pid);
+        let (pid, ppid) = parse_process_start_payload(&data).expect("payload parses");
+        assert_eq!(pid, new_pid);
+        assert_eq!(ppid, creator_pid);
+
+        let mut per_pid = HashMap::new();
+        per_pid.insert(
+            new_pid,
+            CommandLineState::Present("child.exe --from-etw".into()),
         );
-        // 5 (access denied) and 1450 (all 8 system-logger slots taken)
-        // both count toward the consecutive-failure give-up budget.
-        assert_eq!(
-            classify_start_error(ERROR_ACCESS_DENIED),
-            StartErrorDisposition::Counted
+        let querier = SharedCommandLineQuerier::with_backend(
+            Box::new(FakeBackend { per_pid }),
+            Arc::new(CommandLineDiagnostics::new()),
         );
+        let command_line = querier.query(pid);
         assert_eq!(
-            classify_start_error(ERROR_NO_SYSTEM_RESOURCES),
-            StartErrorDisposition::Counted
+            command_line,
+            CommandLineState::Present("child.exe --from-etw".into()),
+            "cmdline query must key on the payload PID, not the header PID"
         );
-        // Anything else (e.g. 53 ERROR_BAD_NETPATH) is counted, never
-        // silently fatal and never silently free.
-        assert_eq!(classify_start_error(53), StartErrorDisposition::Counted);
-        assert_eq!(classify_start_error(0), StartErrorDisposition::Counted);
-        assert_eq!(classify_start_error(u32::MAX), StartErrorDisposition::Counted);
+
+        let graph = LineageGraph::new();
+        graph.record_process(ProcessNode {
+            pid: creator_pid,
+            parent_pid: 0,
+            image_path: "C:\\Windows\\System32\\parent.exe".into(),
+            image_name: "parent.exe".into(),
+            command_line: CommandLineState::NotCollected,
+            is_signed: None,
+            integrity_level: None,
+            created_at: Instant::now(),
+            timestamp: chrono::Utc::now().timestamp(),
+        });
+        graph.record_process(ProcessNode {
+            pid,
+            parent_pid: ppid,
+            image_path: "C:\\Temp\\child.exe".into(),
+            image_name: "child.exe".into(),
+            command_line,
+            is_signed: None,
+            integrity_level: None,
+            created_at: Instant::now(),
+            timestamp: chrono::Utc::now().timestamp(),
+        });
+
+        // The new process's node lives under the PAYLOAD pid and chains to
+        // the payload-declared parent.
+        let node = graph.get_node(new_pid).expect("node recorded under payload pid");
+        assert_eq!(node.parent_pid, creator_pid);
+        assert_eq!(node.image_name, "child.exe");
+        assert_eq!(
+            node.command_line,
+            CommandLineState::Present("child.exe --from-etw".into())
+        );
+        let chain = graph.get_chain(new_pid);
+        assert_eq!(chain.depth, 2);
+        assert_eq!(chain.nodes[0].image_name, "parent.exe");
+        assert_eq!(chain.nodes[1].image_name, "child.exe");
     }
 
     // ── Stage-transition validator ──────────────────────────────
