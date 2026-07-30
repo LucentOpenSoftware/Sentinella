@@ -289,8 +289,9 @@ fn detect_root() -> PathBuf {
 /// True when `dir` is a path we treat as administratively-protected, i.e.
 /// not a directory unprivileged users can write to. Used so we refuse to
 /// honor `runtime/` next to the exe if the exe itself was dropped into a
-/// user-writable location.
-fn is_trusted_install_dir(dir: &Path) -> bool {
+/// user-writable location. Also used by the IPC fairness layer to recognize
+/// first-party clients by image path (`ClientIdentity::is_first_party`).
+pub(crate) fn is_trusted_install_dir(dir: &Path) -> bool {
     let s = dir.to_string_lossy().to_lowercase();
 
     // Explicit deny: classic user-writable roots. Anyone able to drop

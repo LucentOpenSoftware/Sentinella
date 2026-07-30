@@ -174,7 +174,9 @@ fn bucket_config(bucket: RateBucket) -> BucketConfig {
 /// Per-principal identity key for request-rate accounting. Deliberately
 /// mirrors `fairness::PrincipalKey` (same Sid/Unidentified split, same
 /// no-PID-fallback rationale) but is defined locally so the policy module
-/// stays self-contained; fairness.rs keeps its key private.
+/// stays self-contained; fairness.rs keeps its key private. First-party
+/// clients bypass this layer entirely (see `check`), so no FirstParty
+/// variant is needed here.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum PrincipalKey {
     /// String SID from the client process's token (e.g. `S-1-5-21-…`).
@@ -329,7 +331,15 @@ impl RateLimiter {
             None => return Ok(()),
         };
 
-        self.check_principal(bucket, &state.config, principal)?;
+        // First-party clients (installed GUI/CLI by kernel-reported image
+        // path — see ClientIdentity::is_first_party) skip the per-principal
+        // layer: same-user malware cannot enter this pool, and the management
+        // client must not be throttled by a same-SID flooder draining its
+        // own sub-bucket (the re-key finding from adversarial re-review).
+        // The GLOBAL ceiling below still applies to everyone.
+        if !principal.map(|p| p.is_first_party()).unwrap_or(false) {
+            self.check_principal(bucket, &state.config, principal)?;
+        }
 
         // Refill tokens based on elapsed time.
         //
@@ -868,6 +878,7 @@ mod tests {
             is_elevated: false,
             is_system: false,
             well_known_untrusted: false,
+            image_path: None,
         }
     }
 

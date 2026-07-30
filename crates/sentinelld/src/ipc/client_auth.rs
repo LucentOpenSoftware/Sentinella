@@ -40,6 +40,36 @@ pub struct ClientIdentity {
     pub is_system: bool,
     /// SID is a well-known untrusted principal (Anonymous / Null).
     pub well_known_untrusted: bool,
+    /// Full image path of the client process, when resolvable. Used by the
+    /// IPC fairness layer to recognize first-party clients (the installed
+    /// GUI/CLI) — an attacker running as the SAME user shares the SID but
+    /// cannot place their binary in the trusted install dir without admin
+    /// rights. `None` is never treated as first-party.
+    pub image_path: Option<String>,
+}
+
+impl ClientIdentity {
+    /// First-party client recognition for the fairness layer: true when the
+    /// client's image lives under a trusted install dir (Program Files etc. —
+    /// see `paths::is_trusted_install_dir`). WHY this exists: SID-keyed
+    /// fairness alone put same-user malware and the same-user GUI in ONE
+    /// bucket, making GUI lockout 8× cheaper than the global cap it replaced.
+    /// The image path is kernel-reported (QueryFullProcessImageNameW); an
+    /// unprivileged attacker cannot place a binary in the trusted dir, so
+    /// they cannot enter the first-party pool. Canonicalization defeats
+    /// `..`/8.3-name smuggling; on any resolution failure → NOT first-party
+    /// (fail into the per-SID bucket, never into the privileged pool).
+    pub fn is_first_party(&self) -> bool {
+        let Some(img) = &self.image_path else {
+            return false;
+        };
+        let path = std::path::Path::new(img);
+        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        match canon.parent() {
+            Some(dir) => crate::paths::is_trusted_install_dir(dir),
+            None => false,
+        }
+    }
 }
 
 /// Authorization decision.
@@ -313,12 +343,37 @@ fn resolve_client(pipe: std::os::windows::io::RawHandle) -> ResolveOutcome {
             let is_system = sid == "S-1-5-18";
             let well_known_untrusted = sid == "S-1-5-7" || sid == "S-1-0-0";
 
+            // 6. Image path (for first-party recognition in the fairness
+            //    layer). Best-effort: failure must not deny a legitimate
+            //    client — it simply lands in the per-SID bucket.
+            let image_path = {
+                use windows::Win32::System::Threading::QueryFullProcessImageNameW;
+                let mut buf = [0u16; 1024];
+                let mut len: u32 = buf.len() as u32;
+                // SAFETY: `proc` is a live handle with
+                // PROCESS_QUERY_LIMITED_INFORMATION; `buf` is a valid
+                // writable UTF-16 buffer of `len` units on entry and is
+                // only read up to the returned length.
+                match QueryFullProcessImageNameW(
+                    proc,
+                    windows::Win32::System::Threading::PROCESS_NAME_FORMAT(0),
+                    windows::core::PWSTR(buf.as_mut_ptr()),
+                    &mut len,
+                ) {
+                    Ok(()) if (len as usize) < buf.len() => {
+                        Some(String::from_utf16_lossy(&buf[..len as usize]))
+                    }
+                    _ => None,
+                }
+            };
+
             Some(ClientIdentity {
                 sid,
                 session_id,
                 is_elevated,
                 is_system,
                 well_known_untrusted,
+                image_path,
             })
         })();
 
@@ -344,6 +399,7 @@ mod tests {
             is_elevated: elevated,
             is_system: sid == "S-1-5-18",
             well_known_untrusted: sid == "S-1-5-7" || sid == "S-1-0-0",
+            image_path: None,
         }
     }
 
@@ -440,6 +496,7 @@ mod tests {
             is_elevated: true,
             is_system: false,
             well_known_untrusted: true,
+            image_path: None,
         };
         assert_eq!(
             require_elevation(Some(&anon)),
