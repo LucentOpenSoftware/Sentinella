@@ -274,6 +274,74 @@ pub struct VerdictExplanation {
     pub threat_maturity: ThreatMaturity,
     /// Attack stage progression depth (0-3).
     pub progression_depth: u8,
+    /// Installer-framework mitigation provenance (workstream U).
+    ///
+    /// Present whenever the framework dispatcher recognized anything at all
+    /// (including WeakHint-only detections that granted NO mitigation), so an
+    /// analyst can see *why* a file did or did not receive the installer
+    /// weight reductions. Additive field: `#[serde(default)]` keeps old JSON
+    /// (argusd worker output, cached state) deserializable, and
+    /// `skip_serializing_if` keeps the common no-detection payload unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub framework_mitigation: Option<FrameworkMitigationProvenance>,
+}
+
+/// A single piece of framework-detection evidence, serialized for provenance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrameworkEvidenceRecord {
+    /// Evidence source as a stable string (e.g. "Overlay", "TextHint").
+    pub source: String,
+    /// Absolute file offset of the evidence, when it has one.
+    pub offset: Option<u64>,
+    /// Human-readable description (what was found and why it indicates the
+    /// framework).
+    pub detail: String,
+}
+
+/// One weight-reduction operation applied by installer-framework mitigation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MitigationOpRecord {
+    /// Layer of the finding whose weight was reduced (Debug name).
+    pub layer: String,
+    /// Weight before mitigation.
+    pub weight_before: u32,
+    /// Weight after mitigation.
+    pub weight_after: u32,
+}
+
+/// Full provenance of one installer-framework mitigation decision
+/// (workstream T/U): what was detected, on what evidence, whether mitigation
+/// was authorized and applied, every weight reduction performed, the score
+/// before/after mitigation, and the veto reason when independent
+/// high-confidence evidence suppressed mitigation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FrameworkMitigationProvenance {
+    /// Detected framework kind (e.g. "NSIS"), if any.
+    pub kind: Option<String>,
+    /// Confidence tier after invariant enforcement ("Structural",
+    /// "Corroborated", "WeakHint", "Unknown").
+    pub confidence: String,
+    /// Whether the detection satisfied the centralized build() invariant
+    /// (confidence >= Corroborated + structural evidence present).
+    pub mitigation_safe: bool,
+    /// Whether mitigation was actually applied (stricter than
+    /// `mitigation_safe` — requires Structural confidence and no
+    /// high-confidence veto; see engine.rs `FrameworkMitigation::evaluate`).
+    pub mitigation_applied: bool,
+    /// Evidence summaries backing the detection.
+    pub evidence: Vec<FrameworkEvidenceRecord>,
+    /// Every weight-reduction op applied (empty when not applied).
+    pub ops: Vec<MitigationOpRecord>,
+    /// Sum of finding weights immediately before the mitigation pass.
+    pub score_before_mitigation: u32,
+    /// Sum of finding weights immediately after the mitigation pass
+    /// (equal to `score_before_mitigation` when mitigation was not applied).
+    pub score_after_mitigation: u32,
+    /// Why mitigation was suppressed despite a qualifying (Structural-grade)
+    /// detection — e.g. independent high-confidence evidence present.
+    pub veto_reason: Option<String>,
+    /// Non-fatal detection warnings (tamper indicators, downgrades, ...).
+    pub warnings: Vec<String>,
 }
 
 /// Confidence label — a human-friendly assessment that complements the score.

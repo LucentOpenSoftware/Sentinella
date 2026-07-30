@@ -86,6 +86,26 @@ pub enum FrameworkKind {
     Unknown,
 }
 
+impl FrameworkKind {
+    /// Stable human-readable name for explanations, provenance, and the
+    /// `VerdictExplanation.framework` display field.
+    pub fn label(self) -> &'static str {
+        match self {
+            FrameworkKind::Nsis => "NSIS",
+            FrameworkKind::InnoSetup => "Inno Setup",
+            FrameworkKind::WixBurn => "WiX Burn",
+            FrameworkKind::MsiOle2 => "Windows Installer (MSI/OLE2)",
+            FrameworkKind::InstallShield => "InstallShield",
+            FrameworkKind::AdvancedInstaller => "Advanced Installer",
+            FrameworkKind::ElectronBundle => "Electron",
+            FrameworkKind::GoStatic => "Go (static)",
+            FrameworkKind::RustStatic => "Rust (static)",
+            FrameworkKind::GenericFramework => "Generic bundle framework",
+            FrameworkKind::Unknown => "Unknown",
+        }
+    }
+}
+
 /// Where a piece of detection evidence was found.
 ///
 /// The structural/non-structural split is the security-relevant property:

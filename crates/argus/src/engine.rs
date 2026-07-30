@@ -483,49 +483,21 @@ impl ArgusEngine {
             layers::reputation::analyze_with_discount(&path_str, &data);
         findings.extend(rep_findings);
 
-        // ── Installer framework detection ──────────────────────
-        // NSIS, InnoSetup, WiX, Electron installers are expected to have
-        // compressed data, few imports, large overlays, temp extraction,
-        // and download capabilities. These are NOT suspicious in an installer.
-        // Compute once and reuse — is_known_installer scans the buffer for
-        // multiple signatures (NSIS, InnoSetup, WiX, Electron); running it
-        // twice per file (once here, once during aggregation below) doubled
-        // the cost for every PE.
-        // NOT gated on `is_pe` here — MSI installers are OLE2 compound files
-        // (by definition not PE); the PE/OLE2 gating lives inside
-        // `is_known_installer` itself (fast reject for everything else).
-        let installer_detected = is_known_installer(&data, &path_str);
-        let installer_detected_early = installer_detected;
-        if installer_detected_early {
-            for f in &mut findings {
-                match f.layer {
-                    // Structural/packer: aggressive reduction (/3).
-                    Layer::StructuralAnalysis | Layer::PackerDetection => {
-                        f.weight = f.weight / 3;
-                    }
-                    // YARA: moderate reduction (/2) for installer-expected patterns.
-                    // Dropper, updater, and persistence rules fire on normal installers.
-                    Layer::YaraRules => {
-                        if let Some(ref detail) = f.technical_detail {
-                            let dl = detail.to_lowercase();
-                            if dl.contains("dropper")
-                                || dl.contains("updater")
-                                || dl.contains("installer")
-                                || dl.contains("persistence")
-                                || dl.contains("temp_extraction")
-                                || dl.contains("fake_updater")
-                            {
-                                f.weight = f.weight / 2;
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-                if f.weight == 0 && f.severity > Severity::Info {
-                    f.severity = Severity::Info;
-                }
-            }
-        }
+        // ── Installer framework detection & mitigation ───────
+        // Replaces the legacy `is_known_installer` substring scan (deleted):
+        // unanchored `windows(needle)` searches over the whole buffer were a
+        // confirmed spoof primitive — any attacker could embed "Nullsoft Inst"
+        // / "ASAR" / "Go build ID:" anywhere in a file they fully control and
+        // earn the installer leniency discount (Structural/Packer /3,
+        // installer-class YARA /2). Detection is now structural and
+        // evidence-based (`layers::framework::detect`); the weight divisions
+        // below apply ONLY when `FrameworkMitigation::evaluate` authorizes
+        // them — see that function for the exact policy (Structural-grade
+        // evidence required, WeakHint grants nothing, high-confidence veto,
+        // one pass only).
+        let framework_detection = layers::framework::detect(&data, &path_str);
+        let framework_mitigation =
+            FrameworkMitigation::evaluate(framework_detection, &mut findings);
 
         // ── Trusted binary noise suppression ───────────────────
         // If both Authenticode + reputation agree this is trusted,
@@ -556,12 +528,12 @@ impl ArgusEngine {
         }
 
         // ── Aggregate score + build explanation ────────────────
-        // installer_detected was computed above — reuse instead of re-scanning.
+        // framework_mitigation was computed above — reuse instead of re-scanning.
         let (score, verdict, explanation) = aggregate_score(
             &mut findings,
             reputation_discount,
             authenticode_discount,
-            installer_detected,
+            &framework_mitigation,
         );
         let elapsed = start.elapsed();
         let elapsed_us = elapsed.as_micros() as u64;
@@ -719,8 +691,13 @@ impl ArgusEngine {
         // Route through the unified scoring contract so buffer scans share
         // dedup, per-category caps, convergence, and explanation with file
         // scans. Reputation and Authenticode are path-only signals, so they
-        // pass through as 0 here.
-        let (score, verdict, explanation) = aggregate_score(&mut findings, 0, 0, false);
+        // pass through as 0 here. Buffer scans (AMSI/ADS/memory regions)
+        // deliberately get NO installer-framework mitigation: the file path
+        // is a synthetic name, so filename evidence would be meaningless,
+        // and a memory region is not an installer on disk. This preserves the
+        // pre-refactor behavior (is_known_installer was never consulted here).
+        let (score, verdict, explanation) =
+            aggregate_score(&mut findings, 0, 0, &FrameworkMitigation::none());
 
         // ── Update stats ──────────────────────────────────────
         // Buffer scans (AMSI, ADS, memory regions) count too — otherwise
@@ -820,6 +797,7 @@ fn default_explanation() -> VerdictExplanation {
         framework: None,
         threat_maturity: ThreatMaturity::Benign,
         progression_depth: 0,
+        framework_mitigation: None,
     }
 }
 
@@ -962,6 +940,250 @@ fn deduplicate_findings(findings: &mut Vec<Finding>) {
     }
 }
 
+/// Installer-framework mitigation — the ONLY place in the engine where a
+/// framework detection may reduce finding weights.
+///
+/// ## POLICY (calibration decisions, do not relax without a review)
+///
+/// 1. **Mitigation requires `confidence == Structural` AND
+///    `mitigation_safe()`.** This is deliberately stricter than the
+///    `FrameworkDetection::build` invariant (which marks Corroborated +
+///    structural evidence as `mitigation_safe` for diagnostic purposes).
+///    Corroborated results mean conflicting/tampered evidence — an NSIS
+///    archive whose CRC does not verify, a truncated Inno setup, a Burn
+///    container that cannot be validated. Failing conservatively costs a
+///    damaged legitimate installer a few points; failing open hands a
+///    tamper-for-leniency primitive to attackers. Structural-grade means the
+///    file *verifiably is* the framework (validated header grammar at a
+///    structural offset, integrity check passed or legitimately absent).
+///
+/// 2. **WeakHint grants NO discount — including every legacy substring
+///    hint** (Electron "ASAR", "Go build ID:", Qt/Squirrel markers, the
+///    name+body-hint heuristic, extension-only MSI). Embedding such a marker
+///    is exactly the same attack as embedding "Nullsoft Inst" was; leaving
+///    any of them discounted keeps the evasion CLASS alive. FP cost is
+///    bounded and accepted: legit unsigned Go/Electron apps with structural
+///    noise may now land in the Suspicious label band, but the daemon's
+///    ARGUS-only quarantine bar is 85, so no auto-quarantine shift is
+///    expected. Restoring leniency for these frameworks requires a
+///    *structural* detector, not a marker string.
+///
+/// 3. **High-confidence veto:** installer mitigation must never suppress
+///    independent high-confidence malicious evidence. If ANY finding
+///    (evaluated pre-mitigation) has weight >= [`HIGH_CONFIDENCE_VETO_WEIGHT`]
+///    mitigation does not apply AT ALL and the veto is recorded. The
+///    threshold 40 covers the three known high-weight emitters — IoC hash
+///    match (90), weight-40 YARA rules, MIME/magic mismatch (45) — while the
+///    installer-class YARA findings the /2 division targets are <= ~25, so
+///    an installer can still be flagged by ordinary detections (decision:
+///    mitigation and conviction are separate dimensions). This also covers
+///    the MIME-45 × system-path interaction (workstream W): a real installer
+///    with a genuine MIME mismatch keeps the full 45 (veto, no division);
+///    the authenticode system-path −20 discount is a *trust* discount applied
+///    independently in `aggregate_score`, orthogonal to this pass.
+///
+/// 4. **One mitigation pass only.** A file gets at most one mitigation
+///    application (no stacking of multiple hints/divisions).
+///
+/// 5. **Divisions unchanged:** Structural/Packer findings /3, installer-class
+///    YARA findings /2 — the calibration of these ratios is preserved from
+///    the legacy code.
+struct FrameworkMitigation {
+    /// The detection this decision was based on.
+    detection: layers::framework::FrameworkDetection,
+    /// Whether any weight division was applied.
+    applied: bool,
+    /// Why a qualifying (Structural-grade) detection was refused mitigation.
+    veto_reason: Option<String>,
+    /// Every weight reduction performed (the mitigation trace).
+    ops: Vec<MitigationOp>,
+    /// Sum of finding weights immediately before the pass.
+    score_before: u32,
+    /// Sum of finding weights immediately after the pass.
+    score_after: u32,
+}
+
+/// One applied weight reduction (layer + before/after), for the provenance
+/// trace.
+struct MitigationOp {
+    layer: Layer,
+    weight_before: u32,
+    weight_after: u32,
+}
+
+/// Findings at or above this weight veto installer-framework mitigation
+/// (policy item 3 above). Covers IoC (90), weight-40 YARA, MIME mismatch (45).
+const HIGH_CONFIDENCE_VETO_WEIGHT: u32 = 40;
+
+impl FrameworkMitigation {
+    /// No detection / no mitigation — the default for buffer scans and tests.
+    fn none() -> Self {
+        Self {
+            detection: layers::framework::FrameworkDetection::unknown(),
+            applied: false,
+            veto_reason: None,
+            ops: Vec::new(),
+            score_before: 0,
+            score_after: 0,
+        }
+    }
+
+    /// Decide whether the detection authorizes mitigation and, if so, apply
+    /// the divisions to `findings` in a single pass. This is the only
+    /// mutation point for installer leniency in the engine.
+    fn evaluate(
+        detection: layers::framework::FrameworkDetection,
+        findings: &mut [Finding],
+    ) -> Self {
+        use crate::layers::framework::Confidence;
+
+        let score_before: u32 = findings.iter().map(|f| f.weight).sum();
+
+        // Policy 1: Structural-grade evidence only. Corroborated (tampered /
+        // truncated / unverifiable) is diagnostic-only; WeakHint (text and
+        // filename hints, including all legacy substring heuristics) is
+        // diagnostic-only (policy 2). Both are recorded in the provenance so
+        // the decision is explainable.
+        let qualifies =
+            detection.confidence() == Confidence::Structural && detection.mitigation_safe();
+        if !qualifies {
+            return Self {
+                detection,
+                applied: false,
+                veto_reason: None,
+                ops: Vec::new(),
+                score_before,
+                score_after: score_before,
+            };
+        }
+
+        // Policy 3: independent high-confidence malicious evidence vetoes
+        // mitigation entirely — a structurally valid installer can still BE
+        // malware, and leniency must never soften a strong independent signal.
+        if let Some(f) = findings
+            .iter()
+            .filter(|f| f.weight >= HIGH_CONFIDENCE_VETO_WEIGHT)
+            .max_by_key(|f| f.weight)
+        {
+            let veto_reason = format!(
+                "mitigation vetoed: independent high-confidence evidence present \
+                 ({:?} finding, weight {} >= {}): {}",
+                f.layer, f.weight, HIGH_CONFIDENCE_VETO_WEIGHT, f.description
+            );
+            debug!(
+                kind = ?detection.kind(),
+                veto = %veto_reason,
+                "installer mitigation suppressed by high-confidence veto"
+            );
+            return Self {
+                detection,
+                applied: false,
+                veto_reason: Some(veto_reason),
+                ops: Vec::new(),
+                score_before,
+                score_after: score_before,
+            };
+        }
+
+        // Policy 4+5: exactly one pass; divisions preserved from the legacy
+        // calibration (Structural/Packer /3, installer-class YARA /2).
+        let mut ops = Vec::new();
+        for f in findings.iter_mut() {
+            let before = f.weight;
+            match f.layer {
+                // Structural/packer: aggressive reduction (/3).
+                Layer::StructuralAnalysis | Layer::PackerDetection => {
+                    f.weight /= 3;
+                }
+                // YARA: moderate reduction (/2) for installer-expected patterns.
+                // Dropper, updater, and persistence rules fire on normal installers.
+                Layer::YaraRules => {
+                    if let Some(ref detail) = f.technical_detail {
+                        let dl = detail.to_lowercase();
+                        if dl.contains("dropper")
+                            || dl.contains("updater")
+                            || dl.contains("installer")
+                            || dl.contains("persistence")
+                            || dl.contains("temp_extraction")
+                            || dl.contains("fake_updater")
+                        {
+                            f.weight /= 2;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            if f.weight != before {
+                ops.push(MitigationOp {
+                    layer: f.layer,
+                    weight_before: before,
+                    weight_after: f.weight,
+                });
+            }
+            if f.weight == 0 && f.severity > Severity::Info {
+                f.severity = Severity::Info;
+            }
+        }
+
+        let score_after: u32 = findings.iter().map(|f| f.weight).sum();
+        debug!(
+            kind = ?detection.kind(),
+            ops = ops.len(),
+            score_before,
+            score_after,
+            "installer-framework mitigation applied"
+        );
+        Self {
+            detection,
+            applied: true,
+            veto_reason: None,
+            ops,
+            score_before,
+            score_after,
+        }
+    }
+
+    /// Build the additive serde provenance record (workstream U). Returns
+    /// `Some` whenever the dispatcher recognized anything — including
+    /// WeakHint detections that granted nothing, so "why no discount?" is
+    /// answerable from the verdict alone.
+    fn provenance(&self) -> Option<crate::verdict::FrameworkMitigationProvenance> {
+        use crate::layers::framework::FrameworkKind;
+        if self.detection.kind() == FrameworkKind::Unknown && !self.applied {
+            return None;
+        }
+        Some(crate::verdict::FrameworkMitigationProvenance {
+            kind: Some(self.detection.kind().label().to_string()),
+            confidence: format!("{:?}", self.detection.confidence()),
+            mitigation_safe: self.detection.mitigation_safe(),
+            mitigation_applied: self.applied,
+            evidence: self
+                .detection
+                .evidence()
+                .iter()
+                .map(|e| crate::verdict::FrameworkEvidenceRecord {
+                    source: format!("{:?}", e.source),
+                    offset: e.offset,
+                    detail: e.detail.clone(),
+                })
+                .collect(),
+            ops: self
+                .ops
+                .iter()
+                .map(|op| crate::verdict::MitigationOpRecord {
+                    layer: format!("{:?}", op.layer),
+                    weight_before: op.weight_before,
+                    weight_after: op.weight_after,
+                })
+                .collect(),
+            score_before_mitigation: self.score_before,
+            score_after_mitigation: self.score_after,
+            veto_reason: self.veto_reason.clone(),
+            warnings: self.detection.warnings().to_vec(),
+        })
+    }
+}
+
 /// Pure scoring function — computes final score, verdict, and explanation
 /// from raw findings + discount values. Sorts findings by weight.
 ///
@@ -970,7 +1192,7 @@ fn aggregate_score(
     findings: &mut Vec<Finding>,
     reputation_discount: u32,
     authenticode_discount: u32,
-    installer_detected: bool,
+    framework_mitigation: &FrameworkMitigation,
 ) -> (u32, Verdict, VerdictExplanation) {
     // ── Evidence deduplication — prevent counting same behavior twice ──
     // When multiple layers detect the same semantic behavior (e.g., "downloader"
@@ -1079,8 +1301,23 @@ fn aggregate_score(
             "Valid digital signature (−{authenticode_discount} points)"
         ));
     }
-    if installer_detected {
-        trust_reasons.push("Installer framework detected — structural weights reduced".into());
+    if framework_mitigation.applied {
+        // Workstream T req 5/7: score transformations must be justified and
+        // visible. Cite the framework kind, the evidence count behind the
+        // classification, exactly what was divided, and the weight delta.
+        let det = &framework_mitigation.detection;
+        trust_reasons.push(format!(
+            "Installer framework detected ({}; {} structural-grade evidence item{}) — \
+             Structural/Packer weights ÷3, installer-class YARA weights ÷2 \
+             ({} finding{} adjusted, {} → {})",
+            det.kind().label(),
+            det.evidence().len(),
+            if det.evidence().len() == 1 { "" } else { "s" },
+            framework_mitigation.ops.len(),
+            if framework_mitigation.ops.len() == 1 { "" } else { "s" },
+            framework_mitigation.score_before,
+            framework_mitigation.score_after,
+        ));
     }
 
     let signer = findings
@@ -1104,12 +1341,22 @@ fn aggregate_score(
         score,
         authenticode_discount > 0,
         reputation_discount > 0,
-        installer_detected,
+        framework_mitigation.applied,
         &convergence,
     );
 
-    // Detect framework from findings.
-    let framework = detect_framework_from_findings(findings);
+    // Detect framework: prefer the structural/evidence-based detection (even
+    // a WeakHint names what was seen — the provenance record carries the
+    // confidence tier, so the label alone cannot overstate it); fall back to
+    // packer-finding inference (PyInstaller, Nuitka, ...) which the
+    // dispatcher does not cover.
+    let framework = if framework_mitigation.detection.kind()
+        != crate::layers::framework::FrameworkKind::Unknown
+    {
+        Some(framework_mitigation.detection.kind().label().to_string())
+    } else {
+        detect_framework_from_findings(findings)
+    };
 
     let threat_maturity = ThreatMaturity::from_convergence(&convergence, score);
 
@@ -1117,7 +1364,7 @@ fn aggregate_score(
         raw_score,
         reputation_discount,
         authenticode_discount,
-        installer_discount_applied: installer_detected,
+        installer_discount_applied: framework_mitigation.applied,
         final_score: score,
         signer,
         recognized_software,
@@ -1127,6 +1374,7 @@ fn aggregate_score(
         framework,
         threat_maturity,
         progression_depth: convergence.progression_score,
+        framework_mitigation: framework_mitigation.provenance(),
     };
 
     (score, verdict, explanation)
@@ -1159,141 +1407,6 @@ fn detect_framework_from_findings(findings: &[Finding]) -> Option<String> {
         }
     }
     None
-}
-
-/// Detect if a PE file is a known installer framework.
-/// These legitimately have high entropy, few imports, and large overlays.
-fn is_known_installer(data: &[u8], path: &str) -> bool {
-    // Fast reject: the installer/framework heuristics below only apply to PE
-    // binaries and OLE2 compound files (MSI). The engine used to gate this
-    // call on `is_pe`; when the gate moved in here (to let OLE2/MSI through)
-    // the ~20 full-buffer substring scans below started running on EVERY
-    // scanned file — media, documents, scripts — and incidental marker
-    // strings in a non-PE file (a PDF containing "Nullsoft Inst", a 3MB blob
-    // containing "runtime.main") earned the installer discount. Neither the
-    // wasted work nor the widened trust was intended.
-    let is_pe = data.len() >= 2 && data[0] == 0x4D && data[1] == 0x5A;
-    let is_ole2 =
-        data.len() >= 8 && data[0..8] == [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
-    if !is_pe && !is_ole2 {
-        return false;
-    }
-
-    // Binary content checks for known installer frameworks.
-    let contains = |needle: &[u8]| data.windows(needle.len()).any(|w| w == needle);
-    let has_nsis = contains(b"Nullsoft Inst") || contains(b"NullsoftInst");
-    let has_inno = contains(b"Inno Setup S") || contains(b"InnoSetupLdr");
-    let has_wix = contains(b"Windows Installer");
-    // MSI is an OLE2 compound file — but so are legacy Office docs
-    // (.doc/.xls/.ppt) and many other formats. Treating bare OLE2 magic as an
-    // "installer" handed every macro-laden Office document a structural+YARA
-    // detection discount (a false-negative vector for macro droppers). Require
-    // an actual MSI indicator: the .msi extension or an MSI-specific marker.
-    // For an OLE2 file the discount MUST key on the extension alone, never on
-    // free-text content. "Windows Installer" and "Installation Database" are
-    // plain substrings an attacker fully controls: embedding either anywhere in
-    // a real .doc they author (body, metadata, an embedded object name) earned a
-    // macro dropper the /3 structural + /2 YARA discount below — an
-    // attacker-forceable heuristic-suppression primitive. Round 1 removed the
-    // caller's `is_pe &&` gate and round 2 narrowed OLE2 to this branch but kept
-    // the substrings, so the vector stayed live while being documented as fixed.
-    //
-    // Extension-only is the safe direction: a genuine MSI/MSP always carries the
-    // extension, and an unnamed/renamed installer merely loses a leniency
-    // discount (scanned more strictly) rather than opening a bypass.
-    let msi_ext = {
-        let lower = path.to_lowercase();
-        lower.ends_with(".msi") || lower.ends_with(".msp")
-    };
-    // NOTE: `has_msi` requires `is_ole2`, and OLE2 / PE magic are mutually
-    // exclusive (both are offset-0 checks), so this is only ever consulted via
-    // the early return below — it contributes nothing to the PE OR-chain.
-    let has_msi = is_ole2 && msi_ext;
-    // OLE2 files that aren't MSIs (Office docs, etc.) stop here: only the MSI
-    // branch may grant the discount, so a macro-laden document can't earn it
-    // via incidental framework-marker strings in its body.
-    if is_ole2 && !is_pe {
-        return has_msi;
-    }
-    let has_installshield = contains(b"InstallShiel");
-    let has_ai = contains(b"Advanced Installer");
-
-    // Framework detection — Electron, Tauri, Qt, Squirrel, and similar bundle frameworks.
-    // These have unusual PE characteristics (large overlay, few imports)
-    // that trigger structural false positives.
-    let has_electron = contains(b"ASAR")
-        || contains(b"electron.asar")
-        || contains(b"Electron Framework")
-        || contains(b"electron.exe");
-    let has_nwjs = contains(b"nw.exe") || contains(b"nwjs");
-    let has_tauri = contains(b"tauri") && contains(b"webview");
-    let has_squirrel = contains(b"Squirrel") && contains(b"Update.exe");
-    let has_qt_installer = contains(b"Qt Installer Framework") || contains(b"QtInstallerFramework");
-    let has_flutter = contains(b"flutter_engine") || contains(b"FlutterDesktop");
-    let has_unity = contains(b"UnityPlayer") || contains(b"Unity Technologies");
-    let has_unreal = contains(b"UnrealEngine") || contains(b"EpicGames");
-
-    // Filename heuristic — only applies if binary also has framework markers.
-    // Prevents "setup.exe" random files from getting discount.
-    let path_lower = path.to_lowercase();
-    let name_indicators = [
-        "setup",
-        "install",
-        "installer",
-        "update",
-        "updater",
-        "_setup",
-        "-setup",
-    ];
-    let has_installer_name = name_indicators.iter().any(|p| path_lower.contains(p));
-
-    // Framework detected → always installer.
-    if has_nsis || has_inno || has_wix || has_msi || has_installshield || has_ai {
-        return true;
-    }
-    // Framework → installer treatment (structural noise reduction).
-    if has_electron
-        || has_nwjs
-        || has_tauri
-        || has_squirrel
-        || has_qt_installer
-        || has_flutter
-        || has_unity
-        || has_unreal
-    {
-        return true;
-    }
-    // Go binaries — large static binaries with unusual sections but NOT packed/malicious.
-    // They have "Go build ID:" marker and are typically >5MB.
-    let has_go = contains(b"Go build ID:") || contains(b"runtime.main");
-    if has_go && data.len() > 3_000_000 {
-        return true; // Go binary → framework treatment.
-    }
-
-    // Rust binaries — large static binaries via musl or similar.
-    // Contain Rust panic messages and are typically >2MB.
-    let has_rust_static = contains(b"rust_begin_unwind") || contains(b"rust_panic");
-    if has_rust_static && data.len() > 2_000_000 {
-        return true;
-    }
-
-    // Name heuristic. The filename alone is trivially forgeable (rename malware
-    // to "setup.exe" + pad past 2 MB), and the older code granted the discount
-    // on name+size+PE alone — contradicting its own comment about requiring a
-    // marker. Require at least one generic installer body hint (an uninstaller
-    // stub, a CAB/SFX payload). Real installers whose specific framework wasn't
-    // matched above still carry one of these; a bare rename does not.
-    let has_generic_installer_hint = contains(b"uninstall")
-        || contains(b"Uninstall")
-        || contains(b".cab")
-        || contains(b"Cabinet")
-        || contains(b"SFX")
-        || contains(b"7-Zip")
-        || contains(b"setup.ico");
-    if has_installer_name && is_pe && data.len() > 2_000_000 && has_generic_installer_hint {
-        return true;
-    }
-    false
 }
 
 /// Check for packer signatures in non-PE files.
@@ -1332,6 +1445,89 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    // ── framework-mitigation test helpers ────────────────────
+
+    use crate::layers::framework::{
+        Confidence, EvidenceItem, EvidenceSource, FrameworkDetection, FrameworkKind,
+    };
+
+    /// A synthetic Structural-grade NSIS detection (valid under build()'s
+    /// invariant) for tests that need an "applied" mitigation without
+    /// building PE bytes.
+    fn structural_nsis_detection() -> FrameworkDetection {
+        FrameworkDetection::build(
+            FrameworkKind::Nsis,
+            Confidence::Structural,
+            vec![
+                EvidenceItem::new(
+                    EvidenceSource::Overlay,
+                    Some(0x400),
+                    "NSIS data block at 512-aligned overlay offset 0x400",
+                ),
+                EvidenceItem::new(
+                    EvidenceSource::EmbeddedArchive,
+                    Some(0x400),
+                    "valid NSIS firstheader (test fixture)",
+                ),
+            ],
+            Vec::new(),
+        )
+    }
+
+    /// An "applied" mitigation for tests that exercise aggregate_score's
+    /// installer flag without caring about the weight math (evaluated
+    /// against an empty findings sink, so nothing is divided).
+    fn applied_mitigation_stub() -> FrameworkMitigation {
+        let mut sink = Vec::new();
+        FrameworkMitigation::evaluate(structural_nsis_detection(), &mut sink)
+    }
+
+    /// A minimal PE whose overlay starts at 512-aligned 0x400, carrying a
+    /// valid NSIS firstheader (NO_CRC) and `payload_len` payload bytes →
+    /// Structural detection. Mirrors the nsis.rs detector fixtures.
+    fn structural_nsis_pe(payload_len: u32) -> Vec<u8> {
+        use crate::layers::framework::fixtures::{PeBuilder, SectionSpec};
+        let arc_size = 28u32 + payload_len;
+        let mut overlay = Vec::new();
+        overlay.extend_from_slice(&4u32.to_le_bytes()); // FH_FLAGS_NO_CRC
+        overlay.extend_from_slice(&0xDEAD_BEEFu32.to_le_bytes()); // siginfo
+        overlay.extend_from_slice(b"NullsoftInst");
+        overlay.extend_from_slice(&0x100u32.to_le_bytes()); // length_of_header
+        overlay.extend_from_slice(&arc_size.to_le_bytes()); // length_of_all_following_data
+        overlay.extend(std::iter::repeat(0xCC).take(payload_len as usize));
+        PeBuilder::new()
+            .add_section(SectionSpec::new(".text", 0x200, 0x200).raw_ptr_override(0x200))
+            .overlay(&overlay)
+            .build()
+    }
+
+    /// Same PE shape with a CRC trailer whose stored value is deliberately
+    /// wrong → Corroborated detection (tampered archive).
+    fn nsis_pe_crc_mismatch(payload_len: u32) -> Vec<u8> {
+        use crate::layers::framework::fixtures::{PeBuilder, SectionSpec};
+        let arc_size = 28u32 + payload_len + 4;
+        let mut overlay = Vec::new();
+        overlay.extend_from_slice(&0u32.to_le_bytes()); // CRC present
+        overlay.extend_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        overlay.extend_from_slice(b"NullsoftInst");
+        overlay.extend_from_slice(&0x100u32.to_le_bytes());
+        overlay.extend_from_slice(&arc_size.to_le_bytes());
+        overlay.extend(std::iter::repeat(0xCC).take(payload_len as usize));
+        overlay.extend_from_slice(&0xDEAD_BEEFu32.to_le_bytes()); // bogus stored CRC
+        PeBuilder::new()
+            .add_section(SectionSpec::new(".text", 0x200, 0x200).raw_ptr_override(0x200))
+            .overlay(&overlay)
+            .build()
+    }
+
+    /// Evaluate a detection against an empty findings sink and report
+    /// whether mitigation was applied.
+    fn mitigation_applied(data: &[u8], path: &str) -> bool {
+        let d = layers::framework::detect(data, path);
+        let mut sink = Vec::new();
+        FrameworkMitigation::evaluate(d, &mut sink).applied
+    }
+
     #[test]
     fn ole2_office_doc_is_not_treated_as_installer() {
         // OLE2 compound-file magic — shared by legacy .doc/.xls AND .msi.
@@ -1341,15 +1537,20 @@ mod tests {
         // A .doc with bare OLE2 magic must NOT get installer trust (else macro
         // droppers receive a structural+YARA detection discount).
         assert!(
-            !is_known_installer(&ole2, "C:\\Users\\me\\invoice.doc"),
+            !mitigation_applied(&ole2, "C:\\Users\\me\\invoice.doc"),
             "bare OLE2 doc must not be treated as an installer"
         );
 
-        // A real MSI (by extension) still gets installer treatment.
-        assert!(
-            is_known_installer(&ole2, "C:\\Downloads\\app-setup.msi"),
-            ".msi must still be recognized as an installer"
-        );
+        // INTENTIONAL CHANGE (policy 2 — WeakHint grants nothing): a genuine
+        // MSI is still DETECTED by extension (MsiOle2, diagnostically), but
+        // no longer earns mitigation — filename evidence is forgeable, so
+        // extension-only detection is WeakHint. Fail-safe direction; see
+        // detect_msi docs for what a structural MSI validator would require.
+        let d = layers::framework::detect(&ole2, "C:\\Downloads\\app-setup.msi");
+        assert_eq!(d.kind(), FrameworkKind::MsiOle2);
+        assert_eq!(d.confidence(), Confidence::WeakHint);
+        assert!(!d.mitigation_safe());
+        assert!(!mitigation_applied(&ole2, "C:\\Downloads\\app-setup.msi"));
 
         // An OLE2 file carrying the "Windows Installer" string but NOT named
         // .msi must NOT qualify. This assertion previously demanded the
@@ -1359,69 +1560,96 @@ mod tests {
         let mut msi_marker = vec![0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
         msi_marker.extend_from_slice(b"...Windows Installer...");
         assert!(
-            !is_known_installer(&msi_marker, "x.bin"),
+            !mitigation_applied(&msi_marker, "x.bin"),
             "OLE2 content markers must not grant the installer discount"
         );
         assert!(
-            !is_known_installer(&msi_marker, "C:\\Users\\me\\invoice.doc"),
+            !mitigation_applied(&msi_marker, "C:\\Users\\me\\invoice.doc"),
             "macro dropper embedding 'Windows Installer' must not be discounted"
         );
-        // The same bytes DO qualify when the file is a genuine .msi/.msp.
-        assert!(
-            is_known_installer(&msi_marker, "C:\\Downloads\\pkg.msi"),
-            "real .msi must still be recognized"
+        // The same bytes are still DETECTED (diagnostically) when named
+        // .msi/.msp — but detection no longer implies mitigation.
+        assert_eq!(
+            layers::framework::detect(&msi_marker, "C:\\Downloads\\pkg.msi").kind(),
+            FrameworkKind::MsiOle2,
+            "real .msi must still be detected"
         );
-        assert!(
-            is_known_installer(&ole2, "C:\\Downloads\\patch.msp"),
-            ".msp patch must still be recognized"
+        assert_eq!(
+            layers::framework::detect(&ole2, "C:\\Downloads\\patch.msp").kind(),
+            FrameworkKind::MsiOle2,
+            ".msp patch must still be detected"
         );
+        assert!(!mitigation_applied(&msi_marker, "C:\\Downloads\\pkg.msi"));
 
-        // NSIS content marker still works (unchanged path).
+        // INTENTIONAL FLIP: MZ + "Nullsoft Inst" used to earn the discount
+        // outright. The space-separated needle matches version-info
+        // decoration — fully attacker-controlled; embedding it anywhere was
+        // THE evasion this refactor closes (real NSIS detection is
+        // structural now, see nsis.rs). Here there is no valid firstheader
+        // and no 16-byte archive signature: not even a WeakHint, and never
+        // mitigation.
         let nsis = b"MZ........Nullsoft Inst........".to_vec();
-        assert!(is_known_installer(&nsis, "whatever.exe"));
+        let d = layers::framework::detect(&nsis, "whatever.exe");
+        assert!(d.confidence() <= Confidence::WeakHint);
+        assert!(!d.mitigation_safe());
+        assert!(!mitigation_applied(&nsis, "whatever.exe"));
 
         // An OLE2 doc whose body merely mentions an installer framework is
         // NOT an installer — only the MSI branch may fire for OLE2.
         let mut ole2_nsis = vec![0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
         ole2_nsis.extend_from_slice(b"body text citing Nullsoft Inst strings");
         assert!(
-            !is_known_installer(&ole2_nsis, "C:\\Users\\me\\notes.doc"),
+            !mitigation_applied(&ole2_nsis, "C:\\Users\\me\\notes.doc"),
             "OLE2 doc with incidental installer-marker strings must not get the discount"
         );
     }
 
     #[test]
     fn non_pe_marker_strings_do_not_earn_installer_discount() {
-        // Fast-reject regression: framework-marker strings in a file that is
-        // neither PE nor OLE2 (a PDF, a blob) must not earn the installer
-        // discount — and the ~20 full-buffer substring scans must be skipped.
+        // Fast-reject regression (preserved): framework-marker strings in a
+        // file that is neither PE nor OLE2 (a PDF, a blob) must not even
+        // register as a hint — the legacy substring path is PE-gated.
         let pdf = b"%PDF-1.7 body text citing Nullsoft Inst and electron.asar".to_vec();
-        assert!(!is_known_installer(&pdf, "C:\\Users\\me\\doc.pdf"));
+        let d = layers::framework::detect(&pdf, "C:\\Users\\me\\doc.pdf");
+        assert_eq!(d.kind(), FrameworkKind::Unknown);
+        assert!(!mitigation_applied(&pdf, "C:\\Users\\me\\doc.pdf"));
 
         // A >3MB non-PE blob with the Go marker is not a Go binary.
         let mut blob = vec![0u8; 4_000_000];
         blob[1000..1012].copy_from_slice(b"Go build ID:");
-        assert!(!is_known_installer(&blob, "C:\\Users\\me\\blob.bin"));
+        let d = layers::framework::detect(&blob, "C:\\Users\\me\\blob.bin");
+        assert_eq!(d.kind(), FrameworkKind::Unknown);
+        assert!(!mitigation_applied(&blob, "C:\\Users\\me\\blob.bin"));
     }
 
     #[test]
     fn name_only_installer_requires_content_hint() {
         // Malware renamed "setup.exe" + padded past 2 MB, PE header, but NO
-        // installer body hint → must NOT earn the installer discount.
+        // installer body hint → nothing detected (rename bypass stays closed).
         let mut padded = vec![0u8; 2_000_064];
         padded[0] = 0x4D; // 'M'
         padded[1] = 0x5A; // 'Z'
-        assert!(
-            !is_known_installer(&padded, "C:\\Users\\me\\Downloads\\setup.exe"),
-            "name+size alone must not grant installer trust (rename bypass)"
+        let d = layers::framework::detect(&padded, "C:\\Users\\me\\Downloads\\setup.exe");
+        assert_eq!(
+            d.kind(),
+            FrameworkKind::Unknown,
+            "name+size alone must not even register (rename bypass)"
         );
 
-        // Same file with a generic installer hint (uninstaller stub) → trusted.
+        // INTENTIONAL FLIP: name + size + a generic body hint ("uninstall")
+        // used to earn the FULL discount. All three inputs are
+        // attacker-controlled (rename, padding, an embedded substring), so
+        // the combination is now a diagnostic WeakHint granting NO
+        // mitigation — this was the same evasion class as the NSIS needle.
         let mut real = padded.clone();
         real.extend_from_slice(b"uninstall.exe");
+        let d = layers::framework::detect(&real, "C:\\Users\\me\\Downloads\\setup.exe");
+        assert_eq!(d.kind(), FrameworkKind::GenericFramework);
+        assert_eq!(d.confidence(), Confidence::WeakHint);
+        assert!(!d.mitigation_safe());
         assert!(
-            is_known_installer(&real, "C:\\Users\\me\\Downloads\\setup.exe"),
-            "named installer with an uninstaller stub should be recognized"
+            !mitigation_applied(&real, "C:\\Users\\me\\Downloads\\setup.exe"),
+            "name+size+substring-hint must never authorize mitigation"
         );
     }
 
@@ -1548,7 +1776,7 @@ mod tests {
             technical_detail: None,
         };
         let mut findings = vec![mk(10, "S1"), mk(10, "S2"), mk(11, "S3")];
-        let _ = aggregate_score(&mut findings, 0, 0, false);
+        let _ = aggregate_score(&mut findings, 0, 0, &FrameworkMitigation::none());
         let structural_total: u32 = findings
             .iter()
             .filter(|f| f.layer == Layer::StructuralAnalysis)
@@ -1605,7 +1833,7 @@ mod tests {
         ];
 
         // No discounts → raw score.
-        let (score, verdict, explanation) = aggregate_score(&mut findings, 0, 0, false);
+        let (score, verdict, explanation) = aggregate_score(&mut findings, 0, 0, &FrameworkMitigation::none());
         assert_eq!(score, 40);
         assert_eq!(verdict, Verdict::Suspicious);
         assert_eq!(explanation.raw_score, 40);
@@ -1613,12 +1841,12 @@ mod tests {
         assert!(explanation.suspicion_reasons.len() == 2);
 
         // With reputation discount → reduced.
-        let (score2, verdict2, _) = aggregate_score(&mut findings, 20, 0, false);
+        let (score2, verdict2, _) = aggregate_score(&mut findings, 20, 0, &FrameworkMitigation::none());
         assert_eq!(score2, 20);
         assert_eq!(verdict2, Verdict::LowSuspicion);
 
         // With both discounts → uses max, not sum.
-        let (score3, _, expl3) = aggregate_score(&mut findings, 20, 25, false);
+        let (score3, _, expl3) = aggregate_score(&mut findings, 20, 25, &FrameworkMitigation::none());
         assert_eq!(score3, 15); // 40 - max(20,25) = 15
         assert_eq!(expl3.reputation_discount, 20);
         assert_eq!(expl3.authenticode_discount, 25);
@@ -1695,7 +1923,7 @@ mod tests {
                 technical_detail: None,
             },
         ];
-        let (score, _, _) = aggregate_score(&mut findings, 0, 0, false);
+        let (score, _, _) = aggregate_score(&mut findings, 0, 0, &FrameworkMitigation::none());
         // After cap, structural contribution should be ≤30.
         let structural_total: u32 = findings
             .iter()
@@ -1735,7 +1963,7 @@ mod tests {
                 technical_detail: None,
             },
         ];
-        let (score, _, _) = aggregate_score(&mut findings, 0, 0, false);
+        let (score, _, _) = aggregate_score(&mut findings, 0, 0, &FrameworkMitigation::none());
         let yara_total: u32 = findings
             .iter()
             .filter(|f| f.layer == Layer::YaraRules)
@@ -1826,58 +2054,100 @@ mod tests {
             technical_detail: None,
         }];
 
-        let (_, _, expl) = aggregate_score(&mut findings, 0, 0, true);
+        let fm = FrameworkMitigation::evaluate(structural_nsis_detection(), &mut findings);
+        assert!(fm.applied);
+        assert_eq!(findings[0].weight, 10 / 3, "Structural findings divide by 3");
+
+        let (_, _, expl) = aggregate_score(&mut findings, 0, 0, &fm);
         assert!(expl.installer_discount_applied);
-        assert!(expl.trust_reasons.iter().any(|r| r.contains("Installer")));
+        // Trust reason must cite the framework kind and what was divided.
+        assert!(
+            expl.trust_reasons
+                .iter()
+                .any(|r| r.contains("Installer") && r.contains("NSIS")),
+            "trust reason must cite kind + division: {:?}",
+            expl.trust_reasons
+        );
+        assert!(expl.framework_mitigation.is_some());
     }
 
     #[test]
     fn test_installer_detection() {
-        // NSIS installer.
+        // Every positive case below asserted the OLD substring semantics
+        // (is_known_installer == true → /3 + /2 discount). Those positives
+        // are now INTENTIONALLY NEGATIVE for mitigation: unanchored markers
+        // are attacker-controlled decoration, so the detections they produce
+        // are WeakHint-at-most and never mitigation_safe. The structural
+        // positives live in the framework detector suites (nsis.rs, inno.rs,
+        // wix.rs) and the mitigation_* tests below.
+        let weak_at_most = |data: &[u8], path: &str| {
+            let d = layers::framework::detect(data, path);
+            assert!(
+                d.confidence() <= Confidence::WeakHint,
+                "{path}: {:?} must not exceed WeakHint",
+                d.confidence()
+            );
+            assert!(!d.mitigation_safe(), "{path} must never be mitigation_safe");
+            d
+        };
+
+        // NSIS version-info text — the classic spoof needle.
         let mut nsis_data = vec![0x4D, 0x5A]; // MZ header.
         nsis_data.extend_from_slice(&[0; 500]);
         nsis_data.extend_from_slice(b"Nullsoft Inst");
-        assert!(is_known_installer(&nsis_data, "test.exe"));
+        weak_at_most(&nsis_data, "test.exe");
 
-        // InnoSetup.
+        // InnoSetup marker text.
         let mut inno_data = vec![0x4D, 0x5A];
         inno_data.extend_from_slice(&[0; 500]);
         inno_data.extend_from_slice(b"Inno Setup S");
-        assert!(is_known_installer(&inno_data, "test.exe"));
+        weak_at_most(&inno_data, "test.exe");
 
-        // Filename-based detection: large PE + installer name + a generic
-        // installer body hint (real installers ship an uninstaller stub).
+        // Filename-based: large PE + installer name + a generic body hint →
+        // WeakHint GenericFramework (was: full discount — flipped, see
+        // name_only_installer_requires_content_hint).
         let mut large_data = vec![0u8; 3_000_000];
         large_data[0] = 0x4D; // M
         large_data[1] = 0x5A; // Z
         large_data.extend_from_slice(b"uninstall");
-        assert!(is_known_installer(&large_data, "Notion Setup 7.6.1.exe"));
-        assert!(is_known_installer(&large_data, "git-2.53.0-installer.exe"));
+        let d = weak_at_most(&large_data, "Notion Setup 7.6.1.exe");
+        assert_eq!(d.kind(), FrameworkKind::GenericFramework);
+        let d = weak_at_most(&large_data, "git-2.53.0-installer.exe");
+        assert_eq!(d.kind(), FrameworkKind::GenericFramework);
 
-        // Name + size + PE but NO installer body hint → NOT detected.
-        // Closes the trivial "rename malware to setup.exe and pad to 2 MB" bypass.
+        // Name + size + PE but NO installer body hint → not even a hint.
         let mut renamed = vec![0u8; 3_000_000];
         renamed[0] = 0x4D;
         renamed[1] = 0x5A;
-        assert!(!is_known_installer(&renamed, "setup.exe"));
+        assert_eq!(
+            layers::framework::detect(&renamed, "setup.exe").kind(),
+            FrameworkKind::Unknown
+        );
 
-        // Large non-PE with installer name → NOT detected (prevents FP on archives).
+        // Large non-PE with installer name → nothing (PE gate preserved).
         let large_non_pe = vec![0u8; 3_000_000];
-        assert!(!is_known_installer(&large_non_pe, "setup-files.zip"));
+        assert_eq!(
+            layers::framework::detect(&large_non_pe, "setup-files.zip").kind(),
+            FrameworkKind::Unknown
+        );
 
-        // Small file with installer name → NOT detected (prevents FP on tiny scripts).
-        assert!(!is_known_installer(&[0x4D, 0x5A], "setup.exe"));
+        // Small file with installer name → nothing.
+        assert_eq!(
+            layers::framework::detect(&[0x4D, 0x5A], "setup.exe").kind(),
+            FrameworkKind::Unknown
+        );
+        assert_eq!(
+            layers::framework::detect(&[0x4D, 0x5A], "malware.exe").kind(),
+            FrameworkKind::Unknown
+        );
 
-        // NOT an installer.
-        assert!(!is_known_installer(&[0x4D, 0x5A], "malware.exe"));
-
-        // Electron framework → detected. (Electron apps are PE binaries —
-        // the MZ header is required since the PE/OLE2 fast-reject moved
-        // into `is_known_installer`.)
+        // Electron marker text → WeakHint ElectronBundle (was: full
+        // discount — flipped: "electron.asar" is a 13-byte embeddable string).
         let mut electron_data = vec![0x4D, 0x5A];
         electron_data.extend_from_slice(&[0u8; 500]);
         electron_data.extend_from_slice(b"electron.asar");
-        assert!(is_known_installer(&electron_data, "app.exe"));
+        let d = weak_at_most(&electron_data, "app.exe");
+        assert_eq!(d.kind(), FrameworkKind::ElectronBundle);
     }
 
     #[test]
@@ -1891,7 +2161,7 @@ mod tests {
             description: "Critical IOC match detected".into(),
             technical_detail: None,
         }];
-        let (_, _, expl) = aggregate_score(&mut findings, 0, 0, false);
+        let (_, _, expl) = aggregate_score(&mut findings, 0, 0, &FrameworkMitigation::none());
         assert!(
             expl.suspicion_reasons[0].starts_with("[+35]"),
             "High-weight reason should have weight prefix, got: {}",
@@ -1909,7 +2179,7 @@ mod tests {
                 .into(),
             technical_detail: None,
         }];
-        let (score, verdict, expl) = aggregate_score(&mut findings, 0, 0, false);
+        let (score, verdict, expl) = aggregate_score(&mut findings, 0, 0, &FrameworkMitigation::none());
         assert_eq!(score, 90);
         assert_eq!(verdict, Verdict::Malicious);
         assert_eq!(expl.confidence_label, ConfidenceLabel::HighRisk);
@@ -1950,11 +2220,11 @@ mod tests {
         }];
 
         // Without trust discount — score = 5.
-        let (score_no_trust, _, _) = aggregate_score(&mut findings, 0, 0, false);
+        let (score_no_trust, _, _) = aggregate_score(&mut findings, 0, 0, &FrameworkMitigation::none());
         assert_eq!(score_no_trust, 5);
 
         // With trust discount >= 15 — score should be 0 (5 - 15 = 0, clamped).
-        let (score_trusted, _, _) = aggregate_score(&mut findings, 20, 0, false);
+        let (score_trusted, _, _) = aggregate_score(&mut findings, 20, 0, &FrameworkMitigation::none());
         assert_eq!(
             score_trusted, 0,
             "Trusted binary should have score 0 after discount"
@@ -1974,7 +2244,7 @@ mod tests {
             description: "Internet download context".into(),
             technical_detail: None,
         }];
-        let (score, verdict, _) = aggregate_score(&mut findings, 0, 0, false);
+        let (score, verdict, _) = aggregate_score(&mut findings, 0, 0, &FrameworkMitigation::none());
         assert!(
             score < 76,
             "Context alone should never reach Malicious. Score: {score}"
@@ -2023,7 +2293,7 @@ mod tests {
                 technical_detail: None,
             },
         ];
-        let (score, verdict, _) = aggregate_score(&mut findings, 0, 0, false);
+        let (score, verdict, _) = aggregate_score(&mut findings, 0, 0, &FrameworkMitigation::none());
         assert!(
             score <= 50,
             "Structural+packer alone capped at 50. Score: {score}"
@@ -2058,7 +2328,7 @@ mod tests {
             },
         ];
         // Signed (25 discount) + reputation (20 discount) → max(25,20)=25 off.
-        let (score, verdict, _) = aggregate_score(&mut findings, 20, 25, true);
+        let (score, verdict, _) = aggregate_score(&mut findings, 20, 25, &applied_mitigation_stub());
         assert!(
             score < 76,
             "Signed installer should never be Malicious. Score: {score}"
@@ -2100,7 +2370,7 @@ mod tests {
                 technical_detail: None,
             },
         ];
-        let (score, _, _) = aggregate_score(&mut findings, 0, 0, false);
+        let (score, _, _) = aggregate_score(&mut findings, 0, 0, &FrameworkMitigation::none());
         // YARA capped 30→30, Pattern capped 25→25, Structural capped 15→15, Context capped 10→10 = 80
         assert!(
             score >= 76,
@@ -2127,7 +2397,7 @@ mod tests {
                 technical_detail: None,
             },
         ];
-        let (score, _, _) = aggregate_score(&mut findings, 0, 0, false);
+        let (score, _, _) = aggregate_score(&mut findings, 0, 0, &FrameworkMitigation::none());
         // Same layer + same tag → only max (12) counts.
         assert!(
             score <= 12,
@@ -2155,7 +2425,7 @@ mod tests {
                 technical_detail: None,
             },
         ];
-        let (score, _, _) = aggregate_score(&mut findings, 0, 0, false);
+        let (score, _, _) = aggregate_score(&mut findings, 0, 0, &FrameworkMitigation::none());
         // Different layers → convergence → both count: 25 + 20 = 45.
         assert!(
             score >= 40,
@@ -2182,7 +2452,7 @@ mod tests {
                 technical_detail: None,
             },
         ];
-        let (score, _, _) = aggregate_score(&mut findings, 0, 0, false);
+        let (score, _, _) = aggregate_score(&mut findings, 0, 0, &FrameworkMitigation::none());
         // Different behaviors → both counted.
         assert_eq!(
             score, 40,
@@ -2192,17 +2462,23 @@ mod tests {
 
     #[test]
     fn test_go_binary_installer_detection() {
-        // Go binary (PE, >3MB with Go build ID marker) → installer/framework
-        // treatment. The MZ header is required since the PE/OLE2 fast-reject
-        // moved into `is_known_installer`.
+        // Go binary (PE, >3MB with "Go build ID:" marker) is still DETECTED,
+        // but as a diagnostic WeakHint granting NO mitigation — INTENTIONAL
+        // CHANGE (was: full framework treatment). "Go build ID:" is a
+        // 12-byte string any binary can embed, so the old discount was the
+        // same evasion primitive as the NSIS needle. Accepted FP cost: legit
+        // unsigned Go apps may score higher (Suspicious labels), but the
+        // daemon's ARGUS-only quarantine bar is 85 — no auto-quarantine
+        // shift. Restoring leniency requires a structural Go detector.
         let mut data = vec![0u8; 4_000_000];
         data[0] = 0x4D; // 'M'
         data[1] = 0x5A; // 'Z'
         data[1000..1012].copy_from_slice(b"Go build ID:");
-        assert!(
-            is_known_installer(&data, "mytool.exe"),
-            "Go binary should be detected as installer/framework"
-        );
+        let d = layers::framework::detect(&data, "mytool.exe");
+        assert_eq!(d.kind(), FrameworkKind::GoStatic);
+        assert_eq!(d.confidence(), Confidence::WeakHint);
+        assert!(!d.mitigation_safe());
+        assert!(!mitigation_applied(&data, "mytool.exe"));
     }
 
     #[test]
@@ -2256,7 +2532,7 @@ mod tests {
                 technical_detail: None,
             },
         ];
-        let (score, _, _) = aggregate_score(&mut findings, 0, 0, false);
+        let (score, _, _) = aggregate_score(&mut findings, 0, 0, &FrameworkMitigation::none());
         // All three are different groups → all counted.
         // Pattern 25 (capped 25), YARA 22 (capped 22), Context 10 (capped 10) = 57
         assert!(
@@ -2291,7 +2567,7 @@ mod tests {
                 technical_detail: None,
             },
         ];
-        let (score, _, _) = aggregate_score(&mut findings, 0, 0, false);
+        let (score, _, _) = aggregate_score(&mut findings, 0, 0, &FrameworkMitigation::none());
         // Different behaviors → all counted. 35+20+15 = 70 (under caps).
         assert!(
             score >= 65,
@@ -2318,7 +2594,7 @@ mod tests {
                 technical_detail: None,
             },
         ];
-        let (score, verdict, _) = aggregate_score(&mut findings, 0, 0, false);
+        let (score, verdict, _) = aggregate_score(&mut findings, 0, 0, &FrameworkMitigation::none());
         // Deduplicated: both are "downloader_capability" → only max (15) counts.
         assert!(
             score < 76,
@@ -2347,7 +2623,7 @@ mod tests {
                 technical_detail: None,
             },
         ];
-        let (score, verdict, _) = aggregate_score(&mut findings, 0, 0, false);
+        let (score, verdict, _) = aggregate_score(&mut findings, 0, 0, &FrameworkMitigation::none());
         // Cross-layer convergence: 15 + 6 = 21. Still well below Malicious (76).
         assert!(score <= 25, "Packer-only should be low. Score: {score}");
         assert_ne!(verdict, Verdict::Malicious);
@@ -2373,7 +2649,7 @@ mod tests {
                 technical_detail: None,
             },
         ];
-        let (score, _, _) = aggregate_score(&mut findings, 0, 0, false);
+        let (score, _, _) = aggregate_score(&mut findings, 0, 0, &FrameworkMitigation::none());
         // Context is never deduplicated. Both count: 5 + 8 = 13.
         assert_eq!(
             score, 13,
@@ -2400,7 +2676,7 @@ mod tests {
                 technical_detail: None,
             },
         ];
-        let (score, _, _) = aggregate_score(&mut findings, 0, 0, false);
+        let (score, _, _) = aggregate_score(&mut findings, 0, 0, &FrameworkMitigation::none());
         assert_eq!(
             score, 38,
             "Credential theft + exfil must both count. Score: {score}"
@@ -2440,7 +2716,7 @@ mod tests {
                 technical_detail: None,
             },
         ];
-        let (score, _, _) = aggregate_score(&mut findings, 0, 0, false);
+        let (score, _, _) = aggregate_score(&mut findings, 0, 0, &FrameworkMitigation::none());
         // Different groups: downloader(20) + persistence(20) + evasion(12) + context(12) = 64
         // No trust discounts → 64. Not auto-quarantine (ARGUS-only needs 85) but high suspicion.
         assert!(
@@ -2468,7 +2744,7 @@ mod tests {
                 technical_detail: None,
             },
         ];
-        let (score, _, _) = aggregate_score(&mut findings, 0, 0, false);
+        let (score, _, _) = aggregate_score(&mut findings, 0, 0, &FrameworkMitigation::none());
         // Both are "entropy" group, same layer → only max (12) counts.
         assert!(
             score <= 12,
@@ -3234,5 +3510,412 @@ mod tests {
             ScanStrategy::classify("data.dat", 60_000_000),
             ScanStrategy::SignatureOnly
         );
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // Installer-mitigation scoring integration (workstreams T + U)
+    // ═══════════════════════════════════════════════════════════════
+
+    /// (a) Structural NSIS detection → /3 applied to Structural/Packer
+    /// findings; the mitigation trace records every op with before/after.
+    #[test]
+    fn mitigation_structural_nsis_applies_div3_and_records_trace() {
+        let data = structural_nsis_pe(200);
+        let detection = layers::framework::detect(&data, "setup.exe");
+        assert_eq!(detection.kind(), FrameworkKind::Nsis);
+        assert_eq!(detection.confidence(), Confidence::Structural);
+        assert!(detection.mitigation_safe());
+
+        let mut findings = vec![
+            Finding {
+                layer: Layer::StructuralAnalysis,
+                severity: Severity::Medium,
+                weight: 30,
+                description: "high entropy section".into(),
+                technical_detail: None,
+            },
+            Finding {
+                layer: Layer::PackerDetection,
+                severity: Severity::Low,
+                weight: 15,
+                description: "large overlay".into(),
+                technical_detail: None,
+            },
+        ];
+        let fm = FrameworkMitigation::evaluate(detection, &mut findings);
+        assert!(fm.applied);
+        assert!(fm.veto_reason.is_none());
+        assert_eq!(findings[0].weight, 10, "Structural /3");
+        assert_eq!(findings[1].weight, 5, "Packer /3");
+        assert_eq!(fm.ops.len(), 2);
+        assert!(fm.ops.iter().any(|op| op.layer == Layer::StructuralAnalysis
+            && op.weight_before == 30
+            && op.weight_after == 10));
+        assert!(fm.ops.iter().any(|op| op.layer == Layer::PackerDetection
+            && op.weight_before == 15
+            && op.weight_after == 5));
+        assert_eq!(fm.score_before, 45);
+        assert_eq!(fm.score_after, 15);
+
+        // End-to-end through aggregate_score.
+        let (score, _, expl) = aggregate_score(&mut findings, 0, 0, &fm);
+        assert_eq!(score, 15);
+        assert!(expl.installer_discount_applied);
+        assert_eq!(expl.framework.as_deref(), Some("NSIS"));
+    }
+
+    /// (b) Appended "Nullsoft Inst" text changes nothing: on a plain PE it
+    /// is WeakHint-at-most (no mitigation, weights and score unchanged).
+    #[test]
+    fn mitigation_appended_marker_text_changes_nothing() {
+        use crate::layers::framework::fixtures::PeBuilder;
+        let data = PeBuilder::new()
+            .section(".text", 0x200, 0x200)
+            .overlay(b"Nullsoft Inst")
+            .build();
+        let detection = layers::framework::detect(&data, "setup.exe");
+        assert!(detection.confidence() <= Confidence::WeakHint);
+        assert!(!detection.mitigation_safe());
+
+        let mk_findings = || {
+            vec![Finding {
+                layer: Layer::StructuralAnalysis,
+                severity: Severity::Medium,
+                weight: 30,
+                description: "high entropy section".into(),
+                technical_detail: None,
+            }]
+        };
+
+        let mut f_plain = mk_findings();
+        let (score_plain, _, _) =
+            aggregate_score(&mut f_plain, 0, 0, &FrameworkMitigation::none());
+
+        let mut f_marked = mk_findings();
+        let fm = FrameworkMitigation::evaluate(detection, &mut f_marked);
+        assert!(!fm.applied);
+        assert_eq!(f_marked[0].weight, 30, "WeakHint must not divide weights");
+        let (score_marked, _, _) = aggregate_score(&mut f_marked, 0, 0, &fm);
+        assert_eq!(
+            score_marked, score_plain,
+            "appended installer text must not lower the final score"
+        );
+    }
+
+    /// (c) A weight-40 finding vetoes mitigation on a structurally valid
+    /// installer; the veto is recorded in the trace. A fake marker with the
+    /// same finding never qualifies in the first place (fail-closed either
+    /// way).
+    #[test]
+    fn mitigation_high_confidence_finding_vetoes() {
+        let data = structural_nsis_pe(200);
+        let detection = layers::framework::detect(&data, "setup.exe");
+        assert_eq!(detection.confidence(), Confidence::Structural);
+
+        let mut findings = vec![
+            Finding {
+                layer: Layer::StructuralAnalysis,
+                severity: Severity::Medium,
+                weight: 30,
+                description: "high entropy section".into(),
+                technical_detail: None,
+            },
+            Finding {
+                layer: Layer::YaraRules,
+                severity: Severity::High,
+                weight: 40,
+                description: "Ransomware note pattern".into(),
+                technical_detail: Some("Pack: ransomware".into()),
+            },
+        ];
+        let fm = FrameworkMitigation::evaluate(detection, &mut findings);
+        assert!(!fm.applied, "weight-40 finding must veto mitigation");
+        let veto = fm.veto_reason.clone().expect("veto must be recorded");
+        assert!(veto.contains("vetoed"), "veto reason: {veto}");
+        assert_eq!(
+            findings[0].weight, 30,
+            "vetoed mitigation must leave weights untouched"
+        );
+        assert!(fm.provenance().unwrap().veto_reason.is_some());
+
+        // Fake marker + the same weight-40 finding: the detection never
+        // qualifies (WeakHint), so there is nothing to veto — also closed.
+        use crate::layers::framework::fixtures::PeBuilder;
+        let fake = PeBuilder::new()
+            .section(".text", 0x200, 0x200)
+            .overlay(b"Nullsoft Inst")
+            .build();
+        let d = layers::framework::detect(&fake, "setup.exe");
+        let mut findings2 = vec![Finding {
+            layer: Layer::YaraRules,
+            severity: Severity::High,
+            weight: 40,
+            description: "Ransomware note pattern".into(),
+            technical_detail: Some("Pack: ransomware".into()),
+        }];
+        let fm2 = FrameworkMitigation::evaluate(d, &mut findings2);
+        assert!(!fm2.applied);
+        assert_eq!(findings2[0].weight, 40);
+    }
+
+    /// (W) The MIME-45 emitter is covered by the same ≥40 veto: a
+    /// structurally valid installer with a genuine MIME/magic mismatch
+    /// keeps the full 45 (mitigation must not soften independent
+    /// high-confidence evidence). The authenticode system-path −20 is a
+    /// trust discount applied independently in aggregate_score — no
+    /// interaction with this pass.
+    #[test]
+    fn mitigation_mime45_finding_vetoes() {
+        let data = structural_nsis_pe(200);
+        let detection = layers::framework::detect(&data, "setup.exe");
+        assert_eq!(detection.confidence(), Confidence::Structural);
+        let mut findings = vec![Finding {
+            layer: Layer::MimeValidation,
+            severity: Severity::High,
+            weight: 45,
+            description: "File extension does not match magic bytes".into(),
+            technical_detail: None,
+        }];
+        let fm = FrameworkMitigation::evaluate(detection, &mut findings);
+        assert!(!fm.applied, "MIME-45 must veto installer mitigation");
+        assert!(fm.veto_reason.is_some());
+        assert_eq!(findings[0].weight, 45);
+    }
+
+    /// (d) NSIS with a CRC mismatch is Corroborated — `mitigation_safe`
+    /// under the build() invariant, but mitigation policy 1 requires
+    /// Structural confidence, so NO mitigation applies. Tampered/damaged
+    /// archives fail conservatively.
+    #[test]
+    fn mitigation_nsis_crc_mismatch_gets_no_mitigation() {
+        let data = nsis_pe_crc_mismatch(200);
+        let detection = layers::framework::detect(&data, "setup.exe");
+        assert_eq!(detection.kind(), FrameworkKind::Nsis);
+        assert_eq!(detection.confidence(), Confidence::Corroborated);
+        assert!(
+            detection.mitigation_safe(),
+            "build() invariant marks Corroborated+structural as safe (diagnostic)"
+        );
+        assert!(
+            detection.warnings().iter().any(|w| w.contains("CRC32 mismatch")),
+            "warnings: {:?}",
+            detection.warnings()
+        );
+
+        let mut findings = vec![Finding {
+            layer: Layer::StructuralAnalysis,
+            severity: Severity::Medium,
+            weight: 30,
+            description: "high entropy section".into(),
+            technical_detail: None,
+        }];
+        let fm = FrameworkMitigation::evaluate(detection, &mut findings);
+        assert!(
+            !fm.applied,
+            "Corroborated (tampered) detection must not authorize mitigation"
+        );
+        assert_eq!(findings[0].weight, 30);
+    }
+
+    /// (e) Structural NSIS + installer-class YARA (weight ≤ 25) → /2 still
+    /// applies and the veto does NOT trigger: an installer can still be
+    /// flagged by ordinary detections — mitigation and conviction are
+    /// separate dimensions.
+    #[test]
+    fn mitigation_installer_class_yara_halved_without_veto() {
+        let data = structural_nsis_pe(200);
+        let detection = layers::framework::detect(&data, "setup.exe");
+        assert_eq!(detection.confidence(), Confidence::Structural);
+
+        let mut findings = vec![
+            Finding {
+                layer: Layer::YaraRules,
+                severity: Severity::Medium,
+                weight: 20,
+                description: "Drops and executes a second-stage payload".into(),
+                technical_detail: Some("Rule: Dropper_Generic dropper".into()),
+            },
+            Finding {
+                layer: Layer::YaraRules,
+                severity: Severity::Medium,
+                weight: 20,
+                description: "Discord token stealer".into(),
+                technical_detail: Some("Pack: stealers".into()),
+            },
+        ];
+        let fm = FrameworkMitigation::evaluate(detection, &mut findings);
+        assert!(fm.applied);
+        assert!(fm.veto_reason.is_none(), "weight ≤ 25 must not veto");
+        assert_eq!(findings[0].weight, 10, "installer-class YARA /2");
+        assert_eq!(findings[1].weight, 20, "non-installer-class YARA untouched");
+        assert_eq!(fm.ops.len(), 1);
+    }
+
+    /// (f-i / Y) Metamorphic: stacking multiple weak markers must not
+    /// combine into any mitigation.
+    #[test]
+    fn mitigation_stacked_weak_markers_grant_nothing() {
+        let mut data = vec![0x4D, 0x5A];
+        data.extend_from_slice(&[0u8; 600]);
+        data.extend_from_slice(
+            b"Nullsoft Inst Inno Setup S electron.asar ASAR Windows Installer",
+        );
+        let detection = layers::framework::detect(&data, "setup.exe");
+        assert!(detection.confidence() <= Confidence::WeakHint);
+        let mut findings = vec![Finding {
+            layer: Layer::StructuralAnalysis,
+            severity: Severity::Medium,
+            weight: 30,
+            description: "high entropy section".into(),
+            technical_detail: None,
+        }];
+        let fm = FrameworkMitigation::evaluate(detection, &mut findings);
+        assert!(
+            !fm.applied,
+            "stacked weak markers must not combine into mitigation"
+        );
+        assert_eq!(findings[0].weight, 30);
+    }
+
+    /// (f-ii) Metamorphic: adding independent malicious evidence to a valid
+    /// installer must not lower its score.
+    #[test]
+    fn mitigation_adding_malicious_evidence_never_lowers_score() {
+        let data = structural_nsis_pe(200);
+        let mk_struct = || {
+            vec![Finding {
+                layer: Layer::StructuralAnalysis,
+                severity: Severity::Medium,
+                weight: 30,
+                description: "high entropy section".into(),
+                technical_detail: None,
+            }]
+        };
+
+        let mut f1 = mk_struct();
+        let fm1 = FrameworkMitigation::evaluate(
+            layers::framework::detect(&data, "setup.exe"),
+            &mut f1,
+        );
+        assert!(fm1.applied);
+        let (score_installer, _, _) = aggregate_score(&mut f1, 0, 0, &fm1);
+
+        let mut f2 = mk_struct();
+        f2.push(Finding {
+            layer: Layer::IocCorrelation,
+            severity: Severity::Critical,
+            weight: 90,
+            description: "File hash matches a known-malicious indicator of compromise (IOC)."
+                .into(),
+            technical_detail: None,
+        });
+        let fm2 = FrameworkMitigation::evaluate(
+            layers::framework::detect(&data, "setup.exe"),
+            &mut f2,
+        );
+        assert!(!fm2.applied, "IoC-90 must veto mitigation");
+        assert!(fm2.veto_reason.is_some());
+        let (score_with_ioc, _, _) = aggregate_score(&mut f2, 0, 0, &fm2);
+        assert!(
+            score_with_ioc >= score_installer,
+            "adding malicious evidence must not lower the score ({score_with_ioc} < {score_installer})"
+        );
+        assert_eq!(score_with_ioc, 100, "30 + 90, clamped at MAX_SCORE");
+    }
+
+    /// (g) Legacy Go/Electron hints are still detected diagnostically but
+    /// grant NO mitigation (documented calibration change, policy 2).
+    #[test]
+    fn mitigation_legacy_go_and_electron_hints_grant_nothing() {
+        let mut go = vec![0u8; 3_500_000];
+        go[0] = 0x4D;
+        go[1] = 0x5A;
+        go.extend_from_slice(b"Go build ID:");
+        let d = layers::framework::detect(&go, "tool.exe");
+        assert_eq!(d.kind(), FrameworkKind::GoStatic);
+        assert_eq!(d.confidence(), Confidence::WeakHint);
+        let mut sink = Vec::new();
+        assert!(!FrameworkMitigation::evaluate(d, &mut sink).applied);
+
+        let mut el = vec![0x4D, 0x5A];
+        el.extend_from_slice(&[0u8; 500]);
+        el.extend_from_slice(b"electron.asar");
+        let d = layers::framework::detect(&el, "app.exe");
+        assert_eq!(d.kind(), FrameworkKind::ElectronBundle);
+        assert_eq!(d.confidence(), Confidence::WeakHint);
+        let mut sink = Vec::new();
+        assert!(!FrameworkMitigation::evaluate(d, &mut sink).applied);
+    }
+
+    /// (h) Provenance is populated and serializes (serde_json round-trip);
+    /// old JSON without the additive field still deserializes.
+    #[test]
+    fn mitigation_provenance_populates_and_round_trips() {
+        let data = structural_nsis_pe(200);
+        let detection = layers::framework::detect(&data, "setup.exe");
+        let mut findings = vec![Finding {
+            layer: Layer::StructuralAnalysis,
+            severity: Severity::Medium,
+            weight: 30,
+            description: "high entropy section".into(),
+            technical_detail: None,
+        }];
+        let fm = FrameworkMitigation::evaluate(detection, &mut findings);
+        let (_, _, expl) = aggregate_score(&mut findings, 0, 0, &fm);
+
+        let prov = expl
+            .framework_mitigation
+            .as_ref()
+            .expect("provenance must be populated for a detected framework");
+        assert_eq!(prov.kind.as_deref(), Some("NSIS"));
+        assert_eq!(prov.confidence, "Structural");
+        assert!(prov.mitigation_safe);
+        assert!(prov.mitigation_applied);
+        assert!(!prov.evidence.is_empty());
+        assert!(prov
+            .evidence
+            .iter()
+            .any(|e| e.source == "Overlay" && e.offset == Some(0x400)));
+        assert_eq!(prov.ops.len(), 1);
+        assert_eq!(prov.ops[0].layer, "StructuralAnalysis");
+        assert_eq!((prov.ops[0].weight_before, prov.ops[0].weight_after), (30, 10));
+        assert_eq!(
+            (
+                prov.score_before_mitigation,
+                prov.score_after_mitigation
+            ),
+            (30, 10)
+        );
+        assert!(prov.veto_reason.is_none());
+
+        // Round-trip.
+        let json = serde_json::to_string(&expl).unwrap();
+        let back: VerdictExplanation = serde_json::from_str(&json).unwrap();
+        let prov2 = back.framework_mitigation.unwrap();
+        assert_eq!(prov2.kind.as_deref(), Some("NSIS"));
+        assert_eq!(prov2.ops.len(), 1);
+        assert_eq!(prov2.evidence.len(), prov.evidence.len());
+
+        // Additive compat: JSON without the new key (old argusd worker)
+        // still deserializes.
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v.as_object_mut().unwrap().remove("framework_mitigation");
+        let old: VerdictExplanation = serde_json::from_value(v).unwrap();
+        assert!(old.framework_mitigation.is_none());
+    }
+
+    /// (Y) Metamorphic: truncating a valid installer structure must never
+    /// increase mitigation — every cut inside the archive drops confidence
+    /// below Structural, so no cut receives mitigation at all.
+    #[test]
+    fn mitigation_truncation_never_increases_mitigation() {
+        let full = structural_nsis_pe(200);
+        let overlay_start = 0x400usize;
+        for cut in overlay_start..full.len() {
+            let d = layers::framework::detect(&full[..cut], "setup.exe");
+            let mut sink = Vec::new();
+            let fm = FrameworkMitigation::evaluate(d, &mut sink);
+            assert!(!fm.applied, "cut at {cut} must not receive mitigation");
+        }
     }
 }
