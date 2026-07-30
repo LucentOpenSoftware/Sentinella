@@ -15,6 +15,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, error, info, warn};
 
 mod client_auth;
+// Consumed only by the Windows named-pipe accept loop; on other targets the
+// unix-socket loop has no client-identity source to key it on (see mod note
+// in run_unix_socket), so silence the dead-code lint there.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+mod fairness;
 mod policy;
 mod state;
 pub use state::{AppState, argus_analysis_error, unify_detection_filtered};
@@ -184,6 +189,15 @@ impl Server {
         // exhaustion, GiB-scale transient allocations).
         let conn_sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
 
+        // MED (v0.1.12 audit): the global cap bounds TOTAL connections but
+        // is blind to who holds them — one principal (e.g. malware running
+        // as the console user, which client_auth deliberately Allows) could
+        // park all 64 permits with keep-alive frames and starve every other
+        // caller; the shed below would then reject the victim, not the
+        // flooder. Per-principal quota keyed on the accept-time SID — see
+        // fairness.rs for the identity/trust/cap-sizing rationale.
+        let principal_quota = fairness::PrincipalQuota::new();
+
         loop {
             // Wait for client connection.
             if let Err(e) = server.connect().await {
@@ -292,6 +306,20 @@ impl Server {
             // status control plane of an AV product dies. try_acquire keeps the
             // cap's handle/memory bound while guaranteeing the loop stays live;
             // rejected connections are dropped exactly like the Deny arm above.
+            //
+            // v0.1.12: the global cap alone let ONE principal occupy all 64
+            // permits (each is held for the whole session and the idle timer
+            // restarts per frame), starving every other caller — the shed
+            // rejected the victim, not the flooder. We therefore also enforce
+            // a per-principal quota keyed on the SID resolved above (or the
+            // shared, separately-capped unidentified bucket on the fail-open
+            // path). Identity is available BEFORE this point — auth runs at
+            // accept time — so no reordering of resolution vs. acquisition is
+            // needed. Order here: global try_acquire (existing shed) →
+            // per-principal try_acquire (shed, releasing the global permit
+            // via Drop). The quota's map mutex is never held across .await
+            // and never while acquiring the semaphore, so there is no
+            // lock-ordering between the two limits (see fairness.rs).
             debug!("client connected");
             let permit = match Arc::clone(&conn_sem).try_acquire_owned() {
                 Ok(p) => p,
@@ -302,9 +330,24 @@ impl Server {
                     continue;
                 }
             };
+            let principal_permit = match principal_quota.try_acquire(peer_identity.as_ref()) {
+                Some(p) => p,
+                None => {
+                    // NOT silent: the operator must be able to see which
+                    // principal exhausted its allowance.
+                    warn!(
+                        sid = peer_identity.as_ref().map(|i| i.sid.as_str()).unwrap_or("unresolved"),
+                        "per-principal connection cap reached; shedding client"
+                    );
+                    drop(connected_pipe);
+                    self.state.record_ipc_error();
+                    continue; // global permit released here by Drop
+                }
+            };
             let st = Arc::clone(&self.state);
             tokio::spawn(async move {
                 let _permit = permit;
+                let _principal_permit = principal_permit;
                 if let Err(e) = handle_connection(connected_pipe, st, peer_identity).await {
                     warn!(%e, "client session error");
                 }
@@ -329,6 +372,13 @@ impl Server {
             debug!("client connected");
             // Shed load instead of parking the acceptor — see the Windows loop
             // above for why awaiting the permit here is a self-inflicted DoS.
+            //
+            // NOTE: the per-principal fairness quota (fairness.rs) is
+            // Windows-only by design — this path has no client-identity
+            // source to key it on, and bucketing every Unix connection as
+            // "unidentified" would silently tighten this loop from 64 to 16
+            // concurrent clients. The global cap plus socket-file
+            // permissions remain the mitigation here (dev-oriented path).
             let permit = match Arc::clone(&conn_sem).try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => {
