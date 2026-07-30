@@ -45,7 +45,8 @@
 //!
 //! When the root DACL needed repair, existing children still carry stale
 //! *copies* of the old inherited ACEs (Windows does not retro-propagate),
-//! so a one-time `icacls /reset /T` normalizes the tree to inherit the new
+//! so a one-time verified-walk normalization (`normalize_tree` — never
+//! `icacls /T`, which follows junctions: CWE-59) resets the tree to inherit the new
 //! root policy. `/reset` touches only DACLs — SACLs (audit ACEs) are
 //! preserved — and the known secret files are re-asserted immediately
 //! afterwards, closing the window where their explicit ACLs were reset.
@@ -417,7 +418,7 @@ pub fn evaluate(info: &SdInfo, kind: PolicyKind) -> AclVerdict {
 }
 
 /// DACL-only view of the child-dir rule (owner assessed separately so the
-/// repair can distinguish `/setowner /T` from `/reset /T`).
+/// repair can distinguish owner repair from DACL normalization).
 pub fn child_dir_dacl_is_clean(info: &SdInfo) -> bool {
     info.dacl_present
         && !info.dacl_protected
@@ -434,7 +435,7 @@ pub fn child_dir_dacl_is_clean(info: &SdInfo) -> bool {
 /// the (already-repaired) root — hence only SYSTEM/Administrators trustees
 /// — plus an admin owner. Anything else (explicit ACEs, deny ACEs, Users
 /// grants, non-admin owner) marks the tree as contaminated and triggers
-/// the one-time `/reset /T` normalization.
+/// the one-time verified-walk normalization.
 // Only consumed by tests in this binary crate (production code assesses
 /// owner and DACL separately via `child_dir_dacl_is_clean`).
 #[allow(dead_code)]
@@ -569,8 +570,9 @@ pub fn startup_hardening(pm: &crate::paths::PathManager) {
                     owner_fixed, tree_normalized,
                     "data root DACL repaired to SYSTEM+Administrators policy"
                 );
-                // The tree normalization (/reset /T) reset DACLs on ALL
-                // children, including the explicit ACLs on secret files.
+                // The tree normalization (verified walk, per-entry /reset)
+                // reset DACLs on ALL children, including the explicit ACLs
+                // on secret files.
                 // Re-assert every known secret that exists right now; the
                 // lazy re-assertions (IntegrityVault::init, get_vault_key,
                 // ipc secret load) cover keys created later this boot.
@@ -880,16 +882,11 @@ pub mod imp {
         // WRITE_DAC and could undo anything else we set. Deliberate policy:
         // take ownership (set to Administrators). SYSTEM holds
         // SeTakeOwnershipPrivilege, so this also covers the hostile-owner
-        // case. `/T` fixes the whole tree for the same reason.
+        // case. ROOT ONLY — `/T` is never used anywhere in this module
+        // (see normalize_tree: icacls /T follows directory junctions, which
+        // is a CWE-59 escalation primitive on an attacker-writable tree).
         if fix_owner {
-            if let Err(e) = run_icacls(&[
-                &root_str,
-                "/setowner",
-                "*S-1-5-32-544",
-                "/T",
-                "/C",
-                "/Q",
-            ]) {
+            if let Err(e) = run_icacls(&[&root_str, "/setowner", "*S-1-5-32-544", "/Q"]) {
                 return RootOutcome::Degraded(format!("setowner failed: {e}"));
             }
         }
@@ -907,14 +904,29 @@ pub mod imp {
             ]) {
                 return RootOutcome::Degraded(format!("root DACL grant failed: {e}"));
             }
-            // Children created under the OLD root DACL still carry stale
-            // inherited ACE copies; Windows does not retro-propagate. Reset
-            // every child to inherit the new root policy. `/reset` only
-            // rebuilds DACLs from inheritance — SACLs (audit ACEs) are
-            // untouched — and secret-file ACLs are re-asserted by the
-            // caller immediately after.
-            if let Err(e) = run_icacls(&[&root_str, "/reset", "/T", "/C", "/Q"]) {
-                return RootOutcome::Degraded(format!("tree normalization (/reset) failed: {e}"));
+        }
+
+        // Children created under the OLD root DACL (or planted by the
+        // previously-empowered user) still carry stale/hostile ACEs; Windows
+        // does not retro-propagate. Normalize with a Rust-side walk that
+        // verifies every entry before touching it — NEVER `icacls /T`
+        // (junction-following, see normalize_tree). Runs whenever the owner
+        // or DACL needed repair; per-entry owner fixes included when
+        // fix_owner. Secret-file ACLs are re-asserted by the caller after.
+        if fix_dacl || fix_owner {
+            match normalize_tree(root, fix_owner) {
+                Ok(stats) => {
+                    if stats.skipped_reparse > 0 {
+                        tracing::warn!(
+                            skipped = stats.skipped_reparse,
+                            "tree normalization skipped reparse points (possible junction-plant attempt)"
+                        );
+                    }
+                    tracing::debug!(?stats, "data-root tree normalized via verified walk");
+                }
+                Err(e) => {
+                    return RootOutcome::Degraded(format!("tree normalization failed: {e}"));
+                }
             }
         }
 
@@ -955,9 +967,9 @@ pub mod imp {
 
     /// Aggregate deviation state of the root's immediate child directories.
     struct ChildAssessment {
-        /// Some child DACL deviates from pure-inheritance → `/reset /T`.
+        /// Some child DACL deviates from pure-inheritance → needs reset.
         needs_reset: bool,
-        /// Some child has a non-admin owner → `/setowner /T`.
+        /// Some child has a non-admin owner → needs owner repair.
         needs_owner_fix: bool,
     }
 
@@ -982,9 +994,15 @@ pub mod imp {
                 Ok(ft) => ft,
                 Err(_) => continue,
             };
-            // No reparse following: a junction child is skipped here and
-            // skipped by /reset /T semantics we care about (icacls does not
-            // follow junctions with /T either).
+            // No reparse following: a junction child is skipped here and by
+            // normalize_tree below. NOTE: a previous revision claimed
+            // "icacls does not follow junctions with /T either" — that is
+            // FALSE. `icacls /T` follows directory junctions (verified
+            // empirically from an unelevated shell: /reset /T walked a
+            // planted junction and rewrote DACLs in the target tree). On an
+            // attacker-writable root — exactly the state this repair
+            // targets — that is a CWE-59 SYSTEM-level privilege-escalation
+            // primitive, which is why this module never passes /T.
             if !ft.is_dir() || ft.is_symlink() {
                 continue;
             }
@@ -1004,6 +1022,101 @@ pub mod imp {
         }
         Ok(assessment)
     }
+
+    /// Statistics from a `normalize_tree` walk.
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+    pub struct TreeStats {
+        /// Directories reset to inherit.
+        pub dirs_reset: u32,
+        /// Files reset to inherit.
+        pub files_reset: u32,
+        /// Entries whose owner was repaired to Administrators.
+        pub owners_fixed: u32,
+        /// Reparse points / symlinks refused (never descended, never ACLed).
+        pub skipped_reparse: u32,
+    }
+
+    /// Maximum depth (below root) and total entries the walk will touch —
+    /// bounds the worst-case icacls spawn count on a hostile or runaway tree.
+    const NORMALIZE_MAX_DEPTH: u32 = 8;
+    const NORMALIZE_MAX_ENTRIES: u32 = 10_000;
+
+    /// Recursively normalize a tree to inherit the root's (already repaired)
+    /// DACL, fixing per-entry owners on request — the SAFE replacement for
+    /// `icacls /reset /T` + `/setowner /T`.
+    ///
+    /// WHY never `/T`: `icacls /T` follows directory junctions. On an
+    /// attacker-writable tree — precisely the state this repair exists for —
+    /// a planted junction (`mklink /J`, no admin needed) would make SYSTEM
+    /// rewrite owners and DACLs across an arbitrary target tree
+    /// (CWE-59, reproduced from an unelevated shell during adversarial
+    /// review). This walk instead verifies EVERY entry itself: symlinks and
+    /// reparse points are never descended and never ACLed — they are
+    /// counted in `skipped_reparse` so a junction-plant attempt is visible.
+    ///
+    /// Per verified entry: `icacls <path> /reset /Q` (rebuilds the DACL
+    /// from inheritance — SACLs untouched) and, when `fix_owners` and the
+    /// current owner is not Administrators, `/setowner` WITHOUT `/T`.
+    /// The root itself is never `/reset` (the caller just granted its
+    /// canonical DACL — an earlier revision reset it straight back to
+    /// ProgramData's inheritance, so the repair never converged).
+    pub fn normalize_tree(root: &Path, fix_owners: bool) -> Result<TreeStats, String> {
+        let mut stats = TreeStats::default();
+        let mut stack: Vec<(std::path::PathBuf, u32)> = vec![(root.to_path_buf(), 0)];
+        let mut visited: u32 = 0;
+
+        while let Some((dir, depth)) = stack.pop() {
+            let entries = std::fs::read_dir(&dir)
+                .map_err(|e| format!("read_dir {}: {e}", dir.display()))?;
+            for entry in entries.flatten() {
+                visited += 1;
+                if visited > NORMALIZE_MAX_ENTRIES {
+                    return Err(format!(
+                        "tree exceeds {NORMALIZE_MAX_ENTRIES} entries — refusing to normalize (hostile or runaway tree?)"
+                    ));
+                }
+                let path = entry.path();
+                let ft = match entry.file_type() {
+                    Ok(ft) => ft,
+                    Err(_) => continue,
+                };
+                // Never touch or descend symlinks/reparse points (junctions).
+                // file_type() does not follow links; is_reparse_point uses
+                // symlink_metadata — both are entry-level, no following.
+                if ft.is_symlink() || crate::scan::is_reparse_point(&path) {
+                    stats.skipped_reparse += 1;
+                    continue;
+                }
+
+                if fix_owners {
+                    let sddl = read_sddl(&path)
+                        .map_err(|e| format!("read SD {}: {e}", path.display()))?;
+                    let info = parse_sddl(&sddl)
+                        .map_err(|e| format!("parse SDDL {}: {e}", path.display()))?;
+                    if !info.owner.as_deref().map(is_admin_sid).unwrap_or(false) {
+                        let p = path.to_string_lossy().into_owned();
+                        run_icacls(&[&p, "/setowner", "*S-1-5-32-544", "/Q"])
+                            .map_err(|e| format!("setowner {}: {e}", path.display()))?;
+                        stats.owners_fixed += 1;
+                    }
+                }
+
+                let p = path.to_string_lossy().into_owned();
+                run_icacls(&[&p, "/reset", "/Q"])
+                    .map_err(|e| format!("reset {}: {e}", path.display()))?;
+                if ft.is_dir() {
+                    stats.dirs_reset += 1;
+                    if depth < NORMALIZE_MAX_DEPTH {
+                        stack.push((path, depth + 1));
+                    }
+                } else {
+                    stats.files_reset += 1;
+                }
+            }
+        }
+        Ok(stats)
+    }
+
 
     /// Apply (if needed) the canonical ACL on a secret file, then
     /// re-verify. Never modifies file contents.
@@ -1104,6 +1217,70 @@ pub mod imp {
             run_icacls(&[&root_str]).unwrap();
 
             let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// CWE-59 regression test (unelevated-safe): a directory junction
+        /// planted inside the tree must be neither descended nor ACLed by
+        /// normalize_tree — and the junction TARGET's tree must be
+        /// completely untouched. This is the exact primitive the old
+        /// `icacls /reset /T` design exposed to any local user.
+        /// Junctions (`mklink /J`) need no admin on the same volume.
+        #[test]
+        fn normalize_tree_never_crosses_junction() {
+            let tag = format!("sent_acl_jtest_{}", std::process::id());
+            let base = std::env::temp_dir().join(&tag);
+            let outside = std::env::temp_dir().join(format!("{tag}_outside"));
+            let _ = std::fs::remove_dir_all(&base);
+            let _ = std::fs::remove_dir_all(&outside);
+            std::fs::create_dir_all(base.join("real_dir")).unwrap();
+            std::fs::write(base.join("real_dir\\f.txt"), b"x").unwrap();
+            std::fs::create_dir_all(&outside).unwrap();
+            let victim = outside.join("victim.txt");
+            std::fs::write(&victim, b"protected").unwrap();
+            // Contaminate the victim: deny-read for everyone would break
+            // read-back; instead grant Everyone full — if normalize crosses
+            // the junction, /reset would strip this grant.
+            let victim_str = victim.to_string_lossy().into_owned();
+            run_icacls(&[&victim_str, "/grant", "*S-1-1-0:(F)"]).unwrap();
+            let victim_sddl_before = read_sddl(&victim).unwrap();
+
+            // Plant the junction inside the tree → outside dir.
+            let link = base.join("planted_link");
+            let status = std::process::Command::new("cmd")
+                .args([
+                    "/c",
+                    "mklink",
+                    "/J",
+                    &link.to_string_lossy(),
+                    &outside.to_string_lossy(),
+                ])
+                .status()
+                .expect("spawn mklink");
+            if !status.success() {
+                eprintln!("mklink /J unavailable — skipping junction test");
+                let _ = std::fs::remove_dir_all(&base);
+                let _ = std::fs::remove_dir_all(&outside);
+                return;
+            }
+
+            let stats = normalize_tree(&base, false).expect("normalize_tree");
+            assert!(
+                stats.skipped_reparse >= 1,
+                "the planted junction must be skipped, got {stats:?}"
+            );
+            // Real entries were normalized; the junction was not descended
+            // (real_dir + f.txt = 2 ops, no ops under planted_link).
+            assert_eq!(stats.dirs_reset, 1, "only real_dir may be reset");
+            assert_eq!(stats.files_reset, 1, "only f.txt may be reset");
+            // The target tree is byte-identical ACL-wise.
+            assert_eq!(
+                read_sddl(&victim).unwrap(),
+                victim_sddl_before,
+                "junction target ACL must be untouched (CWE-59)"
+            );
+
+            let _ = std::fs::remove_dir_all(&base);
+            let _ = std::fs::remove_dir_all(&outside);
         }
     }
 }
