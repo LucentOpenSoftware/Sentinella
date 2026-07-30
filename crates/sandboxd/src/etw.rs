@@ -7,6 +7,18 @@
 //!
 //! `monitor_process()` tries ETW first, falls back to polling if unavailable.
 //! The contract (EtwFinding with confidence/source) is identical regardless of backend.
+//!
+//! Architecture (C-1 fix): the ETW session is a PRIVATE SYSTEM-LOGGER
+//! session — `EVENT_TRACE_SYSTEM_LOGGER_MODE | EVENT_TRACE_REAL_TIME_MODE`
+//! plus a fixed private `Wnode.Guid` (see `crate::etw_config`). Without
+//! system-logger mode the kernel ignores `EnableFlags` ("EnableFlags is
+//! only valid for system loggers" — EVENT_TRACE_PROPERTIES, MS Learn):
+//! StartTraceW succeeded and every detonation received ZERO events while
+//! `backend_used` reported `"etw_kernel_session"`. `backend_used` is now
+//! truthful: it reflects actual event flow, and a silent-zero session
+//! mid-detonation marks the report degraded and engages the polling
+//! fallback for the remaining window (detonation is NEVER aborted for
+//! this — containment is job-object based; ETW is telemetry only).
 
 #![cfg(target_os = "windows")]
 
@@ -22,6 +34,8 @@ use windows::Win32::System::Diagnostics::ToolHelp::*;
 use windows::core::PCWSTR;
 
 use sentinella_common::etw_props::EventTracePropsStorage;
+
+use crate::etw_config;
 
 /// Behavioral finding from ETW monitoring.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -44,7 +58,18 @@ pub struct EtwReport {
     #[allow(dead_code)]
     pub files_written: Vec<String>,
     pub errors: Vec<String>,
+    /// Truthful backend label (C-1): `"etw_kernel_session"` ONLY when the
+    /// ETW session actually delivered events; `"etw_session_no_events"`
+    /// when it started but stayed silent; `"polling_fallback"` when
+    /// polling produced the telemetry. See `backend_label()`.
     pub backend_used: String,
+    /// Raw kernel events delivered to the EVENT_RECORD callback (before
+    /// relevance filtering). The truthfulness signal behind `backend_used`.
+    pub events_seen: u64,
+    /// True when the ETW session stayed silent for
+    /// `SILENT_ZERO_DEGRADE_AFTER` mid-detonation and the polling fallback
+    /// was engaged alongside it. Containment is unaffected either way.
+    pub etw_degraded: bool,
 }
 
 impl EtwReport {
@@ -58,6 +83,8 @@ impl EtwReport {
             files_written: Vec::new(),
             errors: Vec::new(),
             backend_used: "none".into(),
+            events_seen: 0,
+            etw_degraded: false,
         }
     }
 }
@@ -164,10 +191,10 @@ fn etw_kernel_monitor(
     stop: &AtomicBool,
 ) -> Result<EtwReport, String> {
     let report = Arc::new(Mutex::new(EtwReport::new()));
-    {
-        let mut r = report.lock().unwrap_or_else(|e| e.into_inner());
-        r.backend_used = "etw_kernel_session".into();
-    }
+    // NOTE: `backend_used` is intentionally NOT set here — it is assigned
+    // at the end from actual event flow (C-1 truthfulness). Pre-setting
+    // "etw_kernel_session" before a single event arrived is exactly the
+    // lie this fix removes.
     let monitored_pids = Arc::new(Mutex::new(HashSet::from([pid])));
 
     // ── Set up callback context ──────────────────────────
@@ -201,13 +228,18 @@ fn etw_kernel_monitor(
         Ok(s) => s,
         Err(e) => return Err(format!("ETW props layout failed: {e}")),
     };
+    // Session-semantic fields come from the pure config builder
+    // (crate::etw_config) — the C-1 fix: SYSTEM_LOGGER_MODE + a private
+    // Wnode.Guid make the kernel EnableFlags valid. Without them this
+    // session started successfully and delivered zero events on every
+    // detonation (StartTraceW success ≠ working ETW).
+    let cfg = etw_config::sandbox_session_config();
     let props = props_storage.props_mut();
-    props.Wnode.ClientContext = 1;
-    props.Wnode.Flags = 0x00020000; // WNODE_FLAG_TRACED_GUID
-    props.LogFileMode = 0x00000100; // EVENT_TRACE_REAL_TIME_MODE
-    props.EnableFlags = EVENT_TRACE_FLAG(
-        0x00000001 | 0x00000004 | 0x00020000 | 0x00010000, // PROCESS + IMAGE + REGISTRY + NETWORK
-    );
+    props.Wnode.ClientContext = cfg.client_context;
+    props.Wnode.Flags = cfg.wnode_flags;
+    props.Wnode.Guid = windows::core::GUID::from_u128(cfg.session_guid);
+    props.LogFileMode = cfg.log_file_mode;
+    props.EnableFlags = EVENT_TRACE_FLAG(cfg.enable_flags);
 
     let mut session_handle = CONTROLTRACE_HANDLE::default();
     let start_result = unsafe {
@@ -218,6 +250,11 @@ fn etw_kernel_monitor(
         )
     };
 
+    // Any hard StartTraceW error — access-denied (5) or
+    // ERROR_NO_SYSTEM_RESOURCES (1450: the 8 system-logger slots on Win8+
+    // are exhausted) — returns Err here and the caller falls back to
+    // polling. Only error 183 (stale session with our fixed name) is
+    // reclaimed in place.
     if start_result.0 != 0 {
         if start_result.0 == 183 {
             // Stale session — stop and retry.
@@ -232,7 +269,7 @@ fn etw_kernel_monitor(
                 }
             }
 
-            // Rebuild props for retry.
+            // Rebuild props for retry — identical session config.
             let mut retry_storage = match EventTracePropsStorage::with_extra(
                 &session_name,
                 None,
@@ -242,11 +279,11 @@ fn etw_kernel_monitor(
                 Err(e) => return Err(format!("ETW props layout failed: {e}")),
             };
             let retry_props = retry_storage.props_mut();
-            retry_props.Wnode.ClientContext = 1;
-            retry_props.Wnode.Flags = 0x00020000;
-            retry_props.LogFileMode = 0x00000100;
-            retry_props.EnableFlags =
-                EVENT_TRACE_FLAG(0x00000001 | 0x00000004 | 0x00020000 | 0x00010000);
+            retry_props.Wnode.ClientContext = cfg.client_context;
+            retry_props.Wnode.Flags = cfg.wnode_flags;
+            retry_props.Wnode.Guid = windows::core::GUID::from_u128(cfg.session_guid);
+            retry_props.LogFileMode = cfg.log_file_mode;
+            retry_props.EnableFlags = EVENT_TRACE_FLAG(cfg.enable_flags);
             let retry = unsafe {
                 StartTraceW(
                     &mut session_handle,
@@ -290,10 +327,60 @@ fn etw_kernel_monitor(
         }
     });
 
+    // ── Monitor window with silent-zero give-up (C-1) ──────────
+    // A session that starts but delivers nothing used to be invisible:
+    // the fallback triggered only on HARD errors. Now, if zero events
+    // arrive within SILENT_ZERO_DEGRADE_AFTER, we log loudly, mark the
+    // report degraded, and run the polling fallback for the remaining
+    // window so the detonation still gets process-spawn telemetry.
+    // The detonation itself is NEVER aborted for this — containment is
+    // job-object based; ETW is telemetry only.
     let start = Instant::now();
+    let mut degraded = false;
+    let fallback_stop = Arc::new(AtomicBool::new(false));
+    let mut fallback_thread: Option<std::thread::JoinHandle<()>> = None;
     while start.elapsed() < timeout && !stop.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(50));
+        if !degraded
+            && start.elapsed() >= SILENT_ZERO_DEGRADE_AFTER
+            && ETW_EVENT_COUNT.load(Ordering::Relaxed) == 0
+        {
+            degraded = true;
+            tracing::warn!(
+                elapsed_secs = start.elapsed().as_secs(),
+                "sandboxd ETW: session started but delivered zero events — \
+                 marking telemetry degraded, engaging polling fallback \
+                 (detonation NOT aborted: containment is job-object based)"
+            );
+            {
+                let mut r = report.lock().unwrap_or_else(|e| e.into_inner());
+                r.etw_degraded = true;
+                r.errors.push(
+                    "ETW session delivered zero events (silent-zero); \
+                     polling fallback engaged for the remaining window"
+                        .into(),
+                );
+            }
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if remaining >= Duration::from_millis(500) {
+                let fb_report = Arc::clone(&report);
+                let fb_stop = Arc::clone(&fallback_stop);
+                fallback_thread = Some(std::thread::spawn(move || {
+                    let deadline = Instant::now() + remaining;
+                    let mut seen: HashSet<u32> = HashSet::from([pid]);
+                    while Instant::now() < deadline && !fb_stop.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(200));
+                        let mut r = fb_report.lock().unwrap_or_else(|e| e.into_inner());
+                        poll_children_round(&mut seen, &mut r);
+                    }
+                }));
+            }
+        }
     }
+
+    // Signal the fallback thread (if any) so the join below returns
+    // promptly on early stop rather than waiting out its deadline.
+    fallback_stop.store(true, Ordering::Relaxed);
 
     // Stop session → unblocks ProcessTrace.
     _guard.stop();
@@ -303,9 +390,36 @@ fn etw_kernel_monitor(
         let _ = CloseTrace(trace_handle);
     }
     let _ = consumer_thread.join();
+    if let Some(h) = fallback_thread {
+        let _ = h.join();
+    }
 
-    let result = report.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    // Truthful finalization: backend label reflects ACTUAL event flow.
+    let events_seen = ETW_EVENT_COUNT.load(Ordering::Relaxed);
+    let mut result = report.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    result.events_seen = events_seen;
+    result.etw_degraded = degraded;
+    result.backend_used = backend_label(events_seen, degraded).into();
     Ok(result)
+}
+
+/// How long a started ETW session may deliver zero events before the
+/// monitor declares silent-zero degradation. Short enough that a default
+/// 10 s detonation still gets ~5 s of polling-fallback coverage.
+const SILENT_ZERO_DEGRADE_AFTER: Duration = Duration::from_secs(5);
+
+/// The truthful `backend_used` label (C-1). `"etw_kernel_session"` is
+/// earned only by actual event flow — never by StartTraceW success alone.
+fn backend_label(events_seen: u64, polling_fallback_engaged: bool) -> &'static str {
+    if events_seen > 0 {
+        "etw_kernel_session"
+    } else if polling_fallback_engaged {
+        "polling_fallback"
+    } else {
+        // Window shorter than the degrade threshold (or stop requested
+        // early): session ran, delivered nothing, no fallback had time.
+        "etw_session_no_events"
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -638,27 +752,36 @@ fn polling_monitor(
 
     while start.elapsed() < timeout && !stop.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(200));
-        // Enumerate children of every PID seen so far — recursively catches
-        // grandchildren, not just direct children of the root (the ETW
-        // backend already tracks the whole tree via monitored_pids).
-        let parents: Vec<u32> = seen.iter().copied().collect();
-        for parent in parents {
-            for (child_pid, child_name) in enumerate_children(parent) {
-                if seen.insert(child_pid) {
-                    let severity = if is_suspicious_process(&child_name) {
-                        "high"
-                    } else {
-                        "medium"
-                    };
-                    report.processes_spawned.push(child_name.clone());
-                    report.findings.push(EtwFinding {
-                        kind: "process_spawn".into(),
-                        severity: severity.into(),
-                        detail: format!("Spawned {} (PID {})", child_name, child_pid),
-                        confidence: "observed".into(),
-                        source: "behavioral_monitor_polling".into(),
-                    });
-                }
+        poll_children_round(&mut seen, report);
+    }
+}
+
+/// One process-tree enumeration round. Shared by the hard-error polling
+/// fallback (`polling_monitor`) and the silent-zero degraded fallback
+/// thread in `etw_kernel_monitor` — the latter locks the shared report
+/// around each call so it must not own the loop.
+///
+/// Enumerates children of every PID seen so far — recursively catches
+/// grandchildren, not just direct children of the root (the ETW backend
+/// already tracks the whole tree via monitored_pids).
+fn poll_children_round(seen: &mut HashSet<u32>, report: &mut EtwReport) {
+    let parents: Vec<u32> = seen.iter().copied().collect();
+    for parent in parents {
+        for (child_pid, child_name) in enumerate_children(parent) {
+            if seen.insert(child_pid) {
+                let severity = if is_suspicious_process(&child_name) {
+                    "high"
+                } else {
+                    "medium"
+                };
+                report.processes_spawned.push(child_name.clone());
+                report.findings.push(EtwFinding {
+                    kind: "process_spawn".into(),
+                    severity: severity.into(),
+                    detail: format!("Spawned {} (PID {})", child_name, child_pid),
+                    confidence: "observed".into(),
+                    source: "behavioral_monitor_polling".into(),
+                });
             }
         }
     }
@@ -1198,5 +1321,170 @@ mod tests {
         );
 
         assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  C-1 contract tests — semantic-drift guards between the
+    //  session config (etw_config) and this file's parsers.
+    // ═══════════════════════════════════════════════════════════
+
+    #[test]
+    fn backend_label_is_truthful() {
+        // The pre-fix lie: StartTraceW success alone earned
+        // "etw_kernel_session". Now only actual event flow does.
+        assert_eq!(backend_label(0, false), "etw_session_no_events");
+        assert_eq!(backend_label(0, true), "polling_fallback");
+        assert_eq!(backend_label(1, false), "etw_kernel_session");
+        // Events flowed even though the fallback was also engaged → ETW
+        // earned the label; the hiccup is recorded via etw_degraded.
+        assert_eq!(backend_label(7, true), "etw_kernel_session");
+    }
+
+    #[test]
+    fn every_parsed_provider_has_an_enable_flag() {
+        // Maps each kernel MOF provider GUID the callback parses (with its
+        // opcodes) to the EnableFlags bit that makes the kernel emit it.
+        // Drift in either direction silently disables a detector or
+        // wastes kernel buffer bandwidth.
+        let cfg = etw_config::sandbox_session_config();
+        let parsed: &[(windows::core::GUID, &[u8], u32, &str)] = &[
+            (PROCESS_GUID, &[1], etw_config::EVENT_TRACE_FLAG_PROCESS, "process"),
+            (
+                IMAGE_GUID,
+                &[10],
+                etw_config::EVENT_TRACE_FLAG_IMAGE_LOAD,
+                "image_load",
+            ),
+            (
+                TCPIP_GUID,
+                &[12, 15],
+                etw_config::EVENT_TRACE_FLAG_NETWORK_TCPIP,
+                "tcpip",
+            ),
+            (
+                REGISTRY_GUID,
+                &[22, 23],
+                etw_config::EVENT_TRACE_FLAG_REGISTRY,
+                "registry",
+            ),
+        ];
+        for (_guid, _opcodes, flag, name) in parsed {
+            assert_ne!(
+                cfg.enable_flags & flag,
+                0,
+                "parser for {name} events exists but its enable flag is missing"
+            );
+        }
+        // And conversely: no enabled flag without a parser. Exact-equality
+        // with the four known bits enforces this.
+        assert_eq!(
+            cfg.enable_flags,
+            etw_config::EVENT_TRACE_FLAG_PROCESS
+                | etw_config::EVENT_TRACE_FLAG_IMAGE_LOAD
+                | etw_config::EVENT_TRACE_FLAG_NETWORK_TCPIP
+                | etw_config::EVENT_TRACE_FLAG_REGISTRY
+        );
+    }
+
+    #[test]
+    fn session_config_is_a_private_system_logger() {
+        // Bit-level mirror of the sentinelld main-intake contract (F-1):
+        // REAL_TIME | SYSTEM_LOGGER_MODE, WNODE_FLAG_TRACED_GUID, QPC
+        // timestamps, private non-kernel GUID.
+        let cfg = etw_config::sandbox_session_config();
+        assert_eq!(cfg.log_file_mode, 0x0000_0100 | 0x0200_0000);
+        assert_eq!(cfg.wnode_flags, 0x0002_0000);
+        assert_eq!(cfg.client_context, 1);
+        assert_ne!(cfg.session_guid, 0);
+        assert_ne!(cfg.session_name, "NT Kernel Logger");
+    }
+
+    #[test]
+    fn mode_and_flag_constants_match_the_windows_sdk() {
+        // Guards the hand-written constants in etw_config against the
+        // authoritative SDK values re-exported by the windows crate. A
+        // typo'd bit here (e.g. 0x0000_0200 = EVENT_TRACE_DELAY_OPEN_FILE
+        // instead of 0x0200_0000 = SYSTEM_LOGGER_MODE) compiles fine and
+        // passes bit-composition tests while silently re-creating the
+        // F-1/C-1 zero-event session — only an SDK cross-check catches it.
+        use windows::Win32::System::Diagnostics::Etw as sdk;
+        assert_eq!(
+            etw_config::EVENT_TRACE_SYSTEM_LOGGER_MODE,
+            sdk::EVENT_TRACE_SYSTEM_LOGGER_MODE
+        );
+        assert_eq!(
+            etw_config::EVENT_TRACE_REAL_TIME_MODE,
+            sdk::EVENT_TRACE_REAL_TIME_MODE
+        );
+        assert_eq!(
+            etw_config::EVENT_TRACE_FLAG_PROCESS,
+            sdk::EVENT_TRACE_FLAG_PROCESS.0
+        );
+        assert_eq!(
+            etw_config::EVENT_TRACE_FLAG_IMAGE_LOAD,
+            sdk::EVENT_TRACE_FLAG_IMAGE_LOAD.0
+        );
+        assert_eq!(
+            etw_config::EVENT_TRACE_FLAG_NETWORK_TCPIP,
+            sdk::EVENT_TRACE_FLAG_NETWORK_TCPIP.0
+        );
+        assert_eq!(
+            etw_config::EVENT_TRACE_FLAG_REGISTRY,
+            sdk::EVENT_TRACE_FLAG_REGISTRY.0
+        );
+    }
+
+    #[test]
+    fn report_schema_carries_truthfulness_fields() {
+        let r = EtwReport::new();
+        assert_eq!(r.events_seen, 0);
+        assert!(!r.etw_degraded);
+        assert_eq!(r.backend_used, "none");
+    }
+
+    /// Opt-in live test: starts the REAL system-logger session and
+    /// verifies the kernel actually delivers events (the C-1 acceptance
+    /// test). Prerequisites: Windows, elevated (admin) shell, no other
+    /// sandboxd detonation running. Run with:
+    ///   cargo test -p sandboxd -- --ignored --nocapture etw_live
+    #[test]
+    #[ignore = "requires elevation (admin) — opt-in live ETW validation"]
+    fn etw_live_system_logger_session_delivers_events() {
+        // Generate our own activity: cmd.exe spawning a child (ping).
+        let mut child = match std::process::Command::new("cmd.exe")
+            .args(["/c", "ping", "-n", "6", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("SKIP: cannot spawn activity process: {e}");
+                return;
+            }
+        };
+
+        let stop = AtomicBool::new(false);
+        let result = etw_kernel_monitor(child.id(), Duration::from_secs(8), Path::new("."), &stop);
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let report = match result {
+            Ok(r) => r,
+            Err(e) => {
+                // Not elevated / slots exhausted: environment limitation,
+                // not a code failure — skip loudly rather than fail.
+                eprintln!("SKIP: ETW session unavailable ({e}) — run elevated");
+                return;
+            }
+        };
+
+        assert!(
+            report.events_seen > 0,
+            "C-1 regression: system-logger session delivered zero events \
+             (backend={}, degraded={})",
+            report.backend_used,
+            report.etw_degraded
+        );
+        assert_eq!(report.backend_used, "etw_kernel_session");
     }
 }

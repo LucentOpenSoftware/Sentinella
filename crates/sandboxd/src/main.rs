@@ -20,6 +20,9 @@
 
 #[cfg(target_os = "windows")]
 mod etw;
+// Pure ETW session-config builder (C-1 fix) — cross-platform by design so
+// its bit-level invariant tests run everywhere.
+mod etw_config;
 #[cfg(target_os = "windows")]
 mod restricted;
 
@@ -59,6 +62,11 @@ struct SandboxOutput {
     sample_path: String,
     sample_sha256: String,
     backend_used: String,
+    // C-1 truthfulness fields (additive — no existing fields removed).
+    // `backend_used` claims "etw_kernel_session" ONLY when the session
+    // actually delivered events; these two make that claim auditable.
+    etw_events_seen: u64,
+    etw_degraded: bool,
     detonation_time_ms: u64,
     monitor_duration_ms: u64,
     findings: Vec<SandboxFinding>,
@@ -105,6 +113,8 @@ fn main() {
                 sample_path: cli.path.to_string_lossy().to_string(),
                 sample_sha256: String::new(),
                 backend_used: "none".into(),
+                etw_events_seen: 0,
+                etw_degraded: false,
                 detonation_time_ms: 0,
                 monitor_duration_ms: 0,
                 findings: vec![],
@@ -127,6 +137,8 @@ fn main() {
                 sample_path: cli.path.to_string_lossy().to_string(),
                 sample_sha256: sha256,
                 backend_used: "none".into(),
+                etw_events_seen: 0,
+                etw_degraded: false,
                 detonation_time_ms: 0,
                 monitor_duration_ms: 0,
                 findings: vec![],
@@ -148,6 +160,8 @@ fn main() {
                     sample_path: cli.path.to_string_lossy().to_string(),
                     sample_sha256: sha256,
                     backend_used: "none".into(),
+                    etw_events_seen: 0,
+                    etw_degraded: false,
                     detonation_time_ms: start.elapsed().as_millis() as u64,
                     monitor_duration_ms: 0,
                     findings: vec![],
@@ -192,6 +206,8 @@ fn main() {
             result.sha256
         },
         backend_used: result.backend_used,
+        etw_events_seen: result.etw_events_seen,
+        etw_degraded: result.etw_degraded,
         detonation_time_ms: elapsed_ms,
         monitor_duration_ms: result.monitor_duration_ms,
         findings: result.findings,
@@ -239,6 +255,8 @@ struct DetonationResult {
     findings: Vec<SandboxFinding>,
     errors: Vec<String>,
     backend_used: String,
+    etw_events_seen: u64,
+    etw_degraded: bool,
     monitor_duration_ms: u64,
     /// SHA256 of the bytes ACTUALLY detonated (the sandbox copy), empty on error.
     sha256: String,
@@ -247,6 +265,8 @@ struct DetonationResult {
 struct LaunchResult {
     status: SandboxStatus,
     backend_used: String,
+    etw_events_seen: u64,
+    etw_degraded: bool,
 }
 
 fn detonate(sample: &Path, timeout: Duration) -> DetonationResult {
@@ -262,6 +282,8 @@ fn detonate(sample: &Path, timeout: Duration) -> DetonationResult {
                 findings: vec![],
                 errors: vec![format!("temp dir creation failed: {e}")],
                 backend_used: "none".into(),
+                etw_events_seen: 0,
+                etw_degraded: false,
                 monitor_duration_ms: 0,
                 sha256: String::new(),
             };
@@ -277,6 +299,8 @@ fn detonate(sample: &Path, timeout: Duration) -> DetonationResult {
             findings: vec![],
             errors: vec![format!("sample copy failed: {e}")],
             backend_used: "none".into(),
+            etw_events_seen: 0,
+            etw_degraded: false,
             monitor_duration_ms: 0,
             sha256: String::new(),
         };
@@ -302,6 +326,8 @@ fn detonate(sample: &Path, timeout: Duration) -> DetonationResult {
         findings,
         errors,
         backend_used: launch_result.backend_used,
+        etw_events_seen: launch_result.etw_events_seen,
+        etw_degraded: launch_result.etw_degraded,
         monitor_duration_ms,
         sha256,
     }
@@ -477,6 +503,8 @@ fn launch_and_monitor(
         return LaunchResult {
             status: SandboxStatus::Error,
             backend_used: "none".into(),
+            etw_events_seen: 0,
+            etw_degraded: false,
         };
     } else {
         // Configure limits: kill on close + memory cap + process-count cap +
@@ -508,6 +536,8 @@ fn launch_and_monitor(
             return LaunchResult {
                 status: SandboxStatus::Error,
                 backend_used: "none".into(),
+                etw_events_seen: 0,
+                etw_degraded: false,
             };
         }
     }
@@ -548,6 +578,8 @@ fn launch_and_monitor(
         return LaunchResult {
             status: SandboxStatus::Blocked,
             backend_used: "none".into(),
+            etw_events_seen: 0,
+            etw_degraded: false,
         };
     }
 
@@ -599,6 +631,8 @@ fn launch_and_monitor(
             return LaunchResult {
                 status: SandboxStatus::Blocked,
                 backend_used: "none".into(),
+                etw_events_seen: 0,
+                etw_degraded: false,
             };
         }
         findings.push(SandboxFinding {
@@ -733,6 +767,8 @@ fn launch_and_monitor(
                 files_written: vec![],
                 errors: vec!["ETW monitor thread panicked".into()],
                 backend_used: "error".into(),
+                events_seen: 0,
+                etw_degraded: false,
             };
             r
         })
@@ -783,11 +819,15 @@ fn launch_and_monitor(
         LaunchResult {
             status: SandboxStatus::Timeout,
             backend_used: etw_report.backend_used,
+            etw_events_seen: etw_report.events_seen,
+            etw_degraded: etw_report.etw_degraded,
         }
     } else {
         LaunchResult {
             status: SandboxStatus::Completed,
             backend_used: etw_report.backend_used,
+            etw_events_seen: etw_report.events_seen,
+            etw_degraded: etw_report.etw_degraded,
         }
     }
 }
@@ -1241,6 +1281,8 @@ fn launch_and_monitor(
     LaunchResult {
         status: SandboxStatus::Error,
         backend_used: "none".into(),
+        etw_events_seen: 0,
+        etw_degraded: false,
     }
 }
 
