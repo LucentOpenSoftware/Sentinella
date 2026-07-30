@@ -21,6 +21,8 @@ use windows::Win32::System::Diagnostics::Etw::*;
 use windows::Win32::System::Diagnostics::ToolHelp::*;
 use windows::core::PCWSTR;
 
+use sentinella_common::etw_props::EventTracePropsStorage;
+
 /// Behavioral finding from ETW monitoring.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct EtwFinding {
@@ -102,16 +104,6 @@ struct EtwContext {
 
 struct EtwContextGuard;
 
-/// Allocate zeroed storage for an `EVENT_TRACE_PROPERTIES` buffer with
-/// guaranteed 8-byte alignment. A `Vec<u8>` is only 1-byte aligned, but
-/// `EVENT_TRACE_PROPERTIES` contains 8-byte-aligned fields
-/// (`WNODE_HEADER.BufferHandle`, `CONTROLTRACE_HANDLE`) — forming a
-/// `&mut EVENT_TRACE_PROPERTIES` over u8 storage is misaligned-reference UB,
-/// even though the Windows heap happens to return aligned blocks in practice.
-fn aligned_props_storage(props_size: usize) -> Vec<u64> {
-    vec![0u64; props_size.div_ceil(8)]
-}
-
 impl Drop for EtwContextGuard {
     fn drop(&mut self) {
         let mut ctx = ETW_CTX.lock().unwrap_or_else(|e| e.into_inner());
@@ -122,7 +114,7 @@ impl Drop for EtwContextGuard {
 /// Drop guard — ensures StopTraceW is called even on panic.
 struct SessionGuard {
     handle: CONTROLTRACE_HANDLE,
-    props_size: usize,
+    session_name: String,
     active: bool,
 }
 
@@ -132,12 +124,29 @@ impl SessionGuard {
             return;
         }
         self.active = false;
-        let mut buf = aligned_props_storage(self.props_size);
-        let props = unsafe { &mut *(buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES) };
-        props.Wnode.BufferSize = self.props_size as u32;
-        props.LoggerNameOffset = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
+        // Aligned storage via the shared helper (was a local Vec<u64>
+        // `aligned_props_storage`; Wnode.BufferSize + LoggerNameOffset are
+        // set by the constructor). The stop buffer needs no name content —
+        // the session is identified by `handle` — but keep the same slack
+        // as the start buffer (struct + name + 256) for parity.
+        let mut storage = match EventTracePropsStorage::with_extra(
+            &self.session_name,
+            None,
+            256,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("WARNING: ETW stop props layout failed: {e}");
+                return;
+            }
+        };
         unsafe {
-            let _ = ControlTraceW(self.handle, PCWSTR::null(), props, EVENT_TRACE_CONTROL_STOP);
+            let _ = ControlTraceW(
+                self.handle,
+                PCWSTR::null(),
+                storage.props_mut(),
+                EVENT_TRACE_CONTROL_STOP,
+            );
         }
     }
 }
@@ -185,34 +194,20 @@ fn etw_kernel_monitor(
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
-    let name_bytes: Vec<u8> = unsafe {
-        std::slice::from_raw_parts(
-            session_name_wide.as_ptr() as *const u8,
-            session_name_wide.len() * 2,
-        )
-        .to_vec()
-    };
 
-    let props_size = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + name_bytes.len() + 256;
-    let mut props_buf = aligned_props_storage(props_size);
-    let props = unsafe { &mut *(props_buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES) };
-    props.Wnode.BufferSize = props_size as u32;
+    // Aligned storage via the shared helper — sets Wnode.BufferSize,
+    // LoggerNameOffset and writes the terminated UTF-16 session name.
+    let mut props_storage = match EventTracePropsStorage::with_extra(&session_name, None, 256) {
+        Ok(s) => s,
+        Err(e) => return Err(format!("ETW props layout failed: {e}")),
+    };
+    let props = props_storage.props_mut();
     props.Wnode.ClientContext = 1;
     props.Wnode.Flags = 0x00020000; // WNODE_FLAG_TRACED_GUID
     props.LogFileMode = 0x00000100; // EVENT_TRACE_REAL_TIME_MODE
-    props.LoggerNameOffset = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
     props.EnableFlags = EVENT_TRACE_FLAG(
         0x00000001 | 0x00000004 | 0x00020000 | 0x00010000, // PROCESS + IMAGE + REGISTRY + NETWORK
     );
-
-    let name_offset = props.LoggerNameOffset as usize;
-    // Byte view over the aligned storage for the session-name copy.
-    let props_bytes = unsafe {
-        std::slice::from_raw_parts_mut(props_buf.as_mut_ptr() as *mut u8, props_buf.len() * 8)
-    };
-    if name_offset + name_bytes.len() <= props_bytes.len() {
-        props_bytes[name_offset..name_offset + name_bytes.len()].copy_from_slice(&name_bytes);
-    }
 
     let mut session_handle = CONTROLTRACE_HANDLE::default();
     let start_result = unsafe {
@@ -226,41 +221,32 @@ fn etw_kernel_monitor(
     if start_result.0 != 0 {
         if start_result.0 == 183 {
             // Stale session — stop and retry.
-            let mut stop_buf = aligned_props_storage(props_size);
-            let stop_props =
-                unsafe { &mut *(stop_buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES) };
-            stop_props.Wnode.BufferSize = props_size as u32;
-            stop_props.LoggerNameOffset = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
-            unsafe {
-                let _ = ControlTraceW(
-                    CONTROLTRACE_HANDLE::default(),
-                    PCWSTR(session_name_wide.as_ptr()),
-                    stop_props,
-                    EVENT_TRACE_CONTROL_STOP,
-                );
+            if let Ok(mut stop_storage) = EventTracePropsStorage::with_extra("", None, 256) {
+                unsafe {
+                    let _ = ControlTraceW(
+                        CONTROLTRACE_HANDLE::default(),
+                        PCWSTR(session_name_wide.as_ptr()),
+                        stop_storage.props_mut(),
+                        EVENT_TRACE_CONTROL_STOP,
+                    );
+                }
             }
 
             // Rebuild props for retry.
-            let mut retry_buf = aligned_props_storage(props_size);
-            let retry_props =
-                unsafe { &mut *(retry_buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES) };
-            retry_props.Wnode.BufferSize = props_size as u32;
+            let mut retry_storage = match EventTracePropsStorage::with_extra(
+                &session_name,
+                None,
+                256,
+            ) {
+                Ok(s) => s,
+                Err(e) => return Err(format!("ETW props layout failed: {e}")),
+            };
+            let retry_props = retry_storage.props_mut();
             retry_props.Wnode.ClientContext = 1;
             retry_props.Wnode.Flags = 0x00020000;
             retry_props.LogFileMode = 0x00000100;
-            retry_props.LoggerNameOffset = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
             retry_props.EnableFlags =
                 EVENT_TRACE_FLAG(0x00000001 | 0x00000004 | 0x00020000 | 0x00010000);
-            let off = retry_props.LoggerNameOffset as usize;
-            let retry_bytes = unsafe {
-                std::slice::from_raw_parts_mut(
-                    retry_buf.as_mut_ptr() as *mut u8,
-                    retry_buf.len() * 8,
-                )
-            };
-            if off + name_bytes.len() <= retry_bytes.len() {
-                retry_bytes[off..off + name_bytes.len()].copy_from_slice(&name_bytes);
-            }
             let retry = unsafe {
                 StartTraceW(
                     &mut session_handle,
@@ -281,7 +267,7 @@ fn etw_kernel_monitor(
 
     let mut _guard = SessionGuard {
         handle: session_handle,
-        props_size,
+        session_name: session_name.clone(),
         active: true,
     };
 

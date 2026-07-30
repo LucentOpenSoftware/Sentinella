@@ -5,8 +5,17 @@
 //! if ETW is unavailable.
 //!
 //! Architecture:
-//!   StartTraceW → EnableTraceEx2 → ProcessTrace (blocking, own thread)
+//!   StartTraceW (private system-logger session: EVENT_TRACE_SYSTEM_LOGGER_MODE
+//!   + private Wnode.Guid + kernel EnableFlags) → OpenTraceW → ProcessTrace
+//!   (blocking, own thread)
 //!   EVENT_RECORD callback → parse process start → feed LineageGraph
+//!
+//! There is intentionally NO EnableTraceEx2: kernel MOF process/image-load/
+//! file-io events are enabled via EVENT_TRACE_PROPERTIES.EnableFlags, which
+//! is only valid for system loggers ("EnableFlags is only valid for system
+//! loggers" — EVENT_TRACE_PROPERTIES, MS Learn). A previous version of this
+//! comment claimed EnableTraceEx2 was called; it never was, and without
+//! system-logger mode the session delivered zero events (F-1).
 
 #![cfg(target_os = "windows")]
 
@@ -145,22 +154,20 @@ fn run_etw_session(
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
-    let name_bytes: Vec<u8> = unsafe {
-        std::slice::from_raw_parts(
-            session_name_wide.as_ptr() as *const u8,
-            session_name_wide.len() * 2,
-        )
-        .to_vec()
-    };
 
-    let props_size = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + name_bytes.len() + 256;
-    let mut props_buf = vec![0u8; props_size];
-    let props = unsafe { &mut *(props_buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES) };
-    props.Wnode.BufferSize = props_size as u32;
+    // Aligned EVENT_TRACE_PROPERTIES storage (shared helper). The previous
+    // `vec![0u8; props_size]` cast to *mut EVENT_TRACE_PROPERTIES was
+    // misaligned-reference UB: the struct has 8-byte-aligned members but
+    // Vec<u8> guarantees only 1-byte alignment. The storage sets
+    // Wnode.BufferSize + LoggerNameOffset and writes the terminated
+    // UTF-16 logger name; we only set session-semantic fields here.
+    let mut props_storage =
+        sentinella_common::etw_props::EventTracePropsStorage::with_extra(session_name, None, 256)
+            .map_err(|e| format!("ETW props layout failed: {e}"))?;
+    let props = props_storage.props_mut();
     props.Wnode.ClientContext = 1;
     props.Wnode.Flags = 0x00020000; // WNODE_FLAG_TRACED_GUID
     props.LogFileMode = 0x00000100; // EVENT_TRACE_REAL_TIME_MODE
-    props.LoggerNameOffset = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
     // Process events (0x00000001 = EVENT_TRACE_FLAG_PROCESS) + image-load
     // events (0x00000004 = EVENT_TRACE_FLAG_IMAGE_LOAD) + file-IO initiator
     // events (0x04000000 = EVENT_TRACE_FLAG_FILE_IO_INIT). The shared
@@ -168,11 +175,6 @@ fn run_etw_session(
     // so the existing PLM process-create path is bit-for-bit unchanged.
     // ImageLoad → `etw_image_load`; FileIo Create → `etw_file_io`.
     props.EnableFlags = EVENT_TRACE_FLAG(0x00000001 | 0x00000004 | 0x04000000);
-
-    let name_offset = props.LoggerNameOffset as usize;
-    if name_offset + name_bytes.len() <= props_buf.len() {
-        props_buf[name_offset..name_offset + name_bytes.len()].copy_from_slice(&name_bytes);
-    }
 
     let mut session_handle = CONTROLTRACE_HANDLE::default();
     let start_result = unsafe {
@@ -186,16 +188,12 @@ fn run_etw_session(
     if start_result.0 != 0 {
         if start_result.0 == 183 {
             // Stale session — stop and retry.
-            let mut stop_buf = vec![0u8; props_size];
-            let stop_props =
-                unsafe { &mut *(stop_buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES) };
-            stop_props.Wnode.BufferSize = props_size as u32;
-            stop_props.LoggerNameOffset = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
+            let mut stop_storage = stop_props_storage()?;
             unsafe {
                 let _ = ControlTraceW(
                     CONTROLTRACE_HANDLE::default(),
                     PCWSTR(session_name_wide.as_ptr()),
-                    stop_props,
+                    stop_storage.props_mut(),
                     EVENT_TRACE_CONTROL_STOP,
                 );
             }
@@ -232,20 +230,15 @@ fn run_etw_session(
         // pointers outlive the session loop.
         CALLBACK_GRAPH.store(0, Ordering::SeqCst);
         CALLBACK_DIAG.store(0, Ordering::SeqCst);
-        // Stop the session we just started (line ~183) before bailing —
+        // Stop the session we just started before bailing —
         // otherwise it leaks as an orphaned kernel session until the next
         // run's stale-session cleanup reclaims it.
-        let stop_size = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + 512;
-        let mut stop_buf = vec![0u8; stop_size];
-        let stop_props =
-            unsafe { &mut *(stop_buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES) };
-        stop_props.Wnode.BufferSize = stop_size as u32;
-        stop_props.LoggerNameOffset = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
+        let mut stop_storage = stop_props_storage()?;
         unsafe {
             let _ = ControlTraceW(
                 CONTROLTRACE_HANDLE::default(),
                 PCWSTR(session_name_wide.as_ptr()),
-                stop_props,
+                stop_storage.props_mut(),
                 EVENT_TRACE_CONTROL_STOP,
             );
         }
@@ -270,16 +263,14 @@ fn run_etw_session(
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
         // Stop session to unblock ProcessTrace (idempotent if already stopped).
-        let stop_size = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + 512;
-        let mut stop_buf = vec![0u8; stop_size];
-        let stop_props = unsafe { &mut *(stop_buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES) };
-        stop_props.Wnode.BufferSize = stop_size as u32;
-        stop_props.LoggerNameOffset = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
+        let Ok(mut stop_storage) = stop_props_storage() else {
+            return;
+        };
         unsafe {
             let _ = ControlTraceW(
                 CONTROLTRACE_HANDLE::default(),
                 PCWSTR(session_name_stop.as_ptr()),
-                stop_props,
+                stop_storage.props_mut(),
                 EVENT_TRACE_CONTROL_STOP,
             );
         }
@@ -302,6 +293,19 @@ fn run_etw_session(
     diag.etw_running.store(false, Ordering::Relaxed);
 
     Ok(())
+}
+
+/// Build an aligned stop/cleanup properties buffer for `ControlTraceW`.
+///
+/// Stop-by-name buffers carry no logger name content (the name is passed
+/// via the PCWSTR argument), so this uses an empty logger name + 512 bytes
+/// of trailing slack — matching the old hand-rolled `size + 512` buffers,
+/// minus the misaligned `vec![0u8; _]` cast UB. `Wnode.BufferSize` and
+/// `LoggerNameOffset` are set by the storage constructor.
+fn stop_props_storage(
+) -> Result<sentinella_common::etw_props::EventTracePropsStorage, String> {
+    sentinella_common::etw_props::EventTracePropsStorage::with_extra("", None, 512)
+        .map_err(|e| format!("ETW stop props layout failed: {e}"))
 }
 
 // ── Callback globals (same pattern as sandboxd) ──────────────

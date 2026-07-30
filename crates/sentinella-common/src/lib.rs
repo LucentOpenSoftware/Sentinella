@@ -4,6 +4,10 @@
 //! the daemon, CLI, GUI backend, and any future tooling without
 //! pulling in heavy transitive deps.
 
+/// Central aligned storage for ETW `EVENT_TRACE_PROPERTIES` buffers
+/// (layout math is cross-platform; the storage type is Windows-only).
+pub mod etw_props;
+
 /// Product metadata.
 pub const PRODUCT_NAME: &str = "Sentinella";
 pub const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
