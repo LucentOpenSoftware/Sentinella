@@ -5,6 +5,7 @@
 //! orchestrates signature updates.
 
 pub mod amsi;
+mod acl;
 mod argus_worker;
 pub mod calibration;
 #[allow(dead_code)]
@@ -317,6 +318,15 @@ async fn run_daemon(
         version = sentinella_common::PRODUCT_VERSION,
         "sentinelld starting"
     );
+
+    // ── Data-root DACL hardening (v0.1.12, workstream I) ───────────
+    // Compare-first, idempotent: repairs the ProgramData root to a
+    // SYSTEM+Administrators-only policy when it deviates (e.g. a tree
+    // first created by a user-context process, or plain %ProgramData%
+    // inheritance which grants Users create/append). Runs before config
+    // load and before any subsystem touches secrets under the root.
+    // Failure is logged loudly and never blocks startup (see acl.rs).
+    acl::startup_hardening(p);
 
     // Load configuration.
     let config = config::load(args.config.as_deref())?;

@@ -79,9 +79,25 @@ fn get_vault_key() -> Result<[u8; 32], String> {
 /// a stale key in memory and all later encrypts use the wrong key.
 fn get_vault_key_in(qdir: &Path) -> Result<[u8; 32], String> {
     let key_path = qdir.join(".vault_key");
+    // v0.1.12 (workstream J): a symlink/junction at the key path would
+    // redirect key reads/writes into attacker-chosen territory — refuse.
+    if key_path.exists() {
+        crate::acl::reject_unsafe_secret_path(&key_path)
+            .map_err(|e| format!("vault key path unsafe (fail-closed): {e}"))?;
+    }
     // Fast path: existing key.
     if let Ok(data) = fs::read(&key_path) {
         if data.len() == 32 {
+            // v0.1.12 (workstream J): the creation-time ACL was applied
+            // once and never re-asserted, so a later relaxation (observed
+            // in the field as a per-user (R) grant on the key) persisted
+            // forever. Re-assert on every load — compare-first, so this
+            // costs one SD read per quarantine op and zero ACL churn when
+            // conforming. The key itself is NEVER rotated over an ACL
+            // problem; a failed assertion fails closed like a crypto-init
+            // failure. No key material is logged on any path.
+            crate::acl::assert_secret_acl(&key_path, crate::acl::PolicyKind::DaemonOnlySecret)
+                .map_err(|e| format!("vault key ACL assertion failed (fail-closed): {e}"))?;
             let mut key = [0u8; 32];
             key.copy_from_slice(&data);
             return Ok(key);
@@ -110,7 +126,10 @@ fn get_vault_key_in(qdir: &Path) -> Result<[u8; 32], String> {
             Ok(new_key)
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // Lost race — read winner's key.
+            // Lost race — read winner's key. Re-assert the ACL here too
+            // (same workstream-J rationale as the fast path above).
+            crate::acl::assert_secret_acl(&key_path, crate::acl::PolicyKind::DaemonOnlySecret)
+                .map_err(|e| format!("vault key ACL assertion failed (fail-closed): {e}"))?;
             let data = fs::read(&key_path).map_err(|e| format!("Cannot read existing vault key: {e}"))?;
             if data.len() != 32 {
                 return Err(format!("Vault key file corrupt: {} bytes", data.len()));

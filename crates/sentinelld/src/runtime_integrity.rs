@@ -5,16 +5,18 @@
 //!
 //! Architecture:
 //!   - On first start, generates a random 256-bit vault key
-//!   - Computes a keyed SipHash of each protected asset
+//!   - Computes an HMAC-SHA256 of each protected asset
 //!   - Stores manifests in `runtime/state/integrity.json`
 //!   - On each daemon start + periodic checks, verifies hashes
 //!   - Tampered files → alert + refuse to use + trigger re-download
 //!
-//! The vault key is stored with restricted ACL (SYSTEM + Administrators).
+//! The vault key is stored with restricted ACL (SYSTEM + Administrators),
+//! re-asserted at every startup (see `acl::assert_secret_acl`).
 //!
-//! NOTE: Uses SipHash (DefaultHasher), NOT cryptographic HMAC-SHA256.
-//! Detects accidental corruption and casual tampering. Not a security
-//! boundary against targeted adversaries with vault key access.
+//! NOTE: HMAC-SHA256 authenticates the manifest against attackers who can
+//! modify files but cannot read the key. An attacker who reads the vault
+//! key (e.g. a pre-hardening over-permissive ACL) could re-sign tampered
+//! files — which is why the key-file ACL is re-asserted every boot.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -60,7 +62,7 @@ impl IntegrityReport {
 
 /// The runtime integrity vault.
 pub struct IntegrityVault {
-    /// Vault key (256-bit, used for keyed SipHash).
+    /// Vault key (256-bit, keys the manifest HMAC-SHA256).
     key: [u8; KEY_LEN],
     /// Manifest of known-good file hashes.
     manifest: IntegrityManifest,
@@ -83,6 +85,15 @@ impl IntegrityVault {
             info!("integrity vault: new key generated");
             k
         };
+
+        // v0.1.12 (workstream J): save_key() applies the restrictive ACL
+        // only at creation; nothing re-asserted it on later startups.
+        // Re-assert on every init (compare-first — no churn when
+        // conforming). Err fails closed like a key-load failure: callers
+        // already treat init failure as "integrity checking unavailable"
+        // and log it. The key is never rotated over an ACL problem.
+        crate::acl::assert_secret_acl(&key_path, crate::acl::PolicyKind::DaemonOnlySecret)
+            .map_err(|e| format!("vault integrity key ACL assertion failed (fail-closed): {e}"))?;
 
         // Load existing manifest or create empty.
         let manifest = if manifest_path.exists() {
