@@ -493,7 +493,6 @@ pub fn start_file_io_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::weedhack_runtime::WeedHackSignal;
     use std::time::Instant;
 
     struct NoOpResolver;

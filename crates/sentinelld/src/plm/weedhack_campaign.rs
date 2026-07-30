@@ -744,7 +744,6 @@ mod tests {
 
     #[test]
     fn multiple_signals_form_campaign() {
-        let t = empty_tracker();
         let resolver = std::sync::Arc::new(MockResolver::default());
         resolver.add(101, 100, 1700_000_000);
         resolver.add(102, 100, 1700_000_000);

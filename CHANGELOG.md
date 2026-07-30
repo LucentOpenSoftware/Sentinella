@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased] - 2026-07
+## [0.1.12] - 2026-07-29
 
 Post-v0.1.11 deep audit of the full tree (all 11 crates, the Tauri GUI,
 and the ClamAV integration glue), followed by a verified fix pass.

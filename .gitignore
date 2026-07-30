@@ -84,3 +84,12 @@ test-corpus/
 # graphify analysis
 graphify-out/
 .graphify_*
+
+# Raw per-agent audit reports (the distilled writeup lives in
+# docs/DEEP_AUDIT_2026-07.md, which IS tracked). These are working files.
+.audit/
+
+# Extracted third-party ClamAV source tree (~15 MB). The upstream archive is
+# already ignored above as third_party/clamav/clamav-main.zip; this catches the
+# unpacked copy so it can never be committed by a stray `git add -A`.
+clamav-main/

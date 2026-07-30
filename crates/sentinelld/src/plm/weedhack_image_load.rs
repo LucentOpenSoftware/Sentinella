@@ -594,7 +594,6 @@ mod tests {
         // Fire MAX_EVENTS_PER_SEC + 50 distinct loads in the same instant.
         let t0 = Instant::now();
         let mut emitted = 0u32;
-        let mut rate_limited = 0u32;
         for i in 0..(MAX_EVENTS_PER_SEC + 50) {
             let e = raw(
                 123,
@@ -606,7 +605,7 @@ mod tests {
                 emitted += 1;
             }
         }
-        rate_limited = f.events_rate_limited.load(Ordering::Relaxed) as u32;
+        let rate_limited = f.events_rate_limited.load(Ordering::Relaxed) as u32;
         assert_eq!(emitted, MAX_EVENTS_PER_SEC, "must emit exactly the budget");
         assert_eq!(rate_limited, 50, "excess must count as rate-limited");
     }
