@@ -169,16 +169,30 @@ fn load_or_create_ipc_secret() -> Option<String> {
             return Some(secret);
         }
         Err(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // Lost the race — read what the winner wrote.
-            if let Ok(s) = std::fs::read_to_string(&path) {
-                let t = s.trim().to_string();
-                if t.len() >= 32 {
-                    restrict_ipc_secret_permissions(&path);
-                    return Some(t);
+            // Lost the race — read what the winner wrote. The winner's
+            // create_new makes the (empty) file visible BEFORE its
+            // write_all lands, so the loser can read an empty/short file
+            // here; retry briefly instead of falling through to the
+            // truncate-write path with our OWN secret, which would leave
+            // the two daemons with divergent in-memory secrets (the GUI
+            // reads the disk copy and gets locked out of the winner).
+            let mut recovered: Option<String> = None;
+            for _ in 0..20 {
+                if let Ok(s) = std::fs::read_to_string(&path) {
+                    let t = s.trim().to_string();
+                    if t.len() >= 32 {
+                        recovered = Some(t);
+                        break;
+                    }
                 }
+                std::thread::sleep(std::time::Duration::from_millis(25));
             }
-            // Disk file unreadable/invalid — fall through to the legacy
-            // write path below as a last resort.
+            if let Some(t) = recovered {
+                restrict_ipc_secret_permissions(&path);
+                return Some(t);
+            }
+            // Disk file still unreadable/invalid after 500ms — fall through
+            // to the legacy write path below as a last resort.
         }
         Err(_) => {}
     }

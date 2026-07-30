@@ -1,8 +1,23 @@
 //! `settings.*` — daemon configuration methods.
+//!
+//! ⚠️ LEGACY SURFACE: the types in this module do NOT describe what the
+//! daemon actually sends today. `settings.get` / `settings.set` exchange
+//! the daemon's own `sentinelld::config::Config` JSON (whose exclusion
+//! list is `excluded_detections`, not `excluded_signatures`), and the
+//! v0.1.8+ GUI uses [`crate::full_config::FullConfig`]
+//! (`settings.get_full` / `settings.set_full`). Nothing in the workspace
+//! references `Settings` / `ScheduledScan` / `SetResult` — they are kept
+//! only to document the pre-v0.1.8 flat schema. When touching exclusion
+//! fields, edit `FullConfig.excluded_detections` / the daemon `Config`;
+//! do not resurrect this file.
 
 use serde::{Deserialize, Serialize};
 
-/// Full daemon settings, returned by `settings.get` and sent via `settings.set`.
+/// LEGACY flat daemon settings schema (pre-v0.1.8) — see the module
+/// docs: the live wire shape is the daemon's `Config`, and the modern
+/// typed surface is [`crate::full_config::FullConfig`]. This type is
+/// currently unreferenced; the doc comment used to claim it was the
+/// `settings.get`/`settings.set` payload, which was false.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {

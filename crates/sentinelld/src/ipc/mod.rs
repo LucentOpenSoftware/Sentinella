@@ -502,6 +502,28 @@ fn validate_local_scan_path(t: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Vault-blob plausibility check for the `quarantine.list` health flag.
+/// Applies the minimum size of the format the blob actually carries:
+/// chunked v1 = 16-byte header + 12-byte nonce + 16-byte tag = 44;
+/// legacy one-shot = 12-byte nonce + 16-byte tag = 28. The previous
+/// `len >= 12` accepted any truncated vault as "restorable".
+fn vault_blob_plausible(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let Ok(len) = f.metadata().map(|m| m.len()) else {
+        return false;
+    };
+    let mut magic = [0u8; 4];
+    let n = f.read(&mut magic).unwrap_or(0);
+    if n == 4 && magic == crate::quarantine::CHUNKED_MAGIC {
+        len >= 44
+    } else {
+        len >= 28
+    }
+}
+
 /// Adversary A2 — closed allowlist of methods that may be scoped by a
 /// challenge token. Keep this list in lockstep with every handler call site
 /// that invokes `validate_challenge_token`. An attacker who can request a
@@ -811,13 +833,16 @@ fn dispatch_sync(
             let rows = state.quarantine_list();
             let items: Vec<serde_json::Value> = rows
                 .into_iter()
+                // Bound the response frame: the CLI client rejects frames
+                // over MAX_FRAME_SIZE (1 MiB), so an unbounded list could
+                // desync the protocol on long-lived installs. Ordered by
+                // quarantined_at DESC, so the newest entries survive.
+                // (The scheduler's retention sweep uses the FULL list —
+                // do not push this cap down into db::list_quarantine.)
+                .take(1000)
                 .map(|r| {
                     let vault_path = std::path::Path::new(&r.vault_path);
-                    let vault_ok = vault_path.exists()
-                        && vault_path
-                            .metadata()
-                            .map(|m| m.len() >= 12)
-                            .unwrap_or(false);
+                    let vault_ok = vault_blob_plausible(vault_path);
                     serde_json::json!({
                         "id": r.quarantine_id,
                         "original_path": r.original_path,
@@ -3119,5 +3144,42 @@ mod tests {
         let long = "C:\\".to_string() + &"a".repeat(5000);
         assert!(validate_local_scan_path(&long).is_err());
         assert!(validate_local_scan_path("C:\\foo\0bar").is_err());
+    }
+
+    #[test]
+    fn vault_blob_plausible_enforces_per_format_minimum() {
+        // The old `len >= 12` heuristic accepted truncated vaults as
+        // "restorable". Chunked v1 min = 44 (16 header + 12 nonce + 16
+        // tag); legacy one-shot min = 28 (12 nonce + 16 tag).
+        let dir = std::env::temp_dir().join(format!("sent_vault_ok_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let write = |name: &str, bytes: &[u8]| {
+            let p = dir.join(name);
+            std::fs::write(&p, bytes).unwrap();
+            p
+        };
+
+        // Truncated blob (< 12 even) and a 12-byte husk: not plausible.
+        assert!(!super::vault_blob_plausible(&write("tiny.vault", &[0u8; 5])));
+        assert!(!super::vault_blob_plausible(&write("husk.vault", &[0u8; 12])));
+
+        // Legacy minimum (28) accepted; 27 rejected.
+        assert!(!super::vault_blob_plausible(&write("legacy27.vault", &[1u8; 27])));
+        assert!(super::vault_blob_plausible(&write("legacy28.vault", &[1u8; 28])));
+
+        // Chunked magic present: 44 required.
+        let mut chunked_short = crate::quarantine::CHUNKED_MAGIC.to_vec();
+        chunked_short.extend_from_slice(&[0u8; 39]); // 43 total
+        assert!(!super::vault_blob_plausible(&write("chunked43.vault", &chunked_short)));
+        let mut chunked_ok = crate::quarantine::CHUNKED_MAGIC.to_vec();
+        chunked_ok.extend_from_slice(&[0u8; 40]); // 44 total
+        assert!(super::vault_blob_plausible(&write("chunked44.vault", &chunked_ok)));
+
+        // Missing file: not plausible.
+        assert!(!super::vault_blob_plausible(&dir.join("absent.vault")));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

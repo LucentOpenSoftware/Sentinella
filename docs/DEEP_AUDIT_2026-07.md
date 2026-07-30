@@ -189,6 +189,45 @@ landed in total (including low-severity and enhancement items), plus a
 - `cargo check --manifest-path gui/src-tauri/Cargo.toml`: clean.
 - Frontend: `tsc --noEmit` clean (per GUI fix agent).
 
+## Round 2 — residual sweep (same day)
+
+A second, smaller pass (3 agents) re-reviewed the round-1 diff itself for
+introduced regressions and mined the round-1 reports for unverified
+suspicions and skipped items.
+
+**Regressions introduced by round 1, found and fixed:**
+
+- `config::validate()` clamped the idle-delay floor to ≥1 ms *before* the
+  min/max swap, so a `(0, 0)` pair ended at `min=0` — defeating the
+  tight-loop floor. Reordered (swap → clamp → raise); regression test.
+- `is_known_installer`: dropping the caller's `is_pe &&` gate widened
+  pure-substring installer heuristics (NSIS/Inno/Go/Rust markers) to
+  **all** file types — a false-negative discount vector and ~20 wasted
+  full-buffer scans per non-PE file. Gate moved inside the helper; OLE2
+  restricted to the MSI branch; tests corrected and extended.
+
+**Residual findings fixed:**
+
+- `ipc_secret` creation race: the losing daemon could read the winner's
+  not-yet-written empty file and truncate-write its own secret, locking
+  the GUI out. Read now retries before falling back.
+- `quarantine.list` response could exceed the clients' 1 MiB frame cap —
+  capped at the 1000 newest rows (retention sweep still uses the full
+  DB-side list).
+- `vault_ok` heuristic replaced with `vault_blob_plausible()` magic +
+  per-format minimum-length check.
+- Idle scanner re-checks `is_reparse_point` at scan time (closes a
+  symlink-swap read oracle running as SYSTEM).
+- `clamavd --self-test` added (EICAR round-trip) — first end-to-end
+  coverage for subprocess mode's FFI contract.
+- dev-console password fields scrubbed on clear; stale `Settings` docs
+  in ipc-proto corrected.
+
+Everything else investigated was refuted with evidence or remains
+deferred with a recorded reason (see `.audit/` round-2 reports in the
+session log). Re-verification after round 2: workspace check clean,
+full test suite green.
+
 ## Known residual risks (honest limitations)
 
 - The IPC secret remains world-readable by design (R3); local

@@ -60,6 +60,19 @@ landing.
   decoding, sandbox/ETW alignment and quoting fixes, and GUI runtime
   sharing. See the audit document for the complete list.
 
+### Round-2 residual sweep
+
+- Regression review of this pass's own diff caught two introduced bugs:
+  idle-delay clamp ordering in `Config::validate` (a `(0,0)` pair
+  defeated the tight-loop floor) and `is_known_installer` heuristics
+  firing on non-PE files (false-negative discount vector). Both fixed
+  with regression tests.
+- Residual fixes: `ipc_secret` creation race, `quarantine.list` frame
+  cap (1000 newest rows), `vault_blob_plausible` magic check, idle
+  scanner scan-time reparse re-check, `clamavd --self-test` (EICAR
+  round-trip — first end-to-end FFI coverage), dev-console password
+  scrubbing.
+
 ## [0.1.11] - 2026-06-10
 
 Final release. A bug-fix and hardening pass over the v0.1.10 WeedHack

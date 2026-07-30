@@ -110,8 +110,8 @@ pub fn draw(ui: &mut egui::Ui, app: &mut App) {
                 },
                 "provisioned password + enabled developer mode",
             );
-            app.setup_password.clear();
-            app.setup_password_confirm.clear();
+            provision::scrub_password(&mut app.setup_password);
+            provision::scrub_password(&mut app.setup_password_confirm);
         }
         if clicked_enable_existing {
             spawn_apply(
@@ -145,8 +145,8 @@ pub fn draw(ui: &mut egui::Ui, app: &mut App) {
                 },
                 "password revoked",
             );
-            app.setup_password.clear();
-            app.setup_password_confirm.clear();
+            provision::scrub_password(&mut app.setup_password);
+            provision::scrub_password(&mut app.setup_password_confirm);
         }
 
         ui.add_space(12.0);

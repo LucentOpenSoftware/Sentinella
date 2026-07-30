@@ -491,9 +491,9 @@ impl ArgusEngine {
         // multiple signatures (NSIS, InnoSetup, WiX, Electron); running it
         // twice per file (once here, once during aggregation below) doubled
         // the cost for every PE.
-        // NOT gated on `is_pe`: MSI installers are OLE2 compound files (by
-        // definition not PE), and the name-heuristic branch inside
-        // `is_known_installer` already self-gates on the MZ header.
+        // NOT gated on `is_pe` here — MSI installers are OLE2 compound files
+        // (by definition not PE); the PE/OLE2 gating lives inside
+        // `is_known_installer` itself (fast reject for everything else).
         let installer_detected = is_known_installer(&data, &path_str);
         let installer_detected_early = installer_detected;
         if installer_detected_early {
@@ -1164,6 +1164,21 @@ fn detect_framework_from_findings(findings: &[Finding]) -> Option<String> {
 /// Detect if a PE file is a known installer framework.
 /// These legitimately have high entropy, few imports, and large overlays.
 fn is_known_installer(data: &[u8], path: &str) -> bool {
+    // Fast reject: the installer/framework heuristics below only apply to PE
+    // binaries and OLE2 compound files (MSI). The engine used to gate this
+    // call on `is_pe`; when the gate moved in here (to let OLE2/MSI through)
+    // the ~20 full-buffer substring scans below started running on EVERY
+    // scanned file — media, documents, scripts — and incidental marker
+    // strings in a non-PE file (a PDF containing "Nullsoft Inst", a 3MB blob
+    // containing "runtime.main") earned the installer discount. Neither the
+    // wasted work nor the widened trust was intended.
+    let is_pe = data.len() >= 2 && data[0] == 0x4D && data[1] == 0x5A;
+    let is_ole2 =
+        data.len() >= 8 && data[0..8] == [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+    if !is_pe && !is_ole2 {
+        return false;
+    }
+
     // Binary content checks for known installer frameworks.
     let contains = |needle: &[u8]| data.windows(needle.len()).any(|w| w == needle);
     let has_nsis = contains(b"Nullsoft Inst") || contains(b"NullsoftInst");
@@ -1174,12 +1189,16 @@ fn is_known_installer(data: &[u8], path: &str) -> bool {
     // "installer" handed every macro-laden Office document a structural+YARA
     // detection discount (a false-negative vector for macro droppers). Require
     // an actual MSI indicator: the .msi extension or an MSI-specific marker.
-    let is_ole2 =
-        data.len() >= 8 && data[0..8] == [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
     let has_msi = is_ole2
         && (path.to_lowercase().ends_with(".msi")
             || contains(b"Windows Installer")
             || contains(b"Installation Database"));
+    // OLE2 files that aren't MSIs (Office docs, etc.) stop here: only the MSI
+    // branch may grant the discount, so a macro-laden document can't earn it
+    // via incidental framework-marker strings in its body.
+    if is_ole2 && !is_pe {
+        return has_msi;
+    }
     let has_installshield = contains(b"InstallShiel");
     let has_ai = contains(b"Advanced Installer");
 
@@ -1248,7 +1267,6 @@ fn is_known_installer(data: &[u8], path: &str) -> bool {
     // marker. Require at least one generic installer body hint (an uninstaller
     // stub, a CAB/SFX payload). Real installers whose specific framework wasn't
     // matched above still carry one of these; a bare rename does not.
-    let is_pe = data.len() >= 2 && data[0] == 0x4D && data[1] == 0x5A;
     let has_generic_installer_hint = contains(b"uninstall")
         || contains(b"Uninstall")
         || contains(b".cab")
@@ -1325,6 +1343,29 @@ mod tests {
         // NSIS content marker still works (unchanged path).
         let nsis = b"MZ........Nullsoft Inst........".to_vec();
         assert!(is_known_installer(&nsis, "whatever.exe"));
+
+        // An OLE2 doc whose body merely mentions an installer framework is
+        // NOT an installer — only the MSI branch may fire for OLE2.
+        let mut ole2_nsis = vec![0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+        ole2_nsis.extend_from_slice(b"body text citing Nullsoft Inst strings");
+        assert!(
+            !is_known_installer(&ole2_nsis, "C:\\Users\\me\\notes.doc"),
+            "OLE2 doc with incidental installer-marker strings must not get the discount"
+        );
+    }
+
+    #[test]
+    fn non_pe_marker_strings_do_not_earn_installer_discount() {
+        // Fast-reject regression: framework-marker strings in a file that is
+        // neither PE nor OLE2 (a PDF, a blob) must not earn the installer
+        // discount — and the ~20 full-buffer substring scans must be skipped.
+        let pdf = b"%PDF-1.7 body text citing Nullsoft Inst and electron.asar".to_vec();
+        assert!(!is_known_installer(&pdf, "C:\\Users\\me\\doc.pdf"));
+
+        // A >3MB non-PE blob with the Go marker is not a Go binary.
+        let mut blob = vec![0u8; 4_000_000];
+        blob[1000..1012].copy_from_slice(b"Go build ID:");
+        assert!(!is_known_installer(&blob, "C:\\Users\\me\\blob.bin"));
     }
 
     #[test]
@@ -1794,8 +1835,11 @@ mod tests {
         // NOT an installer.
         assert!(!is_known_installer(&[0x4D, 0x5A], "malware.exe"));
 
-        // Electron framework → detected.
-        let mut electron_data = vec![0u8; 500];
+        // Electron framework → detected. (Electron apps are PE binaries —
+        // the MZ header is required since the PE/OLE2 fast-reject moved
+        // into `is_known_installer`.)
+        let mut electron_data = vec![0x4D, 0x5A];
+        electron_data.extend_from_slice(&[0u8; 500]);
         electron_data.extend_from_slice(b"electron.asar");
         assert!(is_known_installer(&electron_data, "app.exe"));
     }
@@ -2112,8 +2156,12 @@ mod tests {
 
     #[test]
     fn test_go_binary_installer_detection() {
-        // Go binary (>3MB with Go build ID marker) → installer/framework treatment.
+        // Go binary (PE, >3MB with Go build ID marker) → installer/framework
+        // treatment. The MZ header is required since the PE/OLE2 fast-reject
+        // moved into `is_known_installer`.
         let mut data = vec![0u8; 4_000_000];
+        data[0] = 0x4D; // 'M'
+        data[1] = 0x5A; // 'Z'
         data[1000..1012].copy_from_slice(b"Go build ID:");
         assert!(
             is_known_installer(&data, "mytool.exe"),

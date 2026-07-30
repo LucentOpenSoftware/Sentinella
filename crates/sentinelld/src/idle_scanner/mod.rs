@@ -700,6 +700,14 @@ fn idle_scanner_loop(
                 }
 
                 // ── Verify readable ──────────────────────
+                // Re-check reparse status at scan time: the walk rejected
+                // reparse points at COLLECTION time, but the path can be
+                // swapped for a symlink/junction afterwards — scanning
+                // follows links as SYSTEM (a boolean signature-match read
+                // oracle against files the user can't read).
+                if crate::scan::is_reparse_point(file_path) {
+                    continue;
+                }
                 if std::fs::File::open(file_path).is_err() {
                     continue;
                 }

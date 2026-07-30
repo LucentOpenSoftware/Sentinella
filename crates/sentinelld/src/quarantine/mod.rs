@@ -29,7 +29,9 @@ const CHUNK_SIZE: usize = 1024 * 1024;
 /// Old vaults start with a 12-byte random nonce, so the first byte is uniform
 /// over 0..=255. A 4-byte magic gives ~1/2^32 odds that a legacy vault is
 /// misclassified — effectively zero for the corpus sizes we ever hold.
-const CHUNKED_MAGIC: [u8; 4] = [0xC1, 0xAE, 0x53, 0x01];
+/// `pub(crate)` so the IPC `quarantine.list` vault-health heuristic can
+/// apply the correct per-format minimum size.
+pub(crate) const CHUNKED_MAGIC: [u8; 4] = [0xC1, 0xAE, 0x53, 0x01];
 
 /// Header layout after the magic: original_size u64 LE + num_chunks u32 LE.
 const CHUNKED_HEADER_LEN: usize = 4 + 8 + 4;

@@ -490,13 +490,17 @@ impl Config {
                 &mut self.idle_scan_fast_delay_max_ms,
             ),
         ] {
+            if *lo > *hi {
+                std::mem::swap(lo, hi);
+            }
             // A 0ms floor defeats the idle scanner's politeness throttling
-            // (tight scan loop) — clamp to at least 1ms.
+            // (tight scan loop) — clamp to at least 1ms. Clamp AFTER the
+            // swap: clamping first let (0, 0) swap back to min=0.
             if *lo == 0 {
                 *lo = 1;
             }
-            if *lo > *hi {
-                std::mem::swap(lo, hi);
+            if *hi < *lo {
+                *hi = *lo;
             }
         }
         // R4-C20: powershell_poll_seconds = 0 → tight loop spawning PS processes.
@@ -1747,6 +1751,34 @@ mod tests {
         c3.validate();
         assert!(c3.developer.enabled);
         assert_eq!(c3.developer.telemetry_max_kb, 65_536);
+    }
+
+    #[test]
+    fn idle_delay_clamp_survives_zero_zero() {
+        // Regression: the 0ms floor clamp ran BEFORE the min/max swap, so a
+        // (0, 0) pair clamped lo→1 and then swapped right back to min=0 —
+        // the tight-loop floor the clamp exists to prevent.
+        let mut c = Config {
+            idle_scan_fast_delay_min_ms: 0,
+            idle_scan_fast_delay_max_ms: 0,
+            ..Config::default()
+        };
+        c.validate();
+        assert!(
+            c.idle_scan_fast_delay_min_ms >= 1,
+            "0ms min must be clamped even when max is also 0"
+        );
+        assert!(c.idle_scan_fast_delay_min_ms <= c.idle_scan_fast_delay_max_ms);
+
+        // (0, N) → min clamped to 1, max untouched.
+        let mut c2 = Config {
+            idle_scan_fast_delay_min_ms: 0,
+            idle_scan_fast_delay_max_ms: 50,
+            ..Config::default()
+        };
+        c2.validate();
+        assert_eq!(c2.idle_scan_fast_delay_min_ms, 1);
+        assert_eq!(c2.idle_scan_fast_delay_max_ms, 50);
     }
 
     #[test]

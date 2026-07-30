@@ -25,6 +25,19 @@ pub fn sha256_hex(password: &str) -> String {
     s
 }
 
+/// Zero a password field's heap buffer, then clear it. Plain
+/// `String::clear()` only truncates — the plaintext bytes stay in the
+/// retained allocation until something overwrites them. (Poor-man's
+/// `zeroize`; not worth a new dependency for a dev-only tool. egui's
+/// `TextEdit` keeps its own internal copies regardless, so this is
+/// best-effort hygiene, not a guarantee.)
+pub fn scrub_password(s: &mut String) {
+    // SAFETY: filling the buffer with 0u8 keeps the `Vec<u8>` valid
+    // UTF-8 (NUL is a valid code unit), so the `String` invariant holds.
+    unsafe { s.as_mut_vec() }.fill(0);
+    s.clear();
+}
+
 /// Apply a developer-section patch to the TOML config at `path`. Creates
 /// the [developer] table if missing. Returns the new file contents.
 pub fn patch_developer_section(

@@ -4,6 +4,9 @@
 //! All ClamAV memory (signatures, engine, buffers) freed on exit.
 //! If ClamAV crashes on a malformed file, only this process dies —
 //! the daemon survives and respawns a new worker.
+//!
+//! `--self-test` scans the EICAR test string and expects a detection —
+//! a cheap end-to-end health check for the subprocess scan path.
 
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
@@ -19,7 +22,7 @@ const EXIT_ERROR: i32 = 3;
 #[command(name = "clamavd", version, about = "Sentinella ClamAV isolated worker")]
 struct Cli {
     /// File to scan.
-    path: PathBuf,
+    path: Option<PathBuf>,
 
     /// Directory containing libclamav.dll.
     #[arg(long)]
@@ -32,6 +35,12 @@ struct Cli {
     /// Emit JSON output (required for IPC).
     #[arg(long)]
     json: bool,
+
+    /// Self-test: scan the EICAR test string and expect a detection.
+    /// Exercises the full load → cl_scanfile path (a broken FFI signature or
+    /// NULL scanoptions fails here instead of silently bypassing scans).
+    #[arg(long)]
+    self_test: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -57,7 +66,16 @@ fn main() {
 
     let cli = Cli::parse();
 
-    if !cli.path.exists() {
+    if cli.self_test {
+        std::process::exit(self_test(&cli));
+    }
+
+    let Some(ref path) = cli.path else {
+        emit_error(&cli, "no file to scan (positional path required)");
+        std::process::exit(EXIT_ERROR);
+    };
+
+    if !path.exists() {
         emit_error(&cli, "file not found");
         std::process::exit(EXIT_ERROR);
     }
@@ -74,11 +92,11 @@ fn main() {
     };
 
     // Scan the file.
-    let result = scan_file(&engine, &cli.path);
+    let result = scan_file(&engine, path);
     let elapsed_ms = start.elapsed().as_millis() as u64;
 
     let output = ScanOutput {
-        path: cli.path.to_string_lossy().to_string(),
+        path: path.to_string_lossy().to_string(),
         infected: result.infected,
         virus_name: result.virus_name,
         scanned_bytes: result.scanned_bytes,
@@ -148,10 +166,15 @@ fn harden_dll_search(_dll_dir: &Path) {
 
 fn emit_error(cli: &Cli, msg: &str) {
     if cli.json {
+        let path = cli
+            .path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
         println!(
             "{}",
             serde_json::json!({
-                "path": cli.path.to_string_lossy(),
+                "path": path,
                 "infected": false,
                 "virus_name": null,
                 "scanned_bytes": 0,
@@ -163,6 +186,59 @@ fn emit_error(cli: &Cli, msg: &str) {
     } else {
         eprintln!("clamavd error: {msg}");
     }
+}
+
+/// Self-test: load the engine, scan the EICAR test string written to a temp
+/// file, expect a detection. This is the end-to-end check that would have
+/// caught the broken `cl_scanfile` FFI (6-arg signature / NULL scanoptions)
+/// immediately — that bug made every scan return CL_ENULLARG without
+/// scanning a byte. Exit 0 on detection, EXIT_ERROR otherwise.
+fn self_test(cli: &Cli) -> i32 {
+    // Standard EICAR anti-virus test string (industry-standard, harmless).
+    const EICAR: &[u8] =
+        b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
+
+    let (engine, sig_count) = match load_clamav(&cli.dll_dir, &cli.db_dir) {
+        Ok(v) => v,
+        Err(e) => {
+            emit_error(cli, &e);
+            return EXIT_ERROR;
+        }
+    };
+
+    let temp_path = std::env::temp_dir().join(format!("clamavd-selftest-{}.com", std::process::id()));
+    if let Err(e) = std::fs::write(&temp_path, EICAR) {
+        emit_error(cli, &format!("self-test temp file write failed: {e}"));
+        return EXIT_ERROR;
+    }
+    let result = scan_file(&engine, &temp_path);
+    std::fs::remove_file(&temp_path).ok();
+
+    let ok = result.infected;
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "self_test": if ok { "pass" } else { "fail" },
+                "infected": result.infected,
+                "virus_name": result.virus_name,
+                "error": result.error,
+                "signature_count": sig_count,
+            })
+        );
+    } else if ok {
+        println!(
+            "clamavd self-test PASS ({} signatures, detected: {})",
+            sig_count,
+            result.virus_name.as_deref().unwrap_or("unknown")
+        );
+    } else {
+        eprintln!(
+            "clamavd self-test FAIL ({} signatures, error: {:?})",
+            sig_count, result.error
+        );
+    }
+    if ok { EXIT_CLEAN } else { EXIT_ERROR }
 }
 
 // ═══════════════════════════════════════════════════════════════
