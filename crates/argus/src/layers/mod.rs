@@ -6,6 +6,7 @@
 pub mod authenticode;
 pub mod context;
 pub mod file_deception;
+pub mod framework;
 pub mod ioc;
 pub mod jar;
 pub mod mime;
