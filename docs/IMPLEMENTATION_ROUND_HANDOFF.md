@@ -322,3 +322,48 @@ instrumentation (Z) · `2e9178c` changelog · `e56e3f9` adversarial suite
 ## Final diffstat
 
 `git diff --stat 06229a8..HEAD`: **80 files changed, +15,558 / −716.**
+
+---
+
+## ROUND-2 RE-VERIFICATION (independent adversarial review of this round)
+
+A second verifier re-ran headline claims and attacked the five
+highest-risk surfaces empirically (compiled + crafted inputs through the
+shipped scanner). 17 confirmed findings (7H/6M/4L), 6 refuted. Disposition:
+
+**Fixed (4 commits, 2026-07-30):**
+- **ACL hardening was a local privilege escalation (HIGH)** — `icacls /T`
+  follows junctions; reproduced unelevated. Replaced with a verified
+  Rust-side walk (never `/T`; reparse entries skipped + counted) and fixed
+  the root-reset convergence bug → `2dadc63`.
+- **Fairness re-keyed (HIGH)** — SID-only keying put same-user malware and
+  the GUI in one bucket (lockout 8× cheaper). First-party pool keyed on
+  kernel-reported image path under the trusted install dir → `722703e`.
+- **Inno needle-flood DoS (HIGH, measured 472 s/100 MB)** — candidate
+  cap (32) before any CRC work + `engine.rs` budget/cancel guard on
+  framework detection → `651640f`.
+- **ETW wrong-process command line (HIGH)** — header PID is the creator
+  on process-start; now keyed on payload PID/PPID → `a03be54`.
+- **Command-line privacy (MEDIUM)** — `CommandLineState` redacts on
+  serialization (len + truncated hash, never raw) → `a03be54`.
+- **Transient-error permanent give-up, discarded `ProcessTrace` result,
+  unreachable shutdown join, 183 livelock (MEDIUM/LOW)** — persistent-vs-
+  transient classifier, stream-loss → Failed+reconnect, explicit
+  `PlmMonitor::shutdown()` wired into main, bounded stale cleanup → `a03be54`.
+
+**Held for design decision (as the verifier recommended):**
+- **F-7 NSIS anchor strength** — the detector grants Structural for a
+  28-byte self-consistent firstheader; `FH_FLAGS_NO_CRC` skips CRC;
+  512-alignment is stock. Forgery cost rose from a 13-byte string to a
+  28-byte header + (usually) a CRC — real but not decisive. Options:
+  (a) decompress+validate the header block (real archive proof),
+  (b) refuse mitigation when NO_CRC is set, (c) accept the cost model.
+  **Open** — guessing here has burned us twice; decide with corpus data.
+
+**Verifier's process note adopted:** verification must assert per-suite
+test counts, not just `0 failed` — the Defender FP silently dropped the
+entire 552-test sentinelld suite from one run. Refuted items, and the
+good work they confirmed, stand as recorded above.
+
+Final state: 24 commits `06229a8..HEAD`; **1,020 tests, 0 failed**;
+`cargo check --workspace --all-targets` 0 warnings.

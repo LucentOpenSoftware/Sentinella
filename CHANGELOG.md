@@ -1679,3 +1679,15 @@ unchanged unless explicitly noted.
 - Tauri 2 GUI with frosted glass design
 - System tray integration
 - Windows service install scripts
+
+### Post-round adversarial re-verification (2026-07-30)
+
+An independent verifier attacked this round empirically: 17 confirmed
+findings, 6 refuted. Fixed in 4 commits: ACL junction-following `icacls
+/T` local privilege escalation (`2dadc63`), SID-only fairness that made
+GUI lockout 8× cheaper (`722703e`), Inno needle-flood scan DoS +
+missing budget guard (`651640f`), ETW wrong-process command line,
+command-line privacy redaction, transient give-up, discarded
+ProcessTrace result, unreachable shutdown join, 183 livelock
+(`a03be54`). F-7 NSIS anchor strength held open for a design decision
+with corpus data. 1,020 tests green.
