@@ -479,6 +479,12 @@ pub fn reject_unsafe_secret_path(path: &Path) -> Result<(), String> {
 // ─────────────────────────────────────────────────────────────────────
 
 /// Outcome of a secret-file ACL (re-)assertion.
+///
+/// `Secure`/`Repaired` are constructed only by the production (non-test)
+/// backend — under `cfg(test)` `assert_secret_acl` always returns `Skipped`
+/// so the user-running test process can't lock itself out of its own temp
+/// files — hence the test-build dead-code allowance.
+#[cfg_attr(test, allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecretAclStatus {
     /// Already conforming — nothing was modified.
