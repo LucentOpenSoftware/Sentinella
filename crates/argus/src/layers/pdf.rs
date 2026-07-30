@@ -49,6 +49,24 @@ const MAX_STREAM_DECOMPRESSED: usize = 8 * 1024 * 1024;
 const MAX_TOTAL_DECOMPRESSED: usize = 64 * 1024 * 1024;
 const MAX_JS_SCAN_BYTES: usize = 512 * 1024;
 
+/// Raw-byte scan window served once `MAX_TOTAL_DECOMPRESSED` is exhausted.
+///
+/// Returning an EMPTY buffer at that point (the original behaviour) silently
+/// blinded `scan_js_content` and the XFA submit sniffer for every remaining
+/// stream in the file — including streams with no `/Filter` at all, which need
+/// no decompression to read. Two ways that bites:
+///   * Adversarial: `decompressed_total` accumulates in object-traversal
+///     order, so eight ~8 KB zlib all-zero streams at low object numbers spend
+///     the whole 64 MiB budget from a ~64 KB PDF, and the real JS payload at a
+///     higher object number is then scanned as zero bytes.
+///   * Benign false negative: a large scanned PDF full of DCTDecode/JPXDecode
+///     image XObjects takes the raw fallback, burns the budget on image bytes,
+///     and blinds the JS scanner for everything walked afterwards.
+/// Raw content is already resident in `stream.content`, so serving this window
+/// costs no decompression work — only the budget's own purpose (bounding
+/// *inflate* effort) is preserved.
+const BUDGET_EXHAUSTED_RAW_SCAN: usize = 64 * 1024;
+
 /// Depth cap for the reference-following helpers below
 /// (`uri_or_file_looks_unc`, `uri_is_suspicious`, `xfa_content_has_submit`).
 /// Unlike `scan_object` they follow `Object::Reference` chains without a
@@ -100,7 +118,11 @@ fn bounded_decompressed(stream: &lopdf::Stream, total_remaining: usize) -> Vec<u
     let raw = stream.content.as_slice();
     let cap = MAX_STREAM_DECOMPRESSED.min(total_remaining);
     if cap == 0 {
-        return Vec::new();
+        // Budget spent: skip all decompression, but do NOT go blind. Serve a
+        // bounded window of the already-resident raw bytes so uncompressed and
+        // ASCII-filtered streams remain scannable. See BUDGET_EXHAUSTED_RAW_SCAN.
+        let n = raw.len().min(BUDGET_EXHAUSTED_RAW_SCAN);
+        return raw[..n].to_vec();
     }
 
     // Fast path: sole FlateDecode with no DecodeParms predictor.
@@ -939,6 +961,40 @@ mod tests {
         // It should actually reach the cap (proving it decompressed, just
         // bounded) rather than bailing to a near-empty raw scan.
         assert_eq!(out.len(), MAX_STREAM_DECOMPRESSED);
+    }
+
+    #[test]
+    fn exhausted_total_budget_still_scans_raw_bytes() {
+        // Regression (v0.1.12): once MAX_TOTAL_DECOMPRESSED was spent,
+        // bounded_decompressed returned an EMPTY buffer, which silently blinded
+        // scan_js_content and the XFA sniffer for every remaining stream in the
+        // file — including streams with no /Filter, which need no decompression
+        // at all. An attacker could park a few cheap zlib all-zero streams at
+        // low object numbers to burn the budget and hide the real JS payload
+        // behind them. With the budget exhausted we must still serve a bounded
+        // window of the raw bytes.
+        let dict = lopdf::Dictionary::new(); // no /Filter
+        let payload = b"app.launchURL('http://evil.example')".to_vec();
+        let stream = lopdf::Stream::new(dict, payload);
+
+        let out = bounded_decompressed(&stream, 0);
+        assert!(
+            !out.is_empty(),
+            "exhausted budget must not blind the scanner"
+        );
+        assert!(
+            contains_bytes(&out, b"app.launchURL"),
+            "raw bytes must stay scannable when the decompression budget is spent"
+        );
+        assert!(out.len() <= BUDGET_EXHAUSTED_RAW_SCAN);
+
+        // And the JS scanner must actually still fire on that window.
+        let mut hit = PdfHits::default();
+        scan_js_content(&out, &mut hit);
+        assert!(
+            hit.js_app_launch,
+            "app.launchURL must still be detected after budget exhaustion"
+        );
     }
 
     #[test]

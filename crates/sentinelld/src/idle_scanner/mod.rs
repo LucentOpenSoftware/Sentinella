@@ -765,6 +765,17 @@ fn idle_scanner_loop(
                     v
                 };
 
+                // v0.1.12: `partial_analysis` above is set only when ARGUS is
+                // skipped WHOLESALE. Truncation *inside* ARGUS is just as
+                // blinding — every layer after MIME/IOC is gated on
+                // `is_expired()` and a skipped layer emits no finding — so the
+                // existing trust/cache gates below did not cover it. Fold the
+                // in-ARGUS case in so a timed-out scan is never treated as
+                // "clean" for caching or trust purposes.
+                if idle_tracker.is_expired() || !idle_tracker.timeouts().is_empty() {
+                    partial_analysis = true;
+                }
+
                 // ── ConvergenceLedger (ARCH-M1 fix: idle uses same path as manual) ──
                 let mut ledger = crate::convergence::ConvergenceLedger::new(
                     &argus_verdict,

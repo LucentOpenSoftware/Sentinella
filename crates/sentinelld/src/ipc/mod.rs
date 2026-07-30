@@ -279,13 +279,28 @@ impl Server {
 
             // Spawn handler for connected client. Single spawn site regardless
             // of whether server recreation succeeded immediately or after retries.
-            // Bounded by conn_sem: when saturated, backpressure parks here
-            // (a fresh listener instance already exists upstream, so new
-            // clients keep queueing at the OS level).
+            //
+            // Bounded by conn_sem, but we SHED LOAD rather than park the
+            // acceptor. Awaiting the permit here (the original form) was an
+            // unauthenticated local availability kill: `client_auth::decide`
+            // deliberately Allows any unelevated process in the active console
+            // session, each `handle_connection` holds its permit for the whole
+            // session, and the 60 s idle timer restarts on every frame — so 64
+            // hold-open connections stalled this loop indefinitely. With the
+            // loop parked, `server.connect()` is never polled again and every
+            // GUI / tray / CLI request hangs, i.e. the entire management and
+            // status control plane of an AV product dies. try_acquire keeps the
+            // cap's handle/memory bound while guaranteeing the loop stays live;
+            // rejected connections are dropped exactly like the Deny arm above.
             debug!("client connected");
-            let permit = match Arc::clone(&conn_sem).acquire_owned().await {
+            let permit = match Arc::clone(&conn_sem).try_acquire_owned() {
                 Ok(p) => p,
-                Err(_) => continue, // semaphore is never closed; serve defensively
+                Err(_) => {
+                    warn!("connection cap reached; shedding client");
+                    drop(connected_pipe);
+                    self.state.record_ipc_error();
+                    continue;
+                }
             };
             let st = Arc::clone(&self.state);
             tokio::spawn(async move {
@@ -312,9 +327,15 @@ impl Server {
         loop {
             let (stream, _) = listener.accept().await?;
             debug!("client connected");
-            let permit = match Arc::clone(&conn_sem).acquire_owned().await {
+            // Shed load instead of parking the acceptor — see the Windows loop
+            // above for why awaiting the permit here is a self-inflicted DoS.
+            let permit = match Arc::clone(&conn_sem).try_acquire_owned() {
                 Ok(p) => p,
-                Err(_) => continue, // semaphore is never closed; serve defensively
+                Err(_) => {
+                    warn!("connection cap reached; shedding client");
+                    drop(stream);
+                    continue;
+                }
             };
             let st = Arc::clone(&self.state);
             tokio::spawn(async move {
@@ -831,30 +852,57 @@ fn dispatch_sync(
                 .unwrap_or_default();
             }
             let rows = state.quarantine_list();
-            let items: Vec<serde_json::Value> = rows
-                .into_iter()
-                // Bound the response frame: the CLI client rejects frames
-                // over MAX_FRAME_SIZE (1 MiB), so an unbounded list could
-                // desync the protocol on long-lived installs. Ordered by
-                // quarantined_at DESC, so the newest entries survive.
-                // (The scheduler's retention sweep uses the FULL list —
-                // do not push this cap down into db::list_quarantine.)
-                .take(1000)
-                .map(|r| {
-                    let vault_path = std::path::Path::new(&r.vault_path);
-                    let vault_ok = vault_blob_plausible(vault_path);
-                    serde_json::json!({
-                        "id": r.quarantine_id,
-                        "original_path": r.original_path,
-                        "original_size": r.original_size,
-                        "signature": r.virus_name,
-                        "sha256": r.sha256,
-                        "quarantined_at": r.quarantined_at,
-                        "restorable": vault_ok && r.status == "quarantined",
-                        "scan_id": r.scan_id,
-                    })
-                })
-                .collect();
+            // Bound the response by SERIALISED BYTES, not row count.
+            //
+            // The `.take(1000)` this replaces did not actually achieve its
+            // stated goal: the limit being protected is a BYTE limit (the CLI
+            // rejects frames over MAX_FRAME_SIZE = 1 MiB), while rows vary
+            // enormously in size because a Windows path can reach 32,767 chars
+            // via the \\?\ form — so 1000 rows could still overflow, and in the
+            // common case it needlessly hid entries that would have fit.
+            //
+            // The hiding mattered: past 1000 items the older entries became
+            // invisible in the GUI quarantine page and therefore un-restorable
+            // through it — and since quarantining deletes the original, the
+            // vault blob is the only copy — right up until the retention sweep
+            // deleted them for good. Ordered by quarantined_at DESC, so the
+            // newest entries survive. (The scheduler's retention sweep uses the
+            // FULL list — do not push this cap down into db::list_quarantine.)
+            const RESPONSE_BUDGET: usize = 768 * 1024; // headroom under 1 MiB
+            let total_rows = rows.len();
+            let mut used: usize = 2; // "[]"
+            let mut items: Vec<serde_json::Value> = Vec::new();
+            for r in rows {
+                let vault_path = std::path::Path::new(&r.vault_path);
+                let vault_ok = vault_blob_plausible(vault_path);
+                let item = serde_json::json!({
+                    "id": r.quarantine_id,
+                    "original_path": r.original_path,
+                    "original_size": r.original_size,
+                    "signature": r.virus_name,
+                    "sha256": r.sha256,
+                    "quarantined_at": r.quarantined_at,
+                    "restorable": vault_ok && r.status == "quarantined",
+                    "scan_id": r.scan_id,
+                });
+                // +1 for the separating comma.
+                let cost = serde_json::to_string(&item).map(|s| s.len()).unwrap_or(0) + 1;
+                if used + cost > RESPONSE_BUDGET && !items.is_empty() {
+                    break;
+                }
+                used += cost;
+                items.push(item);
+            }
+            if items.len() < total_rows {
+                // Not silent any more: the operator can see it in the log even
+                // though the array shape gives us nowhere to put a flag without
+                // breaking the GUI and CLI consumers.
+                warn!(
+                    returned = items.len(),
+                    total = total_rows,
+                    "quarantine.list truncated to fit the IPC frame — older entries omitted"
+                );
+            }
             ok_json(items)
         }
         "quarantine.add" => {

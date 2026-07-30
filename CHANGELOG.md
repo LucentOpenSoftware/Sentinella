@@ -8,6 +8,62 @@ Full details: `docs/DEEP_AUDIT_2026-07.md`. 13 high, ~34 medium, and
 ~60 low findings fixed; every fix re-verified against the code before
 landing.
 
+### Post-audit verification pass
+
+The audit diff was itself re-reviewed across five dimensions with
+adversarial verification (6 findings confirmed, 19 refuted). Three of the
+four HIGHs below are regressions the audit introduced while fixing
+something else — recorded plainly here because the audit's own writeup
+lists them as fixed.
+
+- **IPC control plane could be killed by any local user (HIGH,
+  regression).** The new `MAX_CONCURRENT_CONNECTIONS` cap acquired its
+  permit with a blocking `acquire_owned().await` *inside* the accept loop.
+  Since `client_auth::decide` deliberately allows any unelevated process
+  in the active console session, and each connection holds its permit for
+  the whole session with the 60 s idle timer restarting on every frame, 64
+  hold-open connections parked the acceptor indefinitely — `connect()` is
+  never polled again, so every GUI, tray and CLI request hangs. Now uses
+  `try_acquire_owned()` and sheds load exactly like the existing Deny arm.
+  Fixed on both the named-pipe and Unix-socket loops.
+- **Budget-truncated realtime verdict was cached as CLEAN and earned trust
+  (HIGH, regression).** The watcher was switched to share its 10 s realtime
+  budget tracker with the preceding ClamAV phase. Every ARGUS layer after
+  MIME/IOC is gated on `is_expired()` and a skipped layer emits *no*
+  finding, so a file whose ClamAV pass burned the budget returned score 0
+  with no error — and was written to `scan_cache.db` as clean, persisting a
+  per-file whitelist across daemon restarts, plus trust-graph familiarity.
+  Attacker-influenceable with deliberately slow-to-scan input. `partial` is
+  now derived from the tracker (covering truncation *inside* ARGUS, not
+  just the pre-check), timeouts add suspicion to the score as they do on
+  the manual path, and both the cache write and the trust observation are
+  gated. Same in-ARGUS gap closed in the idle scanner.
+- **Exhausted PDF decompression budget blinded the scanner (HIGH,
+  regression).** The new file-wide `MAX_TOTAL_DECOMPRESSED` returned an
+  empty buffer once spent, so every later stream — including unfiltered
+  ones needing no decompression — was scanned as zero bytes. A few cheap
+  zlib all-zero streams at low object numbers hid the real JS payload
+  behind them; benign scanned PDFs full of DCTDecode images tripped it too.
+  Now serves a bounded window of the already-resident raw bytes.
+- **OLE2 installer discount still forgeable (HIGH).** Round 2 narrowed the
+  discount to the MSI branch but kept free-text markers, so any OLE2 file
+  containing the literal `Windows Installer` — trivially embedded in a
+  `.doc` an attacker authors — still earned the /3 structural + /2 YARA
+  suppression. Now keys on the `.msi`/`.msp` extension only. The existing
+  test asserted the vulnerable behaviour and has been corrected.
+- **quarantine.list truncated silently (MEDIUM).** The `.take(1000)` row
+  cap did not bound what it claimed (a *byte* limit) and hid everything
+  past the newest 1000 — invisible and un-restorable in the GUI, even
+  though the vault blob is the only remaining copy, until retention deleted
+  it. Now bounds by serialised bytes and logs when it truncates.
+- **Cache fingerprint cost documented, not silently regressed (MEDIUM).**
+  The full-file SHA-256 runs on the cache-*hit* path, so a repeat scan
+  re-reads the whole corpus. Retained deliberately — every cheaper scheme
+  leaves ranges an attacker can hide in, which is the bypass it closed —
+  but the comment claiming it "costs ~ms, still ≪ the scan it replaces"
+  was wrong and has been replaced with the real cost and the only safe
+  optimisation path.
+
 ### Security
 
 - **`argus.analyze` UNC/device-path bypass (HIGH).** The handler lacked

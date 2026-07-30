@@ -30,8 +30,27 @@ const DB_WRITE_QUEUE_CAP: usize = 4096;
 /// first 64KB byte-identical (PE headers + first sections), write the
 /// payload into later sections/overlay, pad to the same size, restore
 /// mtime — permanent scanner bypass for any file >64KB. Hashing the
-/// full content closes that hole; streaming SHA-256 costs ~ms for
-/// typical files, still ≪ the 100-500ms scan it replaces.
+/// full content closes that hole.
+///
+/// COST (measured honestly, v0.1.12 — the previous claim here that this
+/// "costs ~ms, still ≪ the 100-500ms scan it replaces" was wrong):
+/// this runs on the cache-HIT path (`check_with_metadata`) *after* the
+/// cheap size/mtime/generation match already succeeded — i.e. precisely
+/// when no scan will follow. So the comparison is not "hash vs scan",
+/// it is "hash vs nothing": a 512 MB hit spends a full 512 MB read plus
+/// SHA-256 of every byte to avoid scanning that same file, and a repeat
+/// full scan of an already-cached corpus re-reads the corpus end-to-end.
+///
+/// This is retained deliberately. Any cheaper scheme (prefix, or a
+/// sparse/strided sample) leaves byte ranges unread, and an attacker who
+/// keeps the file size and mtime fixed can hide the payload in exactly
+/// those ranges — which is the R6b bypass this closed. Reading every byte
+/// is inherent to the defence, so the cost is the price of correctness,
+/// not an oversight. If this ever needs bounding, the only safe direction
+/// is to make the unread ranges unpredictable (derive stride offsets from
+/// `CACHE_INTEGRITY_SECRET`, which is persistent, and keep an exact-size
+/// anchor) — that must be attack-tested before it ships, and it weakens a
+/// property that currently holds absolutely.
 ///
 /// Truncated SHA-256 stored in the cache. 128 bits is enough to make
 /// brute-force preimage attacks against a single file infeasible while

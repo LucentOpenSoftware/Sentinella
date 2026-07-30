@@ -577,6 +577,46 @@ fn watcher_loop(
                     }
                 };
 
+                // ── v0.1.12: budget-TRUNCATED analysis is not a clean result ──
+                //
+                // The pre-ARGUS guard above only covers "ARGUS was skipped
+                // entirely". It does NOT cover truncation *inside* ARGUS: every
+                // layer after MIME/IOC is gated on `tracker.is_expired()`, and a
+                // skipped layer records a timeout reason but emits NO finding. So
+                // a file whose ClamAV phase burned most of the 10 s realtime
+                // budget passes the check at :510, enters ARGUS, has PE/packer/
+                // script/JAR/PDF/pattern/YARA/authenticode all silently skipped,
+                // and returns score 0 / Clean with no error finding —
+                // `argus_analysis_error()` only matches "Analysis incomplete: ",
+                // which a budget timeout never produces.
+                //
+                // Caching that as clean wrote a PERSISTENT per-file whitelist
+                // entry (survives daemon restarts until size/mtime/content
+                // change), and the trust-graph observation below additionally
+                // earned the file a confidence discount on later scans. Net: an
+                // attacker-influenceable realtime detection bypass — feed the
+                // watcher deliberately slow-to-scan input (nested archive,
+                // large polyglot) and the file is whitelisted for good.
+                //
+                // Evaluated as a closure so each use site re-reads the tracker;
+                // it only ever accumulates, so a later check is strictly more
+                // conservative than a snapshot taken here.
+                let rt_analysis_partial =
+                    || rt_tracker.is_expired() || !rt_tracker.timeouts().is_empty();
+
+                // Timeouts are themselves evidence — mirror the manual
+                // full-scan path (ipc/state.rs), which the watcher never did.
+                // Applied BEFORE the ledger, which reads the score.
+                let rt_timeout_weight = rt_tracker.timeout_suspicion();
+                if rt_timeout_weight > 0 {
+                    argus_verdict.score = argus_verdict
+                        .score
+                        .saturating_add(rt_timeout_weight)
+                        .min(100);
+                    argus_verdict.verdict =
+                        argus::verdict::Verdict::from_score(argus_verdict.score);
+                }
+
                 // ── ConvergenceLedger (ARCH-H1 fix: realtime uses same path as manual) ──
                 let mut ledger =
                     crate::convergence::ConvergenceLedger::new(&argus_verdict, result.infected);
@@ -672,7 +712,10 @@ fn watcher_loop(
                 // Prevents malware from slowly earning trust through repeated execution.
                 // Signer-aware (audit cross-cutting): authenticode signer feeds
                 // drift detection — a signer change invalidates prior trust.
-                if final_score == 0 && !result.infected {
+                // v0.1.12: a budget-truncated verdict must not earn familiarity
+                // either — otherwise a slow-to-scan file accrues a confidence
+                // discount on future scans purely because we ran out of time.
+                if final_score == 0 && !result.infected && !rt_analysis_partial() {
                     if let Some(tg) = state.trust_graph() {
                         let file_key = path.to_string_lossy().to_lowercase();
                         let drift = tg.observe_with_signer(
@@ -763,9 +806,14 @@ fn watcher_loop(
                 // Update cache. An ARGUS analysis-error verdict (read
                 // failure / sharing violation) is NOT a clean result —
                 // never cache it; leaving the file uncached retries it on
-                // the next modify event.
+                // the next modify event. Likewise a budget-TRUNCATED verdict
+                // (v0.1.12): heuristic layers were skipped, so "score 0" means
+                // "we didn't look", not "clean". Threats are still cached (a
+                // positive is a positive); clean-looking partials stay uncached
+                // so the next modify event re-scans them.
                 if result.error.is_none()
                     && (is_threat || crate::ipc::argus_analysis_error(&argus_verdict).is_none())
+                    && (is_threat || !rt_analysis_partial())
                 {
                     cache.record_with_metadata(&path, &path_meta, !is_threat);
                 }

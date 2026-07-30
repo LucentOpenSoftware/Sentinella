@@ -1189,10 +1189,26 @@ fn is_known_installer(data: &[u8], path: &str) -> bool {
     // "installer" handed every macro-laden Office document a structural+YARA
     // detection discount (a false-negative vector for macro droppers). Require
     // an actual MSI indicator: the .msi extension or an MSI-specific marker.
-    let has_msi = is_ole2
-        && (path.to_lowercase().ends_with(".msi")
-            || contains(b"Windows Installer")
-            || contains(b"Installation Database"));
+    // For an OLE2 file the discount MUST key on the extension alone, never on
+    // free-text content. "Windows Installer" and "Installation Database" are
+    // plain substrings an attacker fully controls: embedding either anywhere in
+    // a real .doc they author (body, metadata, an embedded object name) earned a
+    // macro dropper the /3 structural + /2 YARA discount below — an
+    // attacker-forceable heuristic-suppression primitive. Round 1 removed the
+    // caller's `is_pe &&` gate and round 2 narrowed OLE2 to this branch but kept
+    // the substrings, so the vector stayed live while being documented as fixed.
+    //
+    // Extension-only is the safe direction: a genuine MSI/MSP always carries the
+    // extension, and an unnamed/renamed installer merely loses a leniency
+    // discount (scanned more strictly) rather than opening a bypass.
+    let msi_ext = {
+        let lower = path.to_lowercase();
+        lower.ends_with(".msi") || lower.ends_with(".msp")
+    };
+    // NOTE: `has_msi` requires `is_ole2`, and OLE2 / PE magic are mutually
+    // exclusive (both are offset-0 checks), so this is only ever consulted via
+    // the early return below — it contributes nothing to the PE OR-chain.
+    let has_msi = is_ole2 && msi_ext;
     // OLE2 files that aren't MSIs (Office docs, etc.) stop here: only the MSI
     // branch may grant the discount, so a macro-laden document can't earn it
     // via incidental framework-marker strings in its body.
@@ -1335,10 +1351,30 @@ mod tests {
             ".msi must still be recognized as an installer"
         );
 
-        // An MSI-specific content marker also qualifies regardless of name.
+        // An OLE2 file carrying the "Windows Installer" string but NOT named
+        // .msi must NOT qualify. This assertion previously demanded the
+        // opposite, locking in an attacker-forceable discount: any macro
+        // dropper shipped as invoice.doc with that literal embedded anywhere
+        // earned the /3 structural + /2 YARA suppression.
         let mut msi_marker = vec![0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
         msi_marker.extend_from_slice(b"...Windows Installer...");
-        assert!(is_known_installer(&msi_marker, "x.bin"));
+        assert!(
+            !is_known_installer(&msi_marker, "x.bin"),
+            "OLE2 content markers must not grant the installer discount"
+        );
+        assert!(
+            !is_known_installer(&msi_marker, "C:\\Users\\me\\invoice.doc"),
+            "macro dropper embedding 'Windows Installer' must not be discounted"
+        );
+        // The same bytes DO qualify when the file is a genuine .msi/.msp.
+        assert!(
+            is_known_installer(&msi_marker, "C:\\Downloads\\pkg.msi"),
+            "real .msi must still be recognized"
+        );
+        assert!(
+            is_known_installer(&ole2, "C:\\Downloads\\patch.msp"),
+            ".msp patch must still be recognized"
+        );
 
         // NSIS content marker still works (unchanged path).
         let nsis = b"MZ........Nullsoft Inst........".to_vec();
