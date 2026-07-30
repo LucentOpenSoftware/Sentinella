@@ -14,6 +14,7 @@ use tracing::{debug, warn};
 
 use crate::budget::{BudgetTracker, ScanExecutionBudget, TimeoutReason};
 use crate::layers;
+use crate::layers::framework::FrameworkDetection;
 use crate::verdict::*;
 
 /// Engine version — embedded in every verdict for traceability.
@@ -495,7 +496,22 @@ impl ArgusEngine {
         // them — see that function for the exact policy (Structural-grade
         // evidence required, WeakHint grants nothing, high-confidence veto,
         // one pass only).
-        let framework_detection = layers::framework::detect(&data, &path_str);
+        // Budget guard: framework detection scans the buffer (bounded linear
+        // passes + capped candidate validation) — skip it entirely when the
+        // execution budget is already spent or the scan was cancelled, so it
+        // can never extend an over-budget scan, and record why. Detectors
+        // themselves are cost-capped (see MAX_TABLE_CANDIDATES in inno.rs);
+        // this guard covers the accumulated-cost case (many layers already
+        // burned the budget before this point).
+        let framework_detection = if tracker.is_expired() || tracker.is_cancelled() {
+            tracing::debug!(
+                path = %path_str,
+                "framework detection skipped: scan budget exhausted or cancelled"
+            );
+            FrameworkDetection::unknown()
+        } else {
+            layers::framework::detect(&data, &path_str)
+        };
         let framework_mitigation =
             FrameworkMitigation::evaluate(framework_detection, &mut findings);
 

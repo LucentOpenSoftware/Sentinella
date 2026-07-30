@@ -131,6 +131,16 @@ const TEXT_MARKERS: [&[u8]; 2] = [b"Inno Setup", b"InnoSetupLdr"];
 /// fails validation) so a hostile file cannot flood diagnostics.
 const MAX_REJECTED: usize = 8;
 
+/// Hard cap on needle candidates VALIDATED across all .rsrc sections.
+/// The 12-byte table ID contains 5 binary bytes, so a genuine file has
+/// ~zero accidental hits (the real table validates on the first candidate).
+/// Without this cap, a hostile file filled with the ID forces a CRC
+/// validation per occurrence — measured 472 s on one crafted 100 MB file
+/// through the full scanner (47× the 10 s realtime budget). 32 rejected
+/// candidates means "needle flood", not "Inno file": fail closed to
+/// Unknown with a diagnostic, at bounded cost.
+const MAX_TABLE_CANDIDATES: usize = 32;
+
 /// Standard zlib CRC-32 (poly 0xEDB88320, init/xorout 0xFFFFFFFF) — the exact
 /// algorithm of Inno's `GetCRC32`. Bitwise (no table): inputs here are at most
 /// 64 bytes, so the extra cycles are noise and there is one less thing to
@@ -318,7 +328,8 @@ fn find_needle(haystack: &[u8], needle: &[u8; 12], from: usize) -> Option<usize>
 /// that did not validate.
 fn find_table_in_rsrc(data: &[u8], pe: &PeInfo, warnings: &mut Vec<String>) -> Option<(u64, OffsetTable)> {
     let mut rejected = 0usize;
-    for sec in pe.sections.iter().filter(|s| s.name == ".rsrc") {
+    let mut candidates = 0usize;
+    'sections: for sec in pe.sections.iter().filter(|s| s.name == ".rsrc") {
         let Some(range) = sec.raw_range(data.len()) else {
             continue;
         };
@@ -327,6 +338,15 @@ fn find_table_in_rsrc(data: &[u8], pe: &PeInfo, warnings: &mut Vec<String>) -> O
         };
         let mut from = 0usize;
         while let Some(pos) = find_needle(bytes, &LDR_TABLE_ID, from) {
+            // DoS bound: the candidate cap is checked BEFORE any CRC work.
+            candidates += 1;
+            if candidates > MAX_TABLE_CANDIDATES {
+                warnings.push(format!(
+                    "more than {MAX_TABLE_CANDIDATES} Inno loader table ID candidates \
+                     in .rsrc — needle flood, not an Inno file; giving up (fail closed)"
+                ));
+                break 'sections;
+            }
             let abs = range.start as u64 + pos as u64;
             match parse_offset_table(data, abs, range.end as u64) {
                 Ok(table) => return Some((abs, table)),
@@ -1044,5 +1064,43 @@ mod tests {
             }
         }
         let _ = pe;
+    }
+
+    // ── DoS bound ──────────────────────────────────────────────────
+
+    /// A .rsrc section filled with the loader table ID must hit the
+    /// candidate cap and fail closed — never a per-hit CRC storm, never
+    /// Structural. Regression for the measured 472 s / 100 MB needle-flood
+    /// scan reported by adversarial verification.
+    #[test]
+    fn needle_flood_hits_candidate_cap_and_fails_closed() {
+        let mut data = PeBuilder::new()
+            .section(".text", 0x200, 0x200)
+            .section(".rsrc", 0x4000, 0x4000)
+            .overlay(b"pad")
+            .build();
+        // Fill .rsrc's raw range with back-to-back copies of the table ID.
+        let pe = pe::parse(&data).unwrap();
+        let rsrc = pe
+            .sections
+            .iter()
+            .find(|s| s.name == ".rsrc")
+            .expect("fixture has .rsrc");
+        let range = rsrc.raw_range(data.len()).unwrap();
+        for chunk in data[range].chunks_mut(LDR_TABLE_ID.len()) {
+            chunk.copy_from_slice(&LDR_TABLE_ID[..chunk.len()]);
+        }
+        let pe = pe::parse(&data).unwrap();
+        let d = detect(&data, &pe);
+        assert!(
+            d.confidence() < Confidence::Structural,
+            "a needle flood must never reach Structural confidence"
+        );
+        assert!(!d.mitigation_safe());
+        assert!(
+            d.warnings().iter().any(|w| w.contains("needle flood")),
+            "candidate-cap diagnostic must be recorded: {:?}",
+            d.warnings()
+        );
     }
 }
