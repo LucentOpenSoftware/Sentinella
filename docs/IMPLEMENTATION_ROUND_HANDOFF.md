@@ -44,7 +44,7 @@ cleared on every occasion; add a `target\` exclusion if it recurs.
 | `SystemTraceControlGuid` proposal (review §4.4 sketch) | **refuted** (private name + that GUID = ERROR_INVALID_PARAMETER); correct design implemented | `b60f296` |
 | 'rDlPtS0Xe87ev' Inno anchor (brief's model) | **refuted** (exists in no tagged Inno ≥5.4.3 source); real anchor = `TSetupLdrOffsetTable` in `.rsrc` | `40c2fdd` |
 | 16-byte NSIS firstheader (brief's model) | **refuted** (it is 28 bytes per fileform.h) | `84762a5` |
-| Public docs advertise 76 as quarantine threshold | **refuted** (canonical #15; `scripts/check-threshold-docs.ps1` guards) | `8a18ed6` |
+| Public docs advertise 76 as quarantine threshold | **refuted** (canonical #15 — the daemon's ARGUS-only bar is 85; `scripts/check-threshold-docs.ps1` guards) | `8a18ed6` |
 | ETW SDK constant `0x200` literal (introduced mid-round) | **confirmed bug, caught in cross-agent review, fixed** (SDK-sourced consts + cross-check test) | `b60f296` |
 
 ## IMPLEMENTED INVARIANTS
@@ -367,3 +367,122 @@ good work they confirmed, stand as recorded above.
 
 Final state: 24 commits `06229a8..HEAD`; **1,020 tests, 0 failed**;
 `cargo check --workspace --all-targets` 0 warnings.
+
+---
+
+## ROUND-4 RE-VERIFICATION (review of the 5 remediation commits)
+
+*Numbering note (VERIFIED — read both): the "ROUND-2 RE-VERIFICATION"
+section above is the review the verifier numbers "round-3 review" (of the
+20-commit implementation round). This section is their "round-4 review"
+(of the remediation commits `2dadc63`..`8cb970d`). The doc's numbering is
+preserved; the mapping is recorded so no one reconciles by guessing.*
+
+**Evidence-class rule for this section (standing):** every claim is
+labeled `VERIFIED` (executed it) / `REASONED` (read the code or docs) /
+`ASSUMED`. An unlabeled assertion in this file has a track record — it
+carried *"icacls does not follow junctions with /T either"*, the sentence
+that let a CWE-59 ship, and a diffstat (`+15,558`) that was wrong at the
+HEAD it described.
+
+### Authoritative figures (VERIFIED — supplied by the verifier, cross-checked against git)
+
+- **Round-3 review** (implementation round, `06229a8..9e03e7c`):
+  **17 confirmed** (7 HIGH / 6 MEDIUM / 4 LOW), 6 refuted.
+  Surfaces: installer-parsers 2c/1r · etw-reconstruction 4c/2r ·
+  command-line-capture 4c/0r · scoring-policy 2c/3r · acl-fairness 5c/0r.
+- **Round-4 review** (remediation commits): **19 confirmed**
+  (4 HIGH / 12 MEDIUM / 3 LOW), 12 refuted.
+  Surfaces: acl-safe-walk 6c/1r · fairness 3c/2r · inno 1c/5r ·
+  plm-six-fixes 4c/2r · regression-sweep 5c/2r.
+- **Disposition:** `41d6dfb` closes 3 (fairness no-op, ACL TOCTOU,
+  `image_path` cmdline leak). **16 findings carry forward** — the
+  per-finding table lives in the verifier's session report (not in
+  tree); this doc does not fabricate rows for it. Named carry-forwards
+  are in the open list below.
+- **Current tree (VERIFIED — re-derived, not carried):** 27 commits
+  `06229a8..41d6dfb`; **84 files, +17,359 / −755**;
+  **1,026 tests, 0 failed**; `cargo check --workspace --all-targets`
+  0 warnings.
+
+### Closed by `41d6dfb` (each independently re-verified by a second party)
+
+1. **Fairness first-party pool was a complete no-op (HIGH).**
+   `std::fs::canonicalize` returns verbatim `\?\C:\...` paths on
+   Windows; the trusted-root literals are plain `c:\...`, so
+   `is_first_party()` returned false for every client.
+   *Evidence: VERIFIED by the verifier and independently reproduced —
+   compiled test binary prints `\?\C:\...` and no prefix-match against
+   plain literals.* The pre-existing regression test was vacuous
+   (`if cond { assert }`, always false under `cargo test`). Fix:
+   verbatim-strip + UNC rejection, strict `is_first_party_image_dir`
+   that excludes the user-writable `ProgramData\Sentinella` asset root,
+   key-injection test that asserts unconditionally.
+2. **ACL safe-walk was check-then-act by name (HIGH).** The `/T`
+   removal narrowed but did not close CWE-59: entries were reparse-
+   checked by path, then `icacls <path>` re-resolved the same name, and
+   the deferred descent stack made the swap window unbounded. Fix: each
+   entry pinned by an open handle (`FILE_FLAG_OPEN_REPARSE_POINT` |
+   `FILE_FLAG_BACKUP_SEMANTICS`, share mode omits `FILE_SHARE_DELETE`)
+   held across the `icacls` call; recursion keeps ancestors pinned.
+   *Evidence: VERIFIED mechanism (share modes do not gate WRITE_DAC/
+   WRITE_OWNER; no DELETE share ⇒ no rename/delete ⇒ no re-point) plus
+   a property test proving a pinned directory cannot be removed or
+   renamed while held and can after release.*
+   **Open, not closed:** nobody has raced the pin as SYSTEM against a
+   live attacker. The window is closed by construction and the refusal
+   is empirically proven; the live race is not tested. (VERIFIER'S OWN
+   LIMIT, recorded as required.)
+3. **Raw command lines still reached the forensic DB via `image_path`
+   (MEDIUM).** The payload probe seeks a *wide* `X:` string, but
+   `ImageFileName` in `Process_TypeGroup1` is ANSI — the probe lands on
+   the `CommandLine` field, arguments included, which was serialized to
+   SQLite and IPC. Fix: `strip_command_line_arguments` (quoted form →
+   inside quotes; first executable-extension component end → cut after;
+   else first space; fails toward truncation, never disclosure).
+   *Evidence: VERIFIED by test asserting no secret from realistic
+   credential-bearing command lines survives, and unquoted paths with
+   spaces are preserved.*
+
+### Carried forward (open list)
+
+- **F-7 NSIS structural anchor strength** — needs corpus data, not a
+  fourth guess. (REASONED — see Round-2 section.)
+- **Inno zero-hit `.rsrc` walk** — needs a bound on *section count*,
+  not candidates; a behavior change to the parser, deferred to its own
+  reviewed change. (REASONED.)
+- **Remaining ETW give-up / ProcessTrace items** — cannot be validated
+  without an elevated live box. (REASONED.)
+- **ACL pin live-race** — see item 2 above. (VERIFIED as untested.)
+- The balance of the 16 (ASSUMED to be enumerated in the verifier's
+  session report; not reproduced here to avoid inventing rows).
+
+## CROSS-ROUND FAILURE PATTERNS (the part that is not a findings list)
+
+Five rounds produced HIGHs of the *same five shapes*. The pattern is
+more useful to the next attacker than any individual finding:
+
+1. **A confident false assertion in a comment or doc.** The junction
+   claim; an architecture comment describing an `EnableTraceEx2` call
+   that exists nowhere in the tree; wrong diffstats. Prose isn't tested,
+   so it rots into load-bearing fiction. *Standing rule: backslash /
+   verbatim-path / prefix claims must be confirmed from compiled output,
+   never from shell echo — during this very review, a test heredoc
+   mangled the exact string class under test and only the compiled
+   binary's printed output settled it.*
+2. **Tests that assert the change rather than the property.** The
+   vacuous `if cond { assert }`; the OLE2 test asserting
+   `"Windows Installer"` *should* earn the discount (locking in the
+   vulnerable behavior); the junction test covering only the static
+   case. A test that can't fail when the security property breaks is
+   not a test of that property.
+3. **Check-then-act by name.** The ACL TOCTOU is one instance; any
+   path-based verify-then-operate is the same bug. Pin by handle or
+   don't trust the interval.
+4. **Fixing a sink instead of the data.** `command_line` was redacted;
+   the secret walked out through `image_path`. Redaction belongs as a
+   property of the type or at the boundary, not at one call site.
+5. **Narrowing mistaken for closing.** `/T` removal, the NSIS 28-byte
+   header, the SID fairness re-key — each reduced attacker cost without
+   changing the class. A fix that only raises cost must say so in its
+   commit message, or the next reader files it as closed.
