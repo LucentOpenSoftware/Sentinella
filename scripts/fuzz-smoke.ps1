@@ -1,8 +1,15 @@
-# fuzz-smoke.ps1 — Run 15-minute smoke fuzz on each target.
+# fuzz-smoke.ps1 -- Run 15-minute smoke fuzz on each target.
 # Usage: .\scripts\fuzz-smoke.ps1 [-Duration 900] [-Target fuzz_convergence]
 #
 # Requires: rustup nightly, cargo-fuzz
 # Install: rustup toolchain install nightly; cargo install cargo-fuzz
+#
+# Windows toolchain note: libfuzzer-sys 0.4 builds
+# FuzzerExtFunctionsWindows.cpp, which uses MSVC-only __pragma/alternatename
+# directives. MinGW g++ rejects it and --target=x86_64-pc-windows-gnu clang
+# mis-handles the alternatename semantics; the reliable paths are WSL2/Linux
+# or clang-cl with the MSVC toolchain. A build failure is reported as
+# BUILD-BLOCKED (exit 2), never as a fuzzing crash.
 
 param(
     [int]$Duration = 900,        # seconds per target
@@ -24,7 +31,11 @@ $targets = @(
     "fuzz_ipc_frame",
     "fuzz_argus_pe",
     "fuzz_etw_parser",
-    "fuzz_paths"
+    "fuzz_paths",
+    "framework_detect",
+    "framework_pe_parse",
+    "etw_props_layout",
+    "cmdline_decode"
 )
 
 if ($Target -ne "") {
@@ -48,10 +59,23 @@ foreach ($t in $targets) {
     $output = cargo fuzz run $t --sanitizer none --target x86_64-pc-windows-gnu -- -max_total_time=$Duration 2>&1 | Out-String
 
     $elapsed = ((Get-Date) - $start).TotalSeconds
-    $crashed = $output -match "SUMMARY.*BINGO\!|panicked|ERROR|ABORTING"
+    # Distinguish toolchain build failure (NOT a fuzzing crash) from a real
+    # fuzzer crash. Known blocker on this box: libfuzzer-sys 0.4's
+    # FuzzerExtFunctionsWindows.cpp uses MSVC-only __pragma+alternatename,
+    # which neither MinGW g++ nor --target=...-gnu clang accepts. Real
+    # fuzzing needs WSL2/Linux or a clang-cl setup — see header comment.
+    $buildBlocked = $output -match "failed to build fuzz script|error occurred in cc-rs"
+    $crashed = (-not $buildBlocked) -and ($output -match "SUMMARY.*BINGO\!|panicked|ERROR|ABORTING")
     $timeout = $output -match "Done.*iterations"
 
-    if ($crashed) {
+    if ($buildBlocked) {
+        Write-Host "  BUILD-BLOCKED (toolchain, not a crash) in $t" -ForegroundColor Magenta
+        $results += [PSCustomObject]@{
+            Target = $t
+            Status = "BUILD-BLOCKED"
+            Duration = [math]::Round($elapsed, 1)
+        }
+    } elseif ($crashed) {
         Write-Host "  CRASH FOUND in $t!" -ForegroundColor Red
         $crashCount++
         $results += [PSCustomObject]@{
@@ -89,8 +113,11 @@ Write-Host "=== Smoke Results ===" -ForegroundColor Cyan
 $results | Format-Table -AutoSize
 
 if ($crashCount -gt 0) {
-    Write-Host "$crashCount target(s) had crashes — fix before release!" -ForegroundColor Red
+    Write-Host "$crashCount target(s) had crashes -- fix before release!" -ForegroundColor Red
     exit 1
+} elseif (@($results | Where-Object { $_.Status -eq "BUILD-BLOCKED" }).Count -gt 0) {
+    Write-Host "Some targets BUILD-BLOCKED (toolchain prerequisite, not a crash) -- see header comment." -ForegroundColor Magenta
+    exit 2
 } else {
     Write-Host "All targets clean." -ForegroundColor Green
     exit 0

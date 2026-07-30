@@ -61,9 +61,26 @@ on top of that.
 |---|---|---|
 | `fuzz_ipc_frame` | JSON-RPC frame parsing, method dispatch validation | Critical |
 | `fuzz_argus_pe` | PE analysis, entropy, imports, structural heuristics | Critical |
+| `framework_detect` | Installer-framework dispatch (NSIS/Inno/WiX detectors + centralized mitigation invariant) | Critical |
+| `framework_pe_parse` | Bounded PE header parsing (section table, raw-range clamping, overlay extent) | Critical |
 | `fuzz_convergence` | Score aggregation, verdict consistency, cap enforcement | High |
 | `fuzz_etw_parser` | ETW event data parsing, UTF-16, path extraction | High |
 | `fuzz_paths` | Path parsing, skip logic, exclusion matching, Unicode | High |
+| `etw_props_layout` | ETW properties buffer layout arithmetic (size/offset overflow edges) | High |
+| `cmdline_decode` | PLM command-line UNICODE_STRING parsing (attacker-controlled headers) | High |
+
+### Notes on the v0.1.12 targets (X+Y)
+
+- `framework_pe_parse` is why `argus::layers::framework::pe` is `pub` —
+  the harness (a separate crate) drives the parser directly. The
+  visibility change is documented in `layers/framework/mod.rs`.
+- `cmdline_decode` `#[path]`-includes `crates/sentinelld/src/plm/cmdline.rs`
+  VERBATIM (sentinelld is a binary-only crate and cannot be linked). The
+  fuzzed code is byte-identical to production; see the target's module
+  docs. Its pointer field uses a RELATIVE-offset rebase convention
+  (mirrored by the corpus generator and the replay test).
+- All four use the same oracles as their no-cargo-fuzz replay tests, so a
+  fuzz-found crash can be pinned as a regression test immediately.
 
 ## Running
 
@@ -104,12 +121,40 @@ in `artifacts/<target>/`.
 
 ```
 corpus/
-  ipc/          # JSON-RPC frames (5 seeds)
-  argus/        # PE/binary samples (3 seeds)
-  convergence/  # Structured fuzzer input (2 seeds)
-  etw/          # ETW event payloads (2 seeds)
-  paths/        # Adversarial path strings (3 seeds)
+  ipc/                 # JSON-RPC frames (5 seeds)
+  argus/               # PE/binary samples (3 seeds)
+  convergence/         # Structured fuzzer input (2 seeds)
+  etw/                 # ETW event payloads (2 seeds)
+  paths/               # Adversarial path strings (3 seeds)
+  framework_detect/    # Installer-framework PE fixtures (8 seeds, deterministic)
+  framework_pe_parse/  # Same PE fixtures for the header parser (8 seeds)
+  etw_props_layout/    # 32-byte compute_layout param blobs (4 seeds)
+  cmdline_decode/      # UNICODE_STRING buffers, relative-pointer convention (5 seeds)
 ```
+
+The four v0.1.12 corpora are generated deterministically (fixed PRNG
+seeds, no timestamps) and are reproducible byte-for-byte:
+
+```bash
+python fuzz/tools/gen_framework_corpus.py
+```
+
+## Deterministic replay WITHOUT cargo-fuzz (Windows-friendly)
+
+Each v0.1.12 target has a matching seed-replay + seeded-sweep test that
+runs on stable Rust with no cargo-fuzz installation — this is the
+Windows-side smoke story (live fuzzing still needs Linux/WSL2, above):
+
+```bash
+cargo test -p argus --test installer_spoofing seed_corpus_replays_cleanly
+cargo test -p sentinella-common etw_props::tests::seed_corpus_replays_cleanly
+cargo test -p sentinelld plm::cmdline::tests::seed_corpus_replays_cleanly
+```
+
+These replay the committed corpus through the SAME entry points and
+oracles as the fuzz targets. The full adversarial suite
+(`cargo test -p argus --test installer_spoofing`) adds 33 fixture and
+metamorphic tests on top.
 
 ## Reproducing Crashes
 
@@ -155,7 +200,8 @@ cp artifacts/fuzz_argus_pe/crash-abc123.min corpus/argus/crashes/
 
 ```bash
 # Regression replay — replay all known crash inputs (no new fuzzing):
-for target in fuzz_ipc_frame fuzz_argus_pe fuzz_convergence fuzz_etw_parser fuzz_paths; do
+for target in fuzz_ipc_frame fuzz_argus_pe fuzz_convergence fuzz_etw_parser fuzz_paths \
+              framework_detect framework_pe_parse etw_props_layout cmdline_decode; do
   corpus_dir="corpus/${target#fuzz_}"
   if [ -d "$corpus_dir" ]; then
     cargo +nightly fuzz run $target $corpus_dir -- -runs=0

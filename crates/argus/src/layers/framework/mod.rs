@@ -50,7 +50,13 @@
 pub(crate) mod fixtures;
 pub(crate) mod inno;
 pub(crate) mod nsis;
-pub(crate) mod pe;
+// WHY `pub`: the bounded header parser is exposed so the cargo-fuzz harness
+// (`fuzz/fuzz_targets/framework_pe_parse.rs`, a separate crate) can drive
+// `pe::parse` directly, not only through `detect`. It is a facts-only,
+// total parser — exposing it grants no mitigation authority (that decision
+// lives in `FrameworkDetection::build`, unchanged). The detectors and the
+// test fixture builder stay crate-private.
+pub mod pe;
 pub(crate) mod wix;
 
 /// The installer/bundle framework a file is built with, if any.

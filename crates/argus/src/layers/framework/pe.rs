@@ -30,7 +30,7 @@ use std::ops::Range;
 /// than clamped — a header claiming thousands of sections is malformed, and
 /// parsing an attacker-chosen prefix of it as authoritative would be worse
 /// than failing closed.
-pub(crate) const MAX_SECTIONS: u16 = 96;
+pub const MAX_SECTIONS: u16 = 96;
 
 /// Cap on recorded warnings. Pathological headers (96 mutually-overlapping
 /// sections) would otherwise produce thousands of diagnostic strings.
@@ -60,20 +60,20 @@ const RESOURCE_DIR_INDEX: u64 = 2;
 ///
 /// Returns `None` when `offset` does not fit `usize` or `offset + len`
 /// overflows or exceeds the buffer. Total on any inputs.
-pub(crate) fn get(data: &[u8], offset: u64, len: usize) -> Option<&[u8]> {
+pub fn get(data: &[u8], offset: u64, len: usize) -> Option<&[u8]> {
     let start = usize::try_from(offset).ok()?;
     let end = start.checked_add(len)?;
     data.get(start..end)
 }
 
 /// Bounded little-endian u16 read.
-pub(crate) fn read_u16_le(data: &[u8], offset: u64) -> Option<u16> {
+pub fn read_u16_le(data: &[u8], offset: u64) -> Option<u16> {
     let bytes: [u8; 2] = get(data, offset, 2)?.try_into().ok()?;
     Some(u16::from_le_bytes(bytes))
 }
 
 /// Bounded little-endian u32 read.
-pub(crate) fn read_u32_le(data: &[u8], offset: u64) -> Option<u32> {
+pub fn read_u32_le(data: &[u8], offset: u64) -> Option<u32> {
     let bytes: [u8; 4] = get(data, offset, 4)?.try_into().ok()?;
     Some(u32::from_le_bytes(bytes))
 }
@@ -87,7 +87,7 @@ pub(crate) fn read_u32_le(data: &[u8], offset: u64) -> Option<u32> {
 // next; only the parser tests read most of them today.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
-pub(crate) struct SectionInfo {
+pub struct SectionInfo {
     /// Section name, NUL-trimmed and lossy-decoded from the 8 header bytes.
     pub name: String,
     /// `VirtualAddress` (RVA) from the section header.
@@ -110,7 +110,7 @@ impl SectionInfo {
     /// cannot wrap.
     // Consumed by the detector wave that lands next; only tests use it today.
     #[allow(dead_code)]
-    pub(crate) fn raw_range(&self, file_len: usize) -> Option<Range<usize>> {
+    pub fn raw_range(&self, file_len: usize) -> Option<Range<usize>> {
         if self.raw_size == 0 {
             return None;
         }
@@ -134,7 +134,7 @@ impl SectionInfo {
 // next; only the parser tests read most of them today.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
-pub(crate) struct PeInfo {
+pub struct PeInfo {
     /// `e_lfanew` — file offset of the PE signature, as declared in the DOS
     /// header.
     pub e_lfanew: u32,
@@ -186,7 +186,7 @@ pub(crate) struct PeInfo {
 /// - **Flag + keep**: raw ranges overlapping the headers and mutually
 ///   overlapping sections are recorded in `warnings` but do not abort
 ///   parsing — the remaining structure is still usable evidence.
-pub(crate) fn parse(data: &[u8]) -> Option<PeInfo> {
+pub fn parse(data: &[u8]) -> Option<PeInfo> {
     let mut warnings: Vec<String> = Vec::new();
 
     // DOS header + e_lfanew.

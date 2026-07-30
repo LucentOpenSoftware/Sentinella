@@ -3919,3 +3919,7 @@ mod tests {
         }
     }
 }
+
+/// Adversarial scoring suite (workstreams X+Y) — see the module docs.
+#[cfg(test)]
+mod adversarial;

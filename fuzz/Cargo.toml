@@ -13,9 +13,27 @@ arbitrary = { version = "1", features = ["derive"] }
 
 # Sentinella crates under test.
 argus = { path = "../crates/argus" }
+sentinella-common = { path = "../crates/sentinella-common" }
 
 # Shared dependencies for harness construction.
 serde_json = "1"
+# serde (derive) is required ONLY by the cmdline_decode target, which
+# #[path]-includes sentinelld's parser source verbatim (sentinelld is a
+# binary-only crate — see that target's module docs). Both serde and
+# serde_derive are already in this project's lockfile via serde_json's
+# ecosystem; no new external code is introduced.
+serde = { version = "1", features = ["derive"] }
+
+# Required ONLY by the cmdline_decode target on Windows hosts: the
+# #[path]-included parser source compiles its cfg(windows) backend, which
+# imports these two windows-crate modules. Same crate/version already used
+# by sentinelld — additive, no new external code.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Wdk_System_Threading",
+] }
 
 [[bin]]
 name = "fuzz_convergence"
@@ -40,4 +58,24 @@ doc = false
 [[bin]]
 name = "fuzz_argus_pe"
 path = "fuzz_targets/fuzz_argus_pe.rs"
+doc = false
+
+[[bin]]
+name = "framework_detect"
+path = "fuzz_targets/framework_detect.rs"
+doc = false
+
+[[bin]]
+name = "framework_pe_parse"
+path = "fuzz_targets/framework_pe_parse.rs"
+doc = false
+
+[[bin]]
+name = "etw_props_layout"
+path = "fuzz_targets/etw_props_layout.rs"
+doc = false
+
+[[bin]]
+name = "cmdline_decode"
+path = "fuzz_targets/cmdline_decode.rs"
 doc = false

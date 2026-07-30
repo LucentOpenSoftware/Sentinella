@@ -709,4 +709,149 @@ mod tests {
         assert_eq!(j["present"], 1);
         assert_eq!(j["access_denied"], 1);
     }
+
+    // ── adversarial sweeps (workstreams X+Y) ────────────────────
+    //
+    // The UNICODE_STRING parser consumes attacker-controlled bytes (a
+    // process supplies its own command line). These tests pin totality
+    // against seeded deterministic sweeps and replay the committed
+    // cargo-fuzz seed corpus through the SAME rebase convention the
+    // `cmdline_decode` fuzz target uses (no cargo-fuzz required).
+    //
+    // Rebase convention: the parser requires the payload pointer to be an
+    // absolute address inside the buffer, which a byte string cannot
+    // carry. Harnesses therefore interpret the pointer field as a
+    // RELATIVE offset and rebase it: ptr = buf.as_ptr() + (rel % len).
+    // This keeps every validation branch reachable from bytes alone.
+
+    /// xorshift64* — deterministic, no rand crate, no thread_rng.
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn bytes(&mut self, n: usize) -> Vec<u8> {
+            let mut v = Vec::with_capacity(n);
+            while v.len() < n {
+                v.extend_from_slice(&self.next().to_le_bytes());
+            }
+            v.truncate(n);
+            v
+        }
+    }
+
+    /// Rebase the pointer field of a raw buffer per the convention above.
+    fn rebase_pointer(buf: &mut [u8]) {
+        let ptr_size = std::mem::size_of::<usize>();
+        if buf.len() < 2 * ptr_size {
+            return; // parser will call it Malformed on its own
+        }
+        let mut rel_bytes = [0u8; 8];
+        rel_bytes[..ptr_size].copy_from_slice(&buf[ptr_size..2 * ptr_size]);
+        let rel = usize::from_le_bytes(rel_bytes) % buf.len();
+        let abs = buf.as_ptr() as usize + rel;
+        buf[ptr_size..2 * ptr_size].copy_from_slice(&abs.to_le_bytes()[..ptr_size]);
+    }
+
+    /// The post-conditions every parse outcome must satisfy.
+    fn assert_state_invariants(state: &CommandLineState) {
+        if let CommandLineState::Present(s) = state {
+            assert!(
+                s.encode_utf16().count() <= MAX_COMMAND_LINE_UTF16_UNITS,
+                "present value exceeds the structural cap"
+            );
+            assert!(!s.is_empty(), "empty string must be Empty, not Present");
+            assert!(!s.contains('\0'), "embedded NUL must have truncated");
+        }
+    }
+
+    /// Seeded sweep: arbitrary byte buffers (rebased) through the
+    /// UNICODE_STRING parser — never panics, outcome always a valid state.
+    #[test]
+    fn seeded_sweep_parse_never_panics() {
+        let mut rng = XorShift(0xCD10_0BAD_F00D_1234);
+        for i in 0..2048 {
+            let len = (rng.next() % 512) as usize;
+            let mut buf = rng.bytes(len);
+            // Every fourth buffer gets a plausible-looking header so the
+            // deep validation branches (extent checks, decode) are hit.
+            if i % 4 == 0 && buf.len() >= 2 * std::mem::size_of::<usize>() + 8 {
+                let claimed = (rng.next() % 700) as u16;
+                buf[0..2].copy_from_slice(&claimed.to_le_bytes());
+            }
+            rebase_pointer(&mut buf);
+            let state = parse_unicode_string_payload(&buf);
+            assert_state_invariants(&state);
+        }
+    }
+
+    /// Seeded sweep: arbitrary UTF-16 unit sequences through the decoder —
+    /// lone surrogates, NUL runs, cap-length inputs; never panics.
+    #[test]
+    fn seeded_sweep_decode_units_never_panics() {
+        let mut rng = XorShift(0xDEC0_DE11_5EED_A55E);
+        for _ in 0..2048 {
+            let n = (rng.next() % 600) as usize;
+            let mut units = Vec::with_capacity(n);
+            for _ in 0..n {
+                // Bias toward interesting code units: NULs and surrogates.
+                units.push(match rng.next() % 4 {
+                    0 => 0,
+                    1 => 0xD800 + (rng.next() % 0x800) as u16, // surrogate range
+                    _ => rng.next() as u16,
+                });
+            }
+            let state = decode_command_line_units(&units);
+            assert_state_invariants(&state);
+            // Deterministic truncation contract: the visible value never
+            // extends past the first NUL unit.
+            if let (CommandLineState::Present(s), Some(nul)) =
+                (&state, units.iter().position(|&u| u == 0))
+            {
+                let prefix: String = String::from_utf16_lossy(&units[..nul]);
+                assert_eq!(*s, prefix);
+            }
+        }
+    }
+
+    /// Replay the committed cargo-fuzz seed corpus for `cmdline_decode`
+    /// through the same rebase convention + entry point. Seeds come from
+    /// fuzz/tools/gen_framework_corpus.py (deterministic). Exact outcome
+    /// expectations are x64-layout-specific (16-byte header); the no-panic
+    /// + invariants replay runs on every platform.
+    #[test]
+    fn seed_corpus_replays_cleanly() {
+        let seeds: [&[u8]; 5] = [
+            include_bytes!("../../../../fuzz/corpus/cmdline_decode/seed00-valid-terminated.bin"),
+            include_bytes!("../../../../fuzz/corpus/cmdline_decode/seed01-embedded-nul.bin"),
+            include_bytes!("../../../../fuzz/corpus/cmdline_decode/seed02-odd-length.bin"),
+            include_bytes!("../../../../fuzz/corpus/cmdline_decode/seed03-extent-past-buffer.bin"),
+            include_bytes!("../../../../fuzz/corpus/cmdline_decode/seed04-random.bin"),
+        ];
+        let mut states = Vec::new();
+        for raw in seeds {
+            let mut buf = raw.to_vec();
+            rebase_pointer(&mut buf);
+            let state = parse_unicode_string_payload(&buf);
+            assert_state_invariants(&state);
+            states.push(state);
+        }
+
+        if std::mem::size_of::<usize>() == 8 {
+            assert_eq!(
+                states[0],
+                CommandLineState::Present("javaw.exe -jar Component.jar".into())
+            );
+            assert_eq!(states[1], CommandLineState::Present("benign.exe".into()));
+            assert_eq!(states[2], CommandLineState::Malformed, "odd byte length");
+            assert_eq!(states[3], CommandLineState::Malformed, "extent past buffer");
+        }
+    }
 }
