@@ -1,5 +1,107 @@
 # Changelog
 
+## [Unreleased] - 2026-07-30
+
+Full implementation/reconstruction round following the v0.1.12 external
+review (`docs/EXTERNAL_REVIEW_v0.1.12.md`). Audit spine:
+`docs/IMPLEMENTATION_ROUND_MATRIX.md`; handoff:
+`docs/IMPLEMENTATION_ROUND_HANDOFF.md`.
+
+### Detection engine (ARGUS)
+
+- **Structural installer-framework detection replaces substring
+  markers (F-7, CRITICAL evasion closed).** `is_known_installer`'s
+  unanchored full-buffer scans (`Nullsoft Inst`, `Inno Setup S`,
+  `Windows Installer`) are replaced by an evidence model
+  (`layers/framework/`) whose centralized invariant — constructible only
+  via `FrameworkDetection::build` — makes textual/filename hints
+  diagnostically visible but permanently mitigation-ineligible:
+  - NSIS: 28-byte firstheader at a 512-aligned overlay offset, validated
+    like the NSIS exehead itself, including zlib CRC-32 of the archive
+    span (primary sources: kichik/nsis fileform.h/.c, build.cpp).
+  - Inno Setup: `TSetupLdrOffsetTable` inside the `.rsrc` section raw
+    range, SetupLdr's own validation chain (Version, TableCRC, coherent
+    offsets) plus grammar-valid setup-data header at `Offset0`
+    (jrsoftware/issrc primary sources).
+  - WiX Burn: `.wixburn` section + `BURN_SECTION_HEADER` + `MSCF` UX
+    container chain (wixtoolset wix3/v4 sources). Native MSI stays
+    extension-only (WeakHint); MSI-API imports are deliberately not a
+    classification input.
+- **Mitigation policy hardened.** Score mitigation now requires
+  `Structural` confidence AND `mitigation_safe`; Corroborated
+  (tampered/truncated archives) is diagnostic-only; WeakHint grants
+  nothing — including legacy Electron/Go/Rust/name hints (deliberate
+  calibration change closing the whole marker-injection class; bounded
+  to Suspicious labels, the 85 quarantine bar is untouched). A
+  high-confidence veto (any pre-mitigation finding ≥ 40: IoC 90,
+  YARA-40, MIME-45) blocks mitigation entirely — installer identity can
+  never erase independent malicious evidence. One mitigation pass per
+  file; `/3` and `/2` divisions preserved.
+- **Score provenance.** `VerdictExplanation.framework_mitigation`
+  (additive, serde-compatible) records kind, confidence, evidence with
+  offsets, every weight division before/after, score before/after, and
+  veto reasons — "why (no) discount?" is answerable from verdict JSON.
+- **Calibration tooling.** `examples/eval.rs` gains `--json` (NDJSON
+  with full provenance) and `--compare-old-new` (old-logic replica,
+  transition tags, quarantine crossings; read-only). Verification on
+  100 System32 binaries: 0 category changes, 0 quarantine crossings,
+  1 correctly-rejected weak marker.
+
+### Runtime detection (ETW / PLM)
+
+- **ETW reconstructed as a real system-logger session (F-1).** The old
+  session started successfully but received zero kernel events
+  (`EnableFlags` invalid for non-system loggers). Now:
+  `EVENT_TRACE_SYSTEM_LOGGER_MODE` + frozen private session GUID (never
+  `SystemTraceControlGuid`), all constants SDK-sourced with a
+  cross-check test (a hand-typed `0x200` literal for the mode — actually
+  `DELAY_OPEN_FILE_MODE` — was caught in cross-agent review). Stage
+  machine replaces the `etw_running` bool (true only at
+  ConsumerOpened+); zero-event watchdog; ≥5-failure give-up;
+  1450-slot-exhaustion handling; shutdown join stops the session (no
+  more orphaned kernel sessions on fast stops). sandboxd parity +
+  truthful labels (`polling_fallback`/`etw_session_no_events` vs
+  claiming kernel session); `etw_probe` rewritten as a real PASS/FAIL
+  diagnostic. Central aligned `EVENT_TRACE_PROPERTIES` storage in
+  `sentinella_common::etw_props` fixes the `Vec<u8>`-cast alignment UB
+  in all three components (18 layout tests).
+- **Command-line capture restores 4 WeedHack signals (C-6).**
+  `ProcessNode.command_line` was `None` at every production site; now
+  captured at discovery time via
+  `NtQueryInformationProcess(ProcessCommandLineInformation)` with a
+  `CommandLineState` enum (no fabricated defaults; per-state telemetry;
+  bounded 64 KiB; attacker-controlled-input handling). Signal tests pin
+  silence for every non-Present state.
+
+### Hardening
+
+- **Data-root DACL (F-15):** idempotent startup repair converges
+  `C:\ProgramData\Sentinella` to SYSTEM+Admins-only (owner repaired to
+  Administrators; compare-first, no churn; reparse-safe; dev-mode
+  skip). Vault keys' ACLs re-asserted on every load (was creation-only)
+  — fail closed, keys never rotated.
+- **IPC fairness:** per-SID connection quota (8/principal + capped
+  unidentified bucket — one principal can no longer park all 64
+  permits) and per-principal request-rate budgets under the unchanged
+  global ceiling (one caller can no longer drain the global ScanControl
+  bucket; verified live pre-fix, harness test post-fix).
+- **Watch roots (F-9):** per-user `%LOCALAPPDATA%\Programs` now watched
+  unconditionally (SYSTEM-safe profile enumeration, case-insensitive
+  dedup, missing-dir skip).
+- **Threshold documentation (F-8):** engine Malicious *label* (76) vs
+  daemon ARGUS-only quarantine bar (85) now stated correctly in code
+  comments and docs, with a regression test +
+  `scripts/check-threshold-docs.ps1` guard. The intentional 85 bar is
+  unchanged.
+
+### Testing
+
+~150 new tests this round (detector rejection/metamorphic/fuzz sweeps,
+ETW layout/state machine, ACL policy, limiter fairness, command-line
+states, scoring veto/provenance, corpus transitions). Fuzz targets for
+the framework parsers. Elevated live tests exist but are opt-in
+(`--ignored`): ETW event delivery, ACL repair roundtrip.
+
 ## [0.1.12] - 2026-07-29
 
 Post-v0.1.11 deep audit of the full tree (all 11 crates, the Tauri GUI,
