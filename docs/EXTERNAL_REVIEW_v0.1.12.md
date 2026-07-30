@@ -21,7 +21,10 @@ are preserved under `.audit/` (`ws-agent-3*.md`, `.audit/eval/*.tsv`).
 2. **The real quarantine bar is not 76 — it's 85, ARGUS-only.**
    `unify_detection_filtered` (`ipc/state.rs:6414-6422`): ClamAV hit →
    always a threat; ARGUS-only needs score ≥ 85 — and 76–84 ARGUS-only
-   is silently dropped, not even recorded. Every threshold discussion in
+   is silently dropped from detection handling: no detection row, no
+   quarantine, scan reported clean (the raw ARGUS verdict is still
+   persisted as a forensic record via `persist_argus_verdict`,
+   `ipc/state.rs:2443`). Every threshold discussion in
    this report must be read against 85, not the documented 76.
 3. **The ETW session delivers zero events — and the brief's hypothesized
    fix would have broken it further.** `SentinellaPLM` is not a system
@@ -157,8 +160,10 @@ weight 90).
 ### F-8 [HIGH] The documented quarantine threshold is wrong: ARGUS-only needs 85
 `crates/sentinelld/src/ipc/state.rs:6414-6422` — **REASONED**.
 - *Failure mode:* ARGUS-only scores 76–84 are labeled Malicious by the
-  engine but `(false, None)` in detection unification — not recorded,
-  not quarantined, not surfaced. Every threshold calibration (§3.3) must
+  engine but `(false, None)` in detection unification — no detection
+  record, not quarantined, not surfaced (only the raw ARGUS verdict
+  row is persisted as forensic metadata, `ipc/state.rs:2443`). Every
+  threshold calibration (§3.3) must
   target 85, not 76; at 85, heuristic-only conviction is materially
   harder than §3.3's 76-arithmetic suggests (p2=80 and p4=78 both fall
   short ARGUS-only).

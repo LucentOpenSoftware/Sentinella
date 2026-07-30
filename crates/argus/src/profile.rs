@@ -75,6 +75,13 @@ pub struct ScanProfile {
     /// Lower = more sensitive, higher = fewer false positives.
     pub convergence_threshold: u32,
     /// Score at which auto-quarantine triggers.
+    ///
+    /// NOTE: currently write-only — no code reads this field. The real
+    /// quarantine decision lives in the daemon's `unify_detection_filtered`
+    /// (`sentinelld/src/ipc/state.rs`): ClamAV-confirmed → always a threat;
+    /// ARGUS-only → requires score >= 85 (the engine's Malicious *label*
+    /// at 76 does NOT quarantine on its own). The value here is kept for
+    /// future profile-driven policy; do not treat it as authoritative.
     pub quarantine_threshold: u32,
 
     // ── Archive behavior ─────────────────────────────────

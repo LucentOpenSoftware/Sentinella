@@ -434,7 +434,14 @@ impl ConfidenceLabel {
 }
 
 impl ArgusVerdict {
-    /// True if the score reaches the Malicious threshold (76+).
+    /// True if the score reaches the engine's Malicious *label* threshold
+    /// (76+, see `Verdict::from_score`).
+    ///
+    /// This is a label only — it is NOT the daemon's quarantine bar.
+    /// `sentinelld`'s `unify_detection_filtered` treats a ClamAV-confirmed
+    /// file as a threat at this level, but requires score >= 85 for
+    /// ARGUS-only auto-quarantine; ARGUS-only 76-84 is labeled Malicious
+    /// here yet produces no detection record and no quarantine.
     ///
     /// Critical findings alone do NOT make a file a threat — they need
     /// corroboration from other layers to push the score above 76.

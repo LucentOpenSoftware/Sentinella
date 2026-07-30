@@ -6507,7 +6507,10 @@ pub fn unify_detection_filtered(
 ) -> (bool, Option<String>) {
     // ClamAV signature match → always threat.
     // ARGUS-only → require higher confidence for auto-quarantine.
-    // Score 76-84 ARGUS-only = suspicious but NOT auto-quarantined.
+    // Score 76-84 ARGUS-only = labeled Malicious by the engine
+    // (Verdict::from_score) but NOT a detection here: no detection row,
+    // no quarantine, scan reported clean — only the raw ARGUS verdict is
+    // persisted as a forensic record (persist_argus_verdict).
     // Score 85+ ARGUS-only = high confidence → auto-quarantine.
     // This prevents "Suspicious.Generic [78/100]" from quarantining
     // legitimate installers that happen to look structurally suspicious.
@@ -6803,6 +6806,42 @@ mod tests {
     }
 
     // ── unify_detection_filtered ─────────────────────────────────
+
+    // Regression guard for the documented threshold split (F-8):
+    // the engine's Malicious *label* starts at 76 (argus Verdict::from_score),
+    // but the daemon's ARGUS-only quarantine bar is 85. Docs once claimed
+    // 76 was THE quarantine threshold — wrong.
+    //
+    // EDITORS: if you change the 85 bar below, you MUST also update
+    // docs/ARGUS_CONVERGENCE_MODEL.md, docs/EXTERNAL_REVIEW_v0.1.12.md,
+    // the comment block on unify_detection_filtered, and run
+    // scripts/check-threshold-docs.ps1 to re-validate the docs.
+    #[test]
+    fn argus_only_quarantine_threshold_is_85_not_76() {
+        // 84 = Malicious label from the engine, but silently dropped from
+        // detection handling (no detection row, no quarantine).
+        let argus = make_verdict(84);
+        assert!(
+            argus.is_threat(),
+            "engine still labels 84 as Malicious (label threshold is 76)"
+        );
+        let (infected, name) = unify_detection_filtered(false, None, &argus, &[]);
+        assert!(
+            !infected && name.is_none(),
+            "ARGUS-only 84 must NOT be quarantined (daemon bar is 85)"
+        );
+
+        // 85 = high-confidence ARGUS-only → quarantined.
+        let argus = make_verdict(85);
+        let (infected, _) = unify_detection_filtered(false, None, &argus, &[]);
+        assert!(infected, "ARGUS-only 85 must be quarantined");
+
+        // ClamAV confirmation keeps the engine's normal 76 bar.
+        let argus = make_verdict(76);
+        let (infected, _) =
+            unify_detection_filtered(true, Some("Win.Trojan.Agent"), &argus, &[]);
+        assert!(infected, "ClamAV-confirmed 76 must remain a threat");
+    }
 
     #[test]
     fn clamav_positive_argus_low_score_is_infected() {
