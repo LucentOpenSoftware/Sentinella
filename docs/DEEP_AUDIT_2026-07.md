@@ -163,8 +163,8 @@ landed in total (including low-severity and enhancement items), plus a
 
 - Shared libclamav-bindings crate for `sentinelld`/`clamavd`
   (architectural).
-- `clamavd self-test` subcommand (would give subprocess mode its first
-  end-to-end coverage — recommended follow-up).
+- ~~`clamavd self-test` subcommand~~ — **no longer deferred: delivered in
+  round 2** as `clamavd --self-test` (EICAR round-trip). See below.
 - Update-manifest signing (trust anchor is currently hard-fail verify;
   signing is a release-infrastructure decision).
 - `check_chain_drift` wiring (needs PLM chain-key plumbing that doesn't
@@ -236,5 +236,8 @@ full test suite green.
   intentionally serve local users.
 - Pipe-identity resolution still fails open on *transient* API errors
   (documented trade-off so an API quirk can't brick a legitimate GUI).
-- Subprocess `clamavd` mode has no end-to-end test (see Deferred).
+- Subprocess `clamavd` mode's coverage is the round-2 `--self-test`
+  (EICAR round-trip over the real FFI contract) — that closes the
+  "no end-to-end coverage" gap round 1 recorded, but it is a single
+  happy-path probe, not a suite.
 - `clamav-main/` upstream code was not re-audited.
