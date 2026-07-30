@@ -2,10 +2,69 @@
 //!
 //! Every IPC method has a declared class, auth requirements, payload limit,
 //! and rate limit bucket. The dispatcher checks policy BEFORE dispatching.
+//!
+//! # Rate limiter map (v0.1.12, workstream K/L)
+//!
+//! Precise semantics of the request-rate limiter (`RateLimiter`), as
+//! enforced by `dispatch_sync` (ipc/mod.rs) on EVERY request whose method
+//! is in the registry:
+//!
+//! - **Scope/key**: two layers. (1) a GLOBAL token bucket per `RateBucket`
+//!   class (one `RateLimiter` lives in `AppState`, shared by all
+//!   connections) — the hard ceiling, unchanged since introduction;
+//!   (2) a PER-PRINCIPAL sub-bucket per (`RateBucket`, client SID) added
+//!   in v0.1.12. Before v0.1.12 only layer (1) existed, so one caller
+//!   draining ScanControl (10/min, burst 3) starved every other caller's
+//!   scan.start / scan.cancel / update.start / argus.analyze / engine.reload
+//!   (matrix row C-5). The per-principal layer caps any single SID at
+//!   roughly half the steady-state budget of each bucket.
+//! - **Identity source**: the accept-time `ClientIdentity` resolved from
+//!   the named-pipe client process token (same SID fairness.rs keys
+//!   connection quotas on) — kernel-owned, not client-choosable, and NOT
+//!   derived from the `auth` param, so an auth failure cannot rotate
+//!   identities to mint fresh budgets. Unresolved identities (fail-open
+//!   path, non-Windows) share one conservative `Unidentified` bucket with
+//!   the same per-principal numbers — never a per-PID bucket (a PID-keyed
+//!   quota is void on arrival: spawn N processes, get N budgets).
+//! - **Reset interval**: continuous refill, `max_per_minute` tokens/min,
+//!   fractional remainder preserved (v0.1.9 MED-12 fix); burst = initial
+//!   and max accumulated tokens.
+//! - **Check order**: per-principal first, then global. A request rejected
+//!   by EITHER layer consumes NO token from that layer; a per-principal
+//!   rejection consumes no global token either (rejected requests are
+//!   free for the victim's budget — they only cost the flooder CPU).
+//! - **Failure response**: JSON-RPC error `RATE_LIMITED` (-32020) with
+//!   `retry after Ns` where N = max(60/rate_per_minute, 1) of the layer
+//!   that rejected.
+//! - **Memory accounting**: the global layer is a fixed 8-entry map. The
+//!   per-principal layer is bounded by `MAX_PRINCIPAL_ENTRIES` (256)
+//!   (bucket, principal) pairs with LRU eviction — a high-cardinality
+//!   SID spray cannot grow memory unboundedly (and SIDs come from real
+//!   process tokens, so cardinality is naturally small).
+//! - **Relation to the connection semaphore / fairness quota**: fully
+//!   independent. Connection limits (mod.rs `conn_sem` + fairness.rs)
+//!   bound concurrent SESSIONS per principal; this limiter bounds
+//!   REQUESTS within and across sessions. One connection may issue
+//!   unlimited requests — each passes through here.
+//! - **Auth-vs-rate ordering (finding, deliberately kept)**: the rate
+//!   check runs BEFORE the central MethodClass auth gate (dispatch_sync
+//!   Phase 3 before Phase 8), so an unauthenticated request DOES consume
+//!   a token. Pre-v0.1.12 that let an unauthenticated flooder drain the
+//!   shared global bucket; with per-principal keying the flooder now only
+//!   burns their own sub-budget (the IPC secret is world-readable anyway,
+//!   so "authenticated" was never a meaningful rate boundary). Keeping
+//!   rate-first also throttles UNAUTHORIZED-response generation for
+//!   unauthenticated garbage, and preserves the historical error
+//!   precedence (RATE_LIMITED before UNAUTHORIZED). The elevation gate
+//!   for challengeable methods still runs before BOTH, so unelevated
+//!   callers never consume tokens for privileged methods.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::Instant;
+
+use super::client_auth::ClientIdentity;
 
 /// Method security class — determines auth + challenge requirements.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,18 +110,40 @@ pub enum RateBucket {
 struct BucketConfig {
     max_per_minute: u32,
     burst: u32,
+    /// Per-principal sub-budget (v0.1.12): the most ONE resolved SID (or
+    /// the shared unidentified bucket) may draw from this bucket.
+    per_principal_max_per_minute: u32,
+    per_principal_burst: u32,
 }
 
 impl BucketConfig {
-    const fn new(max_per_minute: u32, burst: u32) -> Self {
+    const fn new(
+        max_per_minute: u32,
+        burst: u32,
+        per_principal_max_per_minute: u32,
+        per_principal_burst: u32,
+    ) -> Self {
         Self {
             max_per_minute,
             burst,
+            per_principal_max_per_minute,
+            per_principal_burst,
         }
     }
 }
 
 fn bucket_config(bucket: RateBucket) -> BucketConfig {
+    // Per-principal sizing rule: ~half the steady-state global rate, so a
+    // single principal can never consume the whole bucket and a second
+    // principal always has headroom; the global bucket stays the ceiling
+    // (its numbers are UNCHANGED). Where the per-principal burst is one
+    // below the global burst (ScanControl, QuarantineOps) a cold-start
+    // flooder cannot drain the initial global tokens — one is reserved
+    // for a second principal. For 2-token-burst buckets we keep pairs
+    // working (settings.set→protection.disable, sources.set→sources.update,
+    // memory.list_processes→memory.scan_process): the flooder can take the
+    // whole cold-start burst but steady state stays ≤ half, so a second
+    // principal waits at most one global refill interval (≤ 12s).
     match bucket {
         // v0.1.8: bumped 120/20 -> 300/40 to absorb v0.1.8 Settings page
         // bursts (3 extra reads on every Settings open: settings.get_full,
@@ -72,20 +153,74 @@ fn bucket_config(bucket: RateBucket) -> BucketConfig {
         // 12/min cushion for everything else. New 300/min cushion is
         // 192/min above dashboard baseline, plenty for Settings + ad-hoc
         // user-driven status queries from other pages.
-        RateBucket::Status => BucketConfig::new(300, 40),
-        RateBucket::ScanControl => BucketConfig::new(10, 3),
-        RateBucket::QuarantineOps => BucketConfig::new(30, 5),
-        RateBucket::ConfigMutation => BucketConfig::new(10, 2),
-        RateBucket::DiagnosticsExport => BucketConfig::new(6, 2),
-        RateBucket::SourcesMutation => BucketConfig::new(5, 2),
-        RateBucket::MemoryScan => BucketConfig::new(10, 2),
-        RateBucket::Unlimited => BucketConfig::new(u32::MAX, u32::MAX),
+        //
+        // Per-principal 150/min: the dashboard's ~108/min all comes from
+        // ONE user SID and must keep fitting; 150 leaves the other half
+        // of the global budget for a second session/CLI.
+        RateBucket::Status => BucketConfig::new(300, 40, 150, 40),
+        // Per-principal burst 2 (not 3): reserves one cold-start token so
+        // a second principal's first scan.start/update.start always goes
+        // through; a scan.start+scan.cancel pair still fits.
+        RateBucket::ScanControl => BucketConfig::new(10, 3, 5, 2),
+        RateBucket::QuarantineOps => BucketConfig::new(30, 5, 15, 4),
+        RateBucket::ConfigMutation => BucketConfig::new(10, 2, 5, 2),
+        RateBucket::DiagnosticsExport => BucketConfig::new(6, 2, 3, 2),
+        RateBucket::SourcesMutation => BucketConfig::new(5, 2, 2, 2),
+        RateBucket::MemoryScan => BucketConfig::new(10, 2, 5, 2),
+        RateBucket::Unlimited => BucketConfig::new(u32::MAX, u32::MAX, u32::MAX, u32::MAX),
     }
 }
 
-/// Per-bucket token-bucket rate limiter.
+/// Per-principal identity key for request-rate accounting. Deliberately
+/// mirrors `fairness::PrincipalKey` (same Sid/Unidentified split, same
+/// no-PID-fallback rationale) but is defined locally so the policy module
+/// stays self-contained; fairness.rs keeps its key private.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum PrincipalKey {
+    /// String SID from the client process's token (e.g. `S-1-5-21-…`).
+    Sid(String),
+    /// Identity unresolved (fail-open path) or non-Windows — one shared,
+    /// conservatively-capped bucket, never a bypass.
+    Unidentified,
+}
+
+impl PrincipalKey {
+    fn from_identity(id: Option<&ClientIdentity>) -> Self {
+        match id {
+            Some(i) => PrincipalKey::Sid(i.sid.clone()),
+            None => PrincipalKey::Unidentified,
+        }
+    }
+}
+
+/// Hard bound on tracked (bucket, principal) sub-buckets. 256 entries ×
+/// ~100 bytes is ~25 KB worst case; beyond it the LRU entry is evicted.
+/// Real cardinality is tiny (SIDs come from kernel-owned process tokens,
+/// not from anything the client chooses), so eviction should never fire
+/// outside an artificial SID spray — and even then memory stays flat.
+const MAX_PRINCIPAL_ENTRIES: usize = 256;
+
+/// Per-principal token bucket state. Lives behind the table mutex, so no
+/// atomics are needed; `last_used` is an LRU tick (table clock value).
+struct PrincipalBucket {
+    tokens: u64,
+    last_refill: Instant,
+    last_used: u64,
+}
+
+#[derive(Default)]
+struct PrincipalTable {
+    map: HashMap<(RateBucket, PrincipalKey), PrincipalBucket>,
+    clock: u64,
+}
+
+/// Two-layer rate limiter: per-principal sub-budgets over per-bucket
+/// global token buckets. The GLOBAL layer keeps its exact pre-v0.1.12
+/// semantics (same numbers, same atomic refill algorithm); the
+/// per-principal layer sits in front of it — see module docs.
 pub struct RateLimiter {
     buckets: HashMap<RateBucket, BucketState>,
+    principals: Mutex<PrincipalTable>,
 }
 
 struct BucketState {
@@ -117,11 +252,75 @@ impl RateLimiter {
                 },
             );
         }
-        Self { buckets }
+                Self {
+            buckets,
+            principals: Mutex::new(PrincipalTable::default()),
+        }
     }
 
-    /// Try to consume one token. Returns Ok(()) or Err with retry_after_secs.
-    pub fn check(&self, bucket: RateBucket) -> Result<(), u32> {
+    /// Per-principal phase: refill + consume one token from the caller's
+    /// sub-bucket for `bucket`. Returns Err(retry_after_secs) WITHOUT
+    /// touching the global bucket when the principal's share is spent, so
+    /// a flooder's rejected requests never eat into anyone else's budget.
+    fn check_principal(
+        &self,
+        bucket: RateBucket,
+        config: &BucketConfig,
+        principal: Option<&ClientIdentity>,
+    ) -> Result<(), u32> {
+        let mut table = self.principals.lock().unwrap_or_else(|e| e.into_inner());
+        table.clock += 1;
+        let tick = table.clock;
+        let key = (bucket, PrincipalKey::from_identity(principal));
+        if !table.map.contains_key(&key) && table.map.len() >= MAX_PRINCIPAL_ENTRIES {
+            // LRU eviction — O(n) scan over at most 256 entries, only on
+            // insert-when-full. Bound, not clever, on purpose.
+            if let Some(victim) = table
+                .map
+                .iter()
+                .min_by_key(|(_, b)| b.last_used)
+                .map(|(k, _)| k.clone())
+            {
+                table.map.remove(&victim);
+            }
+        }
+        let entry = table.map.entry(key).or_insert_with(|| PrincipalBucket {
+            tokens: config.per_principal_burst as u64,
+            last_refill: Instant::now(),
+            last_used: tick,
+        });
+        entry.last_used = tick;
+        // Same fractional-remainder-preserving refill as the global layer
+        // (v0.1.9 MED-12): advance `last_refill` by exactly the time the
+        // whole minted tokens account for.
+        let elapsed = entry.last_refill.elapsed();
+        let refill =
+            (elapsed.as_secs_f64() * config.per_principal_max_per_minute as f64 / 60.0) as u64;
+        if refill > 0 {
+            entry.tokens = entry
+                .tokens
+                .saturating_add(refill)
+                .min(config.per_principal_burst as u64);
+            let mpm = config.per_principal_max_per_minute.max(1) as f64;
+            entry.last_refill += std::time::Duration::from_secs_f64(refill as f64 * 60.0 / mpm);
+        }
+        if entry.tokens == 0 {
+            let retry_secs = (60 / config.per_principal_max_per_minute.max(1)).max(1);
+            return Err(retry_secs);
+        }
+        entry.tokens -= 1;
+        Ok(())
+    }
+
+    /// Try to consume one token for `principal` (accept-time identity;
+    /// `None` = unresolved → shared unidentified bucket). Returns Ok(())
+    /// or Err with retry_after_secs. Per-principal budget is checked
+    /// first, then the global bucket ceiling.
+    pub fn check(
+        &self,
+        bucket: RateBucket,
+        principal: Option<&ClientIdentity>,
+    ) -> Result<(), u32> {
         if bucket == RateBucket::Unlimited {
             return Ok(());
         }
@@ -129,6 +328,8 @@ impl RateLimiter {
             Some(s) => s,
             None => return Ok(()),
         };
+
+        self.check_principal(bucket, &state.config, principal)?;
 
         // Refill tokens based on elapsed time.
         //
@@ -536,8 +737,13 @@ mod tests {
     #[test]
     fn rate_limiter_allows_burst() {
         let limiter = RateLimiter::new();
-        for _ in 0..5 {
-            assert!(limiter.check(RateBucket::QuarantineOps).is_ok());
+        // v0.1.12: per-principal burst for QuarantineOps is 4 (global
+        // burst 5 minus the one reserved cold-start token); the global
+        // burst of 5 is still reachable ACROSS two principals (see
+        // global_ceiling_unchanged_across_many_principals for the
+        // ScanControl equivalent).
+        for _ in 0..4 {
+            assert!(limiter.check(RateBucket::QuarantineOps, None).is_ok());
         }
     }
 
@@ -545,18 +751,18 @@ mod tests {
     fn rate_limiter_blocks_excess() {
         let limiter = RateLimiter::new();
         // Exhaust SourcesMutation bucket (burst=2).
-        assert!(limiter.check(RateBucket::SourcesMutation).is_ok());
-        assert!(limiter.check(RateBucket::SourcesMutation).is_ok());
-        assert!(limiter.check(RateBucket::SourcesMutation).is_err());
+        assert!(limiter.check(RateBucket::SourcesMutation, None).is_ok());
+        assert!(limiter.check(RateBucket::SourcesMutation, None).is_ok());
+        assert!(limiter.check(RateBucket::SourcesMutation, None).is_err());
     }
 
     #[test]
     fn rate_limiter_never_underflows() {
         let limiter = RateLimiter::new();
-        assert!(limiter.check(RateBucket::SourcesMutation).is_ok());
-        assert!(limiter.check(RateBucket::SourcesMutation).is_ok());
+        assert!(limiter.check(RateBucket::SourcesMutation, None).is_ok());
+        assert!(limiter.check(RateBucket::SourcesMutation, None).is_ok());
         for _ in 0..10 {
-            assert!(limiter.check(RateBucket::SourcesMutation).is_err());
+            assert!(limiter.check(RateBucket::SourcesMutation, None).is_err());
         }
         let bucket = limiter.buckets.get(&RateBucket::SourcesMutation).unwrap();
         assert_eq!(bucket.tokens.load(Ordering::Relaxed), 0);
@@ -566,7 +772,7 @@ mod tests {
     fn rate_limiter_unlimited_never_blocks() {
         let limiter = RateLimiter::new();
         for _ in 0..100 {
-            assert!(limiter.check(RateBucket::Unlimited).is_ok());
+            assert!(limiter.check(RateBucket::Unlimited, None).is_ok());
         }
     }
 
@@ -595,7 +801,7 @@ mod tests {
         let bucket = limiter.buckets.get(&RateBucket::ConfigMutation).unwrap();
         // Drain initial tokens so the first refill is observable.
         for _ in 0..10 {
-            let _ = limiter.check(RateBucket::ConfigMutation);
+            let _ = limiter.check(RateBucket::ConfigMutation, None);
         }
         // Set last_refill to 6.5s ago via the only mutable backdoor:
         // the lock guard.
@@ -603,8 +809,20 @@ mod tests {
             let mut last = bucket.last_refill.lock().unwrap();
             *last = std::time::Instant::now() - std::time::Duration::from_millis(6_500);
         }
+        // v0.1.12: the drain above also spent the per-principal
+        // (unidentified) sub-bucket, which is checked FIRST — a probe
+        // with a spent sub-bucket would be rejected before ever reaching
+        // the global refill this test observes. Reset the principal
+        // table so the probe gets a fresh sub-bucket; the global state
+        // under test is untouched.
+        limiter
+            .principals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map
+            .clear();
         // Trigger a refill check.
-        let _ = limiter.check(RateBucket::ConfigMutation);
+        let _ = limiter.check(RateBucket::ConfigMutation, None);
         // After: should have minted 1 token (6.5s / 6s per token = 1
         // whole) and rolled last_refill forward by exactly 6s, leaving
         // ~0.5s of remainder.
@@ -630,5 +848,259 @@ mod tests {
         assert!(!reg["sources.set"].allowed_while_reloading);
         assert!(reg["health"].allowed_while_reloading);
         assert!(reg["scan.status"].allowed_while_reloading);
+    }
+
+    // ── v0.1.12 workstream K/L: per-principal starvation harness ─────
+    //
+    // These tests are the executable starvation demonstration for matrix
+    // row C-5. They drive the REAL RateLimiter code path — the exact
+    // `RateLimiter::check` call `dispatch_sync` makes for every request
+    // (a full in-process daemon harness is impractical: AppState::new
+    // spawns the PLM monitor, opens the trust-graph DB and reads vault
+    // keys; the entire rate path is this one call, so exercising it
+    // directly loses no fidelity). A live end-to-end probe against a
+    // running daemon is scripts/probe-request-rate-fairness.ps1.
+
+    fn sid(s: &str) -> ClientIdentity {
+        ClientIdentity {
+            sid: s.into(),
+            session_id: 1,
+            is_elevated: false,
+            is_system: false,
+            well_known_untrusted: false,
+        }
+    }
+
+    /// White-box helper: backdate a principal's sub-bucket clock so the
+    /// next check observes `ms` of refill, without sleeping.
+    fn backdate_principal(
+        limiter: &RateLimiter,
+        bucket: RateBucket,
+        id: Option<&ClientIdentity>,
+        ms: u64,
+    ) {
+        let mut t = limiter.principals.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (bucket, PrincipalKey::from_identity(id));
+        if let Some(b) = t.map.get_mut(&key) {
+            b.last_refill -= std::time::Duration::from_millis(ms);
+        }
+    }
+
+    /// White-box helper: backdate the GLOBAL bucket clock.
+    fn backdate_global(limiter: &RateLimiter, bucket: RateBucket, ms: u64) {
+        let state = limiter.buckets.get(&bucket).unwrap();
+        let mut last = state.last_refill.lock().unwrap_or_else(|e| e.into_inner());
+        *last -= std::time::Duration::from_millis(ms);
+    }
+
+    fn global_tokens(limiter: &RateLimiter, bucket: RateBucket) -> u64 {
+        limiter
+            .buckets
+            .get(&bucket)
+            .unwrap()
+            .tokens
+            .load(Ordering::Relaxed)
+    }
+
+    #[test]
+    fn scancontrol_one_principal_cannot_starve_another() {
+        // THE C-5 demonstration. Pre-v0.1.12 (global bucket only):
+        // ScanControl = 10/min burst 3 shared by everyone — the flooder's
+        // first 3 requests drained the ENTIRE global budget and a second
+        // principal's scan.start was rejected with RATE_LIMITED. Post-fix:
+        // the flooder's per-principal share is 5/min burst 2, one
+        // cold-start global token is reserved, and the victim is served.
+        let limiter = RateLimiter::new();
+        let flooder = sid("S-1-5-21-1-2-3-1100");
+        let victim = sid("S-1-5-21-1-2-3-1200");
+
+        let mut accepted = 0;
+        for _ in 0..20 {
+            if limiter.check(RateBucket::ScanControl, Some(&flooder)).is_ok() {
+                accepted += 1;
+            }
+        }
+        assert_eq!(
+            accepted, 2,
+            "flooder must be capped at its per-principal burst (2), not the global burst (3)"
+        );
+        assert_eq!(
+            global_tokens(&limiter, RateBucket::ScanControl),
+            1,
+            "one cold-start global token is reserved for other principals"
+        );
+        // The victim's first scan.start goes through even while the
+        // flooder is mid-flood.
+        assert!(
+            limiter.check(RateBucket::ScanControl, Some(&victim)).is_ok(),
+            "second principal must be served while the first is capped"
+        );
+    }
+
+    #[test]
+    fn two_principals_split_steady_state() {
+        // Steady-state fairness: over successive 12s windows (ScanControl
+        // refills 2 global + 1 per-principal token per window), the
+        // flooder can never take more than its 5/min share and the victim
+        // gets served every window.
+        let limiter = RateLimiter::new();
+        let flooder = sid("S-1-5-21-1-2-3-1100");
+        let victim = sid("S-1-5-21-1-2-3-1200");
+        // Burn the cold-start bursts first.
+        while limiter.check(RateBucket::ScanControl, Some(&flooder)).is_ok() {}
+        while limiter.check(RateBucket::ScanControl, Some(&victim)).is_ok() {}
+
+        for round in 0..3 {
+            backdate_principal(&limiter, RateBucket::ScanControl, Some(&flooder), 12_000);
+            backdate_principal(&limiter, RateBucket::ScanControl, Some(&victim), 12_000);
+            backdate_global(&limiter, RateBucket::ScanControl, 12_000);
+            // Flooder gets exactly its 1-token refill share, no more.
+            assert!(
+                limiter.check(RateBucket::ScanControl, Some(&flooder)).is_ok(),
+                "round {round}: flooder share"
+            );
+            assert!(
+                limiter.check(RateBucket::ScanControl, Some(&flooder)).is_err(),
+                "round {round}: flooder beyond share must be rejected"
+            );
+            assert!(
+                limiter.check(RateBucket::ScanControl, Some(&victim)).is_ok(),
+                "round {round}: victim must be served every window"
+            );
+        }
+    }
+
+    #[test]
+    fn rejected_requests_consume_no_tokens() {
+        // A request rejected by the per-principal layer must not consume
+        // a GLOBAL token (rejected requests are free for everyone else's
+        // budget), and must not consume a per-principal token either.
+        let limiter = RateLimiter::new();
+        let flooder = sid("S-1-5-21-1-2-3-1100");
+        while limiter.check(RateBucket::ScanControl, Some(&flooder)).is_ok() {}
+        let before = global_tokens(&limiter, RateBucket::ScanControl);
+        for _ in 0..50 {
+            assert!(limiter.check(RateBucket::ScanControl, Some(&flooder)).is_err());
+        }
+        assert_eq!(
+            global_tokens(&limiter, RateBucket::ScanControl),
+            before,
+            "50 rejected requests must not move the global token count"
+        );
+    }
+
+    #[test]
+    fn retry_after_reflects_per_principal_rate() {
+        let limiter = RateLimiter::new();
+        let flooder = sid("S-1-5-21-1-2-3-1100");
+        while limiter.check(RateBucket::ScanControl, Some(&flooder)).is_ok() {}
+        // ScanControl per-principal = 5/min → one token per 12s.
+        assert_eq!(
+            limiter.check(RateBucket::ScanControl, Some(&flooder)),
+            Err(12)
+        );
+    }
+
+    #[test]
+    fn global_ceiling_unchanged_across_many_principals() {
+        // The global bucket is still the hard ceiling: 10 DISTINCT
+        // principals each with a fresh per-principal burst of 2 cannot
+        // collectively exceed the global ScanControl burst (3) in one
+        // instant.
+        let limiter = RateLimiter::new();
+        let mut accepted = 0;
+        for i in 0..10 {
+            let p = sid(&format!("S-1-5-21-1-2-3-{}", 2000 + i));
+            if limiter.check(RateBucket::ScanControl, Some(&p)).is_ok() {
+                accepted += 1;
+            }
+        }
+        assert_eq!(accepted, 3, "global burst (3) remains the ceiling");
+    }
+
+    #[test]
+    fn unidentified_bucket_is_shared_and_conservative() {
+        // Unresolved identities (fail-open, non-Windows) all land in ONE
+        // shared bucket with the per-principal numbers — never an
+        // unbudgeted bypass, never per-PID (see fairness.rs rationale).
+        let limiter = RateLimiter::new();
+        assert!(limiter.check(RateBucket::ScanControl, None).is_ok());
+        assert!(limiter.check(RateBucket::ScanControl, None).is_ok());
+        assert!(
+            limiter.check(RateBucket::ScanControl, None).is_err(),
+            "the shared unidentified bucket must be capped at the per-principal burst"
+        );
+        // Identified principals are unaffected by an exhausted
+        // unidentified bucket.
+        let alice = sid("S-1-5-21-1-2-3-1001");
+        assert!(limiter.check(RateBucket::ScanControl, Some(&alice)).is_ok());
+    }
+
+    #[test]
+    fn principal_state_bounded_with_lru_eviction() {
+        // SID-spray bound: inserting more distinct principals than
+        // MAX_PRINCIPAL_ENTRIES must not grow the map past the cap; the
+        // least-recently-used entry is evicted (and simply starts fresh
+        // if it ever returns — bounded memory beats exact accounting).
+        let limiter = RateLimiter::new();
+        for i in 0..(MAX_PRINCIPAL_ENTRIES + 20) {
+            let p = sid(&format!("S-1-5-21-9-9-9-{}", i));
+            assert!(limiter.check(RateBucket::ScanControl, Some(&p)).is_ok() || i >= 3);
+            // ^ only the first 3 distinct principals get a token (global
+            // burst); the rest are rejected but still tracked.
+        }
+        let len = limiter
+            .principals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map
+            .len();
+        assert!(
+            len <= MAX_PRINCIPAL_ENTRIES,
+            "principal map must stay bounded: {len} > {MAX_PRINCIPAL_ENTRIES}"
+        );
+    }
+
+    #[test]
+    fn per_principal_does_not_tighten_other_buckets() {
+        // A principal capped on ScanControl keeps full budgets elsewhere —
+        // buckets are independent per (bucket, principal) pair.
+        let limiter = RateLimiter::new();
+        let p = sid("S-1-5-21-1-2-3-1001");
+        while limiter.check(RateBucket::ScanControl, Some(&p)).is_ok() {}
+        assert!(limiter.check(RateBucket::ScanControl, Some(&p)).is_err());
+        for _ in 0..4 {
+            assert!(limiter.check(RateBucket::QuarantineOps, Some(&p)).is_ok());
+        }
+    }
+
+    #[test]
+    fn status_per_principal_fits_dashboard_baseline() {
+        // Sizing guard: the dashboard polls ~108 Status requests/min from
+        // ONE user SID. The per-principal Status budget (150/min, burst
+        // 40) must absorb that steady rate; simulate 108 requests after
+        // backdating a full minute and require all to pass.
+        let limiter = RateLimiter::new();
+        let gui = sid("S-1-5-21-1-2-3-1001");
+        while limiter.check(RateBucket::Status, Some(&gui)).is_ok() {}
+        backdate_principal(&limiter, RateBucket::Status, Some(&gui), 60_000);
+        backdate_global(&limiter, RateBucket::Status, 60_000);
+        // Per-principal refill for 60s = 150 tokens (burst cap 40... the
+        // burst cap is the ACCUMULATION ceiling, not the rate ceiling, so
+        // backdating 60s only mints up to burst). Consume in waves with
+        // intermediate backdates to model continuous traffic.
+        let mut ok = 0;
+        for wave in 0..3 {
+            if wave > 0 {
+                backdate_principal(&limiter, RateBucket::Status, Some(&gui), 20_000);
+                backdate_global(&limiter, RateBucket::Status, 20_000);
+            }
+            for _ in 0..36 {
+                if limiter.check(RateBucket::Status, Some(&gui)).is_ok() {
+                    ok += 1;
+                }
+            }
+        }
+        assert_eq!(ok, 108, "dashboard's 108/min from one SID must fit");
     }
 }

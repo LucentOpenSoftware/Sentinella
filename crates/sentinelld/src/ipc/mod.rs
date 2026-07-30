@@ -719,8 +719,17 @@ fn dispatch_sync(
                 .unwrap_or_default();
             }
 
-            // Phase 3: rate limiting.
-            if let Err(retry_secs) = state.rate_limiter.check(pol.rate_bucket) {
+            // Phase 3: rate limiting. Two layers (policy.rs): a
+            // per-principal sub-budget keyed on the accept-time SID
+            // (`peer`, same identity fairness.rs uses — kernel-owned, not
+            // client-choosable; None falls into the shared unidentified
+            // bucket), then the unchanged global per-class ceiling. Runs
+            // BEFORE the Phase 8 auth gate on purpose: with per-principal
+            // keying an unauthenticated flooder can only burn their own
+            // sub-budget, and rate-first throttles UNAUTHORIZED-response
+            // generation for unauthenticated garbage (see policy.rs
+            // module docs for the full ordering analysis).
+            if let Err(retry_secs) = state.rate_limiter.check(pol.rate_bucket, peer) {
                 return serde_json::to_vec(&RpcErrorResponse::err(
                     req.id,
                     policy::ipc_errors::RATE_LIMITED,
