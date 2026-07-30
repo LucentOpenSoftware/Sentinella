@@ -12,6 +12,7 @@ members = [
     "crates/sandboxd",
     "crates/etw_probe",
     "crates/sentinella-dev-console",
+    "crates/dnsguard",
 ]
 exclude = ["gui/src-tauri", "third_party", "fuzz"]
 
