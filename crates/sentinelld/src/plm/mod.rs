@@ -18,6 +18,7 @@
 
 #[cfg(target_os = "windows")]
 pub mod etw_intake;
+pub mod cmdline;
 pub mod etw_file_io;
 pub mod etw_image_load;
 pub mod weedhack_browser_injection;
@@ -51,8 +52,13 @@ pub struct ProcessNode {
     pub image_path: String,
     /// Image file name only.
     pub image_name: String,
-    /// Command line (if available).
-    pub command_line: Option<String>,
+    /// Command-line collection state. Never a bare "missing": every
+    /// non-`Present` state records WHY there is no command line
+    /// (refused / exited / empty / invalid / not attempted) and is
+    /// counted in `PlmDiagnostics::command_line`. Attacker-controlled
+    /// when present — NEVER treated as identity; image path + signer
+    /// remain authoritative. See `plm::cmdline` module docs.
+    pub command_line: cmdline::CommandLineState,
     /// Whether the binary is signed.
     pub is_signed: Option<bool>,
     /// Integrity level (if known).
@@ -394,6 +400,12 @@ pub struct PlmDiagnostics {
     pub chains_scored: AtomicU64,
     pub dropped_events: AtomicU64,
     pub suspicious_chains: AtomicU64,
+    /// Per-state command-line collection telemetry. Shared with the
+    /// `cmdline::SharedCommandLineQuerier` so BOTH discovery paths (ETW
+    /// callback, snapshot poll) account every query outcome here —
+    /// without it a dead command-line pipeline is indistinguishable from
+    /// a quiet box (the exact silent-failure shape this round fixes).
+    pub command_line: Arc<cmdline::CommandLineDiagnostics>,
 }
 
 impl PlmDiagnostics {
@@ -403,6 +415,7 @@ impl PlmDiagnostics {
             chains_scored: AtomicU64::new(0),
             dropped_events: AtomicU64::new(0),
             suspicious_chains: AtomicU64::new(0),
+            command_line: Arc::new(cmdline::CommandLineDiagnostics::new()),
         }
     }
 
@@ -414,6 +427,7 @@ impl PlmDiagnostics {
             "chains_scored": self.chains_scored.load(Ordering::Relaxed),
             "dropped_events": self.dropped_events.load(Ordering::Relaxed),
             "suspicious_chains": self.suspicious_chains.load(Ordering::Relaxed),
+            "command_line": self.command_line.to_json(),
         })
     }
 }
@@ -480,6 +494,14 @@ impl PlmMonitor {
         let graph = Arc::new(LineageGraph::new());
         let diagnostics = Arc::new(PlmDiagnostics::new());
         let running = Arc::new(AtomicBool::new(true));
+
+        // Command-line querier shared by BOTH discovery paths. Telemetry
+        // lands in `diagnostics.command_line`; the querier Arc is cloned
+        // into the ETW thread (raw-pointer callback static) and the
+        // snapshot loop, so it outlives every user of the raw pointer.
+        let cmdline_querier = Arc::new(cmdline::SharedCommandLineQuerier::production(
+            Arc::clone(&diagnostics.command_line),
+        ));
 
         // WeedHack campaign correlator — backed by a resolver wrapping
         // the lineage graph above.
@@ -548,6 +570,7 @@ impl PlmMonitor {
                 Arc::clone(&graph),
                 Arc::clone(&etw_d),
                 Arc::clone(&running),
+                Arc::clone(&cmdline_querier),
             ) {
                 Ok(thread) => {
                     tracing::info!("PLM: ETW real-time mode active");
@@ -578,11 +601,12 @@ impl PlmMonitor {
         let si = Arc::clone(&snapshot_interval);
         let wh_tracker = Arc::clone(&weedhack_tracker);
         let wh_diag = Arc::clone(&weedhack_diagnostics);
+        let cmd_q = Arc::clone(&cmdline_querier);
 
         let snapshot_thread = std::thread::Builder::new()
             .name("plm-snapshot".into())
             .spawn(move || {
-                plm_loop(g, d, r, si, wh_tracker, wh_diag);
+                plm_loop(g, d, r, si, wh_tracker, wh_diag, cmd_q);
             })
             .ok();
 
@@ -901,12 +925,13 @@ fn plm_loop(
     interval: Arc<AtomicU64>,
     weedhack_tracker: Arc<weedhack_campaign::WeedHackCampaignTracker>,
     weedhack_diagnostics: Arc<weedhack_campaign::WeedHackCampaignDiagnostics>,
+    cmdline_querier: Arc<cmdline::SharedCommandLineQuerier>,
 ) {
     let initial = interval.load(Ordering::Relaxed);
     tracing::info!("PLM monitor started (interval={}s)", initial);
 
     // Initial snapshot.
-    snapshot_processes(&graph, &diagnostics);
+    snapshot_processes(&graph, &diagnostics, &cmdline_querier);
 
     while running.load(Ordering::Relaxed) {
         let secs = interval.load(Ordering::Relaxed);
@@ -915,7 +940,7 @@ fn plm_loop(
             break;
         }
 
-        snapshot_processes(&graph, &diagnostics);
+        snapshot_processes(&graph, &diagnostics, &cmdline_querier);
 
         // Periodic eviction of stale lineage nodes and stale campaigns.
         graph.evict_expired();
@@ -929,7 +954,11 @@ fn plm_loop(
 
 /// Snapshot all running processes and add to graph.
 #[cfg(target_os = "windows")]
-fn snapshot_processes(graph: &LineageGraph, diagnostics: &PlmDiagnostics) {
+fn snapshot_processes(
+    graph: &LineageGraph,
+    diagnostics: &PlmDiagnostics,
+    cmdline_querier: &cmdline::SharedCommandLineQuerier,
+) {
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
         TH32CS_SNAPPROCESS,
@@ -995,12 +1024,19 @@ fn snapshot_processes(graph: &LineageGraph, diagnostics: &PlmDiagnostics) {
             drop(map);
 
             if needs_record {
+                // Event-time command-line capture: ToolHelp32 carries no
+                // command line, so query it NOW, at discovery time —
+                // short-lived processes (WeedHack's schtasks/reg/wscript
+                // persistence children) exit before any lazy query could
+                // run. Failures are first-class states counted in
+                // diagnostics, never collapsed into a fabricated value.
+                let command_line = cmdline_querier.query(pid);
                 graph.record_process(ProcessNode {
                     pid,
                     parent_pid: ppid,
                     image_path: exe_name.clone(),
                     image_name: image_name.to_string(),
-                    command_line: None, // ToolHelp32 doesn't provide cmdline.
+                    command_line,
                     is_signed: None,
                     integrity_level: None,
                     created_at: now,
@@ -1020,7 +1056,11 @@ fn snapshot_processes(graph: &LineageGraph, diagnostics: &PlmDiagnostics) {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn snapshot_processes(_graph: &LineageGraph, _diagnostics: &PlmDiagnostics) {
+fn snapshot_processes(
+    _graph: &LineageGraph,
+    _diagnostics: &PlmDiagnostics,
+    _cmdline_querier: &cmdline::SharedCommandLineQuerier,
+) {
     // PLM not available on non-Windows platforms.
 }
 
@@ -1040,7 +1080,7 @@ mod tests {
             parent_pid: ppid,
             image_path: format!("C:\\Windows\\System32\\{name}"),
             image_name: name.to_string(),
-            command_line: None,
+            command_line: cmdline::CommandLineState::NotCollected,
             is_signed: Some(true),
             integrity_level: None,
             created_at: Instant::now(),

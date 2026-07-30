@@ -23,6 +23,13 @@
 //!   * **CMDLINE**      — command-line literal that's a WeedHack fingerprint
 //!                        regardless of who spawned it (e.g.
 //!                        `schtasks /create /tn "JavaSecurityUpdater"`).
+//!
+//! CMDLINE signals consume `ProcessNode::command_line`, a
+//! `CommandLineState` — they fire ONLY on `Present` content. Every
+//! non-`Present` state (collection refused, process exited, empty,
+//! malformed, not attempted) is "no data": the signal stays silent and
+//! the reason is visible in PLM diagnostics, never patched over with a
+//! fabricated value.
 //!   * **ARTIFACT**     — process image path that matches a dropped WeedHack
 //!                        component (e.g. `Pjibf.exe`, the v0.2 backdoor).
 //!
@@ -182,7 +189,18 @@ pub fn evaluate_chain(chain: &[ProcessNode]) -> Vec<WeedHackSignal> {
     // skip the java-conditioned signals to avoid lighting up benign Defender
     // configuration scripts.
     for node in chain {
-        let cmd = node.command_line.as_deref().unwrap_or("");
+        // "No data" semantics, made explicit: `as_present()` yields a
+        // command line ONLY for `CommandLineState::Present`. Every other
+        // state (NotCollected / Failed / AccessDenied / ProcessExited /
+        // Empty / Malformed) collapses to the empty string HERE AND ONLY
+        // HERE — and since every command-line check below pivots on a
+        // non-empty literal (`javasecurityupdater`, `updater.vbs`,
+        // `disablerealtimemonitoring`, `currentversion\run`), an empty
+        // `cmd_lower` can satisfy NONE of them. Missing data therefore
+        // means "signal silent", never "signal fires on a fabricated
+        // default". Do NOT substitute image_path or any other field as a
+        // fallback command line — that would invent evidence.
+        let cmd = node.command_line.as_present().unwrap_or("");
         let cmd_lower_owned;
         let cmd_lower = if cmd.is_empty() {
             ""
@@ -310,7 +328,15 @@ fn is_unnatural_java_child(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::cmdline::CommandLineState;
     use std::time::Instant;
+
+    fn cmd_state(cmd: Option<&str>) -> CommandLineState {
+        match cmd {
+            Some(s) => CommandLineState::Present(s.to_string()),
+            None => CommandLineState::NotCollected,
+        }
+    }
 
     fn node(pid: u32, ppid: u32, name: &str, cmd: Option<&str>) -> ProcessNode {
         ProcessNode {
@@ -318,7 +344,7 @@ mod tests {
             parent_pid: ppid,
             image_path: format!("C:\\Program Files\\Java\\bin\\{name}"),
             image_name: name.to_string(),
-            command_line: cmd.map(|s| s.to_string()),
+            command_line: cmd_state(cmd),
             is_signed: None,
             integrity_level: None,
             created_at: Instant::now(),
@@ -334,7 +360,7 @@ mod tests {
                 "C:\\Users\\test\\AppData\\Roaming\\Microsoft\\SecurityUpdates\\{name}"
             ),
             image_name: name.to_string(),
-            command_line: cmd.map(|s| s.to_string()),
+            command_line: cmd_state(cmd),
             is_signed: None,
             integrity_level: None,
             created_at: Instant::now(),
@@ -497,5 +523,168 @@ mod tests {
         let desc = describe_signals(&hits);
         assert!(desc.contains("JavaSecurityUpdater"));
         assert!(desc.contains("javaw.exe"));
+    }
+
+    // ── Command-line state gating (v0.1.12 workstream O) ─────────
+    //
+    // The four command-line-pivot signals must fire ONLY on
+    // `CommandLineState::Present` with matching content. Every
+    // non-Present state is "no data" — silent, never a fabricated
+    // default. Before the CommandLineState split, production nodes all
+    // carried `None`, and these signals were dead on live boxes while
+    // unit tests (which set Some) stayed green — these tests pin the
+    // state-level contract so that class of lie cannot come back.
+
+    /// Every non-Present state, plus the degenerate empty Present.
+    fn non_matching_states() -> Vec<CommandLineState> {
+        vec![
+            CommandLineState::NotCollected,
+            CommandLineState::Failed(5),
+            CommandLineState::Failed(0xC000_0005),
+            CommandLineState::AccessDenied,
+            CommandLineState::ProcessExited,
+            CommandLineState::Empty,
+            CommandLineState::Malformed,
+            // Degenerate but possible via direct construction: present
+            // yet empty must behave exactly like "no data".
+            CommandLineState::Present(String::new()),
+        ]
+    }
+
+    fn node_with_state(pid: u32, ppid: u32, name: &str, state: CommandLineState) -> ProcessNode {
+        ProcessNode {
+            pid,
+            parent_pid: ppid,
+            image_path: format!("C:\\Program Files\\Java\\bin\\{name}"),
+            image_name: name.to_string(),
+            command_line: state,
+            is_signed: None,
+            integrity_level: None,
+            created_at: Instant::now(),
+            timestamp: chrono::Utc::now().timestamp(),
+        }
+    }
+
+    #[test]
+    fn javasecurityupdater_silent_for_every_non_present_state() {
+        for state in non_matching_states() {
+            let label = state.label().to_string();
+            let chain = vec![
+                node(1, 0, "explorer.exe", None),
+                node_with_state(2, 1, "schtasks.exe", state),
+            ];
+            let hits = evaluate_chain(&chain);
+            assert!(
+                !hits.contains(&WeedHackSignal::JavaSecurityUpdaterTask),
+                "JavaSecurityUpdaterTask fired on state {label}"
+            );
+            // Nothing else in this chain should fire either (no java
+            // root, no artifact paths) — the whole chain is silent.
+            assert!(hits.is_empty(), "unexpected hits on state {label}: {hits:?}");
+        }
+    }
+
+    #[test]
+    fn updater_vbs_silent_for_every_non_present_state() {
+        for state in non_matching_states() {
+            let label = state.label().to_string();
+            let chain = vec![
+                node(1, 0, "explorer.exe", None),
+                node_with_state(2, 1, "wscript.exe", state),
+            ];
+            let hits = evaluate_chain(&chain);
+            assert!(
+                !hits.contains(&WeedHackSignal::UpdaterVbsLaunch),
+                "UpdaterVbsLaunch fired on state {label}"
+            );
+            assert!(hits.is_empty(), "unexpected hits on state {label}: {hits:?}");
+        }
+    }
+
+    #[test]
+    fn defender_disable_silent_for_every_non_present_state() {
+        for state in non_matching_states() {
+            let label = state.label().to_string();
+            let chain = vec![
+                node(1, 0, "explorer.exe", None),
+                node(2, 1, "javaw.exe", None),
+                node_with_state(3, 2, "powershell.exe", state),
+            ];
+            let hits = evaluate_chain(&chain);
+            assert!(
+                !hits.contains(&WeedHackSignal::DefenderDisableUnderJava),
+                "DefenderDisableUnderJava fired on state {label}"
+            );
+            // The image-name transition signal still fires — it needs no
+            // command line and must NOT be gated by cmdline state.
+            assert!(
+                hits.contains(&WeedHackSignal::UnnaturalJavaChild),
+                "UnnaturalJavaChild wrongly gated on state {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_key_silent_for_every_non_present_state() {
+        for state in non_matching_states() {
+            let label = state.label().to_string();
+            let chain = vec![
+                node(1, 0, "javaw.exe", None),
+                node_with_state(2, 1, "reg.exe", state),
+            ];
+            let hits = evaluate_chain(&chain);
+            assert!(
+                !hits.contains(&WeedHackSignal::RunKeyFromJava),
+                "RunKeyFromJava fired on state {label}"
+            );
+            assert!(
+                hits.contains(&WeedHackSignal::UnnaturalJavaChild),
+                "UnnaturalJavaChild wrongly gated on state {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn present_with_matching_content_fires_all_four_cmdline_signals() {
+        // Positive control for the state gating: Present + the literal
+        // fires, same chain shape as the non-present tests above.
+        let chain = vec![
+            node(1, 0, "explorer.exe", None),
+            node(
+                2,
+                1,
+                "schtasks.exe",
+                Some("schtasks /create /tn \"JavaSecurityUpdater\" /tr \"wscript.exe Updater.vbs\" /sc onlogon"),
+            ),
+        ];
+        let hits = evaluate_chain(&chain);
+        assert!(hits.contains(&WeedHackSignal::JavaSecurityUpdaterTask));
+        assert!(hits.contains(&WeedHackSignal::UpdaterVbsLaunch));
+
+        let chain = vec![
+            node(1, 0, "javaw.exe", None),
+            node(
+                2,
+                1,
+                "powershell.exe",
+                Some("powershell Set-MpPreference -DisableRealtimeMonitoring $true; reg add HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run /v x /d y"),
+            ),
+        ];
+        let hits = evaluate_chain(&chain);
+        assert!(hits.contains(&WeedHackSignal::DefenderDisableUnderJava));
+        assert!(hits.contains(&WeedHackSignal::RunKeyFromJava));
+    }
+
+    #[test]
+    fn present_with_unrelated_content_stays_silent() {
+        // FP guard: a Present command line that merely belongs to a
+        // suspicious image pair must not light cmdline signals.
+        let chain = vec![
+            node(1, 0, "javaw.exe", None),
+            node(2, 1, "schtasks.exe", Some("schtasks /query /tn \"MyApp Update\"")),
+        ];
+        let hits = evaluate_chain(&chain);
+        assert!(!hits.contains(&WeedHackSignal::JavaSecurityUpdaterTask));
+        assert!(hits.contains(&WeedHackSignal::UnnaturalJavaChild));
     }
 }

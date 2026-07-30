@@ -674,7 +674,7 @@ mod tests {
             parent_pid: ppid,
             image_path: format!("C:\\{name}"),
             image_name: name.to_string(),
-            command_line: None,
+            command_line: super::super::cmdline::CommandLineState::NotCollected,
             is_signed: None,
             integrity_level: None,
             created_at: Instant::now(),

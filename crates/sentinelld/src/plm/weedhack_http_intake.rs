@@ -647,7 +647,7 @@ mod tests {
             parent_pid: 0,
             image_path: "C:\\Program Files\\Java\\bin\\javaw.exe".into(),
             image_name: "javaw.exe".into(),
-            command_line: None,
+            command_line: super::super::cmdline::CommandLineState::NotCollected,
             is_signed: None,
             integrity_level: None,
             created_at: Instant::now(),

@@ -40,6 +40,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
+use super::cmdline::{CommandLineState, SharedCommandLineQuerier};
 use super::{LineageGraph, ProcessNode};
 use windows::Win32::System::Diagnostics::Etw::EVENT_RECORD;
 
@@ -344,13 +345,14 @@ pub fn start_etw_intake(
     graph: Arc<LineageGraph>,
     diagnostics: Arc<EtwIntakeDiagnostics>,
     running: Arc<AtomicBool>,
+    cmdline_querier: Arc<SharedCommandLineQuerier>,
 ) -> Result<std::thread::JoinHandle<()>, String> {
     // Test if we can create a trace session (requires admin).
     // Do a quick probe before spawning the thread.
     let thread = std::thread::Builder::new()
         .name("plm-etw".into())
         .spawn(move || {
-            etw_process_loop(graph, diagnostics, running);
+            etw_process_loop(graph, diagnostics, running, cmdline_querier);
         })
         .map_err(|e| format!("failed to spawn ETW thread: {e}"))?;
 
@@ -419,6 +421,7 @@ fn etw_process_loop(
     graph: Arc<LineageGraph>,
     diag: Arc<EtwIntakeDiagnostics>,
     running: Arc<AtomicBool>,
+    cmdline_querier: Arc<SharedCommandLineQuerier>,
 ) {
     tracing::info!("PLM ETW intake starting");
 
@@ -432,7 +435,7 @@ fn etw_process_loop(
         if diag.current_stage() != EtwStage::Starting {
             diag.set_stage(EtwStage::Starting);
         }
-        match run_etw_session(session_name, &graph, &diag, &running) {
+        match run_etw_session(session_name, &graph, &diag, &running, &cmdline_querier) {
             Ok(()) => {
                 tracing::info!("PLM ETW session ended cleanly");
                 diag.set_stage(EtwStage::Stopped);
@@ -520,6 +523,7 @@ fn run_etw_session(
     graph: &Arc<LineageGraph>,
     diag: &Arc<EtwIntakeDiagnostics>,
     running: &Arc<AtomicBool>,
+    cmdline_querier: &Arc<SharedCommandLineQuerier>,
 ) -> Result<(), SessionError> {
     use windows::Win32::System::Diagnostics::Etw::*;
     use windows::core::PCWSTR;
@@ -606,6 +610,7 @@ fn run_etw_session(
     // Store context for callback.
     CALLBACK_GRAPH.store(graph_ptr as u64, Ordering::SeqCst);
     CALLBACK_DIAG.store(diag_ptr as u64, Ordering::SeqCst);
+    CALLBACK_CMDLINE.store(Arc::as_ptr(cmdline_querier) as u64, Ordering::SeqCst);
 
     let mut logfile = EVENT_TRACE_LOGFILEW::default();
     let mut logfile_name = session_name_wide.clone();
@@ -622,6 +627,7 @@ fn run_etw_session(
         // pointers outlive the session loop.
         CALLBACK_GRAPH.store(0, Ordering::SeqCst);
         CALLBACK_DIAG.store(0, Ordering::SeqCst);
+        CALLBACK_CMDLINE.store(0, Ordering::SeqCst);
         // Stop the session we just started before bailing —
         // otherwise it leaks as an orphaned kernel session until the next
         // run's stale-session cleanup reclaims it.
@@ -679,6 +685,7 @@ fn run_etw_session(
     // when the caller drops its Arc<LineageGraph> / Arc<EtwIntakeDiagnostics>.
     CALLBACK_GRAPH.store(0, Ordering::SeqCst);
     CALLBACK_DIAG.store(0, Ordering::SeqCst);
+    CALLBACK_CMDLINE.store(0, Ordering::SeqCst);
 
     // R3-10: release consumer handle (was leaked).
     let _ = unsafe { CloseTrace(trace_handle) };
@@ -709,6 +716,12 @@ fn stop_props_storage(
 
 static CALLBACK_GRAPH: AtomicU64 = AtomicU64::new(0);
 static CALLBACK_DIAG: AtomicU64 = AtomicU64::new(0);
+/// Raw pointer to the Arc<SharedCommandLineQuerier> owned by the session
+/// loop — same lifetime discipline as CALLBACK_GRAPH/DIAG: stored before
+/// the consumer opens, zeroed before the owning Arcs drop (both teardown
+/// paths). Zero = no querier wired → nodes record NotCollected, never a
+/// fabricated command line.
+static CALLBACK_CMDLINE: AtomicU64 = AtomicU64::new(0);
 
 /// Process GUID for ETW kernel process events.
 const PROCESS_GUID: windows::core::GUID = windows::core::GUID::from_values(
@@ -828,13 +841,31 @@ unsafe extern "system" fn etw_event_callback(record: *mut EVENT_RECORD) {
                 .unwrap_or(&image_name)
                 .to_string();
 
+            // Event-time command-line capture. The kernel
+            // Process_TypeGroup1 event layout does NOT carry the command
+            // line (its MOF fields end at ImageFileName), so we query the
+            // live process NOW via NtQueryInformationProcess — a lazy
+            // query at scan time would lose the exit race against
+            // short-lived persistence children. Protected/exited
+            // processes yield first-class states (AccessDenied /
+            // ProcessExited), counted in PLM diagnostics; a zeroed
+            // static (querier not wired / tearing down) records honest
+            // NotCollected. NEVER a fabricated empty string.
+            let cmd_ptr = CALLBACK_CMDLINE.load(Ordering::SeqCst);
+            let command_line = if cmd_ptr != 0 {
+                let querier = &*(cmd_ptr as *const SharedCommandLineQuerier);
+                querier.query(pid)
+            } else {
+                CommandLineState::NotCollected
+            };
+
             let graph = &*(graph_ptr as *const LineageGraph);
             graph.record_process(ProcessNode {
                 pid,
                 parent_pid: ppid,
                 image_path: image_name,
                 image_name: exe_name,
-                command_line: None,
+                command_line,
                 is_signed: None,
                 integrity_level: None,
                 created_at: Instant::now(),
@@ -1278,11 +1309,16 @@ mod tests {
         let graph = Arc::new(LineageGraph::new());
         let diag = Arc::new(EtwIntakeDiagnostics::new());
         let running = Arc::new(AtomicBool::new(true));
+        let cmdline_diag = Arc::new(crate::plm::cmdline::CommandLineDiagnostics::new());
+        let cmdline = Arc::new(SharedCommandLineQuerier::production(Arc::clone(
+            &cmdline_diag,
+        )));
 
         let handle = start_etw_intake(
             Arc::clone(&graph),
             Arc::clone(&diag),
             Arc::clone(&running),
+            Arc::clone(&cmdline),
         )
         .expect("ETW thread spawn failed");
 
@@ -1328,5 +1364,18 @@ mod tests {
             diag.degraded_reason.load(Ordering::Relaxed),
         );
         assert_eq!(diag.current_stage(), EtwStage::Stopped);
+
+        // Command-line collection was wired into this session: every
+        // delivered process-start must have produced exactly one query
+        // outcome. `cmd /c exit` is short-lived, so ProcessExited is an
+        // acceptable outcome — what we assert is that the pipeline RAN
+        // and accounted every event, not which state won the race.
+        let total = cmdline_diag.total();
+        assert!(
+            total > 0,
+            "ETW events delivered but command-line querier never ran; \
+             cmdline telemetry: {}",
+            cmdline_diag.to_json()
+        );
     }
 }

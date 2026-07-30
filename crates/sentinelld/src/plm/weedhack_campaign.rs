@@ -972,6 +972,7 @@ mod tests {
     // ── LineageGraphResolver (Phase 1) ─────────────────────────────
 
     use super::super::{LineageGraph, ProcessNode};
+    use super::super::cmdline::CommandLineState;
 
     fn make_node(pid: u32, ppid: u32, name: &str, ts: i64) -> ProcessNode {
         ProcessNode {
@@ -979,7 +980,7 @@ mod tests {
             parent_pid: ppid,
             image_path: format!("C:\\Program Files\\Java\\{name}"),
             image_name: name.to_string(),
-            command_line: None,
+            command_line: CommandLineState::NotCollected,
             is_signed: None,
             integrity_level: None,
             created_at: Instant::now(),
