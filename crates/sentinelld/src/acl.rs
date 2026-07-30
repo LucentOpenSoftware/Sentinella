@@ -1034,6 +1034,9 @@ pub mod imp {
         pub owners_fixed: u32,
         /// Reparse points / symlinks refused (never descended, never ACLed).
         pub skipped_reparse: u32,
+        /// Entries that could not be pinned for exclusive-name access and
+        /// were therefore skipped rather than operated on by name.
+        pub skipped_unpinnable: u32,
     }
 
     /// Maximum depth (below root) and total entries the walk will touch —
@@ -1060,61 +1063,162 @@ pub mod imp {
     /// The root itself is never `/reset` (the caller just granted its
     /// canonical DACL — an earlier revision reset it straight back to
     /// ProgramData's inheritance, so the repair never converged).
+    /// Open `path` WITHOUT following reparse points and WITHOUT granting
+    /// delete sharing.
+    ///
+    /// Both properties are load-bearing:
+    ///   * `FILE_FLAG_OPEN_REPARSE_POINT` — if the entry is, or becomes, a
+    ///     junction we open the junction ITSELF, never its target, so a swap
+    ///     cannot redirect us.
+    ///   * the share mode omits `FILE_SHARE_DELETE` — while this handle is
+    ///     alive the object cannot be deleted or renamed, so its NAME cannot
+    ///     be re-pointed at anything else.
+    ///
+    /// The second property is what makes it sound to hand the same path to
+    /// `icacls` afterwards. Sharing modes only gate read/write/delete access,
+    /// not `WRITE_DAC`/`WRITE_OWNER`, so `icacls` can still rewrite the
+    /// descriptor while we hold this handle — it just cannot be a *different
+    /// object* by then.
+    fn pin_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+            FILE_SHARE_WRITE,
+        };
+        std::fs::OpenOptions::new()
+            .read(true)
+            // FILE_SHARE_DELETE is deliberately ABSENT — that omission is
+            // the anti-swap pin, not an oversight.
+            .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
+            .open(path)
+    }
+
+    /// Reparse test taken from an already-open handle, so it describes the
+    /// object we pinned rather than whatever the name resolves to now.
+    ///
+    /// Fails CLOSED: an entry whose attributes we cannot read from our own
+    /// handle is treated as untrusted and skipped. (`scan::is_reparse_point`
+    /// fails OPEN, which is right for scanning and wrong here.)
+    fn is_reparse_from_handle(f: &std::fs::File) -> bool {
+        use std::os::windows::fs::MetadataExt;
+        use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        match f.metadata() {
+            Ok(m) => m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0,
+            Err(_) => true,
+        }
+    }
+
     pub fn normalize_tree(root: &Path, fix_owners: bool) -> Result<TreeStats, String> {
         let mut stats = TreeStats::default();
-        let mut stack: Vec<(std::path::PathBuf, u32)> = vec![(root.to_path_buf(), 0)];
         let mut visited: u32 = 0;
+        // Pin the root for the whole walk so its own name cannot be
+        // re-pointed underneath the recursion either.
+        let root_pin = pin_no_follow(root)
+            .map_err(|e| format!("pin root {}: {e}", root.display()))?;
+        if is_reparse_from_handle(&root_pin) {
+            return Err(format!(
+                "data root {} is a reparse point — refusing to normalize",
+                root.display()
+            ));
+        }
+        normalize_dir(root, 0, fix_owners, &mut stats, &mut visited)?;
+        drop(root_pin);
+        Ok(stats)
+    }
 
-        while let Some((dir, depth)) = stack.pop() {
-            let entries = std::fs::read_dir(&dir)
-                .map_err(|e| format!("read_dir {}: {e}", dir.display()))?;
-            for entry in entries.flatten() {
-                visited += 1;
-                if visited > NORMALIZE_MAX_ENTRIES {
-                    return Err(format!(
-                        "tree exceeds {NORMALIZE_MAX_ENTRIES} entries — refusing to normalize (hostile or runaway tree?)"
-                    ));
-                }
-                let path = entry.path();
-                let ft = match entry.file_type() {
-                    Ok(ft) => ft,
-                    Err(_) => continue,
-                };
-                // Never touch or descend symlinks/reparse points (junctions).
-                // file_type() does not follow links; is_reparse_point uses
-                // symlink_metadata — both are entry-level, no following.
-                if ft.is_symlink() || crate::scan::is_reparse_point(&path) {
-                    stats.skipped_reparse += 1;
+    /// Depth-first body of [`normalize_tree`].
+    ///
+    /// Recursion (rather than the previous explicit stack of PATHS) is the
+    /// point: each directory's pin stays alive for the whole time we are
+    /// inside it, so every component of every path we act on is pinned by an
+    /// enclosing frame. The old design validated a directory when it was
+    /// enumerated and then `read_dir`'d it again after an unbounded number of
+    /// intervening `icacls` process spawns — an arbitrarily wide window in
+    /// which the entry could be swapped for a junction.
+    fn normalize_dir(
+        dir: &Path,
+        depth: u32,
+        fix_owners: bool,
+        stats: &mut TreeStats,
+        visited: &mut u32,
+    ) -> Result<(), String> {
+        let entries =
+            std::fs::read_dir(dir).map_err(|e| format!("read_dir {}: {e}", dir.display()))?;
+        for entry in entries.flatten() {
+            *visited += 1;
+            if *visited > NORMALIZE_MAX_ENTRIES {
+                return Err(format!(
+                    "tree exceeds {NORMALIZE_MAX_ENTRIES} entries — refusing to normalize (hostile or runaway tree?)"
+                ));
+            }
+            let path = entry.path();
+
+            // PIN FIRST, then decide, then act — all against the same pinned
+            // object. Deciding from the directory-enumeration snapshot (as
+            // the previous revision did) is strictly staler than a fresh
+            // by-name stat, and neither survives a swap.
+            let pin = match pin_no_follow(&path) {
+                Ok(f) => f,
+                Err(_) => {
+                    // Could not obtain exclusive-name access: skip rather
+                    // than operate on a name we cannot hold still. Counted so
+                    // a deliberate pin-denial campaign is visible.
+                    stats.skipped_unpinnable += 1;
                     continue;
                 }
+            };
+            if is_reparse_from_handle(&pin) {
+                stats.skipped_reparse += 1;
+                continue;
+            }
+            let is_dir = pin.metadata().map(|m| m.is_dir()).unwrap_or(false);
 
-                if fix_owners {
-                    let sddl = read_sddl(&path)
-                        .map_err(|e| format!("read SD {}: {e}", path.display()))?;
-                    let info = parse_sddl(&sddl)
-                        .map_err(|e| format!("parse SDDL {}: {e}", path.display()))?;
-                    if !info.owner.as_deref().map(is_admin_sid).unwrap_or(false) {
-                        let p = path.to_string_lossy().into_owned();
-                        run_icacls(&[&p, "/setowner", "*S-1-5-32-544", "/Q"])
-                            .map_err(|e| format!("setowner {}: {e}", path.display()))?;
+            // Per-entry failures must NOT abort the whole walk: one
+            // attacker-controlled entry would otherwise permanently disable
+            // data-root hardening for every boot.
+            if fix_owners {
+                let owner_is_admin = read_sddl(&path)
+                    .ok()
+                    .and_then(|sddl| parse_sddl(&sddl).ok())
+                    .and_then(|info| info.owner)
+                    .map(|o| is_admin_sid(&o))
+                    .unwrap_or(false);
+                if !owner_is_admin {
+                    let p = path.to_string_lossy().into_owned();
+                    if run_icacls(&[&p, "/setowner", "*S-1-5-32-544", "/Q"]).is_ok() {
                         stats.owners_fixed += 1;
+                    } else {
+                        stats.skipped_unpinnable += 1;
                     }
                 }
+            }
 
-                let p = path.to_string_lossy().into_owned();
-                run_icacls(&[&p, "/reset", "/Q"])
-                    .map_err(|e| format!("reset {}: {e}", path.display()))?;
-                if ft.is_dir() {
+            let p = path.to_string_lossy().into_owned();
+            if run_icacls(&[&p, "/reset", "/Q"]).is_ok() {
+                if is_dir {
                     stats.dirs_reset += 1;
-                    if depth < NORMALIZE_MAX_DEPTH {
-                        stack.push((path, depth + 1));
-                    }
                 } else {
                     stats.files_reset += 1;
                 }
+            } else {
+                stats.skipped_unpinnable += 1;
+            }
+
+            if is_dir {
+                if depth + 1 < NORMALIZE_MAX_DEPTH {
+                    // `pin` is still alive across this call, so `path` stays
+                    // pinned for the entire subtree walk.
+                    normalize_dir(&path, depth + 1, fix_owners, stats, visited)?;
+                } else {
+                    // Depth cap reached: record it instead of truncating
+                    // silently, so "repair succeeded" cannot hide an
+                    // un-normalized subtree.
+                    stats.skipped_unpinnable += 1;
+                }
             }
         }
-        Ok(stats)
+        Ok(())
     }
 
 
@@ -1215,6 +1319,51 @@ pub mod imp {
 
             // icacls display sanity (localized output — only exit status).
             run_icacls(&[&root_str]).unwrap();
+
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// The anti-TOCTOU property, tested directly.
+        ///
+        /// The junction test below only covers a junction planted BEFORE the
+        /// walk. It is structurally incapable of catching the real defect,
+        /// which was that the reparse check and the `icacls` call both
+        /// resolved the path independently, so an attacker could swap the
+        /// entry in between. The fix is that each entry is pinned by an open
+        /// handle without `FILE_SHARE_DELETE` for as long as we act on it.
+        /// This asserts that pin actually holds: while pinned, the name
+        /// cannot be deleted or renamed, therefore it cannot be re-pointed.
+        #[test]
+        fn pinned_entry_cannot_be_deleted_or_renamed_while_held() {
+            let tag = format!("sent_acl_pin_{}", std::process::id());
+            let base = std::env::temp_dir().join(&tag);
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(base.join("d")).unwrap();
+            let victim = base.join("d");
+            let moved = base.join("d_moved");
+
+            let pin = pin_no_follow(&victim).expect("pin a real directory");
+            assert!(
+                !is_reparse_from_handle(&pin),
+                "a plain directory must not be reported as a reparse point"
+            );
+            // These two failures ARE the security property: an attacker
+            // cannot substitute a junction for this name mid-walk.
+            assert!(
+                std::fs::remove_dir(&victim).is_err(),
+                "pinned directory must not be removable — without this the \
+                 by-path icacls call could hit a different object"
+            );
+            assert!(
+                std::fs::rename(&victim, &moved).is_err(),
+                "pinned directory must not be renamable"
+            );
+
+            // Once the pin is dropped, ordinary semantics resume — proving
+            // the refusals above came from the pin and not from something
+            // incidental about the fixture.
+            drop(pin);
+            assert!(std::fs::remove_dir(&victim).is_ok());
 
             let _ = std::fs::remove_dir_all(&base);
         }

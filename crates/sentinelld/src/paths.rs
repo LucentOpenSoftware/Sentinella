@@ -291,12 +291,75 @@ fn detect_root() -> PathBuf {
 /// honor `runtime/` next to the exe if the exe itself was dropped into a
 /// user-writable location. Also used by the IPC fairness layer to recognize
 /// first-party clients by image path (`ClientIdentity::is_first_party`).
-pub(crate) fn is_trusted_install_dir(dir: &Path) -> bool {
+/// Lower-case a path for prefix matching, stripping the Windows VERBATIM
+/// prefix that `std::fs::canonicalize` always produces.
+///
+/// This is load-bearing, not cosmetic. `std::fs::canonicalize` on Windows
+/// returns `\\?\C:\program files\...`, while every trusted-root literal
+/// below is an ordinary `c:\...` string. Without stripping, NO canonicalized
+/// path could ever match a trusted root, so any caller that canonicalized
+/// first got a silent, unconditional `false`. That is exactly what disabled
+/// first-party IPC classification wholesale.
+///
+/// Returns `None` for verbatim UNC (`\\?\UNC\server\share`) and for plain
+/// UNC (`\\server\share`): a network location is never a trusted local
+/// install root, and rewriting it into something that could prefix-match a
+/// local root would be a bypass.
+fn normalized_for_root_match(dir: &Path) -> Option<String> {
     let s = dir.to_string_lossy().to_lowercase();
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        if rest.starts_with("unc\\") {
+            return None;
+        }
+        return Some(rest.to_string());
+    }
+    if s.starts_with("\\\\") {
+        return None;
+    }
+    Some(s)
+}
 
-    // Explicit deny: classic user-writable roots. Anyone able to drop
-    // sentinelld.exe + a runtime/ tree here must NOT be able to coerce
-    // a future launch into trusting that tree.
+/// Stricter sibling of [`is_trusted_install_dir`] used ONLY to decide whether
+/// an IPC client is "first party" and therefore eligible for the reserved
+/// connection pool.
+///
+/// The difference that matters: [`is_trusted_install_dir`] also accepts the
+/// daemon's own `%ProgramData%\Sentinella` data root, which is appropriate
+/// when asking "may I load runtime assets from beside the exe", but is NOT
+/// acceptable here. That directory is created with inherited permissions —
+/// on a default install `BUILTIN\Users` holds create-file/create-folder and
+/// `CREATOR OWNER` gets full control of whatever they create — so treating
+/// it as an install root would let any unprivileged user drop a binary there
+/// and be classified first-party. That is precisely the escalation this
+/// function exists to prevent, so first-party status requires a real program
+/// install root.
+pub(crate) fn is_first_party_image_dir(dir: &Path) -> bool {
+    let Some(s) = normalized_for_root_match(dir) else {
+        return false;
+    };
+    if contains_user_writable_marker(&s) {
+        return false;
+    }
+
+    let mut roots: Vec<String> = Vec::new();
+    for var in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Ok(v) = std::env::var(var) {
+            roots.push(v.to_lowercase());
+        }
+    }
+    if roots.is_empty() {
+        roots = ["c:\\program files", "c:\\program files (x86)"]
+            .iter()
+            .map(|r| r.to_string())
+            .collect();
+    }
+    roots
+        .iter()
+        .any(|root| s.starts_with(&format!("{root}\\")) || s == *root)
+}
+
+/// Shared user-writable deny list (see [`is_trusted_install_dir`]).
+fn contains_user_writable_marker(s: &str) -> bool {
     const USER_WRITABLE_PREFIXES: &[&str] = &[
         "\\users\\public\\",
         "\\users\\default\\",
@@ -309,10 +372,19 @@ pub(crate) fn is_trusted_install_dir(dir: &Path) -> bool {
         "\\$recycle.bin\\",
         "\\perflogs\\",
     ];
-    for bad in USER_WRITABLE_PREFIXES {
-        if s.contains(bad) {
-            return false;
-        }
+    USER_WRITABLE_PREFIXES.iter().any(|bad| s.contains(bad))
+}
+
+pub(crate) fn is_trusted_install_dir(dir: &Path) -> bool {
+    let Some(s) = normalized_for_root_match(dir) else {
+        return false;
+    };
+
+    // Explicit deny: classic user-writable roots. Anyone able to drop
+    // sentinelld.exe + a runtime/ tree here must NOT be able to coerce
+    // a future launch into trusting that tree.
+    if contains_user_writable_marker(&s) {
+        return false;
     }
 
     // Anything under a user's own profile (C:\Users\<name>\...) is per-user
@@ -470,6 +542,61 @@ mod tests {
                 !is_trusted_install_dir(Path::new(b)),
                 "must REFUSE to trust user-writable install dir: {b}"
             );
+        }
+    }
+
+    #[test]
+    fn verbatim_prefix_does_not_defeat_root_matching() {
+        // REGRESSION: `std::fs::canonicalize` returns `\\?\C:\...` on
+        // Windows. Every trusted-root literal is an ordinary `c:\...`
+        // string, so an unstripped verbatim prefix made this return false
+        // for EVERY canonicalized client — silently turning the whole
+        // first-party pool into dead code while its own test sat inside an
+        // `if` that never fired.
+        assert!(is_first_party_image_dir(Path::new(
+            "\\\\?\\C:\\Program Files\\Sentinella"
+        )));
+        assert!(is_first_party_image_dir(Path::new(
+            "C:\\Program Files\\Sentinella"
+        )));
+        assert!(is_trusted_install_dir(Path::new(
+            "\\\\?\\C:\\Program Files\\Sentinella"
+        )));
+    }
+
+    #[test]
+    fn data_root_never_confers_first_party_status() {
+        // %ProgramData%\Sentinella is a trusted ASSET root but is created
+        // with inherited permissions — on a default install BUILTIN\Users
+        // holds create-file/create-folder and CREATOR OWNER gets full
+        // control of what it creates. Treating it as an install root would
+        // let any unprivileged user drop a binary there and be classified
+        // first-party, which is the escalation the check exists to stop.
+        for p in [
+            "C:\\ProgramData\\Sentinella",
+            "C:\\ProgramData\\Sentinella\\bin",
+            "\\\\?\\C:\\ProgramData\\Sentinella\\bin",
+        ] {
+            assert!(
+                !is_first_party_image_dir(Path::new(p)),
+                "data root must never be first-party: {p}"
+            );
+        }
+    }
+
+    #[test]
+    fn network_paths_are_never_first_party() {
+        // A remote image is not a local install root, and rewriting a UNC
+        // path into something that could prefix-match one would be a bypass.
+        for p in [
+            "\\\\?\\UNC\\server\\share\\Sentinella",
+            "\\\\server\\share\\Sentinella",
+        ] {
+            assert!(
+                !is_first_party_image_dir(Path::new(p)),
+                "network path must never be first-party: {p}"
+            );
+            assert!(!is_trusted_install_dir(Path::new(p)));
         }
     }
 

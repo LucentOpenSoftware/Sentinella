@@ -64,9 +64,20 @@ impl ClientIdentity {
             return false;
         };
         let path = std::path::Path::new(img);
+        // NOTE: `canonicalize` returns a VERBATIM path on Windows
+        // (`\\?\C:\...`). The trusted-root comparison is against ordinary
+        // `c:\...` literals, so before the prefix was handled this function
+        // returned false for every real client — the entire first-party pool
+        // was dead code and every caller silently fell back into the per-SID
+        // bucket, i.e. the exact bug the pool was introduced to fix.
+        // `is_first_party_image_dir` normalizes the prefix; the fallback to
+        // the raw path preserves fail-closed behaviour if resolution fails.
         let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         match canon.parent() {
-            Some(dir) => crate::paths::is_trusted_install_dir(dir),
+            // Deliberately the STRICT check: the daemon's own ProgramData
+            // data root is user-writable by default and must not confer
+            // first-party status, even though it is a trusted *asset* root.
+            Some(dir) => crate::paths::is_first_party_image_dir(dir),
             None => false,
         }
     }

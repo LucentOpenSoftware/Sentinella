@@ -119,7 +119,18 @@ impl PrincipalQuota {
     /// a panicked holder can only have left a count, and availability of
     /// the accept loop outranks exact accounting in that scenario.
     pub fn try_acquire(self: &Arc<Self>, id: Option<&ClientIdentity>) -> Option<PrincipalPermit> {
-        let key = PrincipalKey::from_identity(id);
+        self.try_acquire_key(PrincipalKey::from_identity(id))
+    }
+
+    /// Acquire against an explicit key.
+    ///
+    /// Split out so the pool-separation invariant can be tested WITHOUT
+    /// depending on where the test runner's executable happens to live.
+    /// The previous test called `is_first_party()` on `current_exe()`,
+    /// which under `cargo test` resolves to `target/debug/deps/…` — never a
+    /// trusted install root — so its assertion sat inside an `if` that was
+    /// always false and the test passed while verifying nothing.
+    fn try_acquire_key(self: &Arc<Self>, key: PrincipalKey) -> Option<PrincipalPermit> {
         let cap = key.cap();
         let mut counts = self.counts.lock().unwrap_or_else(|p| p.into_inner());
         let n = counts.entry(key.clone()).or_insert(0);
@@ -303,24 +314,31 @@ mod tests {
         let _flood: Vec<_> = (0..MAX_CONNECTIONS_PER_PRINCIPAL)
             .map(|_| q.try_acquire(Some(&alice)).unwrap())
             .collect();
-        assert!(q.try_acquire(Some(&alice)).is_none());
-        // A first-party client (same SID, trusted image path) still gets
-        // service from its own pool. In tests is_first_party() resolves
-        // against the real FS, so simulate via the key function directly:
-        // a ClientIdentity whose image_path canonicalizes under a trusted
-        // dir. We use the daemon's own exe — its dir is trusted by
-        // definition in installed mode; in dev mode this may resolve false,
-        // in which case the key is Sid and this test asserts the
-        // distinction only.
-        let mut gui = alice.clone();
-        gui.image_path = std::env::current_exe()
-            .ok()
-            .map(|p| p.to_string_lossy().into_owned());
-        if gui.is_first_party() {
-            assert!(
-                q.try_acquire(Some(&gui)).is_some(),
-                "first-party pool must be unaffected by the SID flood"
-            );
-        }
+        assert!(
+            q.try_acquire(Some(&alice)).is_none(),
+            "the SID bucket must actually be exhausted for this test to mean anything"
+        );
+        // UNCONDITIONAL. Exercise the FirstParty key directly rather than
+        // routing through is_first_party(), which depends on where the test
+        // binary lives and made the previous version of this assertion
+        // unreachable in CI.
+        assert!(
+            q.try_acquire_key(PrincipalKey::FirstParty).is_some(),
+            "first-party pool must be unaffected by the SID flood"
+        );
+    }
+
+    #[test]
+    fn first_party_pool_has_its_own_independent_cap() {
+        // Exhausting the first-party pool must not be reachable from the
+        // SID bucket and vice versa.
+        let q = PrincipalQuota::new();
+        let _fp: Vec<_> = (0..MAX_CONNECTIONS_FIRST_PARTY)
+            .map(|_| q.try_acquire_key(PrincipalKey::FirstParty).unwrap())
+            .collect();
+        assert!(q.try_acquire_key(PrincipalKey::FirstParty).is_none());
+        // The SID bucket is untouched by the first-party flood.
+        let alice = id("S-1-5-21-1-2-3-1001");
+        assert!(q.try_acquire(Some(&alice)).is_some());
     }
 }

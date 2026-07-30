@@ -913,7 +913,17 @@ unsafe extern "system" fn etw_event_callback(record: *mut EVENT_RECORD) {
 
             // Image name resolution for process START events.
             // ETW event data (authoritative, free) → ToolHelp fallback (expensive).
+            // PRIVACY: the wide-string scan below lands on the payload's
+            // CommandLine field, not ImageFileName (ImageFileName is ANSI in
+            // Process_TypeGroup1, so it never matches a UTF-16 `X:` probe).
+            // The result therefore carries ARGUMENTS — which routinely hold
+            // credentials, tokens and private paths — and `image_path` is
+            // serialized into lineage findings, persisted to the forensic
+            // SQLite DB and returned over IPC. Redacting `command_line`
+            // alone did not close that: the leak rode in on the image field.
+            // Strip arguments before the value can escape.
             let image_name = extract_image_from_event(data)
+                .map(|s| strip_command_line_arguments(&s))
                 .or_else(|| get_process_image(pid))
                 .unwrap_or_else(|| format!("pid:{pid}"));
             let exe_name = image_name
@@ -1116,6 +1126,54 @@ pub(crate) fn parse_process_start_payload(data: &[u8]) -> Option<(u32, u32)> {
 ///
 /// The image path is typically at offset 52+ (x64) after SessionId, ExitStatus, etc.
 /// We scan for a plausible wide-string path starting with drive letter.
+/// Reduce a possibly-command-line string to just its executable path.
+///
+/// `extract_image_from_event` scans the MOF payload for a wide `X:` string,
+/// which in practice matches the CommandLine field rather than ImageFileName
+/// (the latter is ANSI). Everything after the executable is attacker- or
+/// user-supplied argument text — frequently credentials, tokens, or private
+/// file paths — and must never reach the forensic DB, IPC, or a finding.
+///
+/// Rules, in order:
+///   * quoted form `"C:\dir with spaces\a.exe" -flag` → take inside the quotes;
+///   * otherwise cut immediately after the first recognized executable
+///     extension, so ordinary unquoted paths containing spaces survive intact;
+///   * otherwise cut at the first space. That can truncate an exotic path,
+///     which is the correct direction to fail: losing display fidelity is
+///     acceptable, leaking an argument is not.
+fn strip_command_line_arguments(s: &str) -> String {
+    let trimmed = s.trim();
+    if let Some(rest) = trimmed.strip_prefix('"') {
+        return rest.split('"').next().unwrap_or("").to_string();
+    }
+    const EXE_EXTS: &[&str] = &[".exe", ".com", ".scr", ".bat", ".cmd", ".pif", ".dll"];
+    let lower = trimmed.to_ascii_lowercase();
+    let mut best: Option<usize> = None;
+    for ext in EXE_EXTS {
+        if let Some(pos) = lower.find(ext) {
+            let end = pos + ext.len();
+            // Only treat it as the boundary when the extension actually ends
+            // a component (end-of-string or followed by a separator/space) —
+            // otherwise `...\exec_report\x` would truncate mid-directory.
+            let ends_component = trimmed[end..]
+                .chars()
+                .next()
+                .map(|c| c.is_whitespace())
+                .unwrap_or(true);
+            if ends_component && best.map(|b| end < b).unwrap_or(true) {
+                best = Some(end);
+            }
+        }
+    }
+    if let Some(end) = best {
+        return trimmed[..end].to_string();
+    }
+    match trimmed.find(' ') {
+        Some(sp) => trimmed[..sp].to_string(),
+        None => trimmed.to_string(),
+    }
+}
+
 fn extract_image_from_event(data: &[u8]) -> Option<String> {
     // Minimum: need at least 60 bytes for fixed fields + some path data.
     if data.len() < 60 {
@@ -1654,5 +1712,56 @@ mod tests {
              cmdline telemetry: {}",
             cmdline_diag.to_json()
         );
+    }
+
+    /// PRIVACY regression: `image_path` is serialized into lineage findings,
+    /// persisted to the forensic SQLite DB and returned over IPC. The payload
+    /// scan yields the CommandLine field, so without argument-stripping every
+    /// secret on a process command line leaked through the image field —
+    /// while `command_line` itself was correctly redacted.
+    #[test]
+    fn image_path_never_carries_command_line_arguments() {
+        let cases = [
+            // (raw payload string, expected image path)
+            (
+                "C:\\Windows\\System32\\net.exe use \\\\srv\\s /user:admin Hunter2",
+                "C:\\Windows\\System32\\net.exe",
+            ),
+            // Unquoted path WITH spaces must survive intact.
+            (
+                "C:\\Program Files\\App\\tool.exe --token=SECRET123",
+                "C:\\Program Files\\App\\tool.exe",
+            ),
+            // Quoted form.
+            (
+                "\"C:\\Program Files\\My App\\run.exe\" -p hunter2",
+                "C:\\Program Files\\My App\\run.exe",
+            ),
+            // No arguments at all — unchanged.
+            (
+                "C:\\Windows\\explorer.exe",
+                "C:\\Windows\\explorer.exe",
+            ),
+            // Extension appearing mid-directory must not truncate early.
+            (
+                "C:\\tools\\exec_report\\run.cmd /pass:abc",
+                "C:\\tools\\exec_report\\run.cmd",
+            ),
+        ];
+        for (raw, want) in cases {
+            let got = strip_command_line_arguments(raw);
+            assert_eq!(got, want, "stripping {raw:?}");
+        }
+
+        // The property that actually matters, stated directly: no secret
+        // token from any of the above survives into the image path.
+        for secret in ["Hunter2", "SECRET123", "hunter2", "abc"] {
+            for (raw, _) in cases {
+                assert!(
+                    !strip_command_line_arguments(raw).contains(secret),
+                    "argument text {secret:?} leaked into image_path from {raw:?}"
+                );
+            }
+        }
     }
 }
