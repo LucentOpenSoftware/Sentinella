@@ -3867,6 +3867,10 @@ impl AppState {
         //   2. Hardcoded enumeration of C:\Users\* (when config empty or only
         //      contains LocalSystem-expanded garbage).
         //
+        // Independent of that choice, well-known system/persistence locations
+        // are ALWAYS watched: ProgramData, TEMP, C:\Windows\Temp, and (F-9,
+        // v0.1.12) each real user's `AppData\Local\Programs`.
+        //
         // When running as LocalSystem service, USERPROFILE expands to
         // C:\Windows\system32\config\systemprofile — NOT the logged-in user's
         // profile. Default config from config/mod.rs:171 contains paths like
@@ -3904,6 +3908,21 @@ impl AppState {
             roots.push(std::path::PathBuf::from(t));
         }
         roots.push(std::path::PathBuf::from("C:\\Windows\\Temp"));
+
+        // F-9 (v0.1.12): per-user `%LOCALAPPDATA%\Programs` — the canonical
+        // per-user install/persistence location (VS Code, Chrome, Discord,
+        // most NSIS/Squirrel per-user installers). VERIFIED missing from
+        // realtime coverage in v0.1.11; a dropper landing there survived
+        // until the next idle/scheduled scan. Added unconditionally, like
+        // the ProgramData/TEMP roots above: this is a persistence location,
+        // not a user preference, so it stays covered even when
+        // config.realtime_roots is customized. Profiles are enumerated
+        // (process LOCALAPPDATA is systemprofile under LocalSystem — never
+        // what we want); missing dirs are skipped; duplicates are dropped
+        // case-insensitively.
+        for p in user_profile_subdirs(Path::new("C:\\Users"), "AppData\\Local\\Programs") {
+            push_unique_existing_root(&mut roots, p);
+        }
 
         // Enumerate C:\Users\* only as fallback when config gave us nothing.
         if roots.iter().filter(|p| {
@@ -5050,6 +5069,87 @@ impl AppState {
         let diag = self.orchestrator.diagnostics();
         diag.workers.iter().filter(|w| w.active_jobs > 0).count() as u32
     }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Watcher root helpers (F-9: per-user %LOCALAPPDATA%\Programs)
+// ═══════════════════════════════════════════════════════════════
+
+/// Profile directories under `C:\Users` that never hold a real interactive
+/// user's data. Same list the idle scanner and the watcher fallback
+/// enumeration use — keep in sync.
+const SKIP_USER_PROFILES: [&str; 6] = [
+    "Default",
+    "Default User",
+    "Public",
+    "All Users",
+    "defaultuser0",
+    "WDAGUtilityAccount",
+];
+
+/// Enumerate `<users_root>\<user>\<subdir>` for every real user profile,
+/// skipping well-known non-user profiles and profiles where the subdir does
+/// not exist.
+///
+/// WHY enumerate instead of expanding `%LOCALAPPDATA%`: the daemon runs as
+/// LocalSystem in session 0, so the process env points at
+/// `C:\Windows\System32\config\systemprofile` — NOT the logged-in user.
+/// This is the same profile-enumeration pattern as
+/// `idle_scanner::build_scan_targets`.
+fn user_profile_subdirs(users_root: &Path, subdir: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir(users_root) {
+        Ok(e) => e,
+        Err(_) => return out,
+    };
+    for entry in entries.flatten() {
+        let profile = entry.path();
+        if !profile.is_dir() {
+            continue;
+        }
+        let name = match profile.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        if SKIP_USER_PROFILES.iter().any(|s| s.eq_ignore_ascii_case(name)) {
+            continue;
+        }
+        let candidate = profile.join(subdir);
+        // Missing dir is normal (fresh profiles never ran a per-user
+        // installer) — skip, don't fail.
+        if candidate.is_dir() {
+            out.push(candidate);
+        }
+    }
+    out
+}
+
+/// Push `candidate` into `roots` iff it is an existing directory that is not
+/// already present under a case-insensitive comparison (Windows path
+/// semantics). Trailing separators are ignored so `...\Programs` and
+/// `...\Programs\` count as the same root. Returns true when pushed.
+///
+/// The final canonicalize+dedupe pass in `start_watcher` is the authoritative
+/// dedupe; this early check keeps the root list small and gives the
+/// no-duplicate-watch invariant a directly testable seam.
+fn push_unique_existing_root(roots: &mut Vec<PathBuf>, candidate: PathBuf) -> bool {
+    if !candidate.is_dir() {
+        return false;
+    }
+    let key = candidate
+        .to_string_lossy()
+        .trim_end_matches(['\\', '/'])
+        .to_lowercase();
+    let duplicate = roots.iter().any(|r| {
+        r.to_string_lossy()
+            .trim_end_matches(['\\', '/'])
+            .eq_ignore_ascii_case(&key)
+    });
+    if duplicate {
+        return false;
+    }
+    roots.push(candidate);
+    true
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -7213,5 +7313,87 @@ mod tests {
             "reader observed a post-reload engine paired with a pre-reload error \
              — engine + last_error must be a single atomic snapshot"
         );
+    }
+
+    // ── F-9: per-user %LOCALAPPDATA%\Programs watched-root helpers ─────
+
+    /// Unique temp dir per test invocation (no external tempfile dep).
+    struct TempDir(std::path::PathBuf);
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir().join(format!(
+                "sentinella-f9-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+            std::fs::create_dir_all(&p).expect("create temp dir");
+            Self(p)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn f9_user_profile_subdirs_enumerates_real_profiles_only() {
+        let users = TempDir::new("enum");
+        // Real user with the Programs dir.
+        std::fs::create_dir_all(users.0.join("alice\\AppData\\Local\\Programs")).unwrap();
+        // Real user WITHOUT the subdir — must be skipped, not error.
+        std::fs::create_dir_all(users.0.join("bob")).unwrap();
+        // Well-known non-user profiles — must be skipped even with the dir.
+        for skipped in ["Public", "Default", "defaultuser0"] {
+            std::fs::create_dir_all(users.0.join(skipped).join("AppData\\Local\\Programs"))
+                .unwrap();
+        }
+        // A stray *file* under the users root — must be skipped.
+        std::fs::write(users.0.join("not-a-profile.txt"), b"x").unwrap();
+
+        let found = user_profile_subdirs(&users.0, "AppData\\Local\\Programs");
+        assert_eq!(
+            found,
+            vec![users.0.join("alice\\AppData\\Local\\Programs")],
+            "only alice's existing Programs dir may be returned"
+        );
+    }
+
+    #[test]
+    fn f9_user_profile_subdirs_missing_users_root_is_empty_not_error() {
+        let missing = std::env::temp_dir().join(format!(
+            "sentinella-f9-no-such-root-{}",
+            std::process::id()
+        ));
+        assert!(user_profile_subdirs(&missing, "AppData\\Local\\Programs").is_empty());
+    }
+
+    #[test]
+    fn f9_push_unique_existing_root_dedupes_case_insensitively() {
+        let dir = TempDir::new("dedup");
+        let mut roots: Vec<std::path::PathBuf> = Vec::new();
+
+        assert!(push_unique_existing_root(&mut roots, dir.0.clone()));
+        // Same path, different casing (Windows paths are case-insensitive):
+        // must NOT produce a second watch on the same physical directory —
+        // notify/ReadDirectoryChangesW misbehaves on duplicate registrations.
+        let upper = dir.0.to_string_lossy().to_uppercase();
+        assert!(!push_unique_existing_root(&mut roots, std::path::PathBuf::from(upper)));
+        // Trailing separator variant — same root.
+        let trailing = format!("{}\\", dir.0.to_string_lossy());
+        assert!(!push_unique_existing_root(&mut roots, std::path::PathBuf::from(trailing)));
+        assert_eq!(roots.len(), 1, "no-duplicate-watch invariant violated");
+    }
+
+    #[test]
+    fn f9_push_unique_existing_root_skips_missing_dir() {
+        let dir = TempDir::new("skip");
+        let missing = dir.0.join("does-not-exist");
+        let mut roots: Vec<std::path::PathBuf> = Vec::new();
+        assert!(!push_unique_existing_root(&mut roots, missing));
+        assert!(roots.is_empty(), "missing dirs must be skipped gracefully");
     }
 }

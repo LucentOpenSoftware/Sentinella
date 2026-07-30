@@ -176,6 +176,14 @@ install/persistence location is absent; daemon comments admit the class,
 - *Fix direction:* add per-user `AppData\Local\Programs` (and
   equivalent) to realtime roots; ship the watched-roots list in the
   operator docs.
+- **FIXED (v0.1.12, workstream J):** `AppState::start_watcher` now
+  unconditionally enumerates `C:\Users\<user>\AppData\Local\Programs` for
+  every real user profile (skipping Default/Public/etc. and non-existent
+  dirs, deduped case-insensitively) — same SYSTEM-safe profile enumeration
+  as the idle scanner. `%LOCALAPPDATA%` also added to the config
+  `realtime_roots` env-expansion list. Unit tests cover case-insensitive
+  dedup, missing-dir skip, env expansion, and the no-duplicate-watch
+  invariant.
 
 ### F-10 [MEDIUM] Management-plane starvation via 64-connection parking
 `crates/sentinelld/src/ipc/mod.rs:296-304,355-362` — **REASONED**

@@ -833,14 +833,25 @@ fn expand_vec(values: &mut [String]) {
 }
 
 fn expand_vars(value: &str) -> String {
+    expand_vars_with(value, |key| std::env::var(key).ok())
+}
+
+/// `expand_vars` with an injectable lookup so tests can exercise expansion
+/// without racing on the process environment (tests run on threads).
+fn expand_vars_with(value: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
     let mut out = value.to_string();
     for (key, fallback) in [
         ("USERPROFILE", ""),
         ("HOME", ""),
         ("TEMP", ""),
         ("PROGRAMDATA", r"C:\ProgramData"),
+        // F-9: lets users write `%LOCALAPPDATA%\Programs` in realtime_roots.
+        // No fallback: unset → left unexpanded (and the path simply won't
+        // exist → skipped by the watcher). Under LocalSystem this expands to
+        // the systemprofile tree, which start_watcher filters out anyway.
+        ("LOCALAPPDATA", ""),
     ] {
-        let resolved = std::env::var(key).unwrap_or_else(|_| fallback.to_string());
+        let resolved = lookup(key).unwrap_or_else(|| fallback.to_string());
         if resolved.is_empty() {
             continue;
         }
@@ -1791,6 +1802,26 @@ mod tests {
         .expanded();
 
         assert_eq!(config.excluded_paths[0], format!(r"{expected}\Sentinella"));
+    }
+
+    #[test]
+    fn f9_expands_localappdata_programs_root() {
+        // F-9: `%LOCALAPPDATA%\Programs` in realtime_roots must expand so a
+        // user can pin the canonical per-user install location explicitly.
+        // Injectable lookup keeps the test off the shared process env.
+        let lookup = |key: &str| {
+            (key == "LOCALAPPDATA").then(|| r"C:\Users\alice\AppData\Local".to_string())
+        };
+        assert_eq!(
+            expand_vars_with(r"%LOCALAPPDATA%\Programs", lookup),
+            r"C:\Users\alice\AppData\Local\Programs"
+        );
+        // Unset var with empty fallback → left unexpanded (the resulting
+        // path won't exist and the watcher skips it — fail-safe).
+        assert_eq!(
+            expand_vars_with(r"%LOCALAPPDATA%\Programs", |_| None),
+            r"%LOCALAPPDATA%\Programs"
+        );
     }
 
     #[test]
