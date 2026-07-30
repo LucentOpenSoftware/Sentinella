@@ -587,7 +587,11 @@ impl PlmMonitor {
             .ok();
 
         // If ETW was attempted, spawn a tiny monitor that detects ETW giving up
-        // and boosts snapshot interval to primary frequency.
+        // and boosts snapshot interval to primary frequency. It also fires the
+        // F-1 zero-event alarm: a consumer that has been open for ~2 minutes
+        // without delivering a single event means the kernel stream is broken
+        // even though the session "started" — the exact silent-zero failure
+        // mode that kept this dead for two audits.
         #[cfg(target_os = "windows")]
         if mode == PlmMode::Etw {
             let etw_d2 = etw_diag.clone();
@@ -597,7 +601,14 @@ impl PlmMonitor {
             std::thread::Builder::new()
                 .name("plm-etw-watchdog".into())
                 .spawn(move || {
-                    // Check every 5s if ETW gave up.
+                    /// Grace period before an open-but-silent consumer is
+                    /// declared Degraded. ~2 min: process starts on any live
+                    /// box are far more frequent than this.
+                    const ZERO_EVENT_GRACE: Duration = Duration::from_secs(120);
+                    // When the conservative etw_running flag was first seen
+                    // true (ConsumerOpened+); reset whenever it drops.
+                    let mut consumer_since: Option<Instant> = None;
+                    // Check every 5s if ETW gave up or is silently starved.
                     while r2.load(Ordering::Relaxed) {
                         std::thread::sleep(Duration::from_secs(5));
                         if let Some(ref ed) = etw_d2 {
@@ -608,6 +619,25 @@ impl PlmMonitor {
                                 );
                                 si2.store(primary_interval, Ordering::Relaxed);
                                 break;
+                            }
+                            // etw_running is now CONSERVATIVE (true only at
+                            // ConsumerOpened+) — see etw_intake::EtwStage.
+                            if ed.etw_running.load(Ordering::Relaxed) {
+                                let since = consumer_since.get_or_insert_with(Instant::now);
+                                if ed.events_seen.load(Ordering::Relaxed) == 0
+                                    && since.elapsed() >= ZERO_EVENT_GRACE
+                                    && !ed.zero_event_alarm.swap(true, Ordering::Relaxed)
+                                {
+                                    tracing::warn!(
+                                        grace_secs = ZERO_EVENT_GRACE.as_secs(),
+                                        "PLM ETW consumer open but zero events delivered; \
+                                         marking Degraded and boosting snapshot to primary"
+                                    );
+                                    ed.note_zero_event_degraded();
+                                    si2.store(primary_interval, Ordering::Relaxed);
+                                }
+                            } else {
+                                consumer_since = None;
                             }
                         }
                     }
@@ -841,6 +871,25 @@ impl PlmMonitor {
 impl Drop for PlmMonitor {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
+        // F-5/C-7 fix: JOIN the ETW thread so its stop thread's
+        // ControlTraceW(STOP) actually lands before the process exits.
+        // Previously Drop only set the flag; a fast service stop beat the
+        // stop thread's 500 ms poll and orphaned the kernel session (next
+        // boot's error-183 stale cleanup reclaimed it). Now that the session
+        // is a real system logger, each orphan also burns one of the 8
+        // system-logger slots, so the join matters more. Bounded: the stop
+        // thread polls every 500 ms, ProcessTrace returns promptly after
+        // STOP, and backoff sleeps are shutdown-interruptible — the join
+        // completes in roughly a second.
+        // The snapshot thread is deliberately NOT joined: it sleeps up to
+        // `interval` seconds per cycle, holds no kernel resources, and
+        // blocking service shutdown on it risks the SCM stop timeout.
+        #[cfg(target_os = "windows")]
+        if let Some(etw) = self._etw_thread.take() {
+            if etw.join().is_err() {
+                tracing::warn!("PLM ETW thread panicked during shutdown join");
+            }
+        }
     }
 }
 

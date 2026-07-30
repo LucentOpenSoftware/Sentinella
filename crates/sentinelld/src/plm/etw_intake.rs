@@ -4,18 +4,35 @@
 //! Requires admin/elevated privileges. Falls back to snapshot mode
 //! if ETW is unavailable.
 //!
-//! Architecture:
-//!   StartTraceW (private system-logger session: EVENT_TRACE_SYSTEM_LOGGER_MODE
-//!   + private Wnode.Guid + kernel EnableFlags) → OpenTraceW → ProcessTrace
-//!   (blocking, own thread)
-//!   EVENT_RECORD callback → parse process start → feed LineageGraph
+//! Architecture (post F-1 fix — this is what the code actually does):
+//!   StartTraceW on a PRIVATELY-NAMED SYSTEM LOGGER session:
+//!     LogFileMode = EVENT_TRACE_REAL_TIME_MODE | EVENT_TRACE_SYSTEM_LOGGER_MODE
+//!     Wnode.Guid = SESSION_GUID (fixed private GUID — randomly generated once,
+//!                  then frozen as a const; NEVER SystemTraceControlGuid —
+//!                  private name + SystemTraceControlGuid makes StartTraceW
+//!                  fail with ERROR_INVALID_PARAMETER per MS Learn)
+//!     EnableFlags = PROCESS | IMAGE_LOAD | FILE_IO_INIT — valid here because
+//!                  EnableFlags "is only valid for system loggers"
+//!                  (EVENT_TRACE_PROPERTIES, MS Learn) and system-logger mode
+//!                  makes this session one. Before this fix the session ran
+//!                  REAL_TIME-only, the flags were inert, and the kernel
+//!                  delivered zero events while diagnostics claimed "running".
+//!   → OpenTraceW → ProcessTrace (blocking, own thread)
+//!   → EVENT_RECORD callback → parse process start → feed LineageGraph
+//!
+//! Health is a stage machine (EtwStage), not a bare bool: etw_running is
+//! derived CONSERVATIVELY — true only once the consumer is open
+//! (ConsumerOpened and beyond). StartTraceW success alone is NOT reported
+//! as running. Persistent StartTraceW failure (>= MAX_CONSECUTIVE_FAILURES
+//! of any code, or ERROR_INVALID_PARAMETER once) or a zero-event consumer
+//! (~2 min) flips the daemon to snapshot-primary via etw_gave_up / the
+//! zero-event alarm in PlmMonitor's watchdog.
 //!
 //! There is intentionally NO EnableTraceEx2: kernel MOF process/image-load/
-//! file-io events are enabled via EVENT_TRACE_PROPERTIES.EnableFlags, which
-//! is only valid for system loggers ("EnableFlags is only valid for system
-//! loggers" — EVENT_TRACE_PROPERTIES, MS Learn). A previous version of this
-//! comment claimed EnableTraceEx2 was called; it never was, and without
-//! system-logger mode the session delivered zero events (F-1).
+//! file-io events are enabled via EVENT_TRACE_PROPERTIES.EnableFlags under
+//! system-logger mode. Switching to manifest providers
+//! (Microsoft-Windows-Kernel-*) via EnableTraceEx2 is future work — it would
+//! change event layouts and break every MOF parser offset in this file.
 
 #![cfg(target_os = "windows")]
 
@@ -26,16 +43,239 @@ use std::time::Instant;
 use super::{LineageGraph, ProcessNode};
 use windows::Win32::System::Diagnostics::Etw::EVENT_RECORD;
 
+// ── Session configuration (F-1 fix) ─────────────────────────────
+
+/// ETW logger mode bits. Sourced from the windows-crate SDK bindings so
+/// the values cannot drift from evntrace.h — a hand-typed literal here
+/// once read 0x00000200, which is actually EVENT_TRACE_DELAY_OPEN_FILE_MODE,
+/// and would have silently kept the session a non-system logger (F-1
+/// unfixed) while the bit-assertion test passed against its own wrong
+/// constant. The SDK cross-check test below guards this class.
+pub const EVENT_TRACE_REAL_TIME_MODE_BITS: u32 =
+    windows::Win32::System::Diagnostics::Etw::EVENT_TRACE_REAL_TIME_MODE;
+pub const EVENT_TRACE_SYSTEM_LOGGER_MODE_BITS: u32 =
+    windows::Win32::System::Diagnostics::Etw::EVENT_TRACE_SYSTEM_LOGGER_MODE;
+
+/// `LogFileMode` for the SentinellaPLM session: real-time delivery AND
+/// system-logger mode. System-logger mode is what makes the kernel
+/// `EnableFlags` below valid (MS Learn, EVENT_TRACE_PROPERTIES:
+/// "EnableFlags is only valid for system loggers").
+pub const SESSION_LOG_FILE_MODE: u32 =
+    EVENT_TRACE_REAL_TIME_MODE_BITS | EVENT_TRACE_SYSTEM_LOGGER_MODE_BITS;
+
+/// Kernel `EnableFlags`: EVENT_TRACE_FLAG_PROCESS | EVENT_TRACE_FLAG_IMAGE_LOAD
+/// | EVENT_TRACE_FLAG_FILE_IO_INIT. Only meaningful for system loggers.
+/// Derived from the SDK bindings (see `session_constants_match_sdk`).
+pub const SESSION_ENABLE_FLAGS: u32 = windows::Win32::System::Diagnostics::Etw::EVENT_TRACE_FLAG_PROCESS.0
+    | windows::Win32::System::Diagnostics::Etw::EVENT_TRACE_FLAG_IMAGE_LOAD.0
+    | windows::Win32::System::Diagnostics::Etw::EVENT_TRACE_FLAG_FILE_IO_INIT.0;
+
+/// Fixed PRIVATE session GUID for SentinellaPLM. Randomly generated once
+/// (UUIDv4) and then frozen here as a const — the value itself carries no
+/// meaning; it only needs to be unique and stable across restarts so a
+/// stale session from a previous run is found by name and stopped.
+///
+/// R-LETHAL-class trap avoided: this must NEVER be SystemTraceControlGuid
+/// ({9e814aad-3204-11d2-9a82-006008a86939}). Per the StartTraceW docs,
+/// `Wnode.Guid == SystemTraceControlGuid` combined with an `InstanceName`
+/// other than KERNEL_LOGGER_NAME fails with ERROR_INVALID_PARAMETER. The
+/// "Configuring and Starting a System Trace Provider Session" doc requires
+/// privately-named system loggers to assign a NEW GUID to Wnode.Guid.
+pub const SESSION_GUID: windows::core::GUID = windows::core::GUID::from_values(
+    0x9c4b1e7a,
+    0x3f2d,
+    0x4a8c,
+    [0xb5, 0xe1, 0x6d, 0x2f, 0x0a, 0x93, 0xc7, 0xd4],
+);
+
+/// The exact session configuration handed to StartTraceW. Pure data so the
+/// bit-level contract with the kernel is unit-testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionConfig {
+    pub log_file_mode: u32,
+    pub enable_flags: u32,
+    pub session_guid: windows::core::GUID,
+}
+
+/// Build the session config. Single source of truth for `run_etw_session`.
+pub fn session_config() -> SessionConfig {
+    SessionConfig {
+        log_file_mode: SESSION_LOG_FILE_MODE,
+        enable_flags: SESSION_ENABLE_FLAGS,
+        session_guid: SESSION_GUID,
+    }
+}
+
+// ── Stage machine (F-1 fix: replaces the bare etw_running bool) ──
+
+/// Lifecycle stage of the ETW intake. The kernel `EnableFlags` apply at
+/// StartTrace time for a system logger, so "provider enablement" is modeled
+/// as `FlagsActive` immediately after the session comes alive.
+///
+/// `etw_running` is derived CONSERVATIVELY from this stage: true only at
+/// `ConsumerOpened` and beyond (session up AND consumer attached). This is
+/// the fix for the F-1 lie where StartTraceW success alone set
+/// `running=true` while the kernel delivered nothing.
+#[repr(u64)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EtwStage {
+    /// Thread spawned, nothing attempted yet.
+    Requested = 0,
+    /// About to call (or retrying) StartTraceW.
+    Starting = 1,
+    /// StartTraceW succeeded; the kernel session exists.
+    SessionAlive = 2,
+    /// Kernel EnableFlags applied at StartTrace (system-logger mode).
+    FlagsActive = 3,
+    /// OpenTraceW succeeded; a consumer is attached to the stream.
+    ConsumerOpened = 4,
+    /// At least one event was delivered to the callback.
+    Processing = 5,
+    /// At least one event parsed into a valid lineage record.
+    EventsConfirmed = 6,
+    /// Consumer open but unhealthy (see degraded_reason codes).
+    Degraded = 7,
+    /// Orderly stop (ProcessTrace returned, handles closed).
+    Stopped = 8,
+    /// StartTraceW/OpenTraceW failed; `failed_win32` carries the code.
+    Failed = 9,
+}
+
+impl EtwStage {
+    fn from_u64(v: u64) -> Self {
+        match v {
+            1 => Self::Starting,
+            2 => Self::SessionAlive,
+            3 => Self::FlagsActive,
+            4 => Self::ConsumerOpened,
+            5 => Self::Processing,
+            6 => Self::EventsConfirmed,
+            7 => Self::Degraded,
+            8 => Self::Stopped,
+            9 => Self::Failed,
+            _ => Self::Requested,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Requested => "requested",
+            Self::Starting => "starting",
+            Self::SessionAlive => "session_alive",
+            Self::FlagsActive => "flags_active",
+            Self::ConsumerOpened => "consumer_opened",
+            Self::Processing => "processing",
+            Self::EventsConfirmed => "events_confirmed",
+            Self::Degraded => "degraded",
+            Self::Stopped => "stopped",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Conservative health derivation: the intake only counts as "running" once
+/// a consumer is actually attached. SessionAlive/FlagsActive are deliberately
+/// NOT running — StartTraceW success proves nothing about event delivery.
+pub fn conservative_etw_running(stage: EtwStage) -> bool {
+    matches!(
+        stage,
+        EtwStage::ConsumerOpened
+            | EtwStage::Processing
+            | EtwStage::EventsConfirmed
+            | EtwStage::Degraded
+    )
+}
+
+/// Stage-transition validator. Keeps the machine honest: any transition not
+/// listed here is ignored (logged at debug) instead of corrupting health.
+pub fn valid_stage_transition(from: EtwStage, to: EtwStage) -> bool {
+    use EtwStage::*;
+    if from == to {
+        return true; // idempotent re-store (e.g. Failed code update)
+    }
+    match from {
+        Requested => to == Starting,
+        Starting => matches!(to, SessionAlive | Failed | Stopped),
+        SessionAlive => matches!(to, FlagsActive | Failed | Stopped),
+        FlagsActive => matches!(to, ConsumerOpened | Failed | Stopped),
+        ConsumerOpened => matches!(to, Processing | Degraded | Stopped | Failed),
+        Processing => matches!(to, EventsConfirmed | Degraded | Stopped | Failed),
+        EventsConfirmed => matches!(to, Degraded | Stopped | Failed),
+        Degraded => matches!(to, Processing | EventsConfirmed | Stopped | Failed),
+        // Retry loop re-enters Starting after a stopped/failed attempt.
+        Stopped | Failed => to == Starting,
+    }
+}
+
+// ── Error classification (give-up semantics) ────────────────────
+
+pub const ERROR_ACCESS_DENIED: u32 = 5;
+pub const ERROR_INVALID_PARAMETER: u32 = 87;
+pub const ERROR_ALREADY_EXISTS: u32 = 183;
+pub const ERROR_NO_SYSTEM_RESOURCES: u32 = 1450;
+
+/// What a failed StartTraceW/OpenTraceW win32 code means for the retry loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartErrorDisposition {
+    /// ERROR_ALREADY_EXISTS (183): a stale session owns the name — the
+    /// caller stops it and retries. NOT counted toward give-up.
+    StaleSession,
+    /// ERROR_INVALID_PARAMETER (87): our session config is invalid; retrying
+    /// can never succeed. Give up immediately (fatal).
+    Fatal,
+    /// Everything else — including ERROR_ACCESS_DENIED (5, not elevated) and
+    /// ERROR_NO_SYSTEM_RESOURCES (1450, all 8 system-logger slots taken) —
+    /// is environmental/transient: counted toward the consecutive-failure
+    /// give-up budget. 1450 counts exactly like access-denied per the F-1
+    /// fix design: slot exhaustion must restore snapshot-primary, not spin.
+    Counted,
+}
+
+pub fn classify_start_error(code: u32) -> StartErrorDisposition {
+    match code {
+        ERROR_ALREADY_EXISTS => StartErrorDisposition::StaleSession,
+        ERROR_INVALID_PARAMETER => StartErrorDisposition::Fatal,
+        _ => StartErrorDisposition::Counted,
+    }
+}
+
+/// Consecutive session-start failures (of ANY counted code) after which ETW
+/// intake gives up and `etw_gave_up` is set so the PLM watchdog restores the
+/// snapshot fallback to primary frequency. Before the F-1 fix only error 5
+/// counted, so a new persistent failure mode would retry forever at 30 s
+/// backoff with the snapshot stuck at supplemental cadence.
+const MAX_CONSECUTIVE_FAILURES: u32 = 5;
+
+/// degraded_reason code: consumer open, zero events after the grace period.
+pub const DEGRADED_ZERO_EVENTS: u64 = 1;
+
+// ── Diagnostics ─────────────────────────────────────────────────
+
 /// ETW process intake diagnostics.
 pub struct EtwIntakeDiagnostics {
     pub events_seen: AtomicU64,
     pub events_dropped: AtomicU64,
     pub reconnects: AtomicU64,
+    /// CONSERVATIVE health flag, derived from `stage` via
+    /// `conservative_etw_running` — true only at ConsumerOpened and beyond.
+    /// Kept as a field (not a method) so existing readers
+    /// (ipc/state.rs surface, plm/mod.rs watchdog + weedhack mirror) keep
+    /// their protocol shape; all writes go through `set_stage`.
     pub etw_running: AtomicBool,
     pub last_event_ts: AtomicU64,
-    /// Set to true when ETW gives up retrying (e.g. access denied, not admin).
+    /// Set to true when ETW gives up retrying (>= MAX_CONSECUTIVE_FAILURES
+    /// consecutive failures of any code, or a fatal config error).
     /// PlmMonitor can check this to switch to full snapshot mode.
     pub etw_gave_up: AtomicBool,
+    /// Current lifecycle stage (`EtwStage as u64`). Single writer: the ETW
+    /// thread (plus the watchdog for the Degraded transition).
+    pub stage: AtomicU64,
+    /// Last win32 code that drove the stage to Failed (0 = none).
+    pub failed_win32: AtomicU64,
+    /// Why the stage is Degraded (0 = not degraded; DEGRADED_* codes).
+    pub degraded_reason: AtomicU64,
+    /// One-shot latch: the zero-event watchdog already warned.
+    pub zero_event_alarm: AtomicBool,
 }
 
 impl EtwIntakeDiagnostics {
@@ -47,7 +287,53 @@ impl EtwIntakeDiagnostics {
             etw_running: AtomicBool::new(false),
             last_event_ts: AtomicU64::new(0),
             etw_gave_up: AtomicBool::new(false),
+            stage: AtomicU64::new(EtwStage::Requested as u64),
+            failed_win32: AtomicU64::new(0),
+            degraded_reason: AtomicU64::new(0),
+            zero_event_alarm: AtomicBool::new(false),
         }
+    }
+
+    pub fn current_stage(&self) -> EtwStage {
+        EtwStage::from_u64(self.stage.load(Ordering::Relaxed))
+    }
+
+    pub fn stage_name(&self) -> &'static str {
+        self.current_stage().name()
+    }
+
+    /// Advance the stage machine. Invalid transitions are ignored (debug
+    /// log) rather than corrupting the health surface. `etw_running` is
+    /// re-derived on every accepted transition.
+    fn set_stage(&self, to: EtwStage) {
+        let from = self.current_stage();
+        if !valid_stage_transition(from, to) {
+            tracing::debug!(
+                from = from.name(),
+                to = to.name(),
+                "PLM ETW: ignoring invalid stage transition"
+            );
+            return;
+        }
+        self.stage.store(to as u64, Ordering::Relaxed);
+        self.etw_running
+            .store(conservative_etw_running(to), Ordering::Relaxed);
+    }
+
+    /// Record a session failure: stage → Failed with the win32 code.
+    fn note_failed(&self, code: u32) {
+        self.failed_win32.store(code as u64, Ordering::Relaxed);
+        self.set_stage(EtwStage::Failed);
+    }
+
+    /// Watchdog hook: consumer open but zero delivered events past the grace
+    /// period — the F-1 silent-zero failure mode. Keeps etw_running true
+    /// (the consumer IS attached; the stream is starved) but flips the stage
+    /// so the health surface stops claiming full health.
+    pub fn note_zero_event_degraded(&self) {
+        self.degraded_reason
+            .store(DEGRADED_ZERO_EVENTS, Ordering::Relaxed);
+        self.set_stage(EtwStage::Degraded);
     }
 }
 
@@ -71,13 +357,64 @@ pub fn start_etw_intake(
     Ok(thread)
 }
 
-/// Maximum retry attempts for access-denied (error 5) before giving up.
-/// After this many failures, ETW intake stops retrying and signals
-/// the PLM monitor to rely on snapshot mode exclusively.
-const MAX_ACCESS_DENIED_RETRIES: u32 = 5;
+/// Structured session failure so the retry loop classifies the actual
+/// win32 code instead of substring-matching a formatted error string (the
+/// old "failed: 5 " match also tripped on codes 50-59/500-599).
+#[derive(Debug)]
+enum SessionError {
+    /// Properties buffer layout failed (internal, not a win32 code).
+    Layout(String),
+    /// StartTraceW returned ERROR_ALREADY_EXISTS; the stale session was
+    /// stopped by-name. Retry immediately, not a failure.
+    StaleSessionCleaned,
+    /// StartTraceW failed with this win32 code.
+    StartTrace { code: u32 },
+    /// OpenTraceW failed with this win32 code (session already stopped).
+    OpenTrace { code: u32 },
+}
+
+impl SessionError {
+    fn win32_code(&self) -> u32 {
+        match self {
+            Self::Layout(_) | Self::StaleSessionCleaned => 0,
+            Self::StartTrace { code } | Self::OpenTrace { code } => *code,
+        }
+    }
+}
+
+impl std::fmt::Display for SessionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Layout(e) => write!(f, "ETW props layout failed: {e}"),
+            Self::StaleSessionCleaned => write!(f, "stale session cleaned, will retry"),
+            Self::StartTrace { code } => write!(f, "StartTraceW failed: win32 {code}"),
+            Self::OpenTrace { code } => write!(f, "OpenTraceW failed: win32 {code}"),
+        }
+    }
+}
+
+impl From<String> for SessionError {
+    fn from(e: String) -> Self {
+        Self::Layout(e)
+    }
+}
+
+/// Sleep in 500 ms slices so shutdown (`running = false`) is observed
+/// promptly — PlmMonitor::Drop joins this thread and must not block for a
+/// full 30 s backoff while the SCM waits on service stop.
+fn interruptible_sleep(running: &AtomicBool, secs: u64) {
+    let mut slices = secs.saturating_mul(2);
+    while slices > 0 && running.load(Ordering::Relaxed) {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        slices -= 1;
+    }
+}
 
 /// Main ETW processing loop. Retries on failure with backoff.
-/// Gives up after `MAX_ACCESS_DENIED_RETRIES` access-denied failures.
+/// Gives up after `MAX_CONSECUTIVE_FAILURES` consecutive failures of ANY
+/// counted code (access-denied, 1450 slot exhaustion, …) or immediately on
+/// a fatal config error (87), setting `etw_gave_up` so the snapshot
+/// fallback is restored to primary frequency.
 fn etw_process_loop(
     graph: Arc<LineageGraph>,
     diag: Arc<EtwIntakeDiagnostics>,
@@ -87,54 +424,91 @@ fn etw_process_loop(
 
     let session_name = "SentinellaPLM";
     let mut backoff_secs = 1u64;
-    let mut access_denied_count = 0u32;
+    let mut consecutive_failures = 0u32;
+
+    diag.set_stage(EtwStage::Starting);
 
     while running.load(Ordering::Relaxed) {
+        if diag.current_stage() != EtwStage::Starting {
+            diag.set_stage(EtwStage::Starting);
+        }
         match run_etw_session(session_name, &graph, &diag, &running) {
             Ok(()) => {
                 tracing::info!("PLM ETW session ended cleanly");
+                diag.set_stage(EtwStage::Stopped);
                 break;
             }
+            Err(SessionError::StaleSessionCleaned) => {
+                // Crash-between-StartTrace-and-OpenTrace (or any orphaned
+                // session from a previous run) lands here: the stale session
+                // was already stopped by name inside run_etw_session. Not a
+                // failure — do not count it toward give-up.
+                diag.reconnects.fetch_add(1, Ordering::Relaxed);
+                consecutive_failures = 0;
+                tracing::info!("PLM ETW: stale session cleaned, will retry");
+                interruptible_sleep(&running, 1);
+                continue;
+            }
             Err(e) => {
-                diag.etw_running.store(false, Ordering::Relaxed);
                 diag.reconnects.fetch_add(1, Ordering::Relaxed);
 
                 if !running.load(Ordering::Relaxed) {
                     break;
                 }
 
-                // Match the exact access-denied code, not the substring
-                // "failed: 5" — that also matched 50-59, 500-599, etc.
-                // (e.g. error 53 = ERROR_BAD_NETPATH), prematurely tripping
-                // the give-up counter on unrelated startup failures. The
-                // error string is formatted "StartTraceW failed: {code} (...".
-                let is_access_denied =
-                    e.contains("failed: 5 ") || e.contains("failed: 5(");
-                if is_access_denied {
-                    access_denied_count += 1;
-                }
+                let code = e.win32_code();
+                let disposition = classify_start_error(code);
+                // A failure after the consumer was open means the config is
+                // fundamentally fine (this is a mid-life stream loss) — reset
+                // the consecutive-start budget; the failure itself still counts.
+                let reached_consumer = diag.etw_running.load(Ordering::Relaxed);
+                diag.note_failed(code);
+                consecutive_failures = if reached_consumer {
+                    1
+                } else {
+                    consecutive_failures.saturating_add(1)
+                };
 
-                if is_access_denied && access_denied_count >= MAX_ACCESS_DENIED_RETRIES {
-                    tracing::info!(
-                        attempts = access_denied_count,
-                        "PLM ETW: access denied (not admin), switching to snapshot-only mode"
+                let fatal = disposition == StartErrorDisposition::Fatal
+                    || consecutive_failures >= MAX_CONSECUTIVE_FAILURES;
+
+                if fatal {
+                    tracing::warn!(
+                        stage = diag.stage_name(),
+                        win32 = code,
+                        disposition = ?disposition,
+                        attempts = consecutive_failures,
+                        fatal = true,
+                        "PLM ETW giving up, snapshot fallback becomes primary"
                     );
                     diag.etw_gave_up.store(true, Ordering::Relaxed);
                     break;
                 }
 
                 tracing::warn!(
-                    error = %e,
+                    stage = diag.stage_name(),
+                    win32 = code,
+                    disposition = ?disposition,
+                    attempts = consecutive_failures,
                     backoff_secs,
-                    attempt = access_denied_count,
+                    fatal = false,
+                    error = %e,
                     "PLM ETW session failed, will retry"
                 );
 
-                // Backoff: 1s, 2s, 4s, 8s, max 30s.
-                std::thread::sleep(std::time::Duration::from_secs(backoff_secs));
+                // Backoff: 1s, 2s, 4s, 8s, max 30s (shutdown-interruptible).
+                interruptible_sleep(&running, backoff_secs);
                 backoff_secs = (backoff_secs * 2).min(30);
             }
         }
+    }
+
+    // Orderly exit with no recorded end stage (e.g. shutdown during backoff):
+    // leave Failed in place (it carries the diagnostic code), otherwise mark
+    // Stopped so health never claims an active session post-exit.
+    match diag.current_stage() {
+        EtwStage::Failed | EtwStage::Stopped => {}
+        _ => diag.set_stage(EtwStage::Stopped),
     }
 
     tracing::info!("PLM ETW intake stopped");
@@ -146,7 +520,7 @@ fn run_etw_session(
     graph: &Arc<LineageGraph>,
     diag: &Arc<EtwIntakeDiagnostics>,
     running: &Arc<AtomicBool>,
-) -> Result<(), String> {
+) -> Result<(), SessionError> {
     use windows::Win32::System::Diagnostics::Etw::*;
     use windows::core::PCWSTR;
 
@@ -163,18 +537,27 @@ fn run_etw_session(
     // UTF-16 logger name; we only set session-semantic fields here.
     let mut props_storage =
         sentinella_common::etw_props::EventTracePropsStorage::with_extra(session_name, None, 256)
-            .map_err(|e| format!("ETW props layout failed: {e}"))?;
+            .map_err(|e| SessionError::Layout(format!("{e}")))?;
+    let cfg = session_config();
     let props = props_storage.props_mut();
     props.Wnode.ClientContext = 1;
     props.Wnode.Flags = 0x00020000; // WNODE_FLAG_TRACED_GUID
-    props.LogFileMode = 0x00000100; // EVENT_TRACE_REAL_TIME_MODE
+    // F-1 fix: privately-named SYSTEM LOGGER. Wnode.Guid is the frozen
+    // private SESSION_GUID (never SystemTraceControlGuid — private name +
+    // that GUID = ERROR_INVALID_PARAMETER per StartTraceW docs), and
+    // LogFileMode carries EVENT_TRACE_SYSTEM_LOGGER_MODE so the kernel
+    // EnableFlags below are valid ("EnableFlags is only valid for system
+    // loggers" — EVENT_TRACE_PROPERTIES, MS Learn). Without the mode bit
+    // the flags were inert and the session delivered zero events.
+    props.Wnode.Guid = cfg.session_guid;
+    props.LogFileMode = cfg.log_file_mode;
     // Process events (0x00000001 = EVENT_TRACE_FLAG_PROCESS) + image-load
     // events (0x00000004 = EVENT_TRACE_FLAG_IMAGE_LOAD) + file-IO initiator
     // events (0x04000000 = EVENT_TRACE_FLAG_FILE_IO_INIT). The shared
     // session dispatcher in `etw_event_callback` routes by provider+opcode
     // so the existing PLM process-create path is bit-for-bit unchanged.
     // ImageLoad → `etw_image_load`; FileIo Create → `etw_file_io`.
-    props.EnableFlags = EVENT_TRACE_FLAG(0x00000001 | 0x00000004 | 0x04000000);
+    props.EnableFlags = EVENT_TRACE_FLAG(cfg.enable_flags);
 
     let mut session_handle = CONTROLTRACE_HANDLE::default();
     let start_result = unsafe {
@@ -186,8 +569,10 @@ fn run_etw_session(
     };
 
     if start_result.0 != 0 {
-        if start_result.0 == 183 {
-            // Stale session — stop and retry.
+        if start_result.0 == ERROR_ALREADY_EXISTS {
+            // Stale session (previous unclean exit, or a crash between
+            // StartTrace and OpenTrace left a session with no consumer) —
+            // stop it by name and let the loop retry.
             let mut stop_storage = stop_props_storage()?;
             unsafe {
                 let _ = ControlTraceW(
@@ -197,16 +582,22 @@ fn run_etw_session(
                     EVENT_TRACE_CONTROL_STOP,
                 );
             }
-            return Err("stale session cleaned, will retry".into());
+            return Err(SessionError::StaleSessionCleaned);
         }
-        return Err(format!(
-            "StartTraceW failed: {} (need admin?)",
-            start_result.0
-        ));
+        return Err(SessionError::StartTrace {
+            code: start_result.0,
+        });
     }
 
-    tracing::info!("PLM ETW kernel trace session started");
-    diag.etw_running.store(true, Ordering::Relaxed);
+    // StartTraceW succeeded. NOTE: this alone is NOT "running" — the
+    // conservative etw_running flag only flips at ConsumerOpened.
+    diag.set_stage(EtwStage::SessionAlive);
+    tracing::info!(
+        "PLM ETW system-logger session started (kernel EnableFlags active at StartTrace)"
+    );
+    // For a system logger the kernel EnableFlags apply at StartTrace time —
+    // there is no separate provider-enablement call to model.
+    diag.set_stage(EtwStage::FlagsActive);
 
     // Set up consumer.
     let graph_ptr = Arc::as_ptr(graph) as usize;
@@ -224,6 +615,7 @@ fn run_etw_session(
 
     let trace_handle = unsafe { OpenTraceW(&mut logfile) };
     if trace_handle.Value == u64::MAX {
+        let code = unsafe { windows::Win32::Foundation::GetLastError() }.0;
         // R3-10: clear the callback context statics installed above —
         // the success path zeroes them after ProcessTrace returns; this
         // early-return branch must do the same so no dangling raw
@@ -242,8 +634,12 @@ fn run_etw_session(
                 EVENT_TRACE_CONTROL_STOP,
             );
         }
-        return Err("OpenTraceW failed".into());
+        return Err(SessionError::OpenTrace { code });
     }
+
+    // The consumer is attached — THIS is the first point where the intake
+    // may report running (conservative derivation via set_stage).
+    diag.set_stage(EtwStage::ConsumerOpened);
 
     // ProcessTrace blocks until session stops.
     // ARCH-3 fix: use a separate flag for the stop thread so that if
@@ -290,7 +686,8 @@ fn run_etw_session(
     // Signal stop thread that ProcessTrace has returned.
     trace_done.store(true, Ordering::Relaxed);
     let _ = stop_thread.join();
-    diag.etw_running.store(false, Ordering::Relaxed);
+    // etw_running is re-derived by the caller's set_stage(Stopped) — no
+    // direct store here (all health writes go through the stage machine).
 
     Ok(())
 }
@@ -368,6 +765,14 @@ unsafe extern "system" fn etw_event_callback(record: *mut EVENT_RECORD) {
 
             let diag = &*(diag_ptr as *const EtwIntakeDiagnostics);
             diag.events_seen.fetch_add(1, Ordering::Relaxed);
+            // First delivered event: ConsumerOpened → Processing (also
+            // rescues a Degraded zero-event stage if the stream recovers).
+            if matches!(
+                diag.current_stage(),
+                EtwStage::ConsumerOpened | EtwStage::Degraded
+            ) {
+                diag.set_stage(EtwStage::Processing);
+            }
             diag.last_event_ts.store(
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -435,6 +840,11 @@ unsafe extern "system" fn etw_event_callback(record: *mut EVENT_RECORD) {
                 created_at: Instant::now(),
                 timestamp: chrono::Utc::now().timestamp(),
             });
+            // First event that parsed into a valid lineage record confirms
+            // end-to-end delivery: Processing → EventsConfirmed.
+            if diag.current_stage() == EtwStage::Processing {
+                diag.set_stage(EtwStage::EventsConfirmed);
+            }
         }
     }));
 
@@ -643,5 +1053,280 @@ fn get_process_image(pid: u32) -> Option<String> {
             }
         }
         None
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Tests
+// ═══════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Session config: exact bit-level contract with the kernel ──
+
+    #[test]
+    fn session_config_exact_bits() {
+        let cfg = session_config();
+        // REAL_TIME (0x100) | SYSTEM_LOGGER (0x02000000) = 0x02000100.
+        // Anything else and the kernel EnableFlags are inert again (the
+        // F-1 bug). Note 0x200 is EVENT_TRACE_DELAY_OPEN_FILE_MODE — a
+        // previous revision of this test asserted THAT as "system logger".
+        assert_eq!(cfg.log_file_mode, 0x02000100);
+        assert_ne!(cfg.log_file_mode & EVENT_TRACE_SYSTEM_LOGGER_MODE_BITS, 0);
+        assert_ne!(cfg.log_file_mode & EVENT_TRACE_REAL_TIME_MODE_BITS, 0);
+        // PROCESS | IMAGE_LOAD | FILE_IO_INIT.
+        assert_eq!(cfg.enable_flags, 0x00000001 | 0x00000004 | 0x04000000);
+        assert_eq!(cfg.session_guid, SESSION_GUID);
+    }
+
+    #[test]
+    fn session_constants_match_sdk() {
+        // The drift guard for the class that produced the 0x200 bug: every
+        // ETW constant this module relies on must equal the SDK binding.
+        use windows::Win32::System::Diagnostics::Etw::*;
+        assert_eq!(EVENT_TRACE_REAL_TIME_MODE_BITS, EVENT_TRACE_REAL_TIME_MODE);
+        assert_eq!(
+            EVENT_TRACE_SYSTEM_LOGGER_MODE_BITS,
+            EVENT_TRACE_SYSTEM_LOGGER_MODE
+        );
+        assert_eq!(EVENT_TRACE_SYSTEM_LOGGER_MODE, 0x02000000);
+        assert_eq!(SESSION_ENABLE_FLAGS, 0x00000001 | 0x00000004 | 0x04000000);
+        assert_eq!(EVENT_TRACE_FLAG_PROCESS.0, 0x00000001);
+        assert_eq!(EVENT_TRACE_FLAG_IMAGE_LOAD.0, 0x00000004);
+        assert_eq!(EVENT_TRACE_FLAG_FILE_IO_INIT.0, 0x04000000);
+    }
+
+    #[test]
+    fn session_guid_is_not_system_trace_control_guid() {
+        // The R-LETHAL trap: private session name + SystemTraceControlGuid
+        // makes StartTraceW fail with ERROR_INVALID_PARAMETER (MS Learn).
+        assert_ne!(
+            SESSION_GUID,
+            windows::Win32::System::Diagnostics::Etw::SystemTraceControlGuid
+        );
+        // And it must not be the zero GUID either (zero asks the system to
+        // generate one — fine per docs, but we deliberately froze a private
+        // one; a regression to zero should be a loud test failure).
+        assert_ne!(SESSION_GUID, windows::core::GUID::zeroed());
+    }
+
+    // ── Error classifier: give-up decisions ─────────────────────
+
+    #[test]
+    fn classify_error_codes() {
+        // 183: stale session — stop + retry, never counted.
+        assert_eq!(
+            classify_start_error(ERROR_ALREADY_EXISTS),
+            StartErrorDisposition::StaleSession
+        );
+        // 87: invalid config — fatal immediately, retrying is pointless.
+        assert_eq!(
+            classify_start_error(ERROR_INVALID_PARAMETER),
+            StartErrorDisposition::Fatal
+        );
+        // 5 (access denied) and 1450 (all 8 system-logger slots taken)
+        // both count toward the consecutive-failure give-up budget.
+        assert_eq!(
+            classify_start_error(ERROR_ACCESS_DENIED),
+            StartErrorDisposition::Counted
+        );
+        assert_eq!(
+            classify_start_error(ERROR_NO_SYSTEM_RESOURCES),
+            StartErrorDisposition::Counted
+        );
+        // Anything else (e.g. 53 ERROR_BAD_NETPATH) is counted, never
+        // silently fatal and never silently free.
+        assert_eq!(classify_start_error(53), StartErrorDisposition::Counted);
+        assert_eq!(classify_start_error(0), StartErrorDisposition::Counted);
+        assert_eq!(classify_start_error(u32::MAX), StartErrorDisposition::Counted);
+    }
+
+    // ── Stage-transition validator ──────────────────────────────
+
+    #[test]
+    fn stage_transitions_happy_path() {
+        use EtwStage::*;
+        let path = [
+            (Requested, Starting),
+            (Starting, SessionAlive),
+            (SessionAlive, FlagsActive),
+            (FlagsActive, ConsumerOpened),
+            (ConsumerOpened, Processing),
+            (Processing, EventsConfirmed),
+            (EventsConfirmed, Stopped),
+        ];
+        for (from, to) in path {
+            assert!(valid_stage_transition(from, to), "{from:?} -> {to:?}");
+        }
+    }
+
+    #[test]
+    fn stage_transitions_reject_skips_and_resurrections() {
+        use EtwStage::*;
+        // Cannot claim consumer-opened straight from Starting (the old lie).
+        assert!(!valid_stage_transition(Starting, ConsumerOpened));
+        assert!(!valid_stage_transition(Starting, Processing));
+        assert!(!valid_stage_transition(Requested, EventsConfirmed));
+        // A stopped/failed session cannot jump back to a live stage without
+        // re-entering Starting.
+        assert!(!valid_stage_transition(Stopped, ConsumerOpened));
+        assert!(!valid_stage_transition(Failed, Processing));
+        // But the retry loop MAY re-enter Starting from a terminal stage.
+        assert!(valid_stage_transition(Stopped, Starting));
+        assert!(valid_stage_transition(Failed, Starting));
+        // Degraded can recover when events resume, or die.
+        assert!(valid_stage_transition(Degraded, Processing));
+        assert!(valid_stage_transition(Degraded, EventsConfirmed));
+        assert!(valid_stage_transition(Degraded, Stopped));
+        assert!(!valid_stage_transition(Degraded, Starting));
+    }
+
+    // ── Conservative health derivation ──────────────────────────
+
+    #[test]
+    fn etw_running_only_from_consumer_opened_up() {
+        use EtwStage::*;
+        for stage in [Requested, Starting, SessionAlive, FlagsActive] {
+            assert!(
+                !conservative_etw_running(stage),
+                "{stage:?} must NOT report running — StartTraceW success proves nothing"
+            );
+        }
+        for stage in [ConsumerOpened, Processing, EventsConfirmed, Degraded] {
+            assert!(conservative_etw_running(stage), "{stage:?} must report running");
+        }
+        for stage in [Stopped, Failed] {
+            assert!(!conservative_etw_running(stage));
+        }
+    }
+
+    #[test]
+    fn diagnostics_derive_running_from_stage() {
+        let d = EtwIntakeDiagnostics::new();
+        assert_eq!(d.current_stage(), EtwStage::Requested);
+        assert!(!d.etw_running.load(Ordering::Relaxed));
+        assert_eq!(d.stage_name(), "requested");
+
+        d.set_stage(EtwStage::Starting);
+        d.set_stage(EtwStage::SessionAlive);
+        d.set_stage(EtwStage::FlagsActive);
+        // Session alive + flags active is still NOT running.
+        assert!(!d.etw_running.load(Ordering::Relaxed));
+
+        d.set_stage(EtwStage::ConsumerOpened);
+        assert!(d.etw_running.load(Ordering::Relaxed));
+
+        // Invalid transition ignored: ConsumerOpened cannot jump to Starting.
+        d.set_stage(EtwStage::Starting);
+        assert_eq!(d.current_stage(), EtwStage::ConsumerOpened);
+
+        d.set_stage(EtwStage::Stopped);
+        assert!(!d.etw_running.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn note_failed_records_code_and_clears_running() {
+        let d = EtwIntakeDiagnostics::new();
+        d.set_stage(EtwStage::Starting);
+        d.note_failed(ERROR_NO_SYSTEM_RESOURCES);
+        assert_eq!(d.current_stage(), EtwStage::Failed);
+        assert_eq!(d.failed_win32.load(Ordering::Relaxed), 1450);
+        assert!(!d.etw_running.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn zero_event_degraded_keeps_running_but_marks_reason() {
+        let d = EtwIntakeDiagnostics::new();
+        d.set_stage(EtwStage::Starting);
+        d.set_stage(EtwStage::SessionAlive);
+        d.set_stage(EtwStage::FlagsActive);
+        d.set_stage(EtwStage::ConsumerOpened);
+        d.note_zero_event_degraded();
+        assert_eq!(d.current_stage(), EtwStage::Degraded);
+        assert_eq!(d.degraded_reason.load(Ordering::Relaxed), DEGRADED_ZERO_EVENTS);
+        // Consumer IS attached — running stays true, health is "degraded".
+        assert!(d.etw_running.load(Ordering::Relaxed));
+    }
+
+    // ── Live integration (opt-in, elevated Windows only) ────────
+
+    /// Prerequisites: Windows 8+, ELEVATED test runner (admin + the trace
+    /// session privilege), no leftover `SentinellaPLM` session is required
+    /// (stale cleanup is exercised if one exists).
+    /// Run explicitly:
+    ///   cargo test -p sentinelld etw_live_system_logger_delivers_events -- --ignored --nocapture
+    ///
+    /// Expected on a healthy elevated box:
+    ///   - stage reaches ConsumerOpened within ~5 s,
+    ///   - events_seen >= 1 within ~30 s of spawning `cmd /c exit`,
+    ///   - stage reaches EventsConfirmed (event parsed, not just delivered).
+    /// Expected failure signatures:
+    ///   - stage Failed + failed_win32 == 5    → test runner not elevated;
+    ///   - stage Failed + failed_win32 == 1450 → all 8 system-logger slots
+    ///     taken (check `logman query -ets`, stop stray sessions);
+    ///   - stage Failed + failed_win32 == 87   → session config regression
+    ///     (e.g. someone set SystemTraceControlGuid);
+    ///   - stage stuck at ConsumerOpened with events_seen == 0 → the kernel
+    ///     flags are inert again (LogFileMode lost SYSTEM_LOGGER_MODE).
+    /// The test always stops the session on exit (running=false → the stop
+    /// thread issues ControlTraceW(STOP) and the loop joins).
+    #[test]
+    #[ignore = "requires an elevated Windows box; run with --ignored"]
+    fn etw_live_system_logger_delivers_events() {
+        let graph = Arc::new(LineageGraph::new());
+        let diag = Arc::new(EtwIntakeDiagnostics::new());
+        let running = Arc::new(AtomicBool::new(true));
+
+        let handle = start_etw_intake(
+            Arc::clone(&graph),
+            Arc::clone(&diag),
+            Arc::clone(&running),
+        )
+        .expect("ETW thread spawn failed");
+
+        // Wait for the consumer to attach (or a failure to surface).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
+            let stage = diag.current_stage();
+            if conservative_etw_running(stage) || stage == EtwStage::Failed {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        assert!(
+            diag.etw_running.load(Ordering::Relaxed),
+            "consumer never opened; stage={} failed_win32={}",
+            diag.stage_name(),
+            diag.failed_win32.load(Ordering::Relaxed),
+        );
+
+        // Generate a process-start event.
+        std::process::Command::new("cmd.exe")
+            .args(["/c", "exit", "0"])
+            .status()
+            .expect("failed to spawn child process");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            if diag.events_seen.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+
+        // Orderly shutdown: flag → stop thread → ControlTraceW(STOP) → join.
+        running.store(false, Ordering::Relaxed);
+        let _ = handle.join();
+
+        assert!(
+            diag.events_seen.load(Ordering::Relaxed) > 0,
+            "zero events delivered; stage={} failed_win32={} degraded_reason={}",
+            diag.stage_name(),
+            diag.failed_win32.load(Ordering::Relaxed),
+            diag.degraded_reason.load(Ordering::Relaxed),
+        );
+        assert_eq!(diag.current_stage(), EtwStage::Stopped);
     }
 }

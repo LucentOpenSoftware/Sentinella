@@ -4649,6 +4649,11 @@ impl AppState {
                             etw_d.events_seen.load(std::sync::atomic::Ordering::Relaxed)
                         ),
                     );
+                    // F-1 fix: etw_running is now CONSERVATIVE — true only
+                    // once the consumer is attached (EtwStage::ConsumerOpened
+                    // and beyond). StartTraceW success alone no longer reads
+                    // as "running". Field name/type unchanged for protocol
+                    // compatibility; the richer stage detail rides alongside.
                     obj.insert(
                         "etw_running".into(),
                         serde_json::json!(
@@ -4659,6 +4664,28 @@ impl AppState {
                         "etw_reconnects".into(),
                         serde_json::json!(
                             etw_d.reconnects.load(std::sync::atomic::Ordering::Relaxed)
+                        ),
+                    );
+                    obj.insert(
+                        "etw_stage".into(),
+                        serde_json::json!(etw_d.stage_name()),
+                    );
+                    obj.insert(
+                        "etw_failed_win32".into(),
+                        serde_json::json!(
+                            etw_d.failed_win32.load(std::sync::atomic::Ordering::Relaxed)
+                        ),
+                    );
+                    obj.insert(
+                        "etw_degraded_reason".into(),
+                        serde_json::json!(
+                            etw_d.degraded_reason.load(std::sync::atomic::Ordering::Relaxed)
+                        ),
+                    );
+                    obj.insert(
+                        "etw_zero_event_alarm".into(),
+                        serde_json::json!(
+                            etw_d.zero_event_alarm.load(std::sync::atomic::Ordering::Relaxed)
                         ),
                     );
                 }
