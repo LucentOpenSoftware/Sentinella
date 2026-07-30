@@ -206,3 +206,9 @@ must target 85 and keep `scripts/check-threshold-docs.ps1` green.
 - Not re-verified live (no elevated box used this round): the literal
   `events_seen == 0` counter, live `watcher.status` root list, service SDDL.
   These remain as stated by the review with code-side corroboration.
+
+---
+
+## Fix-commit map (round close)
+
+Filled at round close; the authoritative VERIFIED RECORD with per-finding commits and statuses now lives in `docs/IMPLEMENTATION_ROUND_HANDOFF.md` (19 commits, `e9f980d`..`e56e3f9`).
