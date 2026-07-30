@@ -183,21 +183,21 @@ pub fn find_sandboxd_public() -> Option<PathBuf> {
 }
 
 fn find_sandboxd() -> Option<PathBuf> {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let c = dir.join("sandboxd.exe");
-            if c.exists() {
-                return Some(c);
-            }
-            for ancestor in dir.ancestors().skip(1) {
-                let r = ancestor.join("target").join("release").join("sandboxd.exe");
-                if r.exists() {
-                    return Some(r);
-                }
-                let d = ancestor.join("target").join("debug").join("sandboxd.exe");
-                if d.exists() {
-                    return Some(d);
-                }
+    // ☠️ R9-LETHAL: same policy as argus_worker::resolve_worker_path —
+    // the daemon's exe dir plus the strictly-shaped dev sibling
+    // target/{release,debug}. NEVER an ancestor walk (would run whatever
+    // C:\target\release\sandboxd.exe it found as SYSTEM).
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let c = dir.join("sandboxd.exe");
+    if c.exists() {
+        return Some(c);
+    }
+    if let Some(root) = crate::argus_worker::project_root_from_target_dir(dir) {
+        for profile in ["release", "debug"] {
+            let dev = root.join("target").join(profile).join("sandboxd.exe");
+            if dev.exists() {
+                return Some(dev);
             }
         }
     }

@@ -166,17 +166,37 @@ impl ClamEngine {
         // MpoolResidencyManager handles cache lifecycle, versioning, and fallback.
         let mut residency = super::residency::MpoolResidencyManager::new();
         let cache_path = residency.prepare();
-        // SAFETY: set_var is unsafe in Rust 2024 due to thread-safety concerns.
-        // We call this during single-threaded daemon initialization, before any
-        // other threads are spawned. The env var is read by ClamAV in the same
-        // thread during cl_engine_new() → mpool_create().
-        unsafe {
-            std::env::set_var(
-                "SENTINELLA_MPOOL_CACHE_PATH",
-                cache_path.to_string_lossy().as_ref(),
+        // R12-LETHAL: pass the cache path via the dedicated FFI export,
+        // NOT std::env::set_var. set_var is `unsafe` in edition 2024
+        // because mutating the process environment races with concurrent
+        // getenv in other threads — and ClamEngine::load is also invoked
+        // from the hot-reload path (reload_engine_inner) while the daemon
+        // is fully multithreaded (tokio workers, watcher threads,
+        // libclamav's own getenv). That was genuine UB on every reload.
+        // The export exists precisely to pass this path and is only
+        // present in SENTINELLA_FILEBACKED_MPOOL builds — which are also
+        // the only builds that read the path at all, so when it is
+        // missing there is nothing useful to fall back to.
+        let fn_set_cache_path: Option<FnSentinellaMpoolSetCachePath> = unsafe {
+            lib.get::<FnSentinellaMpoolSetCachePath>(b"sentinella_mpool_set_cache_path\0")
+                .ok()
+                .map(|f| *f)
+        };
+        if let Some(set_cache_path) = fn_set_cache_path {
+            let wide: Vec<u16> = cache_path
+                .to_string_lossy()
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            unsafe {
+                set_cache_path(wide.as_ptr());
+            }
+            debug!(path = %cache_path.display(), "mpool cache path passed via FFI export");
+        } else {
+            debug!(
+                "sentinella_mpool_set_cache_path not exported — file-backed mpool unavailable in this build"
             );
         }
-        debug!(path = %cache_path.display(), "SENTINELLA_MPOOL_CACHE_PATH set");
 
         // ── Create engine ───────────────────────────────
         let engine = unsafe { fn_engine_new() };
@@ -408,10 +428,11 @@ impl ClamEngine {
 
                 let source_mgr = super::sources::SignatureSourceManager::new(db_dir);
                 let provider_fp = source_mgr.provider_fingerprint();
+                let (cvd_version, cvd_timestamp) = read_cvd_header(db_dir);
 
                 residency.record_compile(
-                    0, // TODO: read from CVD header
-                    0, // TODO: read from CVD header
+                    cvd_version,
+                    cvd_timestamp,
                     compile_ms as u64,
                     total as u64,
                     0, // region count from ClamAV internals
@@ -560,6 +581,47 @@ fn cl_err_str(fn_strerror: FnClStrerror, err: cl_error_t) -> String {
     } else {
         unsafe { CStr::from_ptr(ptr) }.to_string_lossy().to_string()
     }
+}
+
+/// Read (db_version, build_timestamp) from a signed CVD header.
+///
+/// The first 512 bytes of a .cvd are a colon-delimited text header:
+///   `ClamAV-VDB:<build time>:<version>:<sig count>:<f-level>:<md5>:…`
+/// where `<build time>` is e.g. `09 Feb 2024 10:20 -0500` — it CONTAINS
+/// a colon, so after a naive `split(':')` the version lands at index 3
+/// and the build time is fields 1..=2 rejoined.
+///
+/// Metadata only: returns (0, 0) for unsigned .cld files, missing files,
+/// or any parse failure — callers must tolerate zeros.
+fn read_cvd_header(db_dir: &Path) -> (u32, i64) {
+    use std::io::Read;
+
+    for name in ["main.cvd", "daily.cvd", "bytecode.cvd"] {
+        let Ok(mut file) = std::fs::File::open(db_dir.join(name)) else {
+            continue;
+        };
+        let mut buf = [0u8; 512];
+        let Ok(n) = file.read(&mut buf) else {
+            continue;
+        };
+        let Ok(text) = std::str::from_utf8(&buf[..n]) else {
+            continue;
+        };
+        let header = text.trim_end_matches('\0');
+        let fields: Vec<&str> = header.split(':').collect();
+        if fields.first() != Some(&"ClamAV-VDB") || fields.len() < 4 {
+            continue;
+        }
+        let build_time = format!("{}:{}", fields[1], fields[2]);
+        let version: u32 = fields[3].trim().parse().unwrap_or(0);
+        let timestamp = chrono::DateTime::parse_from_str(build_time.trim(), "%d %b %Y %H:%M %z")
+            .map(|d| d.timestamp())
+            .unwrap_or(0);
+        if version != 0 || timestamp != 0 {
+            return (version, timestamp);
+        }
+    }
+    (0, 0)
 }
 
 /// ClamAV message callback — routes libclamav log output through tracing.

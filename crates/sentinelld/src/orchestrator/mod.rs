@@ -652,6 +652,90 @@ mod tests {
         // Release the gate.
         let _ = gate_tx.send(());
     }
+
+    #[test]
+    fn leaked_worker_does_not_disarm_replacement_watchdog_state() {
+        // Regression: a stuck worker whose job finally returns AFTER the
+        // watchdog spawned a replacement must not clear the shared
+        // job_started_ms / current_token — those Arcs are shared with the
+        // replacement, and clearing them blinds the watchdog to the
+        // replacement's next hang (the queue then starves silently).
+        let (tx, rx) = mpsc::channel::<QueueMessage>();
+        let ctx = WorkerCtx {
+            id: "test-leaked".into(),
+            kind: QueueKind::Manual,
+            receiver: Arc::new(Mutex::new(rx)),
+            depth: Arc::new(AtomicU64::new(0)),
+            completed: Arc::new(AtomicU64::new(0)),
+            total_duration_us: Arc::new(AtomicU64::new(0)),
+            state: Arc::new(AtomicU8::new(WorkerState::Starting.as_u8())),
+            active_jobs: Arc::new(AtomicU64::new(0)),
+            worker_completed: Arc::new(AtomicU64::new(0)),
+            crash_count: Arc::new(AtomicU64::new(0)),
+            last_error: Arc::new(Mutex::new(None)),
+            last_duration_ms: Arc::new(AtomicU64::new(0)),
+            longest_duration_ms: Arc::new(AtomicU64::new(0)),
+            current_token: Arc::new(Mutex::new(None)),
+            job_started_ms: Arc::new(AtomicU64::new(0)),
+            restart_count: Arc::new(AtomicU64::new(0)),
+            stuck_worker_timeout_sec: 300,
+            generation: Arc::new(AtomicU64::new(0)),
+        };
+        let shared_started = Arc::clone(&ctx.job_started_ms);
+        let shared_token = Arc::clone(&ctx.current_token);
+        let shared_generation = Arc::clone(&ctx.generation);
+        spawn_worker(ctx);
+
+        // Job wedges on a gate — the "stuck in a native ClamAV call" case.
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        tx.send(QueueMessage {
+            token: CancellationToken::new(),
+            job: Box::new(move |_| {
+                let _ = gate_rx.recv_timeout(Duration::from_secs(10));
+            }),
+        })
+        .unwrap();
+
+        // Wait until the worker has armed itself for the job.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while shared_started.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline, "worker never armed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // Simulate the watchdog: account the leak, bump the generation,
+        // then the REPLACEMENT arms itself for a new job (sentinel state).
+        let leaked_before = LEAKED_WORKERS.load(Ordering::SeqCst);
+        LEAKED_WORKERS.fetch_add(1, Ordering::SeqCst);
+        shared_generation.fetch_add(1, Ordering::SeqCst);
+        let sentinel_ms = monotonic_ms().max(1);
+        shared_started.store(sentinel_ms, Ordering::SeqCst);
+        *shared_token.lock().unwrap_or_else(|e| e.into_inner()) = Some(CancellationToken::new());
+
+        // The stuck job finally returns; the leaked thread runs its epilogue.
+        let _ = gate_tx.send(());
+
+        // Wait for the leaked thread to retire (releases its leak slot).
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while LEAKED_WORKERS.load(Ordering::SeqCst) != leaked_before {
+            assert!(Instant::now() < deadline, "leaked worker never retired");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // The replacement's armed state must be intact.
+        assert_eq!(
+            shared_started.load(Ordering::SeqCst),
+            sentinel_ms,
+            "leaked worker clobbered the replacement's watchdog arm timestamp"
+        );
+        assert!(
+            shared_token
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some(),
+            "leaked worker cleared the replacement's cancellation token"
+        );
+    }
 }
 
 /// Monotonic millisecond clock for stuck-worker detection.
@@ -716,9 +800,20 @@ fn spawn_worker(ctx: WorkerCtx) {
             }));
 
             // Disarm watchdog FIRST so a long post-processing tail is not
-            // mistaken for a stuck job.
-            ctx.job_started_ms.store(0, Ordering::SeqCst);
-            *ctx.current_token.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            // mistaken for a stuck job. Only the CURRENT generation may
+            // disarm: if the watchdog already respawned us, these Arcs are
+            // shared with the replacement worker, and an unconditional
+            // disarm here would clobber the replacement's freshly armed
+            // job — making its next hang permanently invisible to the
+            // watchdog (which detects stuck workers solely via
+            // job_started_ms != 0) and its token uncancellable. A stale
+            // armed timestamp left behind is harmless: the watchdog's
+            // `acted` set already contains it, and the replacement
+            // overwrites both fields when it arms its next job.
+            if ctx.generation.load(Ordering::SeqCst) == my_generation {
+                ctx.job_started_ms.store(0, Ordering::SeqCst);
+                *ctx.current_token.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
 
             let elapsed = started.elapsed();
             let duration_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;

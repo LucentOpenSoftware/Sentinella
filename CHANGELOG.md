@@ -1,5 +1,65 @@
 # Changelog
 
+## [Unreleased] - 2026-07
+
+Post-v0.1.11 deep audit of the full tree (all 11 crates, the Tauri GUI,
+and the ClamAV integration glue), followed by a verified fix pass.
+Full details: `docs/DEEP_AUDIT_2026-07.md`. 13 high, ~34 medium, and
+~60 low findings fixed; every fix re-verified against the code before
+landing.
+
+### Security
+
+- **`argus.analyze` UNC/device-path bypass (HIGH).** The handler lacked
+  the `scan.start` R8-LETHAL path filter, letting any local process make
+  the SYSTEM daemon read attacker SMB shares / device paths. Filter
+  factored into a shared `validate_local_scan_path()`; tests added.
+- **Dead-PID race bypassed the v0.1.9 elevation gate (HIGH).** Pipe
+  identity resolution now fails closed when the client process has
+  already exited (`ResolveOutcome::ClientGone`).
+- **Sandbox containment gaps (HIGH ×2).** Network containment now
+  sweeps the process tree so child processes are blocked too; all
+  restricted-launch fallbacks fail closed instead of running the sample
+  with an unrestricted SYSTEM token.
+- **`clamavd` FFI (HIGH).** `cl_scanfile` was called through a wrong
+  6-arg signature with NULL `scanoptions`; corrected to the real 5-arg
+  signature with real options. `cl_load` dboptions fixed to
+  `CL_DB_STDOPT`.
+- **Reputation trust discount forgeable with a self-signed cert
+  (HIGH).** The discount now requires a successfully verified
+  Authenticode signer.
+- **Central `MethodClass` enforcement.** `scan.history`,
+  `stats.runtime`, `argus.packs`, `sources.status`, `sources.list` are
+  now auth-checked before dispatch; GUI/CLI updated to attach auth.
+- **`memory.scan_process` hardened**: elevation-gated (cross-privilege
+  ASLR-layout disclosure) and moved off the tokio worker. Note: the GUI
+  memory scan now requires an elevated GUI.
+
+### Correctness
+
+- **Fresh-install DB migration wedge (HIGH).** Migration v4 always
+  failed on fresh databases (columns already in base `SCHEMA`),
+  permanently blocking future migrations. Guarded by `column_exists()`.
+- **Scan-cache poisoning (HIGH).** Content fingerprint now streams the
+  full file (was first 64 KB only); signature fingerprint invalidates
+  stale entries at startup; read-failure verdicts are never cached as
+  clean.
+- **Profile budgets (HIGH).** Per-profile scan budgets now reach the
+  engine (watcher, idle, folder, startup, IPC paths) instead of every
+  scan running with the 60 s manual default.
+- **Idle scanner (HIGH).** Now targets real user profiles instead of
+  the LocalSystem profile.
+- **Watchdog blinding (HIGH).** A leaked stuck worker's epilogue no
+  longer disarms the watchdog for its replacement.
+- **PDF robustness (HIGH + mediums).** Reference-following recursion
+  bounded (`MAX_REF_FOLLOW_DEPTH`), LZW expansion capped, cumulative
+  decompression budget added.
+- Plus: quarantine DB error propagation (no more orphan vault files),
+  restore-suppression lifecycle, `sources.update` single-flight,
+  retention-vs-FK fix, Authenticode tamper classification, UTF-16 script
+  decoding, sandbox/ETW alignment and quoting fixes, and GUI runtime
+  sharing. See the audit document for the complete list.
+
 ## [0.1.11] - 2026-06-10
 
 Final release. A bug-fix and hardening pass over the v0.1.10 WeedHack

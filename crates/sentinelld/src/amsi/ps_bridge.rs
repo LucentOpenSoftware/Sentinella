@@ -319,10 +319,12 @@ fn read_new_script_blocks(after_record_id: u64) -> Result<Vec<ScriptBlockEvent>,
     use std::process::Command;
 
     // Use wevtutil to read events — no COM/WinAPI complexity.
+    // ☠️ R9-LETHAL: resolve via System32, never the process PATH (daemon
+    // runs as SYSTEM — see win_process::system32_tool).
     // Filter: Event ID 4104, most recent 20 events.
     let output = {
         use crate::win_process::QuietCommand;
-        Command::new("wevtutil")
+        Command::new(crate::win_process::system32_tool("wevtutil.exe"))
             .args([
                 "qe",
                 "Microsoft-Windows-PowerShell/Operational",

@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "splash",
+  "description": "Splash window — static HTML/JS, invokes nothing. Explicit empty permission set documents that intent.",
+  "windows": ["splash"],
+  "permissions": []
+}

@@ -43,6 +43,9 @@ fn scheduler_loop(state: Arc<crate::ipc::AppState>, running: Arc<AtomicBool>) {
     // R3-11: use monotonic Instant for interval logic. Wall-clock arithmetic
     // (h + interval) is broken across DST/midnight and breaks on clock skew.
     let mut last_update_at: Option<std::time::Instant> = None;
+    // Last successfully loaded config — a transient read failure must not
+    // silently apply DEFAULT policy (incl. auto_update) for that tick.
+    let mut last_good_config: Option<crate::config::Config> = None;
 
     while running.load(Ordering::Relaxed) {
         std::thread::sleep(std::time::Duration::from_secs(60));
@@ -55,7 +58,22 @@ fn scheduler_loop(state: Arc<crate::ipc::AppState>, running: Arc<AtomicBool>) {
         let day = now.format("%j").to_string().parse::<u32>().unwrap_or(0);
 
         // ── Auto-update signatures (every N hours) ─────────────
-        let config = crate::config::Config::load(None).unwrap_or_default();
+        let config = match crate::config::Config::load(None) {
+            Ok(c) => {
+                last_good_config = Some(c.clone());
+                c
+            }
+            Err(e) => match last_good_config.clone() {
+                Some(c) => {
+                    debug!(error = %e, "scheduler: config reload failed — using last good config");
+                    c
+                }
+                None => {
+                    debug!(error = %e, "scheduler: config load failed and no cached config — using defaults");
+                    crate::config::Config::default()
+                }
+            },
+        };
         if config.auto_update {
             let interval_secs = u64::from(config.update_interval_hours.max(1)) * 3600;
             let should_update = match last_update_at {
@@ -104,6 +122,14 @@ fn scheduler_loop(state: Arc<crate::ipc::AppState>, running: Arc<AtomicBool>) {
         // ── Ecosystem lifecycle maintenance ────────────────────
         // Runs every cycle: transitions Active→Cooling→Expired, prunes expired.
         state.ecosystem.expire();
+
+        // ── Trust graph staleness expiry ───────────────────────
+        // Deletes nodes not seen in 2× TRUST_DECAY_DAYS so trust_nodes
+        // doesn't grow to the cap and stay there (query-time decay alone
+        // never removed rows).
+        if let Some(tg) = state.trust_graph() {
+            tg.expire_stale();
+        }
 
         // ── Working set residency management ──────────────────
         // Trims working set after quiet periods to keep Task Manager

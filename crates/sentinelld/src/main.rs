@@ -330,10 +330,15 @@ async fn run_daemon(
 
     let dll_dir = args.dll_dir.map(PathBuf::from).or_else(|| {
         // Auto-detect: look for libclamav.dll in common locations.
-        let candidates = [
-            exe_dir.as_ref().map(|d| d.join(".")),
-            Some(PathBuf::from("build/clamav/libclamav/Release")),
-        ];
+        // The CWD-relative dev-tree path is only trusted in debug builds:
+        // in release, a planted build/clamav/... under the daemon's CWD
+        // (C:\Windows\System32 under the SCM, or wherever --foreground was
+        // launched) must never be auto-selected as the engine DLL directory.
+        #[cfg(debug_assertions)]
+        let dev_candidate = Some(PathBuf::from("build/clamav/libclamav/Release"));
+        #[cfg(not(debug_assertions))]
+        let dev_candidate: Option<PathBuf> = None;
+        let candidates = [exe_dir.as_ref().map(|d| d.join(".")), dev_candidate];
         for c in candidates.iter().flatten() {
             if c.join("libclamav.dll").exists() {
                 info!(path = %c.display(), "auto-detected DLL directory");
@@ -398,7 +403,14 @@ async fn run_daemon(
                 let key = *vault.key_bytes();
                 match runtime_integrity::verify_or_init_binaries(&state_dir, &key) {
                     Ok(report) => {
-                        if report.tofu_initialized {
+                        if report.baseline_lost {
+                            // Baseline existed before but the manifest was
+                            // deleted/emptied/corrupted — the classic way to
+                            // get replaced binaries silently re-trusted.
+                            // Already re-baselined (fail-open); flag drift.
+                            error!("binary integrity: baseline manifest vanished/corrupt since last start — re-baselined, flagging drift");
+                            server.state().set_binary_integrity_drift(true);
+                        } else if report.tofu_initialized {
                             info!("binary integrity: TOFU baseline written");
                         } else if report.has_drift() {
                             for p in &report.drifted {
@@ -409,6 +421,11 @@ async fn run_daemon(
                             if !report.new_entries.is_empty() {
                                 for p in &report.new_entries {
                                     warn!(path = %p.display(), "binary integrity: new binary not in baseline");
+                                }
+                            }
+                            if !report.missing.is_empty() {
+                                for p in &report.missing {
+                                    warn!(path = %p.display(), "binary integrity: baseline binary missing from disk");
                                 }
                             }
                             info!(
@@ -425,12 +442,12 @@ async fn run_daemon(
     }
 
     // ── Config tamper detection (HMAC sidecar) ──────────────────────
-    // Re-load the config through the verifying loader to compare the
-    // on-disk bytes against the HMAC sidecar laid down by the last save.
-    // Drift means someone edited sentinelld.toml outside the daemon
-    // (manual TOML edit, GPO push, scripted tweak). Fail-loud: keep the
-    // loaded values, surface via `health.config_drift`.
-    match config::load_verified(args.config.as_deref()) {
+    // Verify the already-loaded config against the HMAC sidecar laid down
+    // by the last save (no second load — that re-read/re-validated/re-saved
+    // the file for nothing). Drift means someone edited sentinelld.toml
+    // outside the daemon (manual TOML edit, GPO push, scripted tweak).
+    // Fail-loud: keep the loaded values, surface via `health.config_drift`.
+    match config::load_verified(args.config.as_deref(), config.clone()) {
         Ok((_cfg, drift)) => {
             if drift {
                 error!("config drift: sentinelld.toml HMAC sidecar does NOT match file contents");

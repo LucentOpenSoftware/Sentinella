@@ -10,8 +10,10 @@
 //!   - Report JSON on stdout
 //!
 //! Phase 2C (current): Network containment via Windows Firewall rules.
-//!   - Block outbound traffic for detonated sample during execution
-//!   - Cleanup firewall rule after detonation
+//!   - Block outbound traffic for the detonated sample AND its child
+//!     processes during execution (children are covered by a periodic
+//!     process-tree sweep — best-effort, see `launch_and_monitor`)
+//!   - Cleanup firewall rules after detonation
 //!
 //! Phase 3 (future): AppContainer isolation + ETW monitoring.
 //! Phase 4 (future): Full Hyper-V sandbox integration.
@@ -182,7 +184,13 @@ fn main() {
         engine: "sandboxd",
         status: result.status,
         sample_path: cli.path.to_string_lossy().to_string(),
-        sample_sha256: sha256,
+        // Prefer the post-copy hash (bytes actually detonated); fall back to
+        // the pre-scan hash when detonation never reached the copy stage.
+        sample_sha256: if result.sha256.is_empty() {
+            sha256
+        } else {
+            result.sha256
+        },
         backend_used: result.backend_used,
         detonation_time_ms: elapsed_ms,
         monitor_duration_ms: result.monitor_duration_ms,
@@ -232,6 +240,8 @@ struct DetonationResult {
     errors: Vec<String>,
     backend_used: String,
     monitor_duration_ms: u64,
+    /// SHA256 of the bytes ACTUALLY detonated (the sandbox copy), empty on error.
+    sha256: String,
 }
 
 struct LaunchResult {
@@ -253,6 +263,7 @@ fn detonate(sample: &Path, timeout: Duration) -> DetonationResult {
                 errors: vec![format!("temp dir creation failed: {e}")],
                 backend_used: "none".into(),
                 monitor_duration_ms: 0,
+                sha256: String::new(),
             };
         }
     };
@@ -267,8 +278,14 @@ fn detonate(sample: &Path, timeout: Duration) -> DetonationResult {
             errors: vec![format!("sample copy failed: {e}")],
             backend_used: "none".into(),
             monitor_duration_ms: 0,
+            sha256: String::new(),
         };
     }
+
+    // Hash the COPY, not the original path: the original is a live user file
+    // that can change between scan-trigger and copy — the report must match
+    // the bytes that were actually detonated.
+    let sha256 = sha256_file(&temp_sample).unwrap_or_default();
 
     // Launch process with timeout.
     let monitor_start = Instant::now();
@@ -286,6 +303,7 @@ fn detonate(sample: &Path, timeout: Duration) -> DetonationResult {
         errors,
         backend_used: launch_result.backend_used,
         monitor_duration_ms,
+        sha256,
     }
 }
 
@@ -416,8 +434,30 @@ fn create_sandbox_dir() -> Result<PathBuf, String> {
     );
     let dir = base.join(id);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    set_low_integrity_label(&dir);
     Ok(dir)
 }
+
+/// Set a Low mandatory integrity label on the sandbox dir (best-effort).
+///
+/// The dir is created under the SYSTEM worker's temp (`C:\Windows\Temp`) with
+/// the default Medium label — a low-integrity sample is then DENIED write by
+/// No-Write-Up, which silently kills all behavioral file-drop detection.
+/// The sample's token keeps the SYSTEM user SID, so the inherited DACL
+/// already grants write once the label no longer blocks it.
+#[cfg(target_os = "windows")]
+fn set_low_integrity_label(dir: &Path) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    let _ = std::process::Command::new("icacls")
+        .arg(dir.as_os_str())
+        .args(["/setintegritylevel", "Low"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+}
+
+#[cfg(not(target_os = "windows"))]
+fn set_low_integrity_label(_dir: &Path) {}
 
 #[cfg(target_os = "windows")]
 fn launch_and_monitor(
@@ -439,13 +479,18 @@ fn launch_and_monitor(
             backend_used: "none".into(),
         };
     } else {
-        // Configure limits: kill on close + memory cap + no child breakaway.
+        // Configure limits: kill on close + memory cap + process-count cap +
+        // no child breakaway.
         let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE      // Kill entire tree when job handle closed.
-            | JOB_OBJECT_LIMIT_PROCESS_MEMORY; // Per-process memory limit.
+            | JOB_OBJECT_LIMIT_PROCESS_MEMORY // Per-process memory limit.
+            | JOB_OBJECT_LIMIT_ACTIVE_PROCESS; // Cap total processes (fork-bomb guard).
         // NOTE: BREAKAWAY_OK intentionally NOT set — children cannot escape the job.
         // 512 MB per-process memory limit.
         info.ProcessMemoryLimit = 512 * 1024 * 1024;
+        // 64 concurrent processes max — bounds host resource pressure and
+        // sandboxd telemetry growth from fork-bombing samples.
+        info.BasicLimitInformation.ActiveProcessLimit = 64;
 
         let ok = unsafe {
             SetInformationJobObject(
@@ -467,8 +512,23 @@ fn launch_and_monitor(
         }
     }
 
+    // R9-LETHAL pattern: NEVER fall back to CWD when resolving where the
+    // sample runs / ETW behavioural logs land. Sandboxd is spawned by the
+    // daemon (SYSTEM) and a bare-filename `sample` would otherwise dump
+    // telemetry to whatever CWD the parent inherited — potentially
+    // user-writable. Use the per-process temp dir instead, which is bounded
+    // to the sandboxd user profile. The sample also gets this as its CWD so
+    // the low-integrity token can actually write there (see create_sandbox_dir).
+    let sandbox_dir = sample
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("sentinella-sandbox-{}", std::process::id()))
+        });
+
     // Launch with restricted low-integrity token (CREATE_SUSPENDED).
-    let launch = restricted::launch_restricted(sample);
+    let launch = restricted::launch_restricted(sample, &sandbox_dir);
     for e in &launch.errors {
         errors.push(e.clone());
     }
@@ -476,7 +536,7 @@ fn launch_and_monitor(
         findings.push(SandboxFinding {
             kind: "launch_blocked".into(),
             severity: "info".into(),
-            detail: "Process launch failed (restricted + fallback)".into(),
+            detail: "Process launch failed — FAIL CLOSED, sample not detonated".into(),
             confidence: "observed".into(),
             source: "process_spawn".into(),
         });
@@ -544,7 +604,7 @@ fn launch_and_monitor(
         findings.push(SandboxFinding {
             kind: "containment".into(),
             severity: "info".into(),
-            detail: "Process contained in Job Object (kill-on-close + 512MB memory limit)".into(),
+            detail: "Process contained in Job Object (kill-on-close + 512MB memory limit + 64-process limit)".into(),
             confidence: "observed".into(),
             source: "job_object".into(),
         });
@@ -560,8 +620,14 @@ fn launch_and_monitor(
     });
 
     // ── Block outbound network for the sample (best-effort) ──
-    let network_blocked = block_network(pid, sample, findings, errors);
-    if network_blocked {
+    // NOTE: the `program=` rule only covers the ROOT process image — netsh
+    // cannot scope a rule to a Job Object. Child processes are covered by the
+    // periodic tree sweep in the monitor loop below (best-effort; a child
+    // that exfiltrates within its first sweep interval escapes — closing that
+    // race needs a WFP callout, not netsh).
+    let mut firewall_guard = FirewallRuleGuard::new();
+    if block_network(pid, sample, findings, errors) {
+        firewall_guard.add(pid);
         findings.push(SandboxFinding {
             kind: "containment".into(),
             severity: "info".into(),
@@ -570,26 +636,10 @@ fn launch_and_monitor(
             source: "netsh_firewall".into(),
         });
     }
-    let mut firewall_guard = if network_blocked {
-        Some(FirewallRuleGuard::new(pid))
-    } else {
-        None
-    };
 
     // Resume only after job containment and best-effort network block.
     // ── ETW behavioral monitoring (runs in parallel with process) ──
-    // R9-LETHAL pattern: NEVER fall back to CWD when resolving where ETW
-    // behavioural logs land. Sandboxd is spawned by the daemon (SYSTEM) and a
-    // bare-filename `sample` would otherwise dump telemetry to whatever CWD the
-    // parent inherited — potentially user-writable. Use the per-process temp
-    // dir instead, which is bounded to the sandboxd user profile.
-    let sandbox_dir = sample
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| {
-            std::env::temp_dir().join(format!("sentinella-sandbox-{}", std::process::id()))
-        });
+    // Telemetry lands in `sandbox_dir` (computed above, R9-LETHAL: never CWD).
     let etw_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let etw_timeout = timeout;
     let etw_dir = sandbox_dir.clone();
@@ -602,6 +652,11 @@ fn launch_and_monitor(
     let mut timed_out = false;
     let etw_report = {
         let start = Instant::now();
+        // Child-process network containment state: each newly discovered
+        // descendant PID gets its own `program=` firewall rule (see NOTE at
+        // the root block above). Tracked so we add each rule exactly once.
+        let mut child_sweep = Instant::now();
+        let mut blocked_children: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
         loop {
             if start.elapsed() > timeout {
@@ -618,6 +673,32 @@ fn launch_and_monitor(
                     source: "behavioral_monitor_polling".into(),
                 });
                 break;
+            }
+
+            // ── Child network containment sweep (every 500ms) ──
+            if child_sweep.elapsed() >= Duration::from_millis(500) {
+                child_sweep = Instant::now();
+                for child_pid in descendant_pids(pid) {
+                    if !blocked_children.insert(child_pid) {
+                        continue;
+                    }
+                    // Whole image path is required for a `program=` rule.
+                    let Some(image) = etw::get_process_image_path(child_pid) else {
+                        continue;
+                    };
+                    if block_network(child_pid, Path::new(&image), findings, errors) {
+                        firewall_guard.add(child_pid);
+                        findings.push(SandboxFinding {
+                            kind: "containment".into(),
+                            severity: "info".into(),
+                            detail: format!(
+                                "Outbound network blocked for child process (PID {child_pid}): {image}"
+                            ),
+                            confidence: "observed".into(),
+                            source: "netsh_firewall".into(),
+                        });
+                    }
+                }
             }
 
             if let Some(exit_code) = restricted::try_wait(launch.process_handle) {
@@ -680,12 +761,12 @@ fn launch_and_monitor(
     // Post-execution checks.
     check_sandbox_dir_changes(&sandbox_dir, findings);
 
-    // Remove firewall rule before closing job.
-    if network_blocked {
-        unblock_network(pid, errors);
-        if let Some(guard) = firewall_guard.as_mut() {
-            guard.disarm();
+    // Remove firewall rules (root + swept children) before closing job.
+    if !firewall_guard.pids.is_empty() {
+        for rule_pid in firewall_guard.pids.clone() {
+            unblock_network(rule_pid, errors);
         }
+        firewall_guard.disarm();
     }
 
     // Close Job Object — this kills any surviving processes in the tree.
@@ -827,14 +908,22 @@ fn firewall_rule_name(pid: u32) -> String {
 
 #[cfg(target_os = "windows")]
 struct FirewallRuleGuard {
-    pid: u32,
+    /// PIDs whose `sentinella-sandbox-<pid>` rules are active (root + swept children).
+    pids: Vec<u32>,
     active: bool,
 }
 
 #[cfg(target_os = "windows")]
 impl FirewallRuleGuard {
-    fn new(pid: u32) -> Self {
-        Self { pid, active: true }
+    fn new() -> Self {
+        Self {
+            pids: Vec::new(),
+            active: true,
+        }
+    }
+
+    fn add(&mut self, pid: u32) {
+        self.pids.push(pid);
     }
 
     fn disarm(&mut self) {
@@ -846,14 +935,57 @@ impl FirewallRuleGuard {
 impl Drop for FirewallRuleGuard {
     fn drop(&mut self) {
         if self.active {
-            unblock_network_silent(self.pid);
+            for pid in self.pids.drain(..) {
+                unblock_network_silent(pid);
+            }
         }
     }
 }
 
-/// Block outbound network for a detonated sample by adding a Windows Firewall
-/// rule scoped to the sample executable path. Best-effort: failures are logged
-/// but do not abort detonation.
+/// All current descendant PIDs (children, grandchildren, …) of `root_pid`.
+///
+/// One ToolHelp process snapshot → parent map → BFS from the root. Used by
+/// the child network-containment sweep; best-effort (a process that spawns
+/// and exits between snapshots is missed).
+#[cfg(target_os = "windows")]
+fn descendant_pids(root_pid: u32) -> Vec<u32> {
+    let mut result = Vec::new();
+    unsafe {
+        let Some(snap) = windows_create_toolhelp_snapshot() else {
+            return result;
+        };
+        let mut pe: PROCESSENTRY32W = std::mem::zeroed();
+        pe.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut parent_of: Vec<(u32, u32)> = Vec::new(); // (pid, parent_pid)
+        if process32_first(snap, &mut pe) {
+            loop {
+                parent_of.push((pe.th32ProcessID, pe.th32ParentProcessID));
+                if !process32_next(snap, &mut pe) {
+                    break;
+                }
+            }
+        }
+        close_handle(snap);
+
+        let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::from([root_pid]);
+        let mut queue = vec![root_pid];
+        while let Some(parent) = queue.pop() {
+            for &(pid, ppid) in &parent_of {
+                if ppid == parent && seen.insert(pid) {
+                    result.push(pid);
+                    queue.push(pid);
+                }
+            }
+        }
+    }
+    result
+}
+
+/// Block outbound network for a detonated process by adding a Windows Firewall
+/// rule scoped to its executable image path. Best-effort: failures are logged
+/// but do not abort detonation. NOTE: a `program=` rule matches only that one
+/// process image — child processes need their own rules (see the containment
+/// sweep in `launch_and_monitor`).
 #[cfg(target_os = "windows")]
 fn block_network(
     pid: u32,
@@ -870,6 +1002,10 @@ fn block_network(
     // CREATE_NO_WINDOW (0x08000000) — prevent netsh from flashing a console.
     const CREATE_NO_WINDOW: u32 = 0x08000000;
 
+    // The program path MUST be quoted: netsh re-parses its command line on
+    // whitespace, so an attacker-controlled filename with spaces (e.g.
+    // `invoice copy.exe`) would otherwise split into extra tokens, netsh
+    // would error out, and the sample would run with NO network containment.
     let result = Command::new("netsh")
         .args([
             "advfirewall",
@@ -878,7 +1014,7 @@ fn block_network(
             "rule",
             &format!("name={rule_name}"),
             "dir=out",
-            &format!("program={sample_path}"),
+            &format!("program=\"{sample_path}\""),
             "action=block",
         ])
         .creation_flags(CREATE_NO_WINDOW)
@@ -970,6 +1106,8 @@ fn unblock_network_silent(pid: u32) {
 const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x00002000;
 #[cfg(target_os = "windows")]
 const JOB_OBJECT_LIMIT_PROCESS_MEMORY: u32 = 0x00000100;
+#[cfg(target_os = "windows")]
+const JOB_OBJECT_LIMIT_ACTIVE_PROCESS: u32 = 0x00000008;
 #[cfg(target_os = "windows")]
 #[repr(C)]
 #[allow(non_snake_case)]

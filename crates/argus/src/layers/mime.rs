@@ -93,7 +93,6 @@ pub fn analyze(path: &str, data: &[u8]) -> Vec<Finding> {
     // Check for multiple valid file signatures in the same file.
     let has_mz = data.len() >= 2 && data[0] == 0x4D && data[1] == 0x5A;
     let has_pdf = data.windows(5).take(1024).any(|w| w == b"%PDF-");
-    let has_pk = data.len() >= 4 && data[0..4] == [0x50, 0x4B, 0x03, 0x04];
 
     if has_mz && has_pdf {
         findings.push(Finding {
@@ -175,9 +174,11 @@ fn extension_description(ext: &str) -> &'static str {
 
 /// Detect double extensions like `.pdf.exe`, `.doc.scr`.
 fn detect_double_extension(path: &str) -> Option<String> {
+    // Keep in sync with `file_deception::EXECUTABLE_EXTENSIONS` — a
+    // `invoice.pdf.ps1` must be flagged just like `invoice.pdf.exe`.
     let executable_exts = [
         "exe", "scr", "com", "bat", "cmd", "pif", "vbs", "vbe", "js", "jse", "wsh", "wsf", "msi",
-        "msp",
+        "msp", "ps1", "reg", "hta", "lnk", "url",
     ];
 
     let name = std::path::Path::new(path)

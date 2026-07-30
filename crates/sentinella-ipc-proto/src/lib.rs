@@ -7,7 +7,8 @@
 //! # Framing
 //!
 //! Over the wire, each message is a **4-byte big-endian length prefix**
-//! followed by a UTF-8 JSON object. Max frame size: 16 MiB.
+//! followed by a UTF-8 JSON object. Max frame size: 1 MiB (see
+//! [`MAX_FRAME_SIZE`]; reduced from 16 MiB in the K2 fix).
 //!
 //! # Versioning
 //!

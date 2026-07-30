@@ -37,6 +37,22 @@ pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 #[allow(dead_code)]
 pub const DETACHED_PROCESS: u32 = 0x0000_0008;
 
+/// Resolve a Windows system utility (`wevtutil.exe`, `reg.exe`, …) to its
+/// absolute `%SystemRoot%\System32` path.
+///
+/// ☠️ R9-LETHAL: the daemon runs as SYSTEM; a bare program name is resolved
+/// via the process search order (application dir → system32 → PATH), so a
+/// poisoned PATH or exe dir in dev/portable scenarios becomes a
+/// SYSTEM-integrity command execution. Same policy as
+/// `argus_worker::resolve_worker_path` (never search CWD/PATH). Falls back
+/// to the bare name only if SystemRoot is somehow unset.
+pub fn system32_tool(name: &str) -> std::path::PathBuf {
+    match std::env::var("SystemRoot") {
+        Ok(root) if !root.is_empty() => std::path::PathBuf::from(root).join("System32").join(name),
+        _ => std::path::PathBuf::from(name),
+    }
+}
+
 /// Builder-pattern extension that stamps the right Windows flags on a
 /// `Command` to suppress ghost console windows. Returns the same `&mut
 /// Command` so it chains naturally with the rest of the builder.

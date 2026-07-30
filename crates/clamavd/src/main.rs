@@ -169,17 +169,45 @@ fn emit_error(cli: &Cli, msg: &str) {
 //  ClamAV FFI — minimal, self-contained
 // ═══════════════════════════════════════════════════════════════
 
+// Scan options — must match `struct cl_scan_options` and the CL_DB_*/CL_SCAN_*
+// macros in `third_party/clamav/libclamav/clamav.h` exactly. These mirror the
+// proven in-process bindings in `crates/sentinelld/src/engine/bindings.rs`.
+// ☠️ LETHAL: a NULL scanoptions pointer makes cl_scanfile return CL_ENULLARG
+// for every file (silent bypass) and crashes on files > maxfilesize (NULL
+// deref of scanoptions->heuristic inside libclamav). Always pass a real struct.
+#[repr(C)]
+struct ClScanOptions {
+    general: u32,
+    parse: u32,
+    heuristic: u32,
+    mail: u32,
+    dev: u32,
+}
+
+// CL_DB_STDOPT = CL_DB_PHISHING (0x2) | CL_DB_PHISHING_URLS (0x8)
+//              | CL_DB_BYTECODE (0x2000) = 0x200A (clamav.h:173).
+// NOT 0x1F — that omits bytecode signatures and enables CL_DB_PUA.
+const CL_DB_STDOPT: u32 = 0x2 | 0x8 | 0x2000;
+
+// CL_SCAN_GENERAL_HEURISTICS (clamav.h:187).
+const CL_SCAN_GENERAL_HEURISTICS: u32 = 0x4;
+
+// CL_SCAN_PARSE_DEFAULT: enable all common parsers
+// (ARCHIVE | ELF | PDF | MAIL | OLE2 | HTML | PE = 0x3C7).
+const CL_SCAN_PARSE_DEFAULT: u32 = 0x1 | 0x2 | 0x4 | 0x40 | 0x80 | 0x100 | 0x200;
+
 struct ClamavEngine {
     _lib: libloading::Library,
     engine: *mut std::ffi::c_void,
-    // Function pointers.
+    // Function pointers. cl_scanfile has exactly 5 parameters per clamav.h:1702
+    // (filename, virname, scanned, engine, scanoptions); `scanned` is
+    // `unsigned long int *` — 32-bit c_ulong on Windows LLP64.
     cl_scanfile: unsafe extern "C" fn(
         *const std::ffi::c_char,
         *mut *const std::ffi::c_char,
-        *mut u64,
+        *mut std::ffi::c_ulong,
         *mut std::ffi::c_void,
-        *mut std::ffi::c_void,
-        u32,
+        *mut ClScanOptions,
     ) -> i32,
     cl_engine_free: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
 }
@@ -224,10 +252,9 @@ fn load_clamav(dll_dir: &Path, db_dir: &Path) -> Result<(ClamavEngine, u64), Str
     type ScanFn = unsafe extern "C" fn(
         *const std::ffi::c_char,
         *mut *const std::ffi::c_char,
-        *mut u64,
+        *mut std::ffi::c_ulong,
         *mut std::ffi::c_void,
-        *mut std::ffi::c_void,
-        u32,
+        *mut ClScanOptions,
     ) -> i32;
 
     let cl_init: InitFn = unsafe { *lib.get(b"cl_init\0").map_err(|e| format!("cl_init: {e}"))? };
@@ -264,7 +291,7 @@ fn load_clamav(dll_dir: &Path, db_dir: &Path) -> Result<(ClamavEngine, u64), Str
     let db_path =
         CString::new(db_dir.to_string_lossy().as_ref()).map_err(|_| "Invalid db_dir path")?;
     let mut sig_count: u32 = 0;
-    let ret = unsafe { cl_load(db_path.as_ptr(), engine, &mut sig_count, 0x1F) }; // CL_DB_STDOPT
+    let ret = unsafe { cl_load(db_path.as_ptr(), engine, &mut sig_count, CL_DB_STDOPT) };
     if ret != 0 {
         unsafe {
             cl_engine_free(engine);
@@ -306,8 +333,17 @@ fn scan_file(engine: &ClamavEngine, path: &Path) -> RawScanResult {
     };
 
     let mut virus_name_ptr: *const std::ffi::c_char = std::ptr::null();
-    let mut scanned: u64 = 0;
-    let scan_opts: u32 = 0x0001 | 0x0002 | 0x0004; // CL_SCAN_STDOPT equiv
+    let mut scanned: std::ffi::c_ulong = 0;
+    // Same options as the in-process path (sentinelld engine/clamav.rs):
+    // heuristics on, all common parsers enabled. Never pass NULL here — see the
+    // LETHAL note on ClScanOptions.
+    let mut scan_opts = ClScanOptions {
+        general: CL_SCAN_GENERAL_HEURISTICS,
+        parse: CL_SCAN_PARSE_DEFAULT,
+        heuristic: 0,
+        mail: 0,
+        dev: 0,
+    };
 
     let ret = unsafe {
         (engine.cl_scanfile)(
@@ -315,16 +351,16 @@ fn scan_file(engine: &ClamavEngine, path: &Path) -> RawScanResult {
             &mut virus_name_ptr,
             &mut scanned,
             engine.engine,
-            std::ptr::null_mut(),
-            scan_opts,
+            &mut scan_opts,
         )
     };
 
+    let scanned_bytes = scanned as u64;
     match ret {
         0 => RawScanResult {
             infected: false,
             virus_name: None,
-            scanned_bytes: scanned,
+            scanned_bytes,
             error: None,
         },
         1 => {
@@ -340,14 +376,14 @@ fn scan_file(engine: &ClamavEngine, path: &Path) -> RawScanResult {
             RawScanResult {
                 infected: true,
                 virus_name: Some(name),
-                scanned_bytes: scanned,
+                scanned_bytes,
                 error: None,
             }
         }
         _ => RawScanResult {
             infected: false,
             virus_name: None,
-            scanned_bytes: scanned,
+            scanned_bytes,
             error: Some(format!("cl_scanfile returned {ret}")),
         },
     }

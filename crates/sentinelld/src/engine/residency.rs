@@ -282,8 +282,22 @@ impl MpoolResidencyManager {
         // appear "tampered" on first verify post-upgrade → forced cache
         // recompile, which is the SAFE outcome (the old hash was not
         // trustworthy anyway).
-        let vault_key_path = crate::paths::paths().vault_integrity_key();
-        let key = std::fs::read(&vault_key_path).unwrap_or_default();
+        // The vault key is re-read from disk on every call; cache the first
+        // successful read in a OnceLock (same pattern as the scan cache's
+        // CACHE_INTEGRITY_SECRET). A failed/empty read is NOT cached so a
+        // key created later in startup still gets picked up.
+        static VAULT_KEY: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+        let key = match VAULT_KEY.get() {
+            Some(k) => k.clone(),
+            None => {
+                let k = std::fs::read(crate::paths::paths().vault_integrity_key())
+                    .unwrap_or_default();
+                if !k.is_empty() {
+                    let _ = VAULT_KEY.set(k.clone());
+                }
+                k
+            }
+        };
         let mut mac = match <Hmac<Sha256> as Mac>::new_from_slice(&key) {
             Ok(m) => m,
             Err(_) => {

@@ -132,12 +132,22 @@ fn is_protected(pid: u32) -> bool {
     // Check process name against protected list.
     #[cfg(target_os = "windows")]
     {
-        if let Some(name) = get_process_name(pid) {
-            let lower = name.to_lowercase();
-            return PROTECTED_PROCESSES.iter().any(|p| lower == *p);
+        match get_process_name(pid) {
+            Some(name) => {
+                let lower = name.to_lowercase();
+                PROTECTED_PROCESSES.iter().any(|p| lower == *p)
+            }
+            // Fail CLOSED: if we cannot identify the process (PPL, transient
+            // OpenProcess/QueryFullProcessImageName error, PID reuse), treat
+            // it as protected rather than letting suspend/terminate proceed
+            // against an unidentified process.
+            None => true,
         }
     }
-    false
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -270,6 +280,11 @@ fn find_suspects_windows(affected_dir: &Path) -> Vec<SuspectProcess> {
             }
         }
     }
+
+    // Most suspicious first: a process running from the affected directory
+    // outranks weak name-substring matches (which hit Cryptomator/TrueCrypt
+    // and the like). Stable sort preserves enumeration order within a rank.
+    suspects.sort_by_key(|s| usize::from(s.suspicion_reason != "running from affected directory"));
 
     suspects
 }

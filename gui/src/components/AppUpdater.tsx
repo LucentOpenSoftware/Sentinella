@@ -120,16 +120,11 @@ export function AppUpdater() {
               {t("about.upd_install")}
             </button>
           ) : state === "ready" ? (
-            <button
-              onClick={() => {
-                import("@tauri-apps/plugin-updater").then(() => {
-                  /* app will restart via NSIS */
-                });
-              }}
-              className="text-[11px] font-semibold px-3 py-1.5 rounded-lg bg-[rgb(var(--green))]/10 text-[rgb(var(--green))] hover:bg-[rgb(var(--green))]/20 transition-colors cursor-pointer"
-            >
-              {t("about.upd_restart")}
-            </button>
+            // On the NSIS path the installer kills the app mid-
+            // downloadAndInstall, so "ready" is effectively unreachable;
+            // if it ever renders there is no relaunch plugin wired up —
+            // show a success glyph, not a dead Restart button.
+            <CheckCircle2 size={16} className="text-[rgb(var(--green))]" />
           ) : (
             <button
               onClick={handleCheck}

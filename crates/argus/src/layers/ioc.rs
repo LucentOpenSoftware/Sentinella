@@ -76,17 +76,18 @@ impl IocDatabase {
         let mut content = std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read IOC file {}: {e}", path.display()))?;
         if content.len() > MAX_IOC_CONTENT_BYTES {
-            tracing::warn!(
-                path = %path.display(),
-                bytes = content.len(),
-                cap = MAX_IOC_CONTENT_BYTES,
-                "Truncating oversized IOC content"
-            );
             // Truncate on a UTF-8 char boundary to avoid panicking.
             let mut cut = MAX_IOC_CONTENT_BYTES;
             while cut > 0 && !content.is_char_boundary(cut) {
                 cut -= 1;
             }
+            tracing::warn!(
+                path = %path.display(),
+                bytes = content.len(),
+                cap = MAX_IOC_CONTENT_BYTES,
+                dropped_lines = content[cut..].lines().count(),
+                "Truncating oversized IOC content — tail entries silently dropped"
+            );
             content.truncate(cut);
         }
 

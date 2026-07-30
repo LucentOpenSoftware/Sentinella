@@ -315,16 +315,41 @@ fn is_trusted_install_dir(dir: &Path) -> bool {
     }
 
     // Anything under a user's own profile (C:\Users\<name>\...) is per-user
-    // writable. Trust only the system install roots.
-    let trusted = s.contains("\\program files\\")
-        || s.contains("\\program files (x86)\\")
-        || s.contains("\\programdata\\sentinella")
+    // writable. Trust only the system install roots — ANCHORED, not
+    // substring: `C:\Users\mallory\staging\program files\av\` *contains*
+    // "\program files\" but is fully user-writable, so `contains` was a
+    // bypass. Resolve the real roots from the environment (handles
+    // non-C: installs); fall back to the canonical literals when the env
+    // vars are unavailable (non-Windows test hosts, exotic environments).
+    let mut trusted_roots: Vec<String> = Vec::new();
+    for var in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Ok(v) = std::env::var(var) {
+            trusted_roots.push(v.to_lowercase());
+        }
+    }
+    if let Ok(v) = std::env::var("ProgramData") {
+        trusted_roots.push(format!("{}\\sentinella", v.to_lowercase()));
+    }
+    if trusted_roots.is_empty() {
+        trusted_roots = [
+            "c:\\program files",
+            "c:\\program files (x86)",
+            "c:\\programdata\\sentinella",
+        ]
+        .iter()
+        .map(|r| r.to_string())
+        .collect();
+    }
+
+    let under_trusted_root = trusted_roots
+        .iter()
+        .any(|root| s.starts_with(&format!("{root}\\")) || s == *root);
+
+    under_trusted_root
         || s.starts_with("/opt/")
         || s.starts_with("/usr/local/")
         || s.starts_with("/usr/lib/")
-        || s.starts_with("/var/lib/");
-
-    trusted
+        || s.starts_with("/var/lib/")
 }
 
 #[cfg(test)]
@@ -434,6 +459,10 @@ mod tests {
             "C:\\Temp\\app",
             "C:\\PerfLogs\\thing",
             "C:\\Users\\me\\Desktop\\portable",
+            // Anchoring regression: merely *containing* a trusted-looking
+            // component must not grant trust (old substring check bypass).
+            "C:\\Users\\mallory\\staging\\program files\\av",
+            "C:\\FakeDir\\program files\\app",
         ];
         for b in &bad {
             assert!(

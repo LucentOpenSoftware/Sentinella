@@ -17,9 +17,12 @@ pub const MAX_SCORE: u32 = 100;
 pub enum ScanStrategy {
     /// Full analysis: all layers, all rules. For executables, scripts, archives.
     FullAnalysis,
-    /// Light analysis: structural + reputation only, skip YARA. For trusted cached files.
+    /// Light analysis: default for unknown/unclassified extensions. Runs the
+    /// same ARGUS content layers as FullAnalysis today (including YARA).
     LightAnalysis,
-    /// Signature/hash only: ClamAV + IOC hash. For large files, media, firmware.
+    /// Signature-oriented: for large files, media, firmware. Skips YARA rule
+    /// matching; all other ARGUS layers (MIME, deception, structural, script,
+    /// JAR, PDF, patterns, reputation, context) still run. ClamAV runs daemon-side.
     SignatureOnly,
     /// Skip entirely: build artifacts, logs, safe extensions.
     SkipSafe,
@@ -941,7 +944,7 @@ pub fn attack_progression_score(tags: &[BehaviorTag]) -> u8 {
         return 0;
     }
 
-    // Count meaningful forward transitions (gaps of 1-3 stages apart).
+    // Count meaningful forward transitions (gaps of 1-4 stages apart).
     let mut transitions: u8 = 0;
     for window in stages.windows(2) {
         let gap = window[1] - window[0];

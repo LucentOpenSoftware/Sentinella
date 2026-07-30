@@ -89,7 +89,10 @@ pub fn analyze(_path: &str, data: &[u8]) -> Vec<Finding> {
         let read_cap = MAX_PER_ENTRY_DECOMPRESSED
             .min(MAX_TOTAL_DECOMPRESSED - total_decompressed);
 
-        if name == "META-INF/MANIFEST.MF" {
+        // java.util.jar.JarFile locates the manifest with a case-insensitive
+        // fallback, so "meta-inf/manifest.mf" is valid and launchable — match
+        // case-insensitively too or the Main-Class IoC is evaded by case alone.
+        if name.eq_ignore_ascii_case("META-INF/MANIFEST.MF") {
             has_manifest = true;
             let mut buf = Vec::new();
             if let Ok(n) = entry.by_ref().take(read_cap).read_to_end(&mut buf) {
@@ -358,12 +361,18 @@ struct JarStringHits {
 
 /// Parse the `Main-Class:` line from a manifest. Returns `None` if not present
 /// or unparseable. Modified UTF-8 is treated as UTF-8 for the purposes of the
-/// `Main-Class:` ASCII header.
+/// `Main-Class:` ASCII header. Header-name matching is case-insensitive —
+/// `java.util.jar.Attributes.Name` equality ignores ASCII case, so a
+/// lower-case `main-class:` header is honoured by the JVM and must be here too.
 fn parse_manifest_main_class(buf: &[u8]) -> Option<String> {
+    const HEADER: &str = "Main-Class:";
     let text = std::str::from_utf8(buf).ok()?;
     for line in text.lines() {
-        if let Some(value) = line.strip_prefix("Main-Class:") {
-            return Some(value.trim().to_string());
+        // `get(..len)` guard keeps the byte-slice on a char boundary.
+        if let Some(prefix) = line.get(..HEADER.len()) {
+            if prefix.eq_ignore_ascii_case(HEADER) {
+                return Some(line[HEADER.len()..].trim().to_string());
+            }
         }
     }
     None
@@ -611,6 +620,21 @@ fn scan_class_strings(class_bytes: &[u8], hit: &mut JarStringHits) {
     if !hit.process_exec && EXEC.iter().any(|p| contains_bytes(scan, p)) {
         hit.process_exec = true;
     }
+    // Case-insensitive fallback: class files commonly carry `PowerShell`,
+    // `CMD.EXE`, etc., while the lowercase-only entries above would miss
+    // them. Only runs when the exact-case pass missed (one lowercase copy).
+    if !hit.process_exec {
+        let lower = scan.to_ascii_lowercase();
+        const EXEC_LOWER: &[&[u8]] = &[
+            b"java/lang/runtime",
+            b"processbuilder",
+            b"cmd.exe",
+            b"powershell",
+        ];
+        if EXEC_LOWER.iter().any(|p| contains_bytes(&lower, p)) {
+            hit.process_exec = true;
+        }
+    }
 
     // WeedHack-specific distinctive strings (survive class-name obfuscation).
     if !hit.weedhack_signature
@@ -705,6 +729,50 @@ mod tests {
         // Leading whitespace on the value is trimmed.
         let m3 = b"Main-Class:     com.example.Foo  \n";
         assert_eq!(parse_manifest_main_class(m3), Some("com.example.Foo".to_string()));
+
+        // Header name is case-insensitive (Attributes.Name equality ignores
+        // ASCII case) — the JVM honours a lower-case main-class: header.
+        let m4 = b"Manifest-Version: 1.0\nmain-class: DonutDupe\n";
+        assert_eq!(parse_manifest_main_class(m4), Some("DonutDupe".to_string()));
+    }
+
+    #[test]
+    fn scan_class_strings_process_exec_case_insensitive() {
+        // Class files commonly carry mixed-case variants — the lowercase-only
+        // patterns must still fire.
+        let mut hit = JarStringHits::default();
+        scan_class_strings(b"PowerShell -enc SQBFAFgA", &mut hit);
+        assert!(hit.process_exec);
+
+        let mut hit2 = JarStringHits::default();
+        scan_class_strings(b"CMD.EXE /c whoami", &mut hit2);
+        assert!(hit2.process_exec);
+    }
+
+    /// Lower-case manifest entry name + lower-case header: the JVM loads it,
+    /// so the Main-Class IoC must fire too (case-only evasion).
+    #[test]
+    fn lowercase_manifest_still_detected() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        let mut buf = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opts = SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            w.start_file("meta-inf/manifest.mf", opts).unwrap();
+            w.write_all(b"Manifest-Version: 1.0\nmain-class: DonutDupe\n").unwrap();
+            w.start_file("DonutDupe.class", opts).unwrap();
+            w.write_all(b"\xca\xfe\xba\xbe...const pool...").unwrap();
+            w.finish().unwrap();
+        }
+
+        let findings = analyze("evil.jar", &buf);
+        assert!(
+            findings.iter().any(|f| f.weight == 60 && f.layer == Layer::IocCorrelation),
+            "expected DonutDupe IoC finding despite lower-case manifest: {findings:?}"
+        );
     }
 
     #[test]

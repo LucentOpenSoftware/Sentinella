@@ -167,8 +167,17 @@ impl FileIdentity {
             .unwrap_or(&canonical_str);
         let in_watched_root = watched_roots.iter().any(|root| {
             let root_str = root.to_string_lossy().to_lowercase();
-            let root_lower = root_str.strip_prefix("\\\\?\\").unwrap_or(&root_str);
-            canonical_lower.starts_with(root_lower)
+            let root_lower = root_str
+                .strip_prefix("\\\\?\\")
+                .unwrap_or(&root_str)
+                .trim_end_matches(['\\', '/']);
+            // Component-boundary check: a root `C:\Users\bob\Downloads` must
+            // NOT "contain" `C:\Users\bob\Downloads-evil\x.exe`. A raw string
+            // prefix match would accept that sibling directory.
+            canonical_lower == root_lower
+                || canonical_lower
+                    .strip_prefix(root_lower)
+                    .is_some_and(|rest| rest.starts_with('\\') || rest.starts_with('/'))
         });
         if !in_watched_root {
             return Err(IdentityMismatch::EscapedWatchRoot);
@@ -341,6 +350,26 @@ mod tests {
         let fake_root = PathBuf::from("C:\\NonexistentRoot");
         let result = id.revalidate(&[fake_root]);
         assert_eq!(result.is_err(), true);
+    }
+
+    #[test]
+    fn revalidate_sibling_prefix_dir_is_not_contained() {
+        // Root `...\Downloads` must NOT contain `...\Downloads-evil\x.exe` —
+        // a raw string prefix match would wrongly accept the sibling.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("Downloads");
+        let sibling = dir.path().join("Downloads-evil");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let file_path = sibling.join("x.exe");
+        std::fs::write(&file_path, "mz").unwrap();
+
+        let id = FileIdentity::capture(&file_path).unwrap();
+        let roots = vec![std::fs::canonicalize(&root).unwrap()];
+        assert_eq!(
+            id.revalidate(&roots),
+            Err(IdentityMismatch::EscapedWatchRoot)
+        );
     }
 
     // Note: symlink/junction tests require Windows admin privileges or Developer Mode.

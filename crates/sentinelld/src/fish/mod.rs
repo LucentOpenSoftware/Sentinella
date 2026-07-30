@@ -76,7 +76,8 @@ pub struct FishConfig {
     /// Cooldown seconds between repeated identical alerts.
     pub alert_cooldown_seconds: u64,
     /// Active response mode: "observe" (log only), "suspend" (freeze process),
-    /// "terminate" (kill process). Default: "observe".
+    /// "terminate" (kill process). Default: "observe". Ignored while
+    /// `observe_only` is true — the master switch always forces observe.
     pub active_response: String,
 }
 
@@ -224,6 +225,9 @@ pub struct MutationWindow {
     extension_mutations: u64,
     slow_burn_alerts: u64,
     alerts_suppressed: u64,
+    /// Suppressed-alert count per alert type — the global
+    /// `alerts_suppressed` made Cooldown diagnostics meaningless.
+    suppressed_by_key: HashMap<String, u64>,
     total_events: u64,
     last_decision: Option<FishDecision>,
     /// Cooldown: last alert time per alert type.
@@ -265,6 +269,7 @@ impl MutationWindow {
             extension_mutations: 0,
             slow_burn_alerts: 0,
             alerts_suppressed: 0,
+            suppressed_by_key: HashMap::new(),
             total_events: 0,
             last_decision: None,
             last_alert_times: HashMap::new(),
@@ -342,6 +347,7 @@ impl MutationWindow {
         if let Some(last) = self.last_alert_times.get(alert_type) {
             if last.elapsed() < self.cooldown {
                 self.alerts_suppressed += 1;
+                *self.suppressed_by_key.entry(alert_type.to_string()).or_default() += 1;
                 return true;
             }
         }
@@ -385,7 +391,7 @@ impl MutationWindow {
             if self.in_cooldown("rename_burst") {
                 return FishDecision::Cooldown {
                     original: "rename_burst".into(),
-                    suppressed_count: self.alerts_suppressed,
+                    suppressed_count: self.suppressed_by_key.get("rename_burst").copied().unwrap_or(0),
                 };
             }
             self.rename_bursts += 1;
@@ -399,7 +405,7 @@ impl MutationWindow {
             if self.in_cooldown("rewrite_burst") {
                 return FishDecision::Cooldown {
                     original: "rewrite_burst".into(),
-                    suppressed_count: self.alerts_suppressed,
+                    suppressed_count: self.suppressed_by_key.get("rewrite_burst").copied().unwrap_or(0),
                 };
             }
             self.rewrite_bursts += 1;
@@ -413,18 +419,22 @@ impl MutationWindow {
             if self.in_cooldown("ext_mutation") {
                 return FishDecision::Cooldown {
                     original: "ext_mutation".into(),
-                    suppressed_count: self.alerts_suppressed,
+                    suppressed_count: self.suppressed_by_key.get("ext_mutation").copied().unwrap_or(0),
                 };
             }
             self.extension_mutations += 1;
-            let pattern = self
-                .events
-                .iter()
-                .filter_map(|e| match &e.kind {
-                    MutationKind::ExtensionMutation { new_ext, .. } => Some(new_ext.clone()),
-                    _ => None,
-                })
-                .next()
+            // Report the DOMINANT new extension in the window, not the first
+            // event's — the first match is arbitrary and misleads the alert.
+            let mut ext_counts: HashMap<&str, u32> = HashMap::new();
+            for e in &self.events {
+                if let MutationKind::ExtensionMutation { new_ext, .. } = &e.kind {
+                    *ext_counts.entry(new_ext.as_str()).or_default() += 1;
+                }
+            }
+            let pattern = ext_counts
+                .into_iter()
+                .max_by_key(|(_, n)| *n)
+                .map(|(ext, _)| ext.to_string())
                 .unwrap_or_default();
             return FishDecision::ExtensionMutation {
                 count: ext_mutations,
@@ -439,7 +449,7 @@ impl MutationWindow {
             if self.in_cooldown("slow_burn") {
                 return FishDecision::Cooldown {
                     original: "slow_burn".into(),
-                    suppressed_count: self.alerts_suppressed,
+                    suppressed_count: self.suppressed_by_key.get("slow_burn").copied().unwrap_or(0),
                 };
             }
             self.slow_burn_alerts += 1;

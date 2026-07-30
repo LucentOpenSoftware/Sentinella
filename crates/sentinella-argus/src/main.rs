@@ -133,7 +133,7 @@ fn main() {
 
 fn build_engine(cli: &Cli) -> Arc<ArgusEngine> {
     let config = ArgusConfig {
-        max_file_size: cli.max_size_mb * 1024 * 1024,
+        max_file_size: cli.max_size_mb.saturating_mul(1024 * 1024),
         ..ArgusConfig::default()
     };
 
@@ -221,14 +221,15 @@ fn cmd_scan_folder(
     collect_files(dir, &mut files, depth);
 
     eprintln!("Collected {} files", files.len());
+    let collected = files.len();
 
     // Parallel scan.
     let num_threads = threads.max(1).min(files.len().max(1));
 
-    let results: Vec<_> = if files.is_empty() {
-        Vec::new()
+    let (results, panicked): (Vec<_>, usize) = if files.is_empty() {
+        (Vec::new(), 0)
     } else if num_threads <= 1 {
-        files.iter().map(|f| engine.analyze_file(f)).collect()
+        (files.iter().map(|f| engine.analyze_file(f)).collect(), 0)
     } else {
         use std::sync::mpsc;
         let (tx, rx) = mpsc::channel();
@@ -256,12 +257,28 @@ fn cmd_scan_folder(
         drop(tx);
 
         let mut results: Vec<_> = rx.iter().collect();
+        // A panicking worker thread drops its `tx` early, silently skipping the
+        // rest of its share — count join failures so the summary can't look
+        // complete when files were never scanned.
+        let mut panicked = 0usize;
         for h in handles {
-            let _ = h.join();
+            if h.join().is_err() {
+                panicked += 1;
+            }
         }
         results.sort_by(|a, b| b.score.cmp(&a.score));
-        results
+        (results, panicked)
     };
+
+    let incomplete = results.len() < collected;
+    if panicked > 0 || incomplete {
+        eprintln!(
+            "warning: scan incomplete — {} of {} files scanned ({} worker thread panics)",
+            results.len(),
+            collected,
+            panicked
+        );
+    }
 
     let elapsed = start.elapsed();
     let total = results.len();
@@ -280,7 +297,9 @@ fn cmd_scan_folder(
             "suspicious": suspicious,
             "max_score": max_score,
             "elapsed_ms": elapsed.as_millis(),
-            "files_per_sec": if elapsed.as_secs() > 0 { total as u64 / elapsed.as_secs() } else { total as u64 },
+            // Float division + 1 ms floor: integer `as_secs()` truncates
+            // sub-second runs' throughput to zero.
+            "files_per_sec": total as f64 / elapsed.as_secs_f64().max(0.001),
             "results": results.iter().filter(|v| v.score > 0).collect::<Vec<_>>(),
         });
         println!(
@@ -312,7 +331,13 @@ fn cmd_scan_folder(
         println!();
     }
 
-    score_to_exit(max_score, fail_score)
+    // Nonzero exit when the scan was incomplete (worker panics) — the summary
+    // above must not be mistaken for a full result.
+    if incomplete {
+        3
+    } else {
+        score_to_exit(max_score, fail_score)
+    }
 }
 
 fn cmd_explain(engine: &ArgusEngine, path: &str) -> i32 {
@@ -632,8 +657,13 @@ fn score_to_exit(score: u32, fail_threshold: Option<u32>) -> i32 {
     }
 }
 
+/// Upper bound on collected files — a folder scan must not build an unbounded
+/// Vec when pointed at a huge tree (argusd's benchmark walker caps at 4096;
+/// this is an interactive CLI, so the bound is more generous).
+const MAX_COLLECT_FILES: usize = 100_000;
+
 fn collect_files(dir: &Path, files: &mut Vec<PathBuf>, max_depth: u32) {
-    if max_depth == 0 {
+    if max_depth == 0 || files.len() >= MAX_COLLECT_FILES {
         return;
     }
     let entries = match std::fs::read_dir(dir) {
@@ -641,8 +671,21 @@ fn collect_files(dir: &Path, files: &mut Vec<PathBuf>, max_depth: u32) {
         Err(_) => return,
     };
     for entry in entries.flatten() {
+        if files.len() >= MAX_COLLECT_FILES {
+            return;
+        }
         let path = entry.path();
-        if path.is_dir() {
+        // Skip symlinks: `path.is_dir()`/`is_file()` follow them, so a symlink
+        // loop (a -> b -> a) recurses until the OS path-length limit (~32k
+        // chars, ~10⁴ nested frames — stack-overflow territory), and a
+        // symlinked tree would be scanned multiple times.
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.is_dir() {
             let name = path
                 .file_name()
                 .map(|n| n.to_string_lossy().to_lowercase())
@@ -654,7 +697,7 @@ fn collect_files(dir: &Path, files: &mut Vec<PathBuf>, max_depth: u32) {
                 continue;
             }
             collect_files(&path, files, max_depth - 1);
-        } else if path.is_file() {
+        } else if meta.is_file() {
             files.push(path);
         }
     }

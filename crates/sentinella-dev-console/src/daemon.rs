@@ -70,8 +70,20 @@ impl DaemonSnapshot {
 /// installed. (v0.1.5 argusd does not even have the `benchmark`
 /// subcommand — falling through to the installer copy was producing a
 /// confusing "unrecognized subcommand" error.)
+///
+/// Exception: when this process is elevated (post "Restart as Admin"),
+/// the installed Program Files copy wins. An exe-adjacent or workspace
+/// `argusd.exe` can be dropped into a user-writable directory by a
+/// lower-privileged process, and `CreateProcess`ing it with the elevated
+/// token would turn that write into elevated code execution.
 pub fn locate_argusd() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok();
+
+    if is_elevated() {
+        if let Some(p) = installed_argusd() {
+            return Some(p);
+        }
+    }
 
     // (1) Next to this exe.
     if let Some(parent) = exe.as_ref().and_then(|e| e.parent()) {
@@ -96,6 +108,11 @@ pub fn locate_argusd() -> Option<PathBuf> {
     }
 
     // (3) Installed Sentinella.
+    installed_argusd()
+}
+
+/// The installed Sentinella copy under `<Program Files>\Sentinella`.
+fn installed_argusd() -> Option<PathBuf> {
     let pf = std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into());
     let base = PathBuf::from(pf).join("Sentinella");
     for sub in [

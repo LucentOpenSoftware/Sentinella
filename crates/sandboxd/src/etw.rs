@@ -102,6 +102,16 @@ struct EtwContext {
 
 struct EtwContextGuard;
 
+/// Allocate zeroed storage for an `EVENT_TRACE_PROPERTIES` buffer with
+/// guaranteed 8-byte alignment. A `Vec<u8>` is only 1-byte aligned, but
+/// `EVENT_TRACE_PROPERTIES` contains 8-byte-aligned fields
+/// (`WNODE_HEADER.BufferHandle`, `CONTROLTRACE_HANDLE`) — forming a
+/// `&mut EVENT_TRACE_PROPERTIES` over u8 storage is misaligned-reference UB,
+/// even though the Windows heap happens to return aligned blocks in practice.
+fn aligned_props_storage(props_size: usize) -> Vec<u64> {
+    vec![0u64; props_size.div_ceil(8)]
+}
+
 impl Drop for EtwContextGuard {
     fn drop(&mut self) {
         let mut ctx = ETW_CTX.lock().unwrap_or_else(|e| e.into_inner());
@@ -122,7 +132,7 @@ impl SessionGuard {
             return;
         }
         self.active = false;
-        let mut buf = vec![0u8; self.props_size];
+        let mut buf = aligned_props_storage(self.props_size);
         let props = unsafe { &mut *(buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES) };
         props.Wnode.BufferSize = self.props_size as u32;
         props.LoggerNameOffset = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
@@ -184,7 +194,7 @@ fn etw_kernel_monitor(
     };
 
     let props_size = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + name_bytes.len() + 256;
-    let mut props_buf = vec![0u8; props_size];
+    let mut props_buf = aligned_props_storage(props_size);
     let props = unsafe { &mut *(props_buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES) };
     props.Wnode.BufferSize = props_size as u32;
     props.Wnode.ClientContext = 1;
@@ -196,8 +206,12 @@ fn etw_kernel_monitor(
     );
 
     let name_offset = props.LoggerNameOffset as usize;
-    if name_offset + name_bytes.len() <= props_buf.len() {
-        props_buf[name_offset..name_offset + name_bytes.len()].copy_from_slice(&name_bytes);
+    // Byte view over the aligned storage for the session-name copy.
+    let props_bytes = unsafe {
+        std::slice::from_raw_parts_mut(props_buf.as_mut_ptr() as *mut u8, props_buf.len() * 8)
+    };
+    if name_offset + name_bytes.len() <= props_bytes.len() {
+        props_bytes[name_offset..name_offset + name_bytes.len()].copy_from_slice(&name_bytes);
     }
 
     let mut session_handle = CONTROLTRACE_HANDLE::default();
@@ -212,7 +226,7 @@ fn etw_kernel_monitor(
     if start_result.0 != 0 {
         if start_result.0 == 183 {
             // Stale session — stop and retry.
-            let mut stop_buf = vec![0u8; props_size];
+            let mut stop_buf = aligned_props_storage(props_size);
             let stop_props =
                 unsafe { &mut *(stop_buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES) };
             stop_props.Wnode.BufferSize = props_size as u32;
@@ -227,7 +241,7 @@ fn etw_kernel_monitor(
             }
 
             // Rebuild props for retry.
-            let mut retry_buf = vec![0u8; props_size];
+            let mut retry_buf = aligned_props_storage(props_size);
             let retry_props =
                 unsafe { &mut *(retry_buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES) };
             retry_props.Wnode.BufferSize = props_size as u32;
@@ -238,8 +252,14 @@ fn etw_kernel_monitor(
             retry_props.EnableFlags =
                 EVENT_TRACE_FLAG(0x00000001 | 0x00000004 | 0x00020000 | 0x00010000);
             let off = retry_props.LoggerNameOffset as usize;
-            if off + name_bytes.len() <= retry_buf.len() {
-                retry_buf[off..off + name_bytes.len()].copy_from_slice(&name_bytes);
+            let retry_bytes = unsafe {
+                std::slice::from_raw_parts_mut(
+                    retry_buf.as_mut_ptr() as *mut u8,
+                    retry_buf.len() * 8,
+                )
+            };
+            if off + name_bytes.len() <= retry_bytes.len() {
+                retry_bytes[off..off + name_bytes.len()].copy_from_slice(&name_bytes);
             }
             let retry = unsafe {
                 StartTraceW(
@@ -632,21 +652,27 @@ fn polling_monitor(
 
     while start.elapsed() < timeout && !stop.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(200));
-        for (child_pid, child_name) in enumerate_children(pid) {
-            if seen.insert(child_pid) {
-                let severity = if is_suspicious_process(&child_name) {
-                    "high"
-                } else {
-                    "medium"
-                };
-                report.processes_spawned.push(child_name.clone());
-                report.findings.push(EtwFinding {
-                    kind: "process_spawn".into(),
-                    severity: severity.into(),
-                    detail: format!("Spawned {} (PID {})", child_name, child_pid),
-                    confidence: "observed".into(),
-                    source: "behavioral_monitor_polling".into(),
-                });
+        // Enumerate children of every PID seen so far — recursively catches
+        // grandchildren, not just direct children of the root (the ETW
+        // backend already tracks the whole tree via monitored_pids).
+        let parents: Vec<u32> = seen.iter().copied().collect();
+        for parent in parents {
+            for (child_pid, child_name) in enumerate_children(parent) {
+                if seen.insert(child_pid) {
+                    let severity = if is_suspicious_process(&child_name) {
+                        "high"
+                    } else {
+                        "medium"
+                    };
+                    report.processes_spawned.push(child_name.clone());
+                    report.findings.push(EtwFinding {
+                        kind: "process_spawn".into(),
+                        severity: severity.into(),
+                        detail: format!("Spawned {} (PID {})", child_name, child_pid),
+                        confidence: "observed".into(),
+                        source: "behavioral_monitor_polling".into(),
+                    });
+                }
             }
         }
     }
@@ -716,7 +742,9 @@ fn enumerate_children(parent_pid: u32) -> Vec<(u32, String)> {
     results
 }
 
-fn get_process_name(pid: u32) -> Option<String> {
+/// Full image path of a running process — needed by the firewall sweep in
+/// main.rs, where a `program=` rule requires the complete path.
+pub(crate) fn get_process_image_path(pid: u32) -> Option<String> {
     use windows::Win32::System::Threading::*;
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()? };
     let mut buf = [0u16; 260];
@@ -730,10 +758,7 @@ fn get_process_name(pid: u32) -> Option<String> {
         )
         .is_ok()
         {
-            let path = String::from_utf16_lossy(&buf[..len as usize]);
-            std::path::Path::new(&path)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
+            Some(String::from_utf16_lossy(&buf[..len as usize]))
         } else {
             None
         }
@@ -742,6 +767,13 @@ fn get_process_name(pid: u32) -> Option<String> {
         let _ = CloseHandle(handle);
     }
     result
+}
+
+fn get_process_name(pid: u32) -> Option<String> {
+    let path = get_process_image_path(pid)?;
+    std::path::Path::new(&path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
 }
 
 // ═══════════════════════════════════════════════════════════════

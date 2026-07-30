@@ -147,6 +147,16 @@ pub fn scan_file(
     let output: ClamWorkerOutput =
         serde_json::from_slice(&stdout_data).map_err(|e| format!("clamavd JSON parse: {e}"))?;
 
+    // Worker/daemon desync guard (same as argus_worker): the reported path
+    // must be the file we asked to scan. clamavd echoes the CLI arg verbatim.
+    let want = path.to_string_lossy();
+    if !output.path.trim().eq_ignore_ascii_case(&want) {
+        return Err(format!(
+            "clamavd JSON path mismatch: reported {}, requested {want}",
+            output.path.trim()
+        ));
+    }
+
     Ok(output)
 }
 
@@ -167,22 +177,22 @@ fn read_limited<R: Read>(mut reader: R, limit: usize) -> Result<Vec<u8>, String>
 }
 
 fn find_clamavd() -> Option<PathBuf> {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let candidate = dir.join("clamavd.exe");
-            if candidate.exists() {
-                return Some(candidate);
-            }
-            // Dev layout.
-            for ancestor in dir.ancestors().skip(1) {
-                let rel = ancestor.join("target").join("release").join("clamavd.exe");
-                if rel.exists() {
-                    return Some(rel);
-                }
-                let dbg = ancestor.join("target").join("debug").join("clamavd.exe");
-                if dbg.exists() {
-                    return Some(dbg);
-                }
+    // ☠️ R9-LETHAL: same policy as argus_worker::resolve_worker_path —
+    // the daemon's exe dir plus the strictly-shaped dev sibling
+    // target/{release,debug}. NEVER an ancestor walk: from an installed
+    // location (C:\Program Files\Sentinella) that probed e.g.
+    // C:\target\release\clamavd.exe and ran whatever it found as SYSTEM.
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let candidate = dir.join("clamavd.exe");
+    if candidate.exists() {
+        return Some(candidate);
+    }
+    if let Some(root) = crate::argus_worker::project_root_from_target_dir(dir) {
+        for profile in ["release", "debug"] {
+            let dev = root.join("target").join(profile).join("clamavd.exe");
+            if dev.exists() {
+                return Some(dev);
             }
         }
     }

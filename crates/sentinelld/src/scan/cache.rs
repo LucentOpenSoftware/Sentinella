@@ -4,7 +4,8 @@
 //! On startup, loads from SQLite. On record, writes to both.
 //! Survives daemon restarts — no need to rescan 100K files.
 //!
-//! Key: (path, size, mtime) → last scan result + signature DB generation.
+//! Key: (path, size, mtime, full-content fingerprint) → last scan result
+//! + signature DB generation.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -17,20 +18,21 @@ use std::time::SystemTime;
 const MAX_MEMORY_ENTRIES: usize = 50_000;
 const DB_WRITE_QUEUE_CAP: usize = 4096;
 
-/// ☠️ R6-LETHAL: bytes of file content folded into the cache key.
+/// ☠️ R6-LETHAL: file content folded into the cache key.
 /// Without this, the cache key was `(path, size, mtime)` only — and a
 /// user with write access to their own file could overwrite the
 /// contents with malware, pad/truncate to the same size, then restore
 /// the mtime via `SetFileTime()`. The watcher would hit the cache, get
 /// "clean", and skip both ARGUS and ClamAV. Total scanner bypass.
 ///
-/// Reading 64KB and SHA-256-hashing it costs ~0.1ms — cheap compared to
-/// the 100-500ms ARGUS scan it would replace, but defeats the trivial
-/// in-place overwrite attack because the attacker now also has to match
-/// the first 64KB of the original benign bytes (which on real PE/ELF
-/// payloads contains code, imports, symbol tables — not just a header).
-const FINGERPRINT_PREFIX_BYTES: usize = 64 * 1024;
-
+/// R6b-LETHAL: the fingerprint covers the WHOLE file, not a prefix.
+/// The original 64KB-prefix hash was trivially satisfiable: keep the
+/// first 64KB byte-identical (PE headers + first sections), write the
+/// payload into later sections/overlay, pad to the same size, restore
+/// mtime — permanent scanner bypass for any file >64KB. Hashing the
+/// full content closes that hole; streaming SHA-256 costs ~ms for
+/// typical files, still ≪ the 100-500ms scan it replaces.
+///
 /// Truncated SHA-256 stored in the cache. 128 bits is enough to make
 /// brute-force preimage attacks against a single file infeasible while
 /// keeping the on-disk row compact.
@@ -41,17 +43,15 @@ fn compute_content_fingerprint(path: &Path) -> Option<ContentFingerprint> {
     use std::io::Read;
 
     let mut file = std::fs::File::open(path).ok()?;
-    let mut buf = vec![0u8; FINGERPRINT_PREFIX_BYTES];
-    let mut total_read = 0;
-    while total_read < FINGERPRINT_PREFIX_BYTES {
-        match file.read(&mut buf[total_read..]) {
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        match file.read(&mut buf) {
             Ok(0) => break,
-            Ok(n) => total_read += n,
+            Ok(n) => hasher.update(&buf[..n]),
             Err(_) => return None,
         }
     }
-    let mut hasher = Sha256::new();
-    hasher.update(&buf[..total_read]);
     let digest = hasher.finalize();
     let mut out = [0u8; 16];
     out.copy_from_slice(&digest[..16]);
@@ -123,6 +123,10 @@ pub struct ScanCache {
 struct CacheInner {
     entries: HashMap<PathBuf, CacheEntry>,
     sig_generation: u64,
+    /// R7-LETHAL: fingerprint of the signature set the entries were
+    /// recorded under. Persisted in cache_meta; checked at startup by
+    /// `sync_signature_fingerprint`.
+    sig_fingerprint: Option<u64>,
     access_counter: u64,
     hits: u64,
     misses: u64,
@@ -141,6 +145,9 @@ enum DbWrite {
     Invalidate {
         sig_generation: u64,
     },
+    SetSigFingerprint {
+        fingerprint: u64,
+    },
 }
 
 impl ScanCache {
@@ -150,6 +157,7 @@ impl ScanCache {
             inner: Mutex::new(CacheInner {
                 entries: HashMap::new(),
                 sig_generation: 1,
+                sig_fingerprint: None,
                 access_counter: 0,
                 hits: 0,
                 misses: 0,
@@ -176,12 +184,14 @@ impl ScanCache {
         // Load existing entries from SQLite.
         let mut entries = HashMap::new();
         let mut sig_generation = 1u64;
+        let mut sig_fingerprint = None;
         if let Some(ref conn) = db {
             match load_from_db(conn) {
-                Ok((loaded, loaded_gen)) => {
+                Ok((loaded, loaded_gen, loaded_fp)) => {
                     let count = loaded.len();
                     entries = loaded;
                     sig_generation = loaded_gen;
+                    sig_fingerprint = loaded_fp;
                     tracing::info!(
                         entries = count,
                         generation = loaded_gen,
@@ -200,6 +210,7 @@ impl ScanCache {
             inner: Mutex::new(CacheInner {
                 entries,
                 sig_generation,
+                sig_fingerprint,
                 access_counter: 0,
                 hits: 0,
                 misses: 0,
@@ -365,11 +376,75 @@ impl ScanCache {
         }
     }
 
+    /// R7-LETHAL: reconcile the cache with the current signature set.
+    ///
+    /// The hot-reload path (`reload_engine_inner`) calls `invalidate_all`,
+    /// but the update pipeline's `sources.update` handler requires a daemon
+    /// RESTART — and the startup engine load never invalidated the cache,
+    /// so "clean" verdicts recorded under the OLD signature set kept
+    /// hitting under the new one (persisted in SQLite), permanently
+    /// masking anything the update was meant to catch.
+    ///
+    /// Call once after each engine load with a fingerprint of the active
+    /// signature set (e.g. provider_fingerprint + signature count). If it
+    /// differs from the value persisted alongside the cache, all entries
+    /// are invalidated; identical restarts keep the cache warm.
+    // Wired from ipc/state.rs AppState::new (audit R7 cross-cutting).
+    pub fn sync_signature_fingerprint(&self, fingerprint: &str) {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        fingerprint.hash(&mut hasher);
+        let fp = hasher.finish();
+
+        let changed = {
+            let mut inner = match self.inner.lock() {
+                Ok(i) => i,
+                Err(_) => return,
+            };
+            if inner.sig_fingerprint == Some(fp) {
+                false
+            } else {
+                inner.sig_fingerprint = Some(fp);
+                // Always bump the generation, even with an empty memory
+                // map: SQLite may still hold rows under the current
+                // generation (e.g. a partial load), and they must not be
+                // trusted under a different signature set.
+                inner.sig_generation += 1;
+                let new_gen = inner.sig_generation;
+                drop(inner);
+                self.enqueue_invalidation(new_gen);
+                tracing::info!(
+                    generation = new_gen,
+                    "scan cache invalidated — signature-set fingerprint changed"
+                );
+                true
+            }
+        };
+
+        if changed {
+            if let Some(tx) = &self.db_tx {
+                let _ = tx.try_send(DbWrite::SetSigFingerprint { fingerprint: fp });
+            }
+        }
+    }
+
     /// Get cache statistics: (hits, misses, entries).
     pub fn stats(&self) -> (u64, u64, usize) {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let _db_write_drops = inner.db_write_drops;
         (inner.hits, inner.misses, inner.entries.len())
+    }
+
+    /// Number of SQLite writes dropped because the writer queue was full.
+    /// Diagnostics only — previously computed in `stats()` and discarded,
+    /// making the counter unreachable via the public API.
+    #[allow(dead_code)] // exposed for IPC/diagnostics wiring outside this unit
+    pub fn db_write_drops(&self) -> u64 {
+        self.inner
+            .lock()
+            .map(|inner| inner.db_write_drops)
+            .unwrap_or(0)
     }
 
     fn enqueue_invalidation(&self, sig_generation: u64) {
@@ -424,6 +499,11 @@ fn start_db_writer(conn: rusqlite::Connection) -> SyncSender<DbWrite> {
                             tracing::debug!(%e, "scan cache generation write failed");
                         }
                     }
+                    DbWrite::SetSigFingerprint { fingerprint } => {
+                        if let Err(e) = write_fingerprint_to_db(&conn, fingerprint) {
+                            tracing::debug!(%e, "scan cache fingerprint write failed");
+                        }
+                    }
                 }
             }
         });
@@ -472,7 +552,7 @@ fn open_cache_db(path: &Path) -> Result<rusqlite::Connection, String> {
 
 fn load_from_db(
     conn: &rusqlite::Connection,
-) -> Result<(HashMap<PathBuf, CacheEntry>, u64), String> {
+) -> Result<(HashMap<PathBuf, CacheEntry>, u64, Option<u64>), String> {
     // Load generation.
     let sgen: u64 = conn
         .query_row(
@@ -481,6 +561,18 @@ fn load_from_db(
             |row| row.get::<_, i64>(0),
         )
         .unwrap_or(1) as u64;
+
+    // R7-LETHAL: load the signature-set fingerprint the entries were
+    // recorded under (absent on pre-upgrade databases → None → the next
+    // sync_signature_fingerprint call will invalidate + persist).
+    let sfp: Option<u64> = conn
+        .query_row(
+            "SELECT value FROM cache_meta WHERE key = 'sig_fingerprint'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .ok()
+        .map(|v| v as u64);
 
     // Load entries for current generation with integrity verification.
     // D-3 fix: entries with invalid integrity_hash are REJECTED (cache miss).
@@ -565,7 +657,7 @@ fn load_from_db(
         );
     }
 
-    Ok((entries, sgen))
+    Ok((entries, sgen, sfp))
 }
 
 fn write_generation_to_db(conn: &rusqlite::Connection, sig_generation: u64) -> Result<(), String> {
@@ -574,6 +666,15 @@ fn write_generation_to_db(conn: &rusqlite::Connection, sig_generation: u64) -> R
         rusqlite::params![sig_generation as i64],
     )
     .map_err(|e| format!("generation: {e}"))?;
+    Ok(())
+}
+
+fn write_fingerprint_to_db(conn: &rusqlite::Connection, fingerprint: u64) -> Result<(), String> {
+    conn.execute(
+        "INSERT OR REPLACE INTO cache_meta (key, value) VALUES ('sig_fingerprint', ?1)",
+        rusqlite::params![fingerprint as i64],
+    )
+    .map_err(|e| format!("fingerprint: {e}"))?;
     Ok(())
 }
 
@@ -668,6 +769,41 @@ mod tests {
         assert!(
             cache.check_with_metadata(&p, &attacker_meta).is_none(),
             "BUG: in-place content swap returned cache hit — scanner bypass possible"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn r6b_lethal_tail_tamper_past_64kb_misses_cache() {
+        // Regression for the 64KB-prefix-only fingerprint: the attacker
+        // keeps the first 64KB byte-identical (trivial: PE headers + first
+        // sections), writes the payload PAST 64KB, preserves size, and
+        // restores mtime via SetFileTime. With a prefix-only fingerprint
+        // this was a cache HIT → permanent scanner bypass. With the
+        // full-content fingerprint it MUST miss.
+        let dir = std::env::temp_dir().join("sent_r6b_cache_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("victim.bin");
+
+        let clean = vec![0xAAu8; 200_000]; // well past the old 64KB window
+        let meta_clean = write_file(&p, &clean);
+        let cache = ScanCache::new();
+        cache.record_with_metadata(&p, &meta_clean, true);
+        assert_eq!(cache.check_with_metadata(&p, &meta_clean), Some(true));
+
+        // Tamper ONLY past the 64KB mark; first 64KB stay identical.
+        let mut dirty = clean.clone();
+        for b in &mut dirty[150_000..] {
+            *b = 0xBB;
+        }
+        write_file(&p, &dirty);
+        let attacker_meta = meta_clean.clone(); // mtime "restored"
+
+        assert!(
+            cache.check_with_metadata(&p, &attacker_meta).is_none(),
+            "BUG: tail tamper past 64KB returned cache hit — prefix fingerprint bypass"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

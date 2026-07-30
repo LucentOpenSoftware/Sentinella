@@ -16,14 +16,21 @@ pub fn analyze(path: &str, data: &[u8]) -> Vec<Finding> {
         .map(|e| e.to_string_lossy().to_lowercase())
         .unwrap_or_default();
 
-    // Only analyze text-like files.
-    let content = match std::str::from_utf8(data) {
-        Ok(s) => s,
-        Err(_) => {
-            // Try lossy conversion for partial text files.
-            return findings; // Binary files handled elsewhere.
+    // Only analyze text-like files. PowerShell and WSH execute UTF-16
+    // scripts natively (UTF-16LE is the default of `Out-File` and the ISE),
+    // so decode BOM-marked UTF-16 before analysis — otherwise a UTF-16
+    // .ps1/.vbs bypasses this entire layer.
+    let content: std::borrow::Cow<'_, str> = if data.starts_with(&[0xFF, 0xFE]) {
+        std::borrow::Cow::Owned(decode_utf16(&data[2..], false))
+    } else if data.starts_with(&[0xFE, 0xFF]) {
+        std::borrow::Cow::Owned(decode_utf16(&data[2..], true))
+    } else {
+        match std::str::from_utf8(data) {
+            Ok(s) => std::borrow::Cow::Borrowed(s),
+            Err(_) => return findings, // Binary files handled elsewhere.
         }
     };
+    let content = content.as_ref();
 
     match ext.as_str() {
         "ps1" | "psm1" | "psd1" => analyze_powershell(content, &mut findings),
@@ -43,6 +50,22 @@ pub fn analyze(path: &str, data: &[u8]) -> Vec<Finding> {
     }
 
     findings
+}
+
+/// Decode a BOM-stripped UTF-16 byte slice to a String (lossy on odd
+/// trailing bytes / invalid surrogates).
+fn decode_utf16(data: &[u8], big_endian: bool) -> String {
+    let units: Vec<u16> = data
+        .chunks_exact(2)
+        .map(|c| {
+            if big_endian {
+                u16::from_be_bytes([c[0], c[1]])
+            } else {
+                u16::from_le_bytes([c[0], c[1]])
+            }
+        })
+        .collect();
+    String::from_utf16_lossy(&units)
 }
 
 // ── PowerShell analysis ────────────────────────────────────────────

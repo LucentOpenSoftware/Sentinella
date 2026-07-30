@@ -132,6 +132,14 @@ pub async fn call(method: &str, params: Value) -> Result<Value, DaemonError> {
 
     let resp: Value = serde_json::from_slice(&resp_buf)?;
 
+    // Framing sanity: one request per connection with a fixed id (1), and
+    // the daemon echoes it back (RpcResponse.id). A mismatch means the
+    // stream desynced — fail loudly instead of returning a wrong result.
+    match resp.get("id").and_then(|v| v.as_u64()) {
+        Some(1) => {}
+        _ => return Err(DaemonError::InvalidFrame("response id mismatch (expected 1)".into())),
+    }
+
     // Check for RPC error.
     if let Some(err) = resp.get("error") {
         return Err(DaemonError::Rpc {
@@ -210,4 +218,23 @@ async fn call_auth_inner(method: &str, mut params: Value, secret: &str) -> Resul
 #[allow(dead_code)]
 pub async fn call_with<P: Serialize>(method: &str, params: &P) -> Result<Value, DaemonError> {
     call(method, serde_json::to_value(params).unwrap_or(Value::Null)).await
+}
+
+/// Shared runtime for the blocking (sync) tray/supervisor IPC paths.
+/// Audit finding: those paths used to build and drop a fresh
+/// current-thread runtime per call (thread + reactor + timer init) —
+/// the supervisor polls every ~5 s and the tray every 15 s, so the churn
+/// was perpetual. One lazily-created runtime is shared by all callers;
+/// `block_on` on a multi-thread runtime is safe to call concurrently
+/// from several threads.
+pub(crate) fn blocking_runtime() -> &'static tokio::runtime::Runtime {
+    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_io()
+            .enable_time()
+            .build()
+            .expect("tokio runtime for blocking daemon calls")
+    })
 }

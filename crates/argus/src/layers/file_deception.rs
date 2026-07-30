@@ -69,9 +69,15 @@ pub fn analyze_path(path: &str) -> Vec<Finding> {
     ];
 
     for mimic in system_mimics {
+        // Exemption must be anchored at the start of the path — a bare
+        // `contains("\\windows\\system32\\")` would also exempt e.g.
+        // `C:\Temp\windows\system32\svchost.exe`, trivially evading the
+        // mimic check by embedding the substring in an attacker-created
+        // directory tree.
+        let in_real_system_dir = path_lower.starts_with("c:\\windows\\system32\\")
+            || path_lower.starts_with("c:\\windows\\syswow64\\");
         if name_lower.starts_with(mimic)
-            && !path_lower.contains("\\windows\\system32\\")
-            && !path_lower.contains("\\windows\\syswow64\\")
+            && !in_real_system_dir
             && EXECUTABLE_EXTENSIONS.contains(&ext.as_str())
         {
             findings.push(Finding {

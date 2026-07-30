@@ -19,7 +19,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Vault key length in bytes.
 const KEY_LEN: usize = 32;
@@ -87,8 +87,32 @@ impl IntegrityVault {
         // Load existing manifest or create empty.
         let manifest = if manifest_path.exists() {
             match std::fs::read_to_string(&manifest_path) {
-                Ok(json) => serde_json::from_str(&json).unwrap_or_default(),
-                Err(_) => IntegrityManifest::default(),
+                Ok(json) => match serde_json::from_str(&json) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        // An EXISTING manifest that fails to parse is not a
+                        // first run — save() writes atomically, so garbage
+                        // here means truncation/corruption/tampering. Failing
+                        // open with an empty manifest would silently disable
+                        // the entire integrity gate (verify_all over zero
+                        // entries is "clean") — the exact silent lobotomy
+                        // this module exists to catch. Fail LOUD.
+                        error!(
+                            path = %manifest_path.display(),
+                            error = %e,
+                            "integrity manifest unreadable — loaded empty; tamper detection degraded this run"
+                        );
+                        IntegrityManifest::default()
+                    }
+                },
+                Err(e) => {
+                    error!(
+                        path = %manifest_path.display(),
+                        error = %e,
+                        "integrity manifest present but unreadable — loaded empty; tamper detection degraded this run"
+                    );
+                    IntegrityManifest::default()
+                }
             }
         } else {
             IntegrityManifest::default()
@@ -250,6 +274,13 @@ struct BinaryManifest {
 pub struct BinaryIntegrityReport {
     /// Manifest was missing — TOFU baseline established this run.
     pub tofu_initialized: bool,
+    /// A baseline had been established before (marker file present) but the
+    /// manifest was missing/empty/corrupt this run — i.e. someone deleted or
+    /// gutted `binary_integrity.json`, which is exactly how an attacker gets
+    /// replaced binaries silently re-baselined. We re-baseline (fail-open so
+    /// the daemon keeps running) but the caller MUST treat this as a tamper
+    /// signal (log at error + set the binary_integrity_drift health flag).
+    pub baseline_lost: bool,
     /// Binary paths whose stored hash matched.
     pub verified: Vec<PathBuf>,
     /// Binary paths whose stored hash MISMATCHED (real tamper signal).
@@ -273,7 +304,11 @@ impl BinaryIntegrityReport {
 /// created (trust-on-first-run); on subsequent calls a mismatch is
 /// reported via `BinaryIntegrityReport.drifted`. The manifest is rehashed
 /// when new sibling workers appear OR after explicit refresh; on a drift
-/// we DO NOT rehash — the operator must investigate first.
+/// we DO NOT rehash — the operator must investigate first. A marker file
+/// (`binary_integrity.baseline`) records that a baseline was established;
+/// if the manifest is missing/empty/corrupt while the marker exists, the
+/// baseline is re-established but flagged via `BinaryIntegrityReport
+/// .baseline_lost` so a delete-the-manifest reset is not silent.
 ///
 /// `key` is the runtime-integrity vault key (shared, no second secret).
 pub fn verify_or_init_binaries(
@@ -303,10 +338,35 @@ pub fn verify_or_init_binaries(
     }
 
     let manifest_path = state_dir.join("binary_integrity.json");
+    // Marker written on first TOFU: distinguishes "never initialized" from
+    // "baseline existed and vanished". Without it, deleting/emptying the
+    // manifest (same privilege tier as replacing the binaries) silently
+    // re-baselines poisoned binaries as trusted on next start.
+    let marker_path = state_dir.join("binary_integrity.baseline");
     let mut manifest: BinaryManifest = if manifest_path.exists() {
         match std::fs::read_to_string(&manifest_path) {
-            Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
-            Err(_) => BinaryManifest::default(),
+            Ok(s) => match serde_json::from_str(&s) {
+                Ok(m) => m,
+                Err(e) => {
+                    // Same fail-loud rule as the runtime-asset manifest: an
+                    // existing file that does not parse is a tamper signal,
+                    // not a first run.
+                    error!(
+                        path = %manifest_path.display(),
+                        error = %e,
+                        "binary integrity manifest unreadable — will re-baseline and flag drift"
+                    );
+                    BinaryManifest::default()
+                }
+            },
+            Err(e) => {
+                error!(
+                    path = %manifest_path.display(),
+                    error = %e,
+                    "binary integrity manifest present but unreadable — will re-baseline and flag drift"
+                );
+                BinaryManifest::default()
+            }
         }
     } else {
         BinaryManifest::default()
@@ -315,7 +375,16 @@ pub fn verify_or_init_binaries(
     let mut report = BinaryIntegrityReport::default();
 
     if manifest.entries.is_empty() {
-        // TOFU: establish baseline.
+        // TOFU: establish baseline. If the marker says a baseline already
+        // existed, this is not a first run — the manifest was deleted,
+        // emptied, or corrupted since. Re-baseline (fail-open) but flag it.
+        report.baseline_lost = marker_path.exists();
+        if report.baseline_lost {
+            error!(
+                path = %manifest_path.display(),
+                "binary integrity: baseline vanished/corrupt since last start — re-baselining, treating as tamper signal"
+            );
+        }
         for c in &candidates {
             match compute_file_hmac(key, c) {
                 Ok(h) => {
@@ -330,13 +399,29 @@ pub fn verify_or_init_binaries(
         }
         manifest.last_updated = chrono::Utc::now().timestamp();
         write_binary_manifest(&manifest_path, &manifest)?;
-        report.tofu_initialized = true;
-        info!(
-            count = manifest.entries.len(),
-            path = %manifest_path.display(),
-            "binary integrity: TOFU baseline established"
+        // Best-effort marker; contents are just the establishment timestamp.
+        let _ = std::fs::write(
+            &marker_path,
+            chrono::Utc::now().timestamp().to_string().as_bytes(),
         );
+        report.tofu_initialized = true;
+        if !report.baseline_lost {
+            info!(
+                count = manifest.entries.len(),
+                path = %manifest_path.display(),
+                "binary integrity: TOFU baseline established"
+            );
+        }
         return Ok(report);
+    }
+
+    // Backfill the marker for installs whose baseline predates it, so a
+    // later manifest deletion is still distinguishable from a first run.
+    if !marker_path.exists() {
+        let _ = std::fs::write(
+            &marker_path,
+            chrono::Utc::now().timestamp().to_string().as_bytes(),
+        );
     }
 
     // Subsequent start: verify each candidate against the stored hash.
@@ -544,7 +629,7 @@ fn save_key(path: &Path, key: &[u8; KEY_LEN]) -> Result<(), String> {
     {
         use crate::win_process::QuietCommand;
         let path_str = path.to_string_lossy();
-        let _ = std::process::Command::new("icacls")
+        match std::process::Command::new("icacls")
             .args([
                 path_str.as_ref(),
                 "/inheritance:r",
@@ -554,12 +639,26 @@ fn save_key(path: &Path, key: &[u8; KEY_LEN]) -> Result<(), String> {
                 "*S-1-5-32-544:(R)", // BUILTIN\Administrators
             ])
             .quiet_windows()
-            .output();
+            .output()
+        {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => warn!(
+                status = %out.status,
+                stderr = %String::from_utf8_lossy(&out.stderr),
+                "integrity vault: icacls failed — vault key ACL not restricted"
+            ),
+            Err(e) => warn!(
+                error = %e,
+                "integrity vault: could not run icacls — vault key ACL not restricted"
+            ),
+        }
     }
     #[cfg(not(target_os = "windows"))]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+            warn!(error = %e, "integrity vault: chmod 600 failed — vault key ACL not restricted");
+        }
     }
 
     Ok(())
@@ -583,17 +682,28 @@ fn load_key(path: &Path) -> Result<[u8; KEY_LEN], String> {
 /// Walk directory recursively, returning file paths.
 fn walkdir(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
+    walkdir_inner(dir, 0, &mut files);
+    files
+}
+
+fn walkdir_inner(dir: &Path, depth: u32, files: &mut Vec<PathBuf>) {
+    // Depth cap + no reparse-point following: `Path::is_dir()` follows
+    // symlinks/junctions, so a junction cycle would recurse until stack
+    // overflow (crashing the privileged daemon). `DirEntry::file_type()`
+    // does NOT follow reparse points — symlinks/junctions are skipped.
+    const MAX_DEPTH: u32 = 32;
+    if depth > MAX_DEPTH {
+        return;
+    }
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                files.extend(walkdir(&path));
-            } else if path.is_file() {
-                files.push(path);
+            match entry.file_type() {
+                Ok(ft) if ft.is_dir() => walkdir_inner(&entry.path(), depth + 1, files),
+                Ok(ft) if ft.is_file() => files.push(entry.path()),
+                _ => {} // symlink / junction / unknown — do not follow.
             }
         }
     }
-    files
 }
 
 #[cfg(test)]
@@ -625,5 +735,31 @@ mod tests {
         std::fs::write(&f, b"original signatures").unwrap();
         assert_eq!(h1, compute_file_hmac(&key, &f).unwrap());
         let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn vanished_binary_baseline_is_flagged_not_silent() {
+        // Regression: deleting binary_integrity.json after a baseline existed
+        // used to silently re-baseline whatever binaries were on disk
+        // (attacker: replace exe + delete manifest = trusted again). The
+        // marker file must make the second call report baseline_lost.
+        let dir = std::env::temp_dir().join(format!("sent_bin_tofu_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = [9u8; KEY_LEN];
+
+        let r1 = verify_or_init_binaries(&dir, &key).unwrap();
+        assert!(r1.tofu_initialized, "first run must establish TOFU baseline");
+        assert!(!r1.baseline_lost, "first run is not a lost baseline");
+
+        // Attacker deletes the manifest; the marker remains.
+        std::fs::remove_file(dir.join("binary_integrity.json")).unwrap();
+        let r2 = verify_or_init_binaries(&dir, &key).unwrap();
+        assert!(
+            r2.baseline_lost,
+            "vanished baseline must be flagged as a tamper signal"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

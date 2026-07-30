@@ -148,8 +148,11 @@ fn collect_run_key_targets(targets: &mut Vec<PathBuf>) {
     ];
 
     use crate::win_process::QuietCommand;
+    // ☠️ R9-LETHAL: resolve via System32, never the process PATH (daemon
+    // runs as SYSTEM — see win_process::system32_tool).
+    let reg_exe = crate::win_process::system32_tool("reg.exe");
     for key in &keys {
-        let output = Command::new("reg")
+        let output = Command::new(&reg_exe)
             .args(["query", key])
             .quiet_windows()
             .output();

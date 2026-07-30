@@ -13,7 +13,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{Duration, timeout};
 
 const IPC_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+// MAX_FRAME_SIZE comes from `sentinella_ipc_proto::*` — the protocol
+// crate is the single source of truth (1 MiB since the K2 fix; the
+// daemon enforces that cap). Do not shadow it with a local constant.
 
 #[derive(Parser)]
 #[command(name = "sentinella", about = "Sentinella antivirus CLI")]
@@ -148,7 +150,8 @@ async fn main() -> Result<()> {
                 } else {
                     "file"
                 };
-                let params = serde_json::json!({ "type": scan_type, "target": path });
+                let params =
+                    with_ipc_auth(serde_json::json!({ "type": scan_type, "target": path }))?;
                 let resp = send_request("scan.start", params).await?;
                 if let Some(r) = resp.get("result") {
                     let status = r.get("status").and_then(|v| v.as_str()).unwrap_or("?");
@@ -184,7 +187,7 @@ async fn main() -> Result<()> {
             }
         }
         Commands::QuickScan => {
-            let params = serde_json::json!({"type": "quick"});
+            let params = with_ipc_auth(serde_json::json!({"type": "quick"}))?;
             let resp = send_request("scan.start", params).await?;
             println!("{}", serde_json::to_string_pretty(&resp)?);
         }
@@ -203,7 +206,7 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&resp)?);
         }
         Commands::QuarantineList => {
-            let resp = send_request("quarantine.list", serde_json::Value::Null).await?;
+            let resp = send_request("quarantine.list", with_ipc_auth(serde_json::Value::Null)?).await?;
             println!("{}", serde_json::to_string_pretty(&resp)?);
         }
         Commands::QuarantineRestore { id } => {
@@ -229,7 +232,8 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&resp)?);
         }
         Commands::Diag => {
-            let resp = send_request("stats.runtime", serde_json::Value::Null).await?;
+            // stats.runtime is AuthenticatedRead (central policy gate).
+            let resp = send_request("stats.runtime", with_ipc_auth(serde_json::Value::Null)?).await?;
             if let Some(r) = resp.get("result") {
                 println!("  Sentinella Diagnostics");
                 println!("  =====================");
@@ -309,11 +313,11 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Activity => {
-            let resp = send_request("activity.list", serde_json::Value::Null).await?;
+            let resp = send_request("activity.list", with_ipc_auth(serde_json::Value::Null)?).await?;
             println!("{}", serde_json::to_string_pretty(&resp)?);
         }
         Commands::Config => {
-            let resp = send_request("settings.get", serde_json::Value::Null).await?;
+            let resp = send_request("settings.get", with_ipc_auth(serde_json::Value::Null)?).await?;
             println!("{}", serde_json::to_string_pretty(&resp)?);
         }
         Commands::Version => {
@@ -416,6 +420,18 @@ async fn main() -> Result<()> {
             language,
             json,
         } => {
+            // The daemon caps runtime.scan_buffer payloads at 1 MiB — refuse
+            // early instead of loading a file that is guaranteed to be
+            // rejected with PAYLOAD_TOO_LARGE after a full read into memory.
+            let file_len = std::fs::metadata(&path)
+                .map_err(|e| anyhow::anyhow!("cannot stat {}: {e}", path.display()))?
+                .len();
+            if file_len > MAX_FRAME_SIZE as u64 {
+                bail!(
+                    "{} is {file_len} bytes; runtime.scan_buffer accepts at most {MAX_FRAME_SIZE} bytes",
+                    path.display()
+                );
+            }
             let content = std::fs::read_to_string(&path)
                 .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
             let auth_params = ipc_auth_params()?;
@@ -464,13 +480,20 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
+            } else {
+                // Error path (rate-limit, payload-too-large, engine error):
+                // print the raw response like every other subcommand so
+                // scripts don't see exit 0 with zero output.
+                println!("{}", serde_json::to_string_pretty(&resp)?);
             }
         }
         Commands::ExportReport { output } => {
             let status = send_request("engine.status", serde_json::Value::Null).await?;
-            let stats = send_request("stats.runtime", serde_json::Value::Null).await?;
-            let history = send_request("scan.history", serde_json::Value::Null).await?;
-            let quarantine = send_request("quarantine.list", serde_json::Value::Null).await?;
+            // stats.runtime / scan.history are AuthenticatedRead (central policy gate).
+            let stats = send_request("stats.runtime", with_ipc_auth(serde_json::Value::Null)?).await?;
+            let history = send_request("scan.history", with_ipc_auth(serde_json::Value::Null)?).await?;
+            let quarantine =
+                send_request("quarantine.list", with_ipc_auth(serde_json::Value::Null)?).await?;
 
             let report = serde_json::json!({
                 "report_type": "sentinella_scan_report",
@@ -507,10 +530,43 @@ async fn request_challenge_token(method: &str) -> Result<String> {
 }
 
 fn ipc_auth_params() -> Result<serde_json::Value> {
-    let auth = std::env::var("SENTINELLA_IPC_SECRET").map_err(|_| {
-        anyhow::anyhow!("SENTINELLA_IPC_SECRET required for authenticated commands")
+    Ok(serde_json::json!({"auth": ipc_secret()?}))
+}
+
+/// Load the IPC auth secret: `SENTINELLA_IPC_SECRET` first, then the
+/// daemon's state file (`%ProgramData%\Sentinella\state\ipc_secret`),
+/// exactly like the GUI and dev-console do. The file is intentionally
+/// world-readable per the R3 ACL fix — this removes friction, not security.
+fn ipc_secret() -> Result<String> {
+    if let Ok(secret) = std::env::var("SENTINELLA_IPC_SECRET") {
+        return Ok(secret);
+    }
+    let pd = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into());
+    let path = std::path::Path::new(&pd)
+        .join("Sentinella")
+        .join("state")
+        .join("ipc_secret");
+    let secret = std::fs::read_to_string(&path).map_err(|_| {
+        anyhow::anyhow!(
+            "SENTINELLA_IPC_SECRET not set and {} is not readable",
+            path.display()
+        )
     })?;
-    Ok(serde_json::json!({"auth": auth}))
+    Ok(secret.trim().to_string())
+}
+
+/// Merge the IPC auth secret into `params`. Since v0.1.6 the daemon
+/// requires `auth` on scan.start / quarantine.list / activity.list /
+/// settings.get (R4-LETHAL-5/6, R7-LETHAL); without it these commands
+/// always fail against a production daemon.
+fn with_ipc_auth(params: serde_json::Value) -> Result<serde_json::Value> {
+    let mut map = match params {
+        serde_json::Value::Object(m) => m,
+        serde_json::Value::Null => serde_json::Map::new(),
+        other => bail!("IPC params must be an object or null, got {other}"),
+    };
+    map.insert("auth".into(), serde_json::Value::String(ipc_secret()?));
+    Ok(serde_json::Value::Object(map))
 }
 
 /// Connect to the daemon, send a single request, return the response.

@@ -16,14 +16,14 @@ use std::path::Path;
 /// Well-known trusted publishers whose valid signatures substantially
 /// reduce suspicion. These are NOT exempt from scanning.
 const TRUSTED_SIGNERS: &[(&str, u32)] = &[
-    // (substring to match in signer subject, discount)
+    // (name matched word-boundary-wise in signer subject, discount)
     ("Microsoft Corporation", 25),
     ("Microsoft Windows", 25),
     ("Google LLC", 22),
     ("Google Inc", 22),
     ("Mozilla Corporation", 22),
     ("Python Software Foundation", 22),
-    ("Git", 20),
+    ("GitHub", 20),
     ("NVIDIA Corporation", 22),
     ("Advanced Micro Devices", 22),
     ("Intel Corporation", 22),
@@ -78,7 +78,7 @@ const TRUSTED_SIGNERS: &[(&str, u32)] = &[
 /// Coarse Authenticode verdict suitable for callers that only need to
 /// classify a module as trusted / untrusted / unknown — e.g. the
 /// WeedHack ImageLoad signer verifier (sentinelld). Does NOT change the
-/// score-discount semantics of `analyze` / `signature_discount`.
+/// score-discount semantics of `analyze` / `analyze_with_discount`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthenticodeStatus {
     /// Valid Authenticode chain rooted at a known trusted publisher
@@ -150,24 +150,11 @@ pub fn analyze(path: &Path) -> Vec<Finding> {
     }
 }
 
-/// Get the signature discount for scoring (used by the engine).
-pub fn signature_discount(path: &Path) -> u32 {
-    #[cfg(target_os = "windows")]
-    {
-        signature_discount_windows(path)
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = path;
-        0
-    }
-}
-
 /// Combined: run Authenticode verification ONCE and return both the findings
 /// list and the score discount. Engine should prefer this over calling
-/// `analyze` and `signature_discount` separately — those each invoke
-/// `verify_trust` (WinVerifyTrust + cert chain walk), so calling both runs the
-/// expensive PE+CryptoAPI work 2-3× per file. This collapses it to one call.
+/// `analyze` separately — `analyze` invokes `verify_trust` (WinVerifyTrust +
+/// cert chain walk), so calling both runs the expensive PE+CryptoAPI work
+/// twice per file. This collapses it to one call.
 pub fn analyze_with_discount(path: &Path) -> (Vec<Finding>, u32) {
     #[cfg(target_os = "windows")]
     {
@@ -256,40 +243,9 @@ fn analyze_windows(path: &Path) -> Vec<Finding> {
     }
 }
 
-#[cfg(target_os = "windows")]
-fn signature_discount_windows(path: &Path) -> u32 {
-    let (trust_result, _) = verify_trust(path);
-    match trust_result {
-        TrustResult::ValidTrusted(_) => {
-            // Find the specific discount from TRUSTED_SIGNERS.
-            if let (_, Some(signer)) = verify_trust(path) {
-                let signer_lower = signer.to_lowercase();
-                for &(pattern, discount) in TRUSTED_SIGNERS {
-                    if signer_lower.contains(&pattern.to_lowercase()) {
-                        return discount;
-                    }
-                }
-            }
-            10 // Valid trusted but didn't match specific entry.
-        }
-        TrustResult::ValidUnknown => 5,
-        // Windows system binaries are catalog-signed (not embedded).
-        // WinVerifyTrust with WTD_CHOICE_FILE doesn't check catalog sigs.
-        // For files in protected Windows directories, apply system trust discount.
-        TrustResult::Unsigned | TrustResult::Error => {
-            if is_windows_system_path(path) {
-                20
-            } else {
-                0
-            }
-        }
-        _ => 0,
-    }
-}
-
 /// Combined Windows implementation: one verify_trust call drives both the
-/// findings list and the score discount, replacing the 2-3 calls the legacy
-/// pair (`analyze` + `signature_discount`) made per PE.
+/// findings list and the score discount, replacing the multiple calls the
+/// legacy per-accessor design made per PE.
 #[cfg(target_os = "windows")]
 fn analyze_with_discount_windows(path: &Path) -> (Vec<Finding>, u32) {
     let (trust_result, signer) = verify_trust(path);
@@ -345,7 +301,7 @@ fn analyze_with_discount_windows(path: &Path) -> (Vec<Finding>, u32) {
                 let signer_lower = s.to_lowercase();
                 let mut d = 10; // Valid trusted but didn't match a specific entry.
                 for &(pattern, val) in TRUSTED_SIGNERS {
-                    if signer_lower.contains(&pattern.to_lowercase()) {
+                    if signer_matches_pattern(&signer_lower, &pattern.to_lowercase()) {
                         d = val;
                         break;
                     }
@@ -365,17 +321,64 @@ fn analyze_with_discount_windows(path: &Path) -> (Vec<Finding>, u32) {
     (findings, discount)
 }
 
+/// Match a trusted-publisher pattern against the (lowercased) signer subject
+/// with word-boundary semantics. A plain substring match let unrelated
+/// certificates inherit trust discounts — e.g. "Digital Forge Ltd" contains
+/// "git" and "Reset…" contains "eset".
+#[cfg(target_os = "windows")]
+fn signer_matches_pattern(signer_lower: &str, pattern_lower: &str) -> bool {
+    signer_lower.match_indices(pattern_lower).any(|(i, _)| {
+        let before_ok = signer_lower[..i]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric());
+        let after_ok = signer_lower[i + pattern_lower.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric());
+        before_ok && after_ok
+    })
+}
+
 /// Check if path is in a protected Windows system directory.
 /// These binaries are catalog-signed and maintained by Windows Update.
+///
+/// Matching requires an exact directory match or a child path (path
+/// separator after the prefix) — a bare `starts_with` also matches
+/// attacker-created sibling directories like `C:\Windows\system32evil\`,
+/// handing them the 20-point system-binary trust discount. Enumerating the
+/// known `Program Files\Windows*` components instead of a bare `windows`
+/// prefix errs on the conservative side (an unlisted legit component merely
+/// loses the discount, it never gains one).
 #[cfg(target_os = "windows")]
 fn is_windows_system_path(path: &Path) -> bool {
+    const SYSTEM_DIRS: &[&str] = &[
+        "c:\\windows\\system32",
+        "c:\\windows\\syswow64",
+        "c:\\windows\\winsxs",
+        "c:\\windows\\servicing",
+        "c:\\program files\\windows defender",
+        "c:\\program files\\windowsapps",
+        "c:\\program files\\windows nt",
+        "c:\\program files\\windows mail",
+        "c:\\program files\\windows media player",
+        "c:\\program files\\windows photo viewer",
+        "c:\\program files\\windows sidebar",
+        "c:\\program files (x86)\\windows defender",
+        "c:\\program files (x86)\\windowsapps",
+        "c:\\program files (x86)\\windows nt",
+        "c:\\program files (x86)\\windows mail",
+        "c:\\program files (x86)\\windows media player",
+        "c:\\program files (x86)\\windows photo viewer",
+        "c:\\program files (x86)\\windows sidebar",
+    ];
     let p = path.to_string_lossy().to_lowercase();
-    p.starts_with("c:\\windows\\system32")
-        || p.starts_with("c:\\windows\\syswow64")
-        || p.starts_with("c:\\windows\\winsxs")
-        || p.starts_with("c:\\windows\\servicing")
-        || p.starts_with("c:\\program files\\windows")
-        || p.starts_with("c:\\program files (x86)\\windows")
+    SYSTEM_DIRS.iter().any(|dir| {
+        p == *dir
+            || p
+                .strip_prefix(dir)
+                .is_some_and(|rest| rest.starts_with('\\'))
+    })
 }
 
 #[cfg(target_os = "windows")]
@@ -406,6 +409,7 @@ fn verify_trust(path: &Path) -> (TrustResult, Option<String>) {
 
     const TRUST_E_NOSIGNATURE: i32 = 0x800B0100u32 as i32;
     const TRUST_E_EXPLICIT_DISTRUST: i32 = 0x800B0101u32 as i32;
+    const TRUST_E_SUBJECT_FORM_UNKNOWN: i32 = 0x800B0003u32 as i32;
     const TRUST_E_REVOKED: i32 = 0x800B010Cu32 as i32;
 
     if result == 0 {
@@ -413,24 +417,31 @@ fn verify_trust(path: &Path) -> (TrustResult, Option<String>) {
         if let Some(ref s) = signer {
             let s_lower = s.to_lowercase();
             for &(pattern, _) in TRUSTED_SIGNERS {
-                if s_lower.contains(&pattern.to_lowercase()) {
-                    return (TrustResult::ValidTrusted(pattern.to_string()), signer);
+                if signer_matches_pattern(&s_lower, &pattern.to_lowercase()) {
+                    // Report the ACTUAL signer subject, not the matched
+                    // pattern — surfacing the pattern would mask a mismatch.
+                    return (TrustResult::ValidTrusted(s.clone()), signer);
                 }
             }
             (TrustResult::ValidUnknown, signer)
         } else {
             (TrustResult::ValidUnknown, signer)
         }
-    } else if result == TRUST_E_NOSIGNATURE {
+    } else if result == TRUST_E_NOSIGNATURE || result == TRUST_E_SUBJECT_FORM_UNKNOWN {
+        // Genuinely no signature (catalog-signed system binaries also land
+        // here — WinVerifyTrust with WTD_CHOICE_FILE doesn't check catalogs).
         (TrustResult::Unsigned, None)
     } else if result == TRUST_E_EXPLICIT_DISTRUST || result == TRUST_E_REVOKED {
         (TrustResult::Invalid, signer)
     } else if result < 0 {
-        if signer.is_some() {
-            (TrustResult::Invalid, signer)
-        } else {
-            (TrustResult::Unsigned, None)
-        }
+        // Any other failure means a signature IS present but could not be
+        // verified (corrupted cert table, garbled PKCS#7, broken chain).
+        // Mapping this to Unsigned when signer extraction ALSO fails would
+        // let a tampered signature dodge the High/weight-20 "invalid or
+        // tampered digital signature" finding — a mangled signature is not
+        // the same as never-signed. Always treat verification failure as
+        // Invalid.
+        (TrustResult::Invalid, signer)
     } else {
         (TrustResult::Error, None)
     }
@@ -460,6 +471,10 @@ fn win_verify_trust(wide_path: &[u16]) -> i32 {
         let mut trust_data: WINTRUST_DATA = std::mem::zeroed();
         trust_data.cbStruct = std::mem::size_of::<WINTRUST_DATA>() as u32;
         trust_data.dwUIChoice = WTD_UI_NONE;
+        // Deliberate offline/perf tradeoff: no CRL/OCSP fetch per scan. A
+        // signature made with a later-revoked (e.g. stolen) cert still
+        // verifies — revisit with WTD_REVOKE_WHOLE_CHAIN if an online
+        // revocation pass is ever added.
         trust_data.fdwRevocationChecks = WTD_REVOKE_NONE;
         trust_data.dwUnionChoice = WTD_CHOICE_FILE;
         trust_data.Anonymous.pFile = &mut file_info;
@@ -564,7 +579,13 @@ pub(crate) fn extract_signer(path: &Path) -> Option<String> {
             return None;
         }
 
-        let signer_info = &*(signer_buf.as_ptr() as *const CMSG_SIGNER_INFO);
+        // Alignment hardening: `signer_buf` is a `Vec<u8>` (alignment 1)
+        // while `CMSG_SIGNER_INFO` contains pointer-bearing
+        // `CRYPT_INTEGER_BLOB` fields (alignment 8 on x86_64) — forming a
+        // `&CMSG_SIGNER_INFO` into the buffer would be UB. Copy the struct
+        // out by value with `read_unaligned` instead.
+        let signer_info: CMSG_SIGNER_INFO =
+            std::ptr::read_unaligned(signer_buf.as_ptr() as *const CMSG_SIGNER_INFO);
 
         // 3. Look up the signer's cert in the store by issuer + serial.
         let issuer_serial = CERT_ISSUER_SERIAL_NUMBER {

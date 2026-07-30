@@ -150,7 +150,7 @@ impl SignatureUpdateManager {
 
         // Phase 3: Verify downloaded files.
         self.stage = UpdateStage::Verifying;
-        if let Err(e) = self.verify_staged(&staging_dir, &downloaded) {
+        if let Err(e) = self.verify_staged(&staging_dir, &downloaded, &provider.id) {
             self.cleanup_staging(&staging_dir);
             return self.fail(format!("verification failed: {e}"));
         }
@@ -160,27 +160,24 @@ impl SignatureUpdateManager {
         // NOT computed from the downloaded files themselves.
         if let Some(ref base_url) = provider.update_url {
             let manifest_url = format!("{}/manifest.json", base_url.trim_end_matches('/'));
-            match self.fetch_and_verify_manifest(&staging_dir, &manifest_url, &provider.id) {
+            match self.fetch_and_verify_manifest(&staging_dir, &manifest_url, &provider.id, &downloaded) {
                 Ok(()) => info!(
                     provider = provider.id.as_str(),
                     "manifest verification passed"
                 ),
                 Err(e) => {
-                    // Distinguish "manifest not found" (provider doesn't serve one yet)
-                    // from "manifest found but verification FAILED" (tampered/corrupt).
-                    let is_not_found = e.contains("HTTP 404") || e.contains("HTTP 403");
-                    if is_not_found {
-                        warn!(
-                            provider = provider.id.as_str(),
-                            error = %e,
-                            "manifest not available — provider may not serve manifest.json yet"
-                        );
-                    } else {
-                        // Manifest was fetched but verification failed → HARD FAIL.
-                        // This means files don't match the provider's declared hashes.
-                        self.cleanup_staging(&staging_dir);
-                        return self.fail(format!("manifest verification FAILED: {e}"));
-                    }
+                    // R14-LETHAL: FAIL CLOSED on any manifest error —
+                    // including HTTP 404/403. The previous "manifest not
+                    // available" soft path activated the files with NO
+                    // content verification whatsoever (only size>0 and a
+                    // first-line control-char check), so a mirror
+                    // misconfiguration or a TLS-terminating middlebox
+                    // silently degraded verification to zero — violating
+                    // the "downloaded != trusted" invariant. Failure
+                    // degrades to official-ClamAV-only, which is the
+                    // documented safe outcome.
+                    self.cleanup_staging(&staging_dir);
+                    return self.fail(format!("manifest verification FAILED: {e}"));
                 }
             }
         }
@@ -269,6 +266,9 @@ impl SignatureUpdateManager {
         staging_dir: &Path,
     ) -> Result<Vec<StagedFile>, String> {
         let mut files = Vec::new();
+        // One agent per update run (TLS init + connection pool reused
+        // across ~14 file downloads) instead of a fresh Agent per file.
+        let agent = build_agent();
         // R10: track the last per-file download error so a total failure
         // surfaces the real cause (TLS/auth/DNS) instead of the generic
         // "no files downloaded" which hid everything at debug level.
@@ -323,7 +323,7 @@ impl SignatureUpdateManager {
                     return Err(format!("provider URL must use HTTPS, got: {}", base_url));
                 }
                 let url = format!("{}/{}", base_url.trim_end_matches('/'), db_file);
-                match download_file(&url, &dest) {
+                match download_file(&agent, &url, &dest) {
                     Ok(size) => {
                         if size > MAX_DOWNLOAD_SIZE {
                             let _ = std::fs::remove_file(&dest);
@@ -360,7 +360,12 @@ impl SignatureUpdateManager {
 
     /// Verify staged files: size, hash, format.
     /// If a manifest is provided, verify SHA-256 against manifest hashes.
-    fn verify_staged(&self, staging_dir: &Path, files: &[StagedFile]) -> Result<(), String> {
+    fn verify_staged(
+        &self,
+        staging_dir: &Path,
+        files: &[StagedFile],
+        provider_id: &str,
+    ) -> Result<(), String> {
         for file in files {
             let path = staging_dir.join(&file.name);
 
@@ -422,7 +427,7 @@ impl SignatureUpdateManager {
 
         // Save staging metadata.
         let meta = StagingMeta {
-            provider_id: String::new(),
+            provider_id: provider_id.to_string(),
             timestamp: chrono::Utc::now().timestamp(),
             files: files.to_vec(),
             total_bytes: files.iter().map(|f| f.size).sum(),
@@ -443,6 +448,23 @@ impl SignatureUpdateManager {
         manifest: &ProviderManifest,
     ) -> Result<(), String> {
         for mf in &manifest.files {
+            // R14: mf.name comes from untrusted JSON and is used as
+            // `staging_dir.join(&mf.name)` — a value containing path
+            // separators, a drive prefix, or ".." escapes the staging dir
+            // and lets the manifest "verify" (and later activate over)
+            // an arbitrary path. Require a single bare Normal component.
+            let bare_filename = {
+                let mut comps = Path::new(&mf.name).components();
+                matches!(comps.next(), Some(std::path::Component::Normal(_)))
+                    && comps.next().is_none()
+            };
+            if !bare_filename {
+                return Err(format!(
+                    "manifest file name '{}' is not a bare filename — rejected",
+                    mf.name
+                ));
+            }
+
             let path = staging_dir.join(&mf.name);
 
             if !path.exists() {
@@ -581,9 +603,11 @@ impl SignatureUpdateManager {
         staging_dir: &Path,
         manifest_url: &str,
         provider_id: &str,
+        staged: &[StagedFile],
     ) -> Result<(), String> {
         let manifest_path = staging_dir.join("manifest.json");
-        download_file(manifest_url, &manifest_path)?;
+        let agent = build_agent();
+        download_file(&agent, manifest_url, &manifest_path)?;
 
         let manifest_str =
             std::fs::read_to_string(&manifest_path).map_err(|e| format!("read manifest: {e}"))?;
@@ -601,6 +625,18 @@ impl SignatureUpdateManager {
 
         // Verify all manifest-listed files against their pinned hashes.
         self.verify_against_manifest(staging_dir, &manifest)?;
+
+        // R14: coverage must be TWO-DIRECTIONAL. verify_against_manifest
+        // only iterates manifest.files, so a staged file NOT listed in the
+        // manifest would otherwise be activated with NO hash check at all.
+        for sf in staged {
+            if !manifest.files.iter().any(|mf| mf.name == sf.name) {
+                return Err(format!(
+                    "staged file {} not pinned by manifest — refusing activation",
+                    sf.name
+                ));
+            }
+        }
 
         // Clean up the manifest file (not a signature file).
         let _ = std::fs::remove_file(&manifest_path);
@@ -628,9 +664,20 @@ impl SignatureUpdateManager {
 
 // ── Helper functions ──────────────────────────────────────
 
+/// Build the shared HTTP agent for update downloads.
+fn build_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(DOWNLOAD_TIMEOUT_SECS))
+        .max_idle_connections(1)
+        .max_idle_connections_per_host(1)
+        .user_agent(USER_AGENT)
+        .redirects(MAX_REDIRECTS)
+        .build()
+}
+
 /// Download a file via HTTP to a local path.
 /// Writes to a temp file first, then renames atomically.
-fn download_file(url: &str, dest: &Path) -> Result<u64, String> {
+fn download_file(agent: &ureq::Agent, url: &str, dest: &Path) -> Result<u64, String> {
     // Bug R3-5: with_extension("tmp") strips the original extension, so
     // downloading foo.ndb and foo.hdb in the same dir both resolve to foo.tmp
     // — sequential downloads overwrite each other's temp file. Append .tmp
@@ -641,14 +688,6 @@ fn download_file(url: &str, dest: &Path) -> Result<u64, String> {
         .unwrap_or_default();
     tmp_name.push(".tmp");
     let tmp_path = dest.with_file_name(tmp_name);
-
-    let agent = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(DOWNLOAD_TIMEOUT_SECS))
-        .max_idle_connections(1)
-        .max_idle_connections_per_host(1)
-        .user_agent(USER_AGENT)
-        .redirects(MAX_REDIRECTS)
-        .build();
 
     let response = match agent.get(url).call() {
         Ok(response) => response,
@@ -816,7 +855,7 @@ mod tests {
             size: std::fs::metadata(&file_path).unwrap().len(),
             sha256: None,
         }];
-        assert!(mgr.verify_staged(&staging, &good_files).is_ok());
+        assert!(mgr.verify_staged(&staging, &good_files, "test").is_ok());
     }
 
     #[test]
@@ -840,7 +879,7 @@ mod tests {
             size: 999999, // Wrong size.
             sha256: None,
         }];
-        assert!(mgr.verify_staged(&staging, &files).is_err());
+        assert!(mgr.verify_staged(&staging, &files, "test").is_err());
     }
 
     #[test]
@@ -863,7 +902,7 @@ mod tests {
             size: 0,
             sha256: None,
         }];
-        assert!(mgr.verify_staged(&staging, &files).is_err());
+        assert!(mgr.verify_staged(&staging, &files, "test").is_err());
     }
 
     #[test]

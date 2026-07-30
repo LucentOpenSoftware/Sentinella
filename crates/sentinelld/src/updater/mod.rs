@@ -52,8 +52,8 @@ where
     {
         let state_dir = crate::paths::paths().state_dir();
         let key_path = crate::paths::paths().vault_integrity_key();
-        if let Ok(key_bytes) = std::fs::read(&key_path) {
-            if key_bytes.len() == 32 {
+        match std::fs::read(&key_path) {
+            Ok(key_bytes) if key_bytes.len() == 32 => {
                 let mut key = [0u8; 32];
                 key.copy_from_slice(&key_bytes);
                 match crate::runtime_integrity::verify_binary_against_manifest(
@@ -72,10 +72,30 @@ where
                             "freshclam binary failed integrity check — refusing to spawn".into(),
                         );
                     }
+                    // verify_binary_against_manifest returns Ok(true) when no
+                    // manifest exists yet (first boot), so an Err here means a
+                    // manifest EXISTS but verification itself failed — honor
+                    // the fail-closed contract instead of spawning anyway.
                     Err(e) => {
-                        warn!(%e, "freshclam integrity check inconclusive — allowing spawn");
+                        error!(
+                            %e,
+                            path = %freshclam_path.display(),
+                            "freshclam integrity check errored — refusing to spawn (fail closed)"
+                        );
+                        return (
+                            false,
+                            format!("freshclam integrity check failed: {e} — refusing to spawn"),
+                        );
                     }
                 }
+            }
+            _ => {
+                // No (valid) vault key yet — first boot before the TOFU
+                // baseline exists. Skip the check, but say so loudly.
+                warn!(
+                    key = %key_path.display(),
+                    "freshclam integrity check skipped — vault key missing or invalid (pre-baseline)"
+                );
             }
         }
     }
@@ -241,7 +261,10 @@ pub fn find_freshclam() -> Option<PathBuf> {
 
     // PATH fallback is acceptable: PATH for a Windows service is
     // %SystemRoot%\system32 etc. — directories ordinary users cannot write to.
-    if let Ok(output) = Command::new("where").arg("freshclam.exe").quiet_windows().output() {
+    // ☠️ R9-LETHAL: resolve `where` itself against System32 — a bare name
+    // would search the (potentially attacker-influenced) process PATH.
+    let where_exe = crate::win_process::system32_tool("where.exe");
+    if let Ok(output) = Command::new(where_exe).arg("freshclam.exe").quiet_windows().output() {
         let path = String::from_utf8_lossy(&output.stdout);
         let first = path.lines().next().unwrap_or("").trim();
         if !first.is_empty() && Path::new(first).exists() {
@@ -271,8 +294,16 @@ fn resolve_freshclam_config(config_path: &Path) -> Option<PathBuf> {
 
     for line in content.lines() {
         let trimmed = line.trim();
+        // Require whitespace after the keyword — bare strip_prefix would
+        // also match a hypothetical directive starting with the same string
+        // (e.g. `DatabaseDirectoryExtra`).
+        let directive_value = |keyword: &str| -> Option<&str> {
+            trimmed
+                .strip_prefix(keyword)
+                .filter(|rest| rest.starts_with(char::is_whitespace))
+        };
         // Resolve DatabaseDirectory and UpdateLogFile paths.
-        if let Some(rest) = trimmed.strip_prefix("DatabaseDirectory") {
+        if let Some(rest) = directive_value("DatabaseDirectory") {
             let val = rest.trim();
             if !val.is_empty() && !Path::new(val).is_absolute() {
                 let abs = base.join(val);
@@ -281,7 +312,7 @@ fn resolve_freshclam_config(config_path: &Path) -> Option<PathBuf> {
                 changed = true;
                 continue;
             }
-        } else if let Some(rest) = trimmed.strip_prefix("UpdateLogFile") {
+        } else if let Some(rest) = directive_value("UpdateLogFile") {
             let val = rest.trim();
             if !val.is_empty() && !Path::new(val).is_absolute() {
                 let abs = base.join(val);

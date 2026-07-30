@@ -1,7 +1,7 @@
 //! IPC server — JSON-RPC 2.0 over named pipe (Windows) or Unix socket.
 //!
 //! Security hardening:
-//! - Frame size bounds (min 2, max 16 MiB)
+//! - Frame size bounds (min 2, max 1 MiB — `MAX_FRAME_SIZE`)
 //! - Method name length limit (64 chars)
 //! - catch_unwind around dispatch to prevent daemon crash
 //! - Graceful error responses for all failure modes
@@ -17,10 +17,17 @@ use tracing::{debug, error, info, warn};
 mod client_auth;
 mod policy;
 mod state;
-pub use state::{AppState, unify_detection_filtered};
+pub use state::{AppState, argus_analysis_error, unify_detection_filtered};
 
 /// Min valid JSON-RPC frame: `{}`
 const MIN_FRAME_SIZE: usize = 2;
+
+/// Single-flight guard for `sources.update` (see handler). The update
+/// pipeline downloads + verifies + activates provider signature files and
+/// can run for minutes; concurrent invocations would race the same staging
+/// directories and double the network load.
+static SOURCES_UPDATE_IN_PROGRESS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(target_os = "windows")]
 struct PipeSecurity {
@@ -169,6 +176,14 @@ impl Server {
             }
         };
 
+        // MED (audit): cap concurrent connections. Each client costs a
+        // tokio task + pipe handle + up to MAX_FRAME_SIZE of payload buffer
+        // held for the whole read timeout, and nothing else limited
+        // simultaneous clients — any local user could hold thousands of
+        // half-open connections against the SYSTEM daemon (task/handle
+        // exhaustion, GiB-scale transient allocations).
+        let conn_sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+
         loop {
             // Wait for client connection.
             if let Err(e) = server.connect().await {
@@ -218,8 +233,11 @@ impl Server {
             // shared secret (which is world-readable for GUI compat). Rejects
             // anonymous and cross-user/non-console unprivileged callers. Runs
             // AFTER the next listener is ready so a reject can't starve the
-            // pipe. Fail-open inside `authorize_and_resolve_pipe_client` on any
-            // resolution error, so an API quirk never bricks a legit GUI.
+            // pipe. Fails OPEN inside `authorize_and_resolve_pipe_client`
+            // only on a transient resolution error (no client PID), so an
+            // API quirk never bricks a legit GUI; fails CLOSED when the
+            // client process already vanished (dead-PID elevation-bypass
+            // guard — see client_auth::ResolveOutcome).
             //
             // v0.1.9: we now ALSO keep the resolved `ClientIdentity` and pass
             // it through to the dispatcher so kill-vector handlers can apply
@@ -261,9 +279,17 @@ impl Server {
 
             // Spawn handler for connected client. Single spawn site regardless
             // of whether server recreation succeeded immediately or after retries.
+            // Bounded by conn_sem: when saturated, backpressure parks here
+            // (a fresh listener instance already exists upstream, so new
+            // clients keep queueing at the OS level).
             debug!("client connected");
+            let permit = match Arc::clone(&conn_sem).acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => continue, // semaphore is never closed; serve defensively
+            };
             let st = Arc::clone(&self.state);
             tokio::spawn(async move {
+                let _permit = permit;
                 if let Err(e) = handle_connection(connected_pipe, st, peer_identity).await {
                     warn!(%e, "client session error");
                 }
@@ -281,11 +307,18 @@ impl Server {
         }
         let listener = UnixListener::bind(sock_path)?;
         info!(path = sock_path, "listening on unix socket");
+        // Same concurrent-connection cap as the Windows named-pipe loop.
+        let conn_sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
         loop {
             let (stream, _) = listener.accept().await?;
             debug!("client connected");
+            let permit = match Arc::clone(&conn_sem).acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => continue, // semaphore is never closed; serve defensively
+            };
             let st = Arc::clone(&self.state);
             tokio::spawn(async move {
+                let _permit = permit;
                 // Unix has no equivalent ClientIdentity plumbing today; the
                 // elevation gate fails-open on None (matching the Windows
                 // unresolved-identity path).
@@ -301,6 +334,11 @@ impl Server {
 const CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// Per-read timeout — prevent slow-read attacks.
 const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Per-write timeout — a client that stops reading must not pin the
+/// connection task + response buffer forever.
+const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Max simultaneous client connections (see run_named_pipe).
+const MAX_CONCURRENT_CONNECTIONS: usize = 64;
 
 async fn handle_connection<S>(
     mut stream: S,
@@ -395,18 +433,73 @@ where
             }
         };
 
-        if response.is_empty() {
-            // Fallback if serialization itself failed.
-            let fallback = b"{\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{\"code\":-32603,\"message\":\"internal serialization error\"}}";
-            let len = (fallback.len() as u32).to_be_bytes();
-            stream.write_all(&len).await?;
-            stream.write_all(fallback).await?;
-        } else {
-            let resp_len = (response.len() as u32).to_be_bytes();
-            stream.write_all(&resp_len).await?;
-            stream.write_all(&response).await?;
+        // Fallback if serialization itself failed.
+        const FALLBACK: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{\"code\":-32603,\"message\":\"internal serialization error\"}}";
+        let out: &[u8] = if response.is_empty() { FALLBACK } else { &response };
+        let out_len = (out.len() as u32).to_be_bytes();
+        // Write timeout — a client that stops reading must not block the
+        // response write indefinitely (pins the task + buffer).
+        match tokio::time::timeout(WRITE_TIMEOUT, stream.write_all(&out_len)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => {
+                debug!("client write timeout, dropping connection");
+                return Ok(());
+            }
+        }
+        match tokio::time::timeout(WRITE_TIMEOUT, stream.write_all(out)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => {
+                debug!("client write timeout, dropping connection");
+                return Ok(());
+            }
         }
     }
+}
+
+/// ☠️ R8-LETHAL: shared local-path validation for every IPC method that
+/// makes the daemon touch a caller-supplied filesystem path (`scan.start`
+/// target, `argus.analyze` path, …).
+///
+/// The daemon runs as SYSTEM. A path of `\\attacker.com\share\x` makes the
+/// daemon authenticate to the remote SMB server using the machine-account
+/// NTLM hash — captured by responder/inveigh and relayed to LDAP/CIFS/HTTP
+/// for AD compromise. `\\.\PHYSICALDRIVE0` reads the raw disk as SYSTEM.
+/// `\\?\GLOBALROOT\Device\…` bypasses path-canonicalization sanity checks
+/// downstream. And because the IPC secret is intentionally readable by
+/// BUILTIN\Users (see client_auth.rs), "authenticated" still means "any
+/// logged-in user" — so EVERY path-accepting method needs this filter, not
+/// just `scan.start` (the `argus.analyze` bypass was the audit finding
+/// that prompted factoring this out).
+///
+/// We must still allow `\\?\C:\very-long-path` (Windows long-path
+/// namespace — std::fs::canonicalize returns exactly this), so the filter
+/// is precise.
+fn validate_local_scan_path(t: &str) -> Result<(), &'static str> {
+    if t.is_empty() {
+        return Err("empty target path");
+    }
+    if t.len() > 4096 {
+        return Err("target path too long");
+    }
+    // Refuse UNC / device-namespace targets.
+    let lower = t.to_ascii_lowercase();
+    let is_unc_share =
+        (t.starts_with("\\\\") && !lower.starts_with(r"\\?\") && !lower.starts_with(r"\\.\"))
+            || t.starts_with("//");
+    let is_long_unc = lower.starts_with(r"\\?\unc\");
+    let is_device_ns = lower.starts_with(r"\\.\")
+        || lower.contains(r"\globalroot\")
+        || lower.contains(r"\physicaldrive");
+    if is_unc_share || is_long_unc || is_device_ns {
+        return Err("scan target must be a local non-UNC path");
+    }
+    // Embedded NUL = win32 path-truncation trick.
+    if t.contains('\0') {
+        return Err("scan target contains embedded NUL");
+    }
+    Ok(())
 }
 
 /// Adversary A2 — closed allowlist of methods that may be scoped by a
@@ -415,6 +508,13 @@ where
 /// challenge for an arbitrary string could reuse it against any handler that
 /// happens to validate against that same string, so we hard-code the legal
 /// set here rather than echo whatever the caller asked for.
+///
+/// NOTE: `memory.scan_process` is the one entry whose handler does NOT
+/// consume a challenge token — it is listed so the v0.1.9 elevation gate
+/// (dispatch_sync) rejects unelevated callers: the response includes
+/// ModuleInfo.base_address, a cross-privilege ASLR layout disclosure when
+/// the caller is a normal user process. Its auth remains the IPC secret
+/// (central AuthenticatedAction gate) + elevated-caller requirement.
 fn is_challengeable_method(method: &str) -> bool {
     matches!(
         method,
@@ -432,6 +532,7 @@ fn is_challengeable_method(method: &str) -> bool {
             | "quarantine.restore"
             | "quarantine.restore_as"
             | "quarantine.delete"
+            | "memory.scan_process"
     )
 }
 
@@ -544,6 +645,37 @@ fn dispatch_sync(
                 ))
                 .unwrap_or_default();
             }
+
+            // Phase 8 (audit cross-cutting): central MethodClass auth
+            // enforcement. The registry always DECLARED AuthenticatedRead /
+            // AuthenticatedAction, but enforcement was per-handler opt-in —
+            // scan.history / stats.runtime / argus.packs / sources.status /
+            // sources.list declared auth_read yet never checked, so the
+            // declared class was a lie. Enforce it once, here.
+            //
+            // PrivilegedMutation / DangerousOperation are deliberately NOT
+            // `auth`-gated here: those handlers authenticate via one-shot
+            // challenge tokens (issuable only to authenticated + elevated
+            // callers through security.challenge) and their envelopes carry
+            // `token` / `challenge_token`, not `auth`.
+            if matches!(
+                pol.class,
+                policy::MethodClass::AuthenticatedRead | policy::MethodClass::AuthenticatedAction
+            ) {
+                let auth = req
+                    .params
+                    .get("auth")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if !state.validate_ipc_auth(auth) {
+                    return serde_json::to_vec(&RpcErrorResponse::err(
+                        req.id,
+                        policy::ipc_errors::UNAUTHORIZED,
+                        format!("method '{}' requires IPC authentication", req.method),
+                    ))
+                    .unwrap_or_default();
+                }
+            }
         }
     }
 
@@ -564,12 +696,12 @@ fn dispatch_sync(
                 .unwrap_or_default();
             }
             // Scanner-B Finding 1: policy declares engine.reload as
-            // PrivilegedMutation (challenge required) but the central
-            // dispatcher does not enforce class, so the declared
-            // protection was effectively just AuthenticatedAction.
-            // Attacker with the IPC secret could force unlimited engine
-            // reloads (~5-8s scan-blind window each). Now requires a
-            // one-shot challenge token — mirrors protection.set_critical.
+            // PrivilegedMutation (challenge required); the central
+            // dispatcher enforces the Authenticated* classes but
+            // challenge-token verification stays per-handler. Without the
+            // token check below, an attacker with the IPC secret could
+            // force unlimited engine reloads (~5-8s scan-blind window
+            // each). Mirrors protection.set_critical.
             let token = req
                 .params
                 .get("token")
@@ -614,59 +746,14 @@ fn dispatch_sync(
                 .unwrap_or_default();
             }
             let target = req.params.get("target").and_then(|v| v.as_str());
-            // Validate target path if provided.
+            // Validate target path if provided (☠️ R8-LETHAL — see
+            // `validate_local_scan_path` for the full threat model).
             if let Some(t) = target {
-                if t.is_empty() {
+                if let Err(msg) = validate_local_scan_path(t) {
                     return serde_json::to_vec(&RpcErrorResponse::err(
                         req.id,
                         error_codes::INVALID_PARAMS,
-                        "empty target path",
-                    ))
-                    .unwrap_or_default();
-                }
-                if t.len() > 4096 {
-                    return serde_json::to_vec(&RpcErrorResponse::err(
-                        req.id,
-                        error_codes::INVALID_PARAMS,
-                        "target path too long",
-                    ))
-                    .unwrap_or_default();
-                }
-                // ☠️ R8-LETHAL: refuse UNC / device-namespace targets.
-                //
-                // Daemon runs as SYSTEM. A `target` of "\\attacker.com\share\"
-                // makes the scan walker authenticate to the remote SMB
-                // server using the machine-account NTLM hash — captured by
-                // responder/inveigh and relayed to LDAP/CIFS/HTTP for AD
-                // compromise. A `target` of "\\.\PHYSICALDRIVE0" reads the
-                // raw disk as SYSTEM. "\\?\GLOBALROOT\Device\…" bypasses
-                // path-canonicalization sanity checks downstream.
-                //
-                // We must still allow `\\?\C:\very-long-path` (Windows
-                // long-path namespace — std::fs::canonicalize returns
-                // exactly this), so the filter is precise.
-                let lower = t.to_ascii_lowercase();
-                let is_unc_share =
-                    (t.starts_with("\\\\") && !lower.starts_with(r"\\?\") && !lower.starts_with(r"\\.\"))
-                        || t.starts_with("//");
-                let is_long_unc = lower.starts_with(r"\\?\unc\");
-                let is_device_ns = lower.starts_with(r"\\.\")
-                    || lower.contains(r"\globalroot\")
-                    || lower.contains(r"\physicaldrive");
-                if is_unc_share || is_long_unc || is_device_ns {
-                    return serde_json::to_vec(&RpcErrorResponse::err(
-                        req.id,
-                        error_codes::INVALID_PARAMS,
-                        "scan target must be a local non-UNC path",
-                    ))
-                    .unwrap_or_default();
-                }
-                // Embedded NUL = win32 path-truncation trick.
-                if t.contains('\0') {
-                    return serde_json::to_vec(&RpcErrorResponse::err(
-                        req.id,
-                        error_codes::INVALID_PARAMS,
-                        "scan target contains embedded NUL",
+                        msg,
                     ))
                     .unwrap_or_default();
                 }
@@ -1043,11 +1130,12 @@ fn dispatch_sync(
                 .and_then(|v| v.as_str())
                 .unwrap_or("manual");
 
-            // Decode base64 content or use raw UTF-8.
+            // NOTE: the param is named `content_b64` for historical reasons,
+            // but no base64 decode happens here — callers send raw UTF-8
+            // text and we pass the bytes through as-is.
             let content = if content_b64.is_empty() {
                 vec![]
             } else {
-                // Try raw UTF-8 first (for plain text injection).
                 content_b64.as_bytes().to_vec()
             };
 
@@ -1307,9 +1395,29 @@ fn dispatch_sync(
             let target = req.params.get("path").and_then(|v| v.as_str());
             match target {
                 Some(p) => {
+                    // ☠️ R8-LETHAL (audit): this handler used to accept any
+                    // path with only the BUILTIN\Users-readable secret as a
+                    // gate, and `analyze_file` stats + reads the file as
+                    // SYSTEM. A UNC path here is the same machine-account
+                    // NTLM-relay primitive `scan.start` already blocks (plus
+                    // a SYSTEM file-existence/read oracle for local paths).
+                    if let Err(msg) = validate_local_scan_path(p) {
+                        return serde_json::to_vec(&RpcErrorResponse::err(
+                            req.id,
+                            error_codes::INVALID_PARAMS,
+                            msg,
+                        ))
+                        .unwrap_or_default();
+                    }
                     let path = std::path::Path::new(p);
                     if path.exists() {
-                        let verdict = state.argus().analyze_file(path);
+                        // User-initiated single-file analysis → manual
+                        // profile budget (60s deep-analysis cap) instead of
+                        // the engine's implicit default.
+                        let verdict = state.argus().analyze_file_with_budget(
+                            path,
+                            argus::budget::ScanExecutionBudget::manual(),
+                        );
                         ok_json(verdict)
                     } else {
                         Ok(serde_json::json!({"error": "File not found"}))
@@ -1321,6 +1429,24 @@ fn dispatch_sync(
 
         // ARGUS verdict history.
         "argus.verdicts" => {
+            // R7-LETHAL parity (audit): verdict history returns detection
+            // signature names + file paths — the exact intel class
+            // quarantine.list / detections.list are auth-gated for. The
+            // central dispatcher now enforces the declared AuthenticatedRead
+            // class; this in-handler check stays as defence in depth.
+            let auth = req
+                .params
+                .get("auth")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !state.validate_ipc_auth(auth) {
+                return serde_json::to_vec(&RpcErrorResponse::err(
+                    req.id,
+                    error_codes::INVALID_PARAMS,
+                    "authenticated IPC required for ARGUS verdict history".to_string(),
+                ))
+                .unwrap_or_default();
+            }
             let scan_id = req.params.get("scan_id").and_then(|v| v.as_str());
             let db_guard = state.db_ref().lock().unwrap_or_else(|e| e.into_inner());
             if let Some(ref db) = *db_guard {
@@ -1350,7 +1476,7 @@ fn dispatch_sync(
         }
 
         // ── Signature Sources ─────────────────────────────
-        // Read-only: no auth required.
+        // Read-only; auth enforced centrally (registry: AuthenticatedRead).
         "sources.status" | "sources.list" => {
             let sig_dir = crate::paths::paths().signatures_dir();
             let mut mgr = crate::engine::sources::SignatureSourceManager::new(&sig_dir);
@@ -1462,6 +1588,35 @@ fn dispatch_sync(
                 .unwrap_or_default();
             }
 
+            // Single-flight: a second update while one is running gets a
+            // busy response instead of racing the staging directories.
+            if SOURCES_UPDATE_IN_PROGRESS
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_err()
+            {
+                return serde_json::to_vec(&serde_json::json!({
+                    "ok": false,
+                    "error": "signature source update already in progress"
+                }))
+                .unwrap_or_default();
+            }
+            // RAII guard: flag MUST reset even if the pipeline panics —
+            // a stuck flag would reject every future sources.update until
+            // daemon restart (same pattern as ReloadGuard in state.rs).
+            struct SourcesUpdateGuard;
+            impl Drop for SourcesUpdateGuard {
+                fn drop(&mut self) {
+                    SOURCES_UPDATE_IN_PROGRESS
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            let _update_guard = SourcesUpdateGuard;
+
             let config = crate::config::Config::load(None).unwrap_or_default();
             if config.enhanced_signature_provider == "none" {
                 return serde_json::to_vec(&serde_json::json!({
@@ -1488,9 +1643,23 @@ fn dispatch_sync(
                 }
             };
 
-            // Run the update pipeline.
-            let mut pipeline = crate::engine::update_pipeline::SignatureUpdateManager::new();
-            let result = pipeline.update_provider(&provider);
+            // Run the update pipeline OFF the tokio worker — it is minutes
+            // of blocking network + disk I/O (see run_blocking).
+            let provider_name = provider.name.clone();
+            let result = match run_blocking(move || {
+                let mut pipeline =
+                    crate::engine::update_pipeline::SignatureUpdateManager::new();
+                pipeline.update_provider(&provider)
+            }) {
+                Ok(r) => r,
+                Err(e) => {
+                    return serde_json::to_vec(&serde_json::json!({
+                        "ok": false,
+                        "error": format!("update pipeline task failed: {e}")
+                    }))
+                    .unwrap_or_default();
+                }
+            };
 
             if result.success {
                 // Invalidate mpool cache — force rebuild with new signatures.
@@ -1505,7 +1674,7 @@ fn dispatch_sync(
                     "sources",
                     &format!(
                         "Enhanced signatures updated: {} ({} files)",
-                        provider.name, result.files_activated
+                        provider_name, result.files_activated
                     ),
                     "",
                     None,
@@ -1704,11 +1873,33 @@ fn dispatch_sync(
                 ))
                 .unwrap_or_default();
             }
-            let pid = req.params.get("pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-            if pid == 0 {
+            let pid_raw = req.params.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
+            if pid_raw == 0 {
                 Ok(serde_json::json!({"error": "pid required"}))
+            } else if pid_raw > u32::MAX as u64 {
+                // Reject instead of silently truncating u64→u32 and scanning
+                // an arbitrary (wrong) process.
+                Ok(serde_json::json!({"error": "pid out of range"}))
             } else {
-                let result = crate::memory_scanner::scan_process_simple(pid, state.argus());
+                let pid = pid_raw as u32;
+                // The scan walks every readable region of the target process
+                // (up to ~30s of blocking ReadProcessMemory + ARGUS buffer
+                // analysis). Run it on the blocking pool so this tokio worker
+                // keeps serving other IPC connections (see run_blocking).
+                let argus = state.argus_shared();
+                let result = match run_blocking(move || {
+                    crate::memory_scanner::scan_process_simple(pid, &argus)
+                }) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return serde_json::to_vec(&RpcErrorResponse::err(
+                            req.id,
+                            error_codes::INTERNAL_ERROR,
+                            format!("memory scan task failed: {e}"),
+                        ))
+                        .unwrap_or_default();
+                    }
+                };
                 state.log_activity(
                     if result.findings.is_empty() {
                         "info"
@@ -1831,14 +2022,15 @@ fn dispatch_sync(
                 .unwrap_or_default();
             }
             // Scanner-B Finding 1: settings.set is declared PrivilegedMutation
-            // in policy, but the central dispatcher does not enforce the class
-            // — it only blocks rate/reload, never demanding a token. Result:
-            // anyone with the IPC secret could mutate configuration without
-            // ever obtaining a challenge token, downgrading effective protection
-            // to AuthenticatedAction. Even though the kill-vector fields
-            // (excluded_*, trusted_hashes, realtime_roots, etc.) are pinned to
-            // current values below, the remaining mutable surface is still
-            // worth a token gate (e.g. heuristic thresholds, scheduler windows).
+            // in policy; the central dispatcher enforces the Authenticated*
+            // classes but challenge-token verification stays per-handler.
+            // Without the token check below, anyone with the IPC secret could
+            // mutate configuration without ever obtaining a challenge token,
+            // downgrading effective protection to AuthenticatedAction. Even
+            // though the kill-vector fields (excluded_*, trusted_hashes,
+            // realtime_roots, etc.) are pinned to current values below, the
+            // remaining mutable surface is still worth a token gate (e.g.
+            // heuristic thresholds, scheduler windows).
             let token = req
                 .params
                 .get("token")
@@ -2851,6 +3043,21 @@ fn dispatch_sync(
     }
 }
 
+/// Run a blocking closure on tokio's blocking thread pool and wait for it.
+///
+/// `dispatch_sync` executes on a tokio WORKER thread; long blocking work
+/// (signature-source downloads, a ~30s process memory scan) would otherwise
+/// stall every unrelated task scheduled on that worker. `block_in_place`
+/// lets the executor hand the worker's other tasks to a spare thread while
+/// we park here awaiting the `spawn_blocking` result.
+fn run_blocking<T: Send + 'static>(
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, tokio::task::JoinError> {
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(tokio::task::spawn_blocking(f))
+    })
+}
+
 /// Helper: serialize a value into Ok(Value), catching serialization errors.
 fn ok_json<T: serde::Serialize>(val: T) -> Result<Value, (i32, String)> {
     serde_json::to_value(val).map_err(|e| {
@@ -2859,4 +3066,58 @@ fn ok_json<T: serde::Serialize>(val: T) -> Result<Value, (i32, String)> {
             format!("serialization error: {e}"),
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_local_scan_path;
+
+    // ☠️ R8-LETHAL regression: every path-accepting IPC method (scan.start,
+    // argus.analyze) routes through validate_local_scan_path. A miss here
+    // lets any local user make the SYSTEM daemon authenticate to an
+    // attacker SMB share (machine-account NTLM relay) or read the raw disk.
+    #[test]
+    fn unc_and_device_namespace_paths_rejected() {
+        for bad in [
+            r"\\attacker.com\share\x",
+            r"\\10.0.0.5\share",
+            "//attacker/share",
+            r"\\?\UNC\host\share\x",
+            r"\\?\unc\host\share\x",
+            r"\\.\PHYSICALDRIVE0",
+            r"\\.\C:",
+            r"\\?\GLOBALROOT\Device\Harddisk0\DR0",
+            r"C:\somewhere\PhysicalDrive1",
+            "",
+        ] {
+            assert!(
+                validate_local_scan_path(bad).is_err(),
+                "must reject {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_paths_still_allowed() {
+        for good in [
+            r"C:\Users\test\file.exe",
+            r"D:\",
+            // Windows long-path namespace (std::fs::canonicalize output)
+            // must keep working — that is why the filter is precise.
+            r"\\?\C:\very-long-path\file.txt",
+            r"\\?\D:\folder",
+        ] {
+            assert!(
+                validate_local_scan_path(good).is_ok(),
+                "must allow {good:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_and_nul_paths_rejected() {
+        let long = "C:\\".to_string() + &"a".repeat(5000);
+        assert!(validate_local_scan_path(&long).is_err());
+        assert!(validate_local_scan_path("C:\\foo\0bar").is_err());
+    }
 }

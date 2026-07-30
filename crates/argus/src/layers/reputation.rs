@@ -916,7 +916,11 @@ const REPUTATION_DB: &[ReputationEntry] = &[
         category: "science",
     },
     ReputationEntry {
-        patterns: &["r-", "rtools", "rstudio"],
+        // "r-" was dropped: as a non-alnum pattern it used plain substring
+        // matching, so any filename containing `r` followed by `-`
+        // ("driver-update.exe", "color-picker.exe", ...) earned this
+        // Trusted-tier entry's discount unearned.
+        patterns: &["rtools", "rstudio"],
         publisher: "R Foundation / Posit",
         tier: Tier::Trusted,
         category: "science",
@@ -1081,7 +1085,7 @@ const REPUTATION_DB: &[ReputationEntry] = &[
         category: "hardware",
     },
     ReputationEntry {
-        patterns: &["gpuTweak", "gpu tweak"],
+        patterns: &["gputweak", "gpu tweak"],
         publisher: "ASUS (GPU Tweak)",
         tier: Tier::Recognized,
         category: "hardware",
@@ -2071,7 +2075,10 @@ pub fn reputation_discount(path: &str, data: &[u8]) -> u32 {
 
     if let Some(entry) = match_by_filename(&filename) {
         // Filename-only match without cert confirmation → halve discount (spoofable).
-        if match_by_pe_strings(path, data).is_some() {
+        // Confirmation requires the *verified* signer to map to the SAME DB
+        // entry — a valid cert for a different product must not upgrade this
+        // filename's discount.
+        if matches!(match_by_pe_strings(path, data), Some(pe) if std::ptr::eq(pe, entry)) {
             return entry.tier.discount(); // Confirmed by Authenticode cert.
         }
         return entry.tier.discount() / 2; // Unconfirmed → reduced.
@@ -2101,8 +2108,9 @@ pub fn analyze_with_discount(path: &str, data: &[u8]) -> (Vec<Finding>, u32) {
         .unwrap_or_default();
 
     let filename_match = match_by_filename(&filename);
-    // Single Authenticode cert lookup — used to either confirm a filename hit
-    // (full vs halved discount) or to serve as the fallback identifier.
+    // Single Authenticode cert lookup (chain-validated — see
+    // `match_by_pe_strings`) — used to either confirm a filename hit (full
+    // vs halved discount) or to serve as the fallback identifier.
     let pe_match = match_by_pe_strings(path, data);
 
     // Build findings (mirrors `analyze` semantics: filename takes precedence).
@@ -2148,7 +2156,9 @@ pub fn analyze_with_discount(path: &str, data: &[u8]) -> (Vec<Finding>, u32) {
 
     // Compute discount using the same precedence as `reputation_discount`.
     let discount = if let Some(entry) = filename_match {
-        if pe_match.is_some() {
+        // Full discount only when the verified signer confirms THIS entry —
+        // any other cert (even a valid one) leaves it halved.
+        if matches!(pe_match, Some(pe) if std::ptr::eq(pe, entry)) {
             entry.tier.discount()
         } else {
             entry.tier.discount() / 2
@@ -2186,8 +2196,20 @@ fn pattern_matches(filename: &str, pattern: &str) -> bool {
             let abs = pos + idx;
             let before_ok = abs == 0 || !filename.as_bytes()[abs - 1].is_ascii_alphanumeric();
             let after_pos = abs + pattern.len();
-            let after_ok = after_pos >= filename.len()
-                || !filename.as_bytes()[after_pos].is_ascii_alphanumeric();
+            let after = filename.as_bytes().get(after_pos);
+            let after_ok = match after {
+                None => true,
+                Some(c) if !c.is_ascii_alphanumeric() => true,
+                // Version-suffixed installer names ("7z2409-x64.exe"): a digit
+                // right after a pattern ending in a non-digit is a version
+                // boundary, not part of a longer word. An attacker could
+                // already force the same match with "7z-x.exe", so this loses
+                // no spoof-resistance.
+                Some(c) => {
+                    c.is_ascii_digit()
+                        && !pattern.as_bytes()[pattern.len() - 1].is_ascii_digit()
+                }
+            };
             if before_ok && after_ok {
                 return true;
             }
@@ -2203,21 +2225,34 @@ fn pattern_matches(filename: &str, pattern: &str) -> bool {
     }
 }
 
-/// Identify the publisher by extracting the **real signer subject** from the
-/// PE's Authenticode certificate via the Windows CryptoAPI. The `_data`
+/// Identify the publisher by extracting the **verified signer subject** from
+/// the PE's Authenticode signature via the Windows CryptoAPI. The `_data`
 /// argument is retained for ABI compatibility but is intentionally unused.
 ///
 /// The prior implementation scanned the entire file body for UTF-16LE
 /// publisher substrings — an attacker could trivially forge a reputation hit
 /// by embedding bytes like "Python Software Foundation" in a `.rsrc` section
-/// or debug overlay of an arbitrary unsigned PE. The new path returns `None`
-/// for unsigned / unparseable / non-PE files, so the discount only fires
-/// when the cert chain actually says the publisher.
+/// or debug overlay of an arbitrary unsigned PE.
+///
+/// Two gates now stand between an attacker and this discount:
+///   1. `signature_chain_valid` — `WinVerifyTrust` must validate the
+///      signature's chain. `authenticode::extract_signer` alone only reads
+///      the subject out of whatever PKCS#7 blob is embedded in the PE; a
+///      self-signed cert with `CN = "Python Software Foundation"` would
+///      otherwise earn the full Trusted-tier discount.
+///   2. `extract_signer` — the subject comes from the actual signing
+///      certificate, not from file bytes.
+/// So the discount only fires when a *chain-validated* cert names the
+/// publisher.
 fn match_by_pe_strings(path: &str, _data: &[u8]) -> Option<&'static ReputationEntry> {
     #[cfg(target_os = "windows")]
     {
-        let signer =
-            crate::layers::authenticode::extract_signer(std::path::Path::new(path))?;
+        let pe_path = std::path::Path::new(path);
+        // Never map an unverified cert subject to a trust discount.
+        if !signature_chain_valid(pe_path) {
+            return None;
+        }
+        let signer = crate::layers::authenticode::extract_signer(pe_path)?;
         let signer_lower = signer.to_lowercase();
 
         // Map cert-subject substrings → REPUTATION_DB pattern keys.
@@ -2255,6 +2290,66 @@ fn match_by_pe_strings(path: &str, _data: &[u8]) -> Option<&'static ReputationEn
     {
         let _ = path;
         None
+    }
+}
+
+/// True when the file's embedded Authenticode signature chain-validates via
+/// `WinVerifyTrust`. Mirrors `authenticode::win_verify_trust` (kept private
+/// there); the reputation layer must run this check itself because
+/// `extract_signer` deliberately returns the subject of *whatever* PKCS#7
+/// blob is embedded in the PE — verified or not. If the authenticode layer
+/// ever exposes its verified result, prefer that and drop this duplicate.
+#[cfg(target_os = "windows")]
+fn signature_chain_valid(path: &std::path::Path) -> bool {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Security::WinTrust::*;
+    use windows::core::GUID;
+
+    let wide_path: Vec<u16> = OsStr::new(path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    unsafe {
+        let action_verify = GUID::from_values(
+            0x00AAC56B,
+            0xCD44,
+            0x11D0,
+            [0x8C, 0xC2, 0x00, 0xC0, 0x4F, 0xC2, 0x95, 0xEE],
+        );
+
+        let mut file_info = WINTRUST_FILE_INFO {
+            cbStruct: std::mem::size_of::<WINTRUST_FILE_INFO>() as u32,
+            pcwszFilePath: windows::core::PCWSTR(wide_path.as_ptr()),
+            hFile: windows::Win32::Foundation::HANDLE::default(),
+            pgKnownSubject: std::ptr::null_mut(),
+        };
+
+        let mut trust_data: WINTRUST_DATA = std::mem::zeroed();
+        trust_data.cbStruct = std::mem::size_of::<WINTRUST_DATA>() as u32;
+        trust_data.dwUIChoice = WTD_UI_NONE;
+        trust_data.fdwRevocationChecks = WTD_REVOKE_NONE;
+        trust_data.dwUnionChoice = WTD_CHOICE_FILE;
+        trust_data.Anonymous.pFile = &mut file_info;
+        trust_data.dwStateAction = WTD_STATEACTION_VERIFY;
+        trust_data.dwProvFlags = WTD_SAFER_FLAG;
+
+        let result = WinVerifyTrust(
+            HWND::default(),
+            &action_verify as *const _ as *mut _,
+            &mut trust_data as *mut _ as *mut std::ffi::c_void,
+        );
+
+        trust_data.dwStateAction = WTD_STATEACTION_CLOSE;
+        let _ = WinVerifyTrust(
+            HWND::default(),
+            &action_verify as *const _ as *mut _,
+            &mut trust_data as *mut _ as *mut std::ffi::c_void,
+        );
+
+        result == 0
     }
 }
 
@@ -2375,6 +2470,25 @@ mod tests {
         assert!(pattern_matches("php-8.exe", "php-"));
         // Non-alnum patterns use simple substring — specific enough.
         assert!(!pattern_matches("setup.exe", "go1.")); // no match
+
+        // Version-suffixed names: a digit right after a non-digit-ending
+        // short pattern counts as a boundary ("7z2409-x64.exe" is the
+        // canonical 7-Zip installer name).
+        assert!(pattern_matches("7z2409-x64.exe", "7z"));
+        assert!(pattern_matches("7z.msi", "7z"));
+        assert!(!pattern_matches("xyz7z.exe", "7z")); // no boundary before
+    }
+
+    #[test]
+    fn r_dash_pattern_no_longer_grants_trusted_discount() {
+        // "r-" used to substring-match any filename containing `r` + `-`
+        // ("driver-update.exe"), handing out the R Foundation Trusted
+        // discount unearned.
+        assert!(match_by_filename("driver-update.exe").is_none());
+        assert!(match_by_filename("color-picker.exe").is_none());
+        // The real products still match.
+        assert!(match_by_filename("rtools44-x86_64.exe").is_some());
+        assert!(match_by_filename("rstudio-2024.04.exe").is_some());
     }
 
     #[test]

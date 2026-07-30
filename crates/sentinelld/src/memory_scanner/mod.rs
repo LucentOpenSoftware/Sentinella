@@ -194,7 +194,6 @@ fn scan_process_windows(
     start: &std::time::Instant,
     result: &mut MemoryScanResult,
 ) {
-    use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows::Win32::System::Memory::{
         MEM_COMMIT, MEM_IMAGE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE, PAGE_EXECUTE_READ,
@@ -316,10 +315,18 @@ fn scan_process_windows(
 
             let region_size = mbi.RegionSize.min(max_region_size);
             if mbi.RegionSize > max_region_size {
-                result.regions_skipped += 1;
-                result
-                    .skip_reasons
-                    .push(MemoryTimeoutReason::RegionTooLarge);
+                // Region exceeds the per-region cap: scan the truncated first
+                // `max_region_size` bytes only. Do NOT count it as skipped —
+                // its content IS analyzed below, so claiming RegionTooLarge in
+                // skip_reasons double-counts one region as both skipped and
+                // scanned. The truncated read itself is the mitigation.
+                tracing::debug!(
+                    pid,
+                    region_addr = mbi.BaseAddress as u64,
+                    region_size = mbi.RegionSize,
+                    cap = max_region_size,
+                    "memory scan: oversized region truncated to cap"
+                );
             }
 
             if result.bytes_scanned.saturating_add(region_size as u64) > max_scan_bytes {

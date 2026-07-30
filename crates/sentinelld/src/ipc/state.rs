@@ -703,6 +703,23 @@ fn reserve_active_scan(inner: &mut Inner, job: ScanJob) -> Result<(), ScanStartR
     Ok(())
 }
 
+/// Pure cancel decision for [`AppState::cancel_scan`], split out for unit
+/// testing. Only `Pending`/`Running` are cancellable. A terminal job
+/// (Completed/Failed/Cancelled) must NOT be flipped to non-terminal
+/// `Draining`: the workers/completers that write terminal states are gone
+/// by then, so nothing would ever move the job out of `Draining` and
+/// `reserve_active_scan` would reject every future scan until daemon
+/// restart. (The IPC handler's `scan_status()` pre-check is check-then-act
+/// and cannot close that race — the decision has to happen here, under
+/// the same critical section as the transition.)
+fn cancel_transition(previous: ScanJobStatus) -> Option<ScanJobStatus> {
+    match previous {
+        ScanJobStatus::Pending => Some(ScanJobStatus::Cancelled),
+        ScanJobStatus::Running => Some(ScanJobStatus::Draining),
+        _ => None,
+    }
+}
+
 impl AppState {
     /// v0.1.9 Phase 2 — guard for the config read-modify-write window.
     /// IPC handlers that mutate `sentinelld.toml` must wrap their entire
@@ -893,6 +910,39 @@ impl AppState {
             }
         }
 
+        // D-3 fix: seed cache integrity from vault key before loading DB.
+        // Entries without a matching integrity hash are rejected as tampered.
+        let scan_cache = {
+            let p = crate::paths::paths();
+            if let Ok(key_data) = std::fs::read(p.vault_integrity_key()) {
+                crate::scan::cache::set_cache_integrity_secret(&key_data);
+            }
+            Arc::new(crate::scan::cache::ScanCache::with_persistence(
+                &p.scan_cache_db(),
+            ))
+        };
+
+        // R7 (audit cross-cutting): entries recorded under a DIFFERENT
+        // signature set must not survive an update + restart — sync the
+        // persisted signature fingerprint now (provider fingerprint +
+        // loaded signature count). A changed fingerprint bumps
+        // sig_generation, invalidating every stale entry (in-memory and
+        // persisted); identical restarts keep the cache warm. This also
+        // covers the sources.update activation path, which requires a
+        // daemon restart — the post-update fingerprint differs, so the
+        // old "clean" entries are invalidated on first boot after update.
+        if let Some(db) = &db_dir {
+            let mut source_mgr = crate::engine::sources::SignatureSourceManager::new(db);
+            let provider = if daemon_config.enhanced_signature_provider == "none" {
+                None
+            } else {
+                Some(daemon_config.enhanced_signature_provider.clone())
+            };
+            source_mgr.load_config(provider);
+            let fingerprint = format!("{}:{}", source_mgr.provider_fingerprint(), sig_count);
+            scan_cache.sync_signature_fingerprint(&fingerprint);
+        }
+
         Self {
             started_at: Instant::now(),
             // Phase 3 audit fix: engine and last_error are now atomic
@@ -914,17 +964,7 @@ impl AppState {
             db: Mutex::new(database),
             watcher: Mutex::new(None),
             idle_scanner: Mutex::new(None),
-            scan_cache: {
-                // D-3 fix: seed cache integrity from vault key before loading DB.
-                // Entries without a matching integrity hash are rejected as tampered.
-                let p = crate::paths::paths();
-                if let Ok(key_data) = std::fs::read(p.vault_integrity_key()) {
-                    crate::scan::cache::set_cache_integrity_secret(&key_data);
-                }
-                Arc::new(crate::scan::cache::ScanCache::with_persistence(
-                    &p.scan_cache_db(),
-                ))
-            },
+            scan_cache,
             orchestrator: crate::orchestrator::ScanOrchestrator::start(),
             argus: argus_engine,
             argus_worker,
@@ -1150,6 +1190,12 @@ impl AppState {
     }
     pub fn argus(&self) -> &argus::ArgusEngine {
         &self.argus
+    }
+    /// Shared handle to the ARGUS engine for IPC handlers that move analysis
+    /// onto the blocking thread pool (spawn_blocking requires 'static
+    /// ownership — a borrowed &ArgusEngine can't cross into the task).
+    pub(crate) fn argus_shared(&self) -> Arc<argus::ArgusEngine> {
+        Arc::clone(&self.argus)
     }
     pub fn plm(&self) -> Option<&crate::plm::PlmMonitor> {
         self.plm.as_ref()
@@ -1438,6 +1484,7 @@ impl AppState {
         &self,
         path: &Path,
         cancel: &AtomicBool,
+        budget: &argus::budget::ScanExecutionBudget,
     ) -> Result<(argus::ArgusVerdict, Option<String>), String> {
         // Use external worker if explicitly enabled, audit mode, or memory pressure.
         let use_external = self.argus_worker.enabled
@@ -1469,12 +1516,15 @@ impl AppState {
                         reason,
                         "ARGUS worker failed, falling back in-process"
                     );
-                    let verdict = self.argus.analyze_file(path);
+                    let verdict = self.argus.analyze_file_with_budget(path, budget.clone());
                     return Ok((verdict, Some(e)));
                 }
             }
         }
-        Ok((self.argus.analyze_file(path), None))
+        Ok((
+            self.argus.analyze_file_with_budget(path, budget.clone()),
+            None,
+        ))
     }
 
     /// Record an IPC request (called from dispatch).
@@ -1972,9 +2022,17 @@ impl AppState {
             let r = self.scan_file_clamav(&engine, path, &no_cancel);
 
             // ── Layers 1–7: ARGUS heuristic analysis ───────────
+            // Single-file user-initiated scan → manual profile budget.
+            let budget = argus::budget::ScanExecutionBudget::manual();
             let (argus_verdict, worker_error) = self
-                .analyze_argus_file(path, &no_cancel)
-                .unwrap_or_else(|e| (self.argus.analyze_file(path), Some(e)));
+                .analyze_argus_file(path, &no_cancel, &budget)
+                .unwrap_or_else(|e| {
+                    (
+                        self.argus
+                            .analyze_file_with_budget(path, budget.clone()),
+                        Some(e),
+                    )
+                });
 
             // ── Unified verdict: one file, one detection ──────
             let (infected, virus_name) = unify_detection_filtered(
@@ -2009,7 +2067,14 @@ impl AppState {
             }
         };
 
-        let status = if result.error.is_some() {
+        // An ARGUS analysis-error verdict (read failure / sharing violation)
+        // is NOT a clean result — surface the file as errored so the caller
+        // doesn't record it as "scanned clean".
+        let argus_incomplete = argus_result
+            .as_ref()
+            .and_then(|v| argus_analysis_error(v))
+            .is_some();
+        let status = if result.error.is_some() || argus_incomplete {
             "error"
         } else if result.infected {
             "infected"
@@ -2265,17 +2330,31 @@ impl AppState {
             return;
         }
 
-        let cancel_flag = AtomicBool::new(false);
-        let result = self.scan_file_clamav(&engine, &path, &cancel_flag);
+        // Use the orchestrator token's flag (not a fresh AtomicBool nobody
+        // ever sets) so scan.cancel can interrupt a long ClamAV scan of a
+        // large file — the ARGUS phase below already honored it.
+        let cancel_ref = token.flag();
+        let result = self.scan_file_clamav(&engine, &path, &cancel_ref);
         if token.is_cancelled() {
             self.complete_orchestrated_file_cancelled(&job, &live, started.elapsed());
             return;
         }
 
-        let cancel_ref = token.flag();
         let (argus_verdict, worker_error) = self
-            .analyze_argus_file(&path, &cancel_ref)
-            .unwrap_or_else(|e| (self.argus.analyze_file(&path), Some(e)));
+            .analyze_argus_file(
+                &path,
+                &cancel_ref,
+                &argus::budget::ScanExecutionBudget::manual(),
+            )
+            .unwrap_or_else(|e| {
+                (
+                    self.argus.analyze_file_with_budget(
+                        &path,
+                        argus::budget::ScanExecutionBudget::manual(),
+                    ),
+                    Some(e),
+                )
+            });
         if let Some(error) = worker_error {
             tracing::warn!(path = %job.path, error = %error, "ARGUS worker fallback used");
         }
@@ -2319,8 +2398,6 @@ impl AppState {
         let threats = if result.infected { 1 } else { 0 };
         let status = if result.error.is_some() {
             "failed"
-        } else if result.infected {
-            "completed"
         } else {
             "completed"
         };
@@ -2554,6 +2631,31 @@ impl AppState {
         });
     }
 
+    /// Submit-failure cleanup for orchestrated folder/quick/full scans.
+    ///
+    /// Those starters reserve the scan slot (`try_reserve_scan`, status
+    /// `Pending`) BEFORE `orchestrator.submit`. If submit fails (queue
+    /// depth ≥ cap, or the worker channel is closed after a worker panic)
+    /// no worker will ever run — and the old code just returned the error,
+    /// leaving the job `Pending` forever. `reserve_active_scan` rejects
+    /// every future scan while a job is Pending, so one transient
+    /// orchestrator failure bricked all manual scans until daemon restart.
+    /// The file-scan path already handles this via
+    /// `complete_orchestrated_file_failure`; mirror it here by marking the
+    /// reserved job Failed (a terminal state), which releases the slot.
+    fn fail_orchestrated_submit(&self, id: Uuid, live: &ScanLiveState, error: &str) {
+        live.set_status(ScanJobStatus::Failed);
+        let mut inner = self.lock_inner();
+        if let Some(ref mut active) = inner.active_scan {
+            if active.id == id {
+                active.status = ScanJobStatus::Failed;
+                active.finished_at = Some(chrono::Utc::now().timestamp());
+                active.errors.push(error.to_string());
+                active.current_path.clear();
+            }
+        }
+    }
+
     /// Orchestrated folder scan — runs through worker queue with cancel support.
     fn start_orchestrated_folder_scan(
         self: &Arc<Self>,
@@ -2632,7 +2734,14 @@ impl AppState {
         let submit_result = self.orchestrator.submit(
             crate::orchestrator::QueueKind::Manual,
             token.clone(),
-            move |_token| {
+            move |token| {
+                // Entry cancellation check: the job may have been cancelled
+                // (and its slot re-reserved by a successor) while this
+                // closure sat in the queue — running anyway would corrupt
+                // the successor's scan state.
+                if token.is_cancelled() {
+                    return;
+                }
                 // Run through inner worker, passing live state to avoid overwrite.
                 let cancel = Arc::clone(&live_ref.cancel_flag);
                 let targets = vec![PathBuf::from(&folder)];
@@ -2650,6 +2759,9 @@ impl AppState {
 
         if let Err(e) = submit_result {
             tracing::error!(%e, "orchestrator folder scan submit failed");
+            // Slot was reserved above but no worker will run — mark the job
+            // Failed (terminal) so future scans aren't rejected forever.
+            self.fail_orchestrated_submit(id, &live, &e);
             return ScanStartResponse {
                 job_id: id.to_string(),
                 status: "error".into(),
@@ -2739,7 +2851,11 @@ impl AppState {
         let submit_result = self.orchestrator.submit(
             crate::orchestrator::QueueKind::Manual,
             token,
-            move |_token| {
+            move |token| {
+                // Entry cancellation check — see the folder variant.
+                if token.is_cancelled() {
+                    return;
+                }
                 let cancel = Arc::clone(&live_ref.cancel_flag);
                 folder_scan_worker_inner(
                     state,
@@ -2755,6 +2871,9 @@ impl AppState {
 
         if let Err(e) = submit_result {
             tracing::error!(%e, "orchestrator quick scan submit failed");
+            // Slot was reserved above but no worker will run — mark the job
+            // Failed (terminal) so future scans aren't rejected forever.
+            self.fail_orchestrated_submit(id, &live, &e);
             return ScanStartResponse {
                 job_id: id.to_string(),
                 status: "error".into(),
@@ -3004,7 +3123,11 @@ impl AppState {
         let submit_result = self.orchestrator.submit(
             crate::orchestrator::QueueKind::Manual,
             token.clone(),
-            move |_token| {
+            move |token| {
+                // Entry cancellation check — see the folder variant.
+                if token.is_cancelled() {
+                    return;
+                }
                 use crate::targeting::{
                     TargetConfig, TargetProvider, dedup, full_disk::FullDiskTargets,
                 };
@@ -3033,6 +3156,9 @@ impl AppState {
 
         if let Err(e) = submit_result {
             tracing::error!(%e, "orchestrator full scan submit failed");
+            // Slot was reserved above but no worker will run — mark the job
+            // Failed (terminal) so future scans aren't rejected forever.
+            self.fail_orchestrated_submit(id, &live, &e);
             return ScanStartResponse {
                 job_id: id.to_string(),
                 status: "error".into(),
@@ -3222,12 +3348,15 @@ impl AppState {
         if let Ok(live_guard) = self.scan_live.lock() {
             if let Some(ref live) = *live_guard {
                 let previous = live.status_enum();
-                live.cancel_flag.store(true, Ordering::Relaxed);
-                let next = if previous == ScanJobStatus::Pending {
-                    ScanJobStatus::Cancelled
-                } else {
-                    ScanJobStatus::Draining
+                // MED (audit): refuse to transition a terminal job. The old
+                // code mapped ANY non-Pending status — including
+                // Completed/Failed/Cancelled — to Draining, a non-terminal
+                // state nothing ever leaves, permanently bricking every
+                // future scan.start until daemon restart.
+                let Some(next) = cancel_transition(previous) else {
+                    return false;
                 };
+                live.cancel_flag.store(true, Ordering::Relaxed);
                 live.set_status(next);
                 let mut inner = self.lock_inner();
                 if let Some(ref mut job) = inner.active_scan {
@@ -3242,13 +3371,9 @@ impl AppState {
         // Fallback: check inner.
         let mut inner = self.lock_inner();
         if let Some(ref mut job) = inner.active_scan {
-            if job.status == ScanJobStatus::Running || job.status == ScanJobStatus::Pending {
+            if let Some(next) = cancel_transition(job.status) {
                 job.cancel_flag.store(true, Ordering::Relaxed);
-                job.status = if job.status == ScanJobStatus::Pending {
-                    ScanJobStatus::Cancelled
-                } else {
-                    ScanJobStatus::Draining
-                };
+                job.status = next;
                 return true;
             }
         }
@@ -3318,7 +3443,17 @@ impl AppState {
         {
             let db_guard = self.db.lock().map_err(|e| format!("DB lock: {e}"))?;
             let db = db_guard.as_ref().ok_or("Database not available")?;
-            db.insert_quarantine_item(&prepared.row);
+            // Commit-ordering discipline (mirror of quarantine::quarantine_file):
+            // on insert failure the just-written vault blob has no restorable
+            // row — it would be an unlisted, never-GC'd orphan. Remove it and
+            // surface the DB error; the original file stays in place.
+            if let Err(e) = db.insert_quarantine_item(&prepared.row) {
+                if prepared.vault_path.exists() {
+                    let _ = std::fs::remove_file(&prepared.vault_path);
+                }
+                tracing::warn!(id = %prepared.row.quarantine_id, error = %e, "quarantine DB insert failed — vault file removed");
+                return Err(e);
+            }
         }
         if let Err(e) = crate::quarantine::finalize_quarantine_file(&prepared) {
             if let Ok(db_guard) = self.db.lock() {
@@ -3355,11 +3490,22 @@ impl AppState {
     /// GC — keeps the map small without a background sweeper).
     pub(crate) fn mark_restore_in_progress(&self, path: &Path) {
         const TTL: Duration = Duration::from_secs(30);
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let key = restore_suppress_key(path);
         if let Ok(mut map) = self.restore_suppress.lock() {
             let now = Instant::now();
             map.retain(|_, t| now.duration_since(*t) < TTL);
-            map.insert(canonical, now);
+            map.insert(key, now);
+        }
+    }
+
+    /// Quarantine F4: undo a mark_restore_in_progress when the restore then
+    /// FAILED — otherwise the failed target stays suppressed for the full
+    /// TTL and a watcher event for genuinely new content at that path would
+    /// be skipped (detection gap). Key derivation must match the mark side.
+    pub(crate) fn unmark_restore_in_progress(&self, path: &Path) {
+        let key = restore_suppress_key(path);
+        if let Ok(mut map) = self.restore_suppress.lock() {
+            map.remove(&key);
         }
     }
 
@@ -3368,9 +3514,9 @@ impl AppState {
     /// the restore → re-quarantine loop.
     pub fn is_restore_suppressed(&self, path: &Path) -> bool {
         const TTL: Duration = Duration::from_secs(30);
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let key = restore_suppress_key(path);
         if let Ok(map) = self.restore_suppress.lock() {
-            if let Some(t) = map.get(&canonical) {
+            if let Some(t) = map.get(&key) {
                 return Instant::now().duration_since(*t) < TTL;
             }
         }
@@ -3381,13 +3527,22 @@ impl AppState {
         let item = {
             let db_guard = self.db.lock().map_err(|e| format!("DB lock: {e}"))?;
             let db = db_guard.as_ref().ok_or("Database not available")?;
-            db.get_quarantine_item(id)
+            db.get_quarantine_item(id)?
                 .ok_or_else(|| format!("Not found: {id}"))?
         };
         // F4: suppress watcher BEFORE the restore writes to original_path so
         // the CREATE event ReadDirectoryChangesW emits lands inside the TTL.
         self.mark_restore_in_progress(std::path::Path::new(&item.original_path));
-        let path = crate::quarantine::restore_file_from_row(&item)?;
+        let path = match crate::quarantine::restore_file_from_row(&item) {
+            Ok(p) => p,
+            Err(e) => {
+                // Restore failed — nothing was written, so the suppression
+                // mark must not linger (it would blind the watcher to real
+                // drops at this path for the next 30s).
+                self.unmark_restore_in_progress(std::path::Path::new(&item.original_path));
+                return Err(e);
+            }
+        };
         // Commit DB status BEFORE purging vault. If the DB write fails, the
         // restored plaintext file is already on disk (security-positive: user
         // gets their file back) AND the vault is retained so a future retry
@@ -3416,13 +3571,21 @@ impl AppState {
         let item = {
             let db_guard = self.db.lock().map_err(|e| format!("DB lock: {e}"))?;
             let db = db_guard.as_ref().ok_or("Database not available")?;
-            db.get_quarantine_item(id)
+            db.get_quarantine_item(id)?
                 .ok_or_else(|| format!("Not found: {id}"))?
         };
         let dest_path = std::path::Path::new(dest);
         // F4: suppress watcher BEFORE write — see quarantine_restore.
         self.mark_restore_in_progress(dest_path);
-        let path = crate::quarantine::restore_file_as(&item, dest_path)?;
+        let path = match crate::quarantine::restore_file_as(&item, dest_path) {
+            Ok(p) => p,
+            Err(e) => {
+                // Restore failed — drop the suppression mark (see
+                // quarantine_restore for why a stale mark is a detection gap).
+                self.unmark_restore_in_progress(dest_path);
+                return Err(e);
+            }
+        };
         // Same commit-then-cleanup ordering as quarantine_restore — see
         // that method for the unrecoverable-window rationale.
         {
@@ -3445,7 +3608,7 @@ impl AppState {
         let item = {
             let db_guard = self.db.lock().map_err(|e| format!("DB lock: {e}"))?;
             let db = db_guard.as_ref().ok_or("Database not available")?;
-            db.get_quarantine_item(id)
+            db.get_quarantine_item(id)?
                 .ok_or_else(|| format!("Not found: {id}"))?
         };
         // F3: refuse to delete the vault if a concurrent restore has already
@@ -5107,8 +5270,12 @@ fn startup_critical_scan(
         // ClamAV signature scan.
         let result = state.scan_file_clamav(&engine, path, &no_cancel);
 
-        // ARGUS heuristic analysis.
-        let argus_verdict = state.argus().analyze_file(path);
+        // ARGUS heuristic analysis — startup profile budget (fast,
+        // persistence-focused) instead of the 60s manual default.
+        let argus_verdict = state.argus().analyze_file_with_budget(
+            path,
+            argus::budget::ScanExecutionBudget::startup(),
+        );
 
         scanned += 1;
 
@@ -5119,8 +5286,13 @@ fn startup_critical_scan(
             &state.detection_exclusions(),
         );
 
+        // Never cache an ARGUS analysis-error verdict (read failure /
+        // sharing violation) as clean — leave it uncached so the next
+        // pass retries.
         if let Ok(meta) = path.metadata() {
-            cache.record_with_metadata(path, &meta, !is_threat);
+            if is_threat || argus_analysis_error(&argus_verdict).is_none() {
+                cache.record_with_metadata(path, &meta, !is_threat);
+            }
         }
 
         if is_threat {
@@ -5191,6 +5363,11 @@ fn folder_scan_worker_inner(
     // pre-collecting millions of PathBufs into a Vec for full-disk scans.
     let max_depth = if is_quick { 3 } else { 10 };
     let config = crate::config::Config::load(None).unwrap_or_default();
+    // Hoisted out of the per-file hot loop: max_file_size() re-reads and
+    // re-parses the TOML config on every call (millions of disk reads per
+    // full-disk scan) and could flip the size policy mid-scan. Snapshot it
+    // once per scan, like the exclusions config above.
+    let max_file_size = max_file_size();
     let orchestrated_scan = existing_live.is_some();
     let target_summary = targets
         .iter()
@@ -5229,7 +5406,13 @@ fn folder_scan_worker_inner(
     {
         let mut inner = state.lock_inner();
         if let Some(ref mut job) = inner.active_scan {
-            job.live = Some(Arc::clone(&live));
+            // Job-id guard (same pattern as complete_orchestrated_file_*):
+            // a cancelled orchestrated closure can run AFTER a successor
+            // scan reserved the slot — never install our live state into
+            // the successor's job.
+            if job.id == job_id {
+                job.live = Some(Arc::clone(&live));
+            }
         }
     }
 
@@ -5302,7 +5485,7 @@ fn folder_scan_worker_inner(
 
                 // Check file size.
                 let file_meta = match std::fs::metadata(file) {
-                    Ok(meta) if meta.len() > max_file_size() => {
+                    Ok(meta) if meta.len() > max_file_size => {
                         live_w.files_scanned.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
@@ -5367,13 +5550,27 @@ fn folder_scan_worker_inner(
                 // ARGUS analysis (with budget check).
                 let argus_start = std::time::Instant::now();
                 let (mut argus_verdict, worker_error) =
-                    match state_ref.analyze_argus_file(file, &cancel_ref) {
+                    match state_ref.analyze_argus_file(file, &cancel_ref, &scan_profile.budget) {
                         Ok(result) => result,
                         Err(e) => {
                             let _ = tx_ref.send(ScanMsg::Error(format!("{}: {e}", file.display())));
                             break;
                         }
                     };
+
+                // Sharing-violation / read-failure mislabel fix (audit
+                // cross-cutting): an ARGUS analysis-error verdict is NOT a
+                // clean result. Surface it as a scan error and keep it OUT
+                // of the clean cache so the next scan retries the file.
+                // ClamAV positives still flow to the threat path below.
+                if !result.infected {
+                    if let Some(reason) = argus_analysis_error(&argus_verdict) {
+                        let _ =
+                            tx_ref.send(ScanMsg::Error(format!("{}: {reason}", file.display())));
+                        live_w.files_scanned.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                }
 
                 // Check YARA/structural phase budgets.
                 if let Some(ref mut timing) = argus_verdict.timing {
@@ -5512,10 +5709,21 @@ fn folder_scan_worker_inner(
                 }
 
                 // H7 fix: deferred trust observation — only clean files build familiarity.
+                // Signer-aware (audit cross-cutting): feeds the authenticode
+                // signer into the observation so signer drift on a previously
+                // trusted binary invalidates its trust instead of silently
+                // extending it.
                 if final_score == 0 && !result.infected {
                     if let Some(ref tg) = state_ref.trust_graph {
                         let file_key = file.to_string_lossy().to_lowercase();
-                        tg.observe(&file_key, crate::trust_graph::TrustNodeKind::Executable, None);
+                        let drift = tg.observe_with_signer(
+                            &file_key,
+                            crate::trust_graph::TrustNodeKind::Executable,
+                            argus_verdict.explanation.signer.as_deref(),
+                        );
+                        if let Some(d) = drift {
+                            warn!(file = %file.display(), drift = %d.explanation, "trust-graph signer drift");
+                        }
                     }
                 }
 
@@ -5579,8 +5787,10 @@ fn folder_scan_worker_inner(
                 if let Some(ref timing) = verdict.timing {
                     let mut inner = state.lock_inner();
                     if let Some(ref mut job) = inner.active_scan {
-                        job.perf_summary
-                            .record_file(&det.path, verdict.file_size, timing);
+                        if job.id == job_id {
+                            job.perf_summary
+                                .record_file(&det.path, verdict.file_size, timing);
+                        }
                     }
                 }
                 state.persist_argus_verdict(&job_id.to_string(), &verdict);
@@ -5591,8 +5801,10 @@ fn folder_scan_worker_inner(
                 if let Some(ref timing) = verdict.timing {
                     let mut inner = state.lock_inner();
                     if let Some(ref mut job) = inner.active_scan {
-                        job.perf_summary
-                            .record_file(&verdict.path, verdict.file_size, timing);
+                        if job.id == job_id {
+                            job.perf_summary
+                                .record_file(&verdict.path, verdict.file_size, timing);
+                        }
                     }
                 }
                 state.persist_argus_verdict(&job_id.to_string(), &verdict);
@@ -5622,7 +5834,9 @@ fn folder_scan_worker_inner(
     {
         let mut inner = state.lock_inner();
         if let Some(ref mut job) = inner.active_scan {
-            job.files_total = total_discovered;
+            if job.id == job_id {
+                job.files_total = total_discovered;
+            }
         }
     }
 
@@ -5692,6 +5906,9 @@ fn folder_scan_worker_inner(
     {
         let inner = state.lock_inner();
         if let Some(ref job) = inner.active_scan {
+            // Job-id guard: a successor scan may own the slot — its perf
+            // summary is not ours to log.
+            if job.id == job_id {
             let p = &job.perf_summary;
             info!(
                 job = %job_id,
@@ -5712,30 +5929,43 @@ fn folder_scan_worker_inner(
                     info!(file = short, ms = us / 1000, "slow file");
                 }
             }
+            }
         }
     }
 
     // Update in-memory scan job state.
     {
         let mut inner = state.lock_inner();
-        if let Some(ref mut job) = inner.active_scan {
-            job.status = if cancelled {
-                ScanJobStatus::Cancelled
-            } else {
-                ScanJobStatus::Completed
-            };
-            job.finished_at = Some(finished);
-            job.files_scanned = scanned;
-            job.threats_found = threats;
-            job.detections = detections.clone();
-            job.errors = errors;
-            job.current_path = String::new();
+        // Job-id guard (same pattern as the orchestrated-file completers):
+        // a cancelled orchestrated closure can finalize AFTER a successor
+        // scan reserved the slot — attribute status/stats/detections only
+        // to our own job, never overwrite the successor's.
+        let is_current = matches!(inner.active_scan.as_ref(), Some(j) if j.id == job_id);
+        let errors_count = errors.len() as u64;
+        if is_current {
+            if let Some(ref mut job) = inner.active_scan {
+                job.status = if cancelled {
+                    ScanJobStatus::Cancelled
+                } else {
+                    ScanJobStatus::Completed
+                };
+                job.finished_at = Some(finished);
+                job.files_scanned = scanned;
+                job.threats_found = threats;
+                job.detections = detections.clone();
+                job.errors = errors;
+                job.current_path = String::new();
+            }
         }
-        let scan_started_at = inner
-            .active_scan
-            .as_ref()
-            .map(|j| j.started_at)
-            .unwrap_or(0);
+        let scan_started_at = if is_current {
+            inner
+                .active_scan
+                .as_ref()
+                .map(|j| j.started_at)
+                .unwrap_or(0)
+        } else {
+            live.started_at
+        };
         inner.scan_history.push(ScanRecord {
             job_id: scan_id_str.clone(),
             scan_type: scan_type.clone(),
@@ -5749,18 +5979,22 @@ fn folder_scan_worker_inner(
         // Persist scan record to SQLite. The per-job perf aggregates come from
         // `perf_summary`, which `record_file` already populates per scanned file.
         let duration_ms = ((finished - scan_started_at).max(0) as u64) * 1000;
-        let (bytes_scanned, clamav_phase_us, argus_phase_us, errors_count) = inner
-            .active_scan
-            .as_ref()
-            .map(|j| {
-                (
-                    j.perf_summary.total_bytes_scanned,
-                    j.perf_summary.total_clamav_us,
-                    j.perf_summary.total_argus_us,
-                    j.errors.len() as u64,
-                )
-            })
-            .unwrap_or((0, 0, 0, 0));
+        let (bytes_scanned, clamav_phase_us, argus_phase_us, errors_count) = if is_current {
+            inner
+                .active_scan
+                .as_ref()
+                .map(|j| {
+                    (
+                        j.perf_summary.total_bytes_scanned,
+                        j.perf_summary.total_clamav_us,
+                        j.perf_summary.total_argus_us,
+                        j.errors.len() as u64,
+                    )
+                })
+                .unwrap_or((0, 0, 0, 0))
+        } else {
+            (0, 0, 0, errors_count)
+        };
         state.persist_scan(&ScanRow {
             scan_id: scan_id_str.clone(),
             scan_type: scan_type.clone(),
@@ -6112,6 +6346,40 @@ fn format_uptime(secs: u64) -> String {
     }
 }
 
+/// Returns the error reason if this ARGUS verdict is an analysis-ERROR
+/// placeholder (read failure, sharing violation, vanished file) rather
+/// than a real verdict. The engine signals that path with a weight-0 Info
+/// finding whose description starts with "Analysis incomplete:" (see
+/// `ArgusEngine::error_verdict`) while still stamping `Verdict::Clean` on
+/// the envelope — so daemon scan paths MUST check this before treating a
+/// "clean" ARGUS result as cacheable-clean. Returns None for real verdicts.
+pub fn argus_analysis_error(v: &argus::ArgusVerdict) -> Option<&str> {
+    v.findings
+        .iter()
+        .find_map(|f| f.description.strip_prefix("Analysis incomplete: "))
+}
+
+/// Canonical key for the restore-suppression map (Quarantine F4).
+///
+/// Canonicalize the PARENT directory and re-join the file name — NOT the
+/// full path. The full-path canonicalize is racy for restore_as: the dest
+/// doesn't exist yet when mark_restore_in_progress runs before the write
+/// (canonicalize fails → raw-path fallback), but DOES exist when the
+/// watcher's CREATE event fires (canonicalize succeeds) → different map
+/// keys → suppression miss → restore → re-quarantine loop. The parent
+/// exists on both sides, so both derive the same key; the fallback
+/// (unresolvable parent → raw parent) is likewise identical by construction
+/// because mark / unmark / is_restore_suppressed all route through here.
+fn restore_suppress_key(path: &Path) -> PathBuf {
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => parent
+            .canonicalize()
+            .unwrap_or_else(|_| parent.to_path_buf())
+            .join(name),
+        _ => path.canonicalize().unwrap_or_else(|_| path.to_path_buf()),
+    }
+}
+
 /// Unified detection logic — merges ClamAV signature + ARGUS heuristic
 /// into a single coherent verdict. Never creates duplicate detections.
 ///
@@ -6351,6 +6619,40 @@ mod tests {
                 "reserve must succeed once the prior scan is terminal"
             );
         }
+    }
+
+    // ── cancel-on-terminal race regression (audit MED) ────────────
+    //
+    // cancel_scan used to map ANY non-Pending status — including terminal
+    // Completed/Failed/Cancelled — to non-terminal Draining. Nothing ever
+    // moves a finished job out of Draining (the workers that write terminal
+    // states are gone), so one unlucky cancel click landing exactly at scan
+    // completion bricked every future scan.start until daemon restart.
+    #[test]
+    fn cancel_transition_refuses_terminal_states() {
+        // Only Pending/Running may transition.
+        assert!(cancel_transition(ScanJobStatus::Pending) == Some(ScanJobStatus::Cancelled));
+        assert!(cancel_transition(ScanJobStatus::Running) == Some(ScanJobStatus::Draining));
+        // Terminal states (and an in-progress drain) are left untouched.
+        for terminal in [
+            ScanJobStatus::Completed,
+            ScanJobStatus::Cancelled,
+            ScanJobStatus::Failed,
+            ScanJobStatus::Draining,
+        ] {
+            assert!(
+                cancel_transition(terminal).is_none(),
+                "terminal/draining job must not be re-transitioned"
+            );
+        }
+        // And the invariant this protects: a job stuck in Draining rejects
+        // new reservations — which is exactly why flipping a terminal job
+        // to Draining was permanent.
+        let mut inner = empty_inner();
+        let mut stuck = mk_job("folder");
+        stuck.status = ScanJobStatus::Draining;
+        inner.active_scan = Some(stuck);
+        assert!(reserve_active_scan(&mut inner, mk_job("quick")).is_err());
     }
 
     // ── Helpers ──────────────────────────────────────────────────

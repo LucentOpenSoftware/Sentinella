@@ -160,12 +160,18 @@ fn build_engine(cli: &Cli) -> (ArgusEngine, Vec<String>) {
 }
 
 fn candidate_paths(relatives: &[&str]) -> Vec<PathBuf> {
-    let mut roots = vec![PathBuf::from(".")];
+    // Exe-dir FIRST, CWD last: the first existing candidate wins for IOC files
+    // (see `build_engine`'s `break`), so a planted `./rules/ioc_hashes.txt` in
+    // the daemon's CWD must not shadow the installed one. The v0.1.6 changelog
+    // removed CWD from the worker *binary* resolver for the same
+    // SYSTEM-exec hijack class; this applies it to rules/IOC resolution.
+    let mut roots = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             roots.push(dir.to_path_buf());
         }
     }
+    roots.push(PathBuf::from("."));
 
     let mut out = Vec::new();
     for root in roots {
@@ -188,7 +194,11 @@ fn scan_file(engine: &ArgusEngine, path: &Path, json: bool, load_errors: Vec<Str
                     "sha256": "",
                     "mime_type": null,
                     "score": 0,
-                    "verdict": "clean",
+                    // Not a real `Verdict` enum value: a JSON-only consumer
+                    // must not misread a scan error as a clean verdict. The
+                    // daemon is unaffected — it checks exit code >= 3 and the
+                    // `errors` array before parsing (argus_worker.rs).
+                    "verdict": "error",
                     "confidence_label": "normal",
                     "threat_maturity": "benign",
                     "framework": null,
@@ -584,7 +594,10 @@ fn collect_dir(dir: &Path, out: &mut Vec<PathBuf>, depth: u32, max: usize) {
             return;
         }
         let path = entry.path();
-        // Skip reparse points to avoid junction/symlink loops.
+        // Skip symlinks to avoid loops. NOTE: `is_symlink()` is false for
+        // Windows mount-point junctions (IO_REPARSE_TAG_MOUNT_POINT), so
+        // junctions are still traversed — bounded by the depth-12 / count
+        // caps above.
         let Ok(meta) = std::fs::symlink_metadata(&path) else {
             continue;
         };

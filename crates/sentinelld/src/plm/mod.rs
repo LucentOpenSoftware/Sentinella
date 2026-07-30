@@ -106,9 +106,13 @@ impl LineageGraph {
             // inserts, so the steady-state cost per insert is negligible.
             if map.len() >= MAX_NODES {
                 let low_water = MAX_NODES * 9 / 10;
-                let mut by_age: Vec<(i64, u32)> =
-                    map.values().map(|n| (n.timestamp, n.pid)).collect();
-                // Oldest first (ascending timestamp); pid as deterministic tiebreak.
+                // Sort by `created_at` (monotonic Instant), the same clock
+                // the TTL eviction above uses — sorting by the wall-clock
+                // `timestamp` would mix two clocks and make eviction order
+                // sensitive to wall-clock adjustments.
+                let mut by_age: Vec<(Instant, u32)> =
+                    map.values().map(|n| (n.created_at, n.pid)).collect();
+                // Oldest first (ascending age); pid as deterministic tiebreak.
                 by_age.sort_unstable();
                 let drop_count = map.len().saturating_sub(low_water);
                 for (_, pid) in by_age.into_iter().take(drop_count) {
@@ -784,7 +788,8 @@ impl PlmMonitor {
     /// hook surfaces accumulated state when it runs.
     ///
     /// Production lineage / signer probes are built from the PLM
-    /// LineageGraph + NullSignerVerifier. Tests can call the underlying
+    /// LineageGraph + the Wave 5 WinTrust-backed signer verifier
+    /// (`self.weedhack_signer_verifier`). Tests can call the underlying
     /// `weedhack_image_load_filter.process_event` directly with mocks.
     pub fn ingest_image_load(
         &self,
@@ -793,10 +798,9 @@ impl PlmMonitor {
         // The lineage checker is built per-call to capture the graph's
         // current Arc — cheap; the inner graph lookup is the only work.
         let lineage = weedhack_image_load::LineageGraphJavaChecker::new(Arc::clone(&self.graph));
-        let verifier = weedhack_image_load::NullSignerVerifier;
         let signal = self
             .weedhack_image_load_filter
-            .process_event(event.clone(), &verifier, &lineage)?;
+            .process_event(event.clone(), &*self.weedhack_signer_verifier, &lineage)?;
         self.ingest_weedhack_signal(event.target_pid, signal)
     }
 
@@ -924,21 +928,29 @@ fn snapshot_processes(graph: &LineageGraph, diagnostics: &PlmDiagnostics) {
         let ppid = entry.th32ParentProcessID;
 
         if !exe_name.is_empty() && pid != 0 {
-            // Only insert if not already tracked (avoid overwriting timestamps).
+            let image_name = exe_name.rsplit('\\').next().unwrap_or(&exe_name);
+            // Insert if not already tracked — but ALSO re-record when the
+            // tracked node's identity differs from the live ToolHelp
+            // entry: in snapshot-only mode (ETW unavailable) a recycled
+            // PID would otherwise keep the previous owner's image name,
+            // parents, and created_at for up to NODE_TTL, defeating the
+            // PID-reuse guard in get_chain (which keys on created_at
+            // freshness that snapshot mode would never update).
             let map = graph.nodes.lock().unwrap_or_else(|e| e.into_inner());
-            let already_tracked = map.contains_key(&pid);
+            let needs_record = match map.get(&pid) {
+                None => true,
+                Some(n) => {
+                    n.parent_pid != ppid || !n.image_name.eq_ignore_ascii_case(image_name)
+                }
+            };
             drop(map);
 
-            if !already_tracked {
+            if needs_record {
                 graph.record_process(ProcessNode {
                     pid,
                     parent_pid: ppid,
                     image_path: exe_name.clone(),
-                    image_name: exe_name
-                        .rsplit('\\')
-                        .next()
-                        .unwrap_or(&exe_name)
-                        .to_string(),
+                    image_name: image_name.to_string(),
                     command_line: None, // ToolHelp32 doesn't provide cmdline.
                     is_signed: None,
                     integrity_level: None,

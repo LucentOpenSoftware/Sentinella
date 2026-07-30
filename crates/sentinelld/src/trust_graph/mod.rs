@@ -39,30 +39,65 @@ pub fn set_trust_integrity_secret(secret: &[u8]) {
     let _ = TRUST_INTEGRITY_SECRET.set(key);
 }
 
+/// The integrity secret, or a random per-boot one if the vault key was never
+/// installed.
+///
+/// D-2 fail-closed: previously an unreadable vault key left the OnceLock
+/// unset and hashing proceeded with a publicly-known `[0u8; 16]` "secret" —
+/// anyone able to write `trust_graph.db` could then forge valid
+/// `integrity_hash` values offline and manufacture a Trusted node (+8 score
+/// discount). A random per-boot secret instead invalidates every stored hash
+/// (safe mass revocation) and keeps the MAC unforgeable.
+fn integrity_secret() -> [u8; 16] {
+    *TRUST_INTEGRITY_SECRET.get_or_init(|| {
+        warn!(
+            "trust graph: vault integrity key unavailable — using random per-boot secret; \
+             all stored trust nodes will fail verification (fail-closed)"
+        );
+        let mut key = [0u8; 16];
+        use rand::RngCore;
+        rand::thread_rng().fill_bytes(&mut key);
+        key
+    })
+}
+
 /// Compute integrity hash for a trust node's security-critical fields.
+///
+/// HMAC-SHA256 (truncated to 64 bits), not `DefaultHasher`: std explicitly
+/// documents DefaultHasher's algorithm as unspecified and free to change
+/// between rustc releases, which would mass-revoke all stored trust on a
+/// toolchain upgrade; secret-prefixed SipHash is also not a keyed-MAC
+/// construction. HMAC-SHA256 is stable and is already what
+/// `runtime_integrity` uses for binaries. The 64-bit truncation matches the
+/// persisted `integrity_hash INTEGER` column.
 fn trust_node_hash(
     key: &str,
     observation_count: u64,
     stable_days: u32,
     signer: Option<&str>,
 ) -> i64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
 
-    let secret = TRUST_INTEGRITY_SECRET.get().copied().unwrap_or([0u8; 16]);
+    let secret = integrity_secret();
 
-    let mut hasher = DefaultHasher::new();
-    secret.hash(&mut hasher);
-    key.hash(&mut hasher);
-    observation_count.hash(&mut hasher);
-    stable_days.hash(&mut hasher);
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&secret)
+        .expect("HMAC accepts keys of any size");
+    // Length-prefix variable-length fields so (key, signer) concatenations
+    // cannot collide.
+    mac.update(&(key.len() as u64).to_le_bytes());
+    mac.update(key.as_bytes());
+    mac.update(&observation_count.to_le_bytes());
+    mac.update(&stable_days.to_le_bytes());
     // Bind the signer into the integrity hash. `has_signer` (and the signer
     // identity) drives compute_trust_level Established→Trusted, so leaving it
     // unhashed let an `UPDATE trust_nodes SET signer='Microsoft'` manufacture
     // a Trusted node (+discount) without breaking integrity verification.
-    signer.unwrap_or("").hash(&mut hasher);
-    secret.hash(&mut hasher);
-    hasher.finish() as i64
+    let signer = signer.unwrap_or("");
+    mac.update(&(signer.len() as u64).to_le_bytes());
+    mac.update(signer.as_bytes());
+    let out = mac.finalize().into_bytes();
+    i64::from_le_bytes(out[..8].try_into().expect("HMAC-SHA256 is 32 bytes"))
 }
 
 /// Max trust nodes before pruning oldest.

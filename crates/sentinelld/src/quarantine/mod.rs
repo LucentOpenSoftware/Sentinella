@@ -191,7 +191,13 @@ pub fn quarantine_file(
     db: &Database,
 ) -> Result<QuarantineResult, String> {
     let prepared = prepare_quarantine_file(file_path, vault_dir, virus_name, scan_id)?;
-    db.insert_quarantine_item(&prepared.row);
+    // Commit the DB row BEFORE deleting the original: on insert failure the
+    // just-written vault file is removed and the original stays in place —
+    // never an orphan vault blob with no restorable row.
+    if let Err(e) = db.insert_quarantine_item(&prepared.row) {
+        let _ = fs::remove_file(&prepared.vault_path);
+        return Err(e);
+    }
     if let Err(e) = finalize_quarantine_file(&prepared) {
         let _ = db.update_quarantine_status(&prepared.row.quarantine_id, "failed");
         return Err(e);
@@ -219,19 +225,26 @@ pub fn prepare_quarantine_file(
     //
     // Previously `validate_restore_path` existed only on the RESTORE side.
     // The ADD path had no guard, so any caller able to obtain a challenge
-    // token (which — per the current IPC secret ACL — is *any* logged-in
-    // user) could ask the daemon (running as SYSTEM) to quarantine any
+    // token could ask the daemon (running as SYSTEM) to quarantine any
     // file on disk. Quarantine = "encrypt to vault + delete original".
+    // (Since v0.1.9, `challenge.request` refuses token issuance to
+    // unelevated callers — this validation remains as defense-in-depth
+    // in case the elevation gate is ever bypassed or misconfigured.)
     //
-    // Concrete impact: an unprivileged user could ask SYSTEM to delete:
+    // Concrete impact without it: an IPC caller could ask SYSTEM to delete:
     //   - C:\Program Files\Sentinella\sentinelld.exe (kill our own AV)
     //   - Defender / EDR sensor binaries (kill the OS AV)
     //   - Service .exe / .sys under writable ProgramData paths
     //   - Browser updaters, signed installers, etc.
     // → exactly the "kill the AV, leave the system vulnerable" class.
     //
-    // Same blocklist as restore + a hard refusal for our own install dir
-    // so we cannot be socially-engineered into self-destructing.
+    // The source blocklist below covers only OS-critical and AV-kill
+    // roots — deliberately narrower than the restore-destination blocklist
+    // (which bans all of Program Files / ProgramData for caller-chosen
+    // destinations). The policies are reconciled on the restore side:
+    // restore to the recorded `original_path` of a daemon-created row is
+    // allowed back to its source location (see validate_restore_path_in),
+    // so quarantining a false positive from those dirs stays recoverable.
     validate_quarantine_source(&canonical)?;
     // F2: bound + sanitize caller-controlled strings BEFORE we hash/encrypt/write.
     // The DB row, the log line, and the GUI list all consume these fields; a
@@ -426,7 +439,7 @@ pub fn restore_file(
     db: &Database,
 ) -> Result<String, String> {
     let item = db
-        .get_quarantine_item(quarantine_id)
+        .get_quarantine_item(quarantine_id)?
         .ok_or_else(|| format!("Not found: {quarantine_id}"))?;
     let path = restore_file_from_row(&item)?;
     // Commit FIRST, then purge vault. If the DB write fails, leave both the
@@ -541,7 +554,10 @@ pub fn restore_file_from_row(item: &QuarantineRow) -> Result<String, String> {
     let vault_path = validate_vault_path(Path::new(&item.vault_path))?;
 
     let original_path = Path::new(&item.original_path);
-    validate_restore_path(original_path)?;
+    // Recorded original path of a daemon-created row: allowed back to its
+    // source location even under roots the strict dest check blocks (see
+    // validate_restore_path_in for the reconciliation rationale).
+    validate_restore_path_in(original_path, true)?;
     if original_path.exists() {
         return Err(format!("Target exists: {}", original_path.display()));
     }
@@ -767,7 +783,7 @@ pub fn restore_file_as(item: &QuarantineRow, dest: &Path) -> Result<String, Stri
 #[allow(dead_code)]
 pub fn delete_quarantined(quarantine_id: &str, db: &Database) -> Result<(), String> {
     let item = db
-        .get_quarantine_item(quarantine_id)
+        .get_quarantine_item(quarantine_id)?
         .ok_or_else(|| format!("Not found: {quarantine_id}"))?;
     delete_vault_file(&item)?;
     // DB write failure here is non-fatal for the security goal (file is
@@ -922,6 +938,23 @@ fn validate_quarantine_source(canonical: &Path) -> Result<(), String> {
 }
 
 fn validate_restore_path(path: &Path) -> Result<(), String> {
+    validate_restore_path_in(path, false)
+}
+
+/// `is_recorded_original`: the path came from the `original_path` column of
+/// a daemon-created quarantine row, not from a caller-supplied `dest`.
+///
+/// Audit fix: the quarantine-SOURCE blocklist (validate_quarantine_source)
+/// and the restore blocklist disagreed — a file quarantined from
+/// `C:\Program Files\Vendor\` or `C:\ProgramData\Vendor\` passed the source
+/// check but could never be restored to its original location ("System path
+/// blocked"), making any false positive there permanently unrestorable in
+/// place. Restoring the recorded original path under those roots grants a
+/// token-holding caller nothing new: the daemon already deleted that exact
+/// path during quarantine, and the restore writes back only hash-verified
+/// bytes that were there. Caller-supplied `restore_as` destinations keep
+/// the strict system-root block.
+fn validate_restore_path_in(path: &Path, is_recorded_original: bool) -> Result<(), String> {
     let raw = path.to_string_lossy();
     let lower_raw = raw.to_ascii_lowercase();
     if lower_raw.starts_with(r"\\?\unc\")
@@ -947,19 +980,25 @@ fn validate_restore_path(path: &Path) -> Result<(), String> {
         })
         .map_err(|e| format!("Path resolution failed: {e}"))?;
 
-    let s = canonical.to_string_lossy().to_lowercase();
-    let blocked = [
-        "\\windows\\",
-        "\\system32\\",
-        "\\syswow64\\",
-        "\\program files\\",
-        "\\program files (x86)\\",
-        "\\programdata\\",
-        "\\drivers\\",
-    ];
-    for b in &blocked {
-        if s.contains(b) {
-            return Err(format!("System path blocked: {}", canonical.display()));
+    if !is_recorded_original {
+        let s = canonical.to_string_lossy().to_lowercase();
+        let blocked = [
+            "\\windows\\",
+            "\\system32\\",
+            "\\syswow64\\",
+            "\\program files\\",
+            "\\program files (x86)\\",
+            "\\programdata\\",
+            "\\drivers\\",
+            // Persistence location: a restored file lands here
+            // suppression-exempted from rescan and would auto-run at next
+            // logon. All-users Startup is under ProgramData (blocked above).
+            "\\appdata\\roaming\\microsoft\\windows\\start menu\\programs\\startup\\",
+        ];
+        for b in &blocked {
+            if s.contains(b) {
+                return Err(format!("System path blocked: {}", canonical.display()));
+            }
         }
     }
 
@@ -1287,6 +1326,32 @@ mod tests {
             let result = validate_restore_path(Path::new(path_str));
             assert!(result.is_err(), "UNC path should be rejected: {path_str}");
         }
+    }
+
+    #[test]
+    fn recorded_original_restore_allowed_under_system_roots() {
+        // Audit fix: the daemon may quarantine from Program Files/ProgramData
+        // (validate_quarantine_source only blocks OS-critical subsets), so the
+        // recorded original_path must be restorable in place — otherwise those
+        // false positives are permanently unrestorable to their source.
+        // C:\ProgramData always exists on Windows, so the parent-canonicalize
+        // fallback resolves. On non-Windows hosts both calls error out in
+        // path resolution, which still satisfies the strict-side assertion
+        // pattern used by validate_restore_path_rejects_system_paths.
+        let p = Path::new(r"C:\ProgramData\sentinella_test_restore_probe.dat");
+        assert!(
+            validate_restore_path(p).is_err(),
+            "caller-chosen dest under ProgramData must stay blocked"
+        );
+        if p.parent().map(|d| d.is_dir()).unwrap_or(false) {
+            assert!(
+                validate_restore_path_in(p, true).is_ok(),
+                "recorded original path under ProgramData must be restorable in place"
+            );
+        }
+        // UNC stays blocked even for recorded-original restores.
+        let unc = Path::new(r"\\server\share\evil.exe");
+        assert!(validate_restore_path_in(unc, true).is_err());
     }
 
     // ---------------------------------------------------------------

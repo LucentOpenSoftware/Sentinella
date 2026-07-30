@@ -74,9 +74,12 @@ impl RealtimeWatcher {
         let watched = roots.clone();
         let cache_clone = Arc::clone(&cache);
 
-        let thread = std::thread::spawn(move || {
-            watcher_loop(watched, engine, state, r, ec, dc, cache_clone);
-        });
+        let thread = std::thread::Builder::new()
+            .name("realtime-watcher".into())
+            .spawn(move || {
+                watcher_loop(watched, engine, state, r, ec, dc, cache_clone);
+            })
+            .map_err(|e| format!("failed to spawn watcher thread: {e}"))?;
 
         info!(dirs = roots.len(), "real-time watcher started");
 
@@ -519,6 +522,24 @@ fn watcher_loop(
                         let threat_name = result.virus_name.clone().unwrap_or("Unknown".into());
                         warn!(file = %path.display(), threat = %threat_name, "REALTIME THREAT (budget-partial)");
                         detections_count.fetch_add(1, Ordering::Relaxed);
+
+                        // TOCTOU Phase 3: revalidate identity BEFORE quarantine.
+                        // This branch is only reachable when ClamAV alone blew
+                        // the total budget — the longest capture→quarantine
+                        // window in the module — so the swap race matters most
+                        // exactly here. Mirror the main threat path below.
+                        if let Err(mismatch) = file_id.revalidate(&watched_roots_vec) {
+                            warn!(
+                                file = %path.display(),
+                                reason = %mismatch,
+                                "TOCTOU: identity changed before quarantine — PREVENTED"
+                            );
+                            race_diag
+                                .quarantine_race_prevented
+                                .fetch_add(1, Ordering::Relaxed);
+                            continue; // Skip quarantine, move to next file.
+                        }
+
                         let path_str = path.to_string_lossy().to_string();
                         match state.quarantine_file(&path_str, &threat_name, "realtime") {
                             Ok(q) => {
@@ -530,7 +551,10 @@ fn watcher_loop(
                     continue;
                 } else if heuristic_alerts_static {
                     let argus_start = std::time::Instant::now();
-                    let v = state.argus().analyze_file(&path);
+                    // Realtime profile budget: pass the tracker in so ARGUS
+                    // enforces per-layer/total timeouts instead of running
+                    // with the 60s manual default.
+                    let v = state.argus().analyze_file_with_tracker(&path, &rt_tracker);
                     if rt_tracker.phase_expired(argus_start, rt_tracker.budget().max_yara_duration)
                     {
                         rt_tracker.record_timeout(argus::budget::TimeoutReason::YaraTimeout);
@@ -646,14 +670,19 @@ fn watcher_loop(
 
                 // H7 fix: deferred trust observation — only clean files build familiarity.
                 // Prevents malware from slowly earning trust through repeated execution.
+                // Signer-aware (audit cross-cutting): authenticode signer feeds
+                // drift detection — a signer change invalidates prior trust.
                 if final_score == 0 && !result.infected {
                     if let Some(tg) = state.trust_graph() {
                         let file_key = path.to_string_lossy().to_lowercase();
-                        tg.observe(
+                        let drift = tg.observe_with_signer(
                             &file_key,
                             crate::trust_graph::TrustNodeKind::Executable,
-                            None,
+                            argus_verdict.explanation.signer.as_deref(),
                         );
+                        if let Some(d) = drift {
+                            warn!(file = %path.display(), drift = %d.explanation, "trust-graph signer drift");
+                        }
                     }
                 }
 
@@ -699,11 +728,13 @@ fn watcher_loop(
                         let sb_sha256 = argus_verdict.sha256.clone();
                         let sb_dc = Arc::clone(&detections_count);
                         let sb_config = sandbox_config.clone();
+                        let sb_roots = watched_roots_vec.clone();
                         if let Err(e) = std::thread::Builder::new()
                             .name("watcher-sandbox".into())
                             .spawn(move || {
                                 sandbox_detonation_background(
                                     sb_path, sb_state, sb_score, sb_sha256, sb_dc, sb_config,
+                                    sb_roots,
                                 );
                             })
                         {
@@ -729,8 +760,13 @@ fn watcher_loop(
                 );
                 let threat_name = threat_name_opt.unwrap_or_default();
 
-                // Update cache.
-                if result.error.is_none() {
+                // Update cache. An ARGUS analysis-error verdict (read
+                // failure / sharing violation) is NOT a clean result —
+                // never cache it; leaving the file uncached retries it on
+                // the next modify event.
+                if result.error.is_none()
+                    && (is_threat || crate::ipc::argus_analysis_error(&argus_verdict).is_none())
+                {
                     cache.record_with_metadata(&path, &path_meta, !is_threat);
                 }
 
@@ -744,8 +780,23 @@ fn watcher_loop(
                     detections_count.fetch_add(1, Ordering::Relaxed);
 
                     // Auto memory scan if the detected file is a running process.
+                    // Fire-and-forget on a background thread (same pattern as
+                    // sandbox detonation): scan_process_simple can burn its full
+                    // 30s budget — running it inline would stall the single
+                    // watcher thread right after a real detection, exactly when
+                    // follow-on payloads of the same intrusion are being written.
                     let path_str_for_mem = path.to_string_lossy().to_string();
-                    state.auto_memory_scan_if_running(&path_str_for_mem, argus_verdict.score);
+                    let mem_state = Arc::clone(&state);
+                    let mem_score = argus_verdict.score;
+                    if let Err(e) = std::thread::Builder::new()
+                        .name("watcher-memscan".into())
+                        .spawn(move || {
+                            mem_state.auto_memory_scan_if_running(&path_str_for_mem, mem_score);
+                        })
+                    {
+                        warn!(error = %e, "failed to spawn auto memory scan thread");
+                        // Not fatal — detection + quarantine still proceed.
+                    }
 
                     // TOCTOU Phase 3: revalidate identity BEFORE quarantine.
                     // Scanning wrong file is bad. Quarantining wrong file is CRITICAL.
@@ -820,8 +871,16 @@ fn sandbox_detonation_background(
     sha256: String,
     detections_count: Arc<AtomicU64>,
     sandbox_config: crate::config::SandboxConfig,
+    watched_roots: Vec<PathBuf>,
 ) {
     use tracing::{debug, info, warn};
+
+    // TOCTOU: capture file identity BEFORE detonation. The detonation window
+    // (up to timeout_sec + 5, ~35s) is by far the longest capture→quarantine
+    // gap in the module; revalidate before the escalation quarantine below so
+    // a same-path file swap during detonation doesn't get a different file
+    // object encrypted-and-deleted.
+    let file_id = file_identity::FileIdentity::capture(&path);
 
     let no_cancel = std::sync::atomic::AtomicBool::new(false);
     match crate::sandbox_worker::detonate(&path, &sandbox_config, &no_cancel) {
@@ -878,6 +937,27 @@ fn sandbox_detonation_background(
 
                     let threat_name =
                         format!("ARGUS.Behavioral.{}.{}", final_verdict.label(), final_score);
+
+                    // TOCTOU: revalidate identity across the detonation window
+                    // BEFORE quarantine (mirror of the main threat path).
+                    match &file_id {
+                        Some(fid) => {
+                            if let Err(mismatch) = fid.revalidate(&watched_roots) {
+                                warn!(
+                                    file = %path.display(),
+                                    reason = %mismatch,
+                                    "TOCTOU: identity changed during detonation — quarantine PREVENTED"
+                                );
+                                return;
+                            }
+                        }
+                        None => {
+                            // Reparse point or unresolvable at capture → reject.
+                            debug!(file = %path.display(), "sandbox escalation skipped: no valid file identity");
+                            return;
+                        }
+                    }
+
                     warn!(
                         file = %path.display(),
                         threat = %threat_name,
@@ -1089,7 +1169,14 @@ fn fish_handle_burst(
     description: &str,
 ) {
     let fish_diag = state.fish_diagnostics();
-    let response_mode = ResponseType::from_config(&fish_diag.active_response);
+    // observe_only is the master switch: a config with observe_only = true
+    // must NEVER take process action, even if active_response says
+    // "suspend"/"terminate" (stale or misread knob).
+    let response_mode = if fish_diag.observe_only {
+        ResponseType::Observe
+    } else {
+        ResponseType::from_config(&fish_diag.active_response)
+    };
 
     match response_mode {
         ResponseType::Observe => {
@@ -1181,21 +1268,36 @@ fn fish_handle_burst(
 }
 
 fn collect_overflow_rescan_files(dir: &std::path::Path, out: &mut Vec<PathBuf>, cap: usize) {
+    // Recurse (depth-limited) so dropped events in subdirectories are also
+    // recovered after a storm — a flat top-level rescan missed any file
+    // written deeper in the overflowed tree. Files still pass the full skip
+    // filter chain (should_skip_file, exclusions, extension filter) in the
+    // main scan loop, so only reparse-point and depth guards are needed here.
+    const MAX_DEPTH: u32 = 8;
+    fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>, max_len: usize, depth: u32) {
+        if depth > MAX_DEPTH || out.len() >= max_len {
+            return;
+        }
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            if out.len() >= max_len {
+                break;
+            }
+            let path = entry.path();
+            // Never follow reparse points (symlink/junction loops).
+            if file_identity::is_reparse_point(&path) {
+                continue;
+            }
+            if path.is_file() {
+                out.push(path);
+            } else if path.is_dir() {
+                walk(&path, out, max_len, depth + 1);
+            }
+        }
+    }
     let max_len = DEBOUNCE_CAP.saturating_add(cap);
-    if out.len() >= max_len {
-        return;
-    }
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        if out.len() >= max_len {
-            break;
-        }
-        let path = entry.path();
-        if path.is_file() {
-            out.push(path);
-        }
-    }
+    walk(dir, out, max_len, 0);
 }

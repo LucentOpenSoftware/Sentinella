@@ -75,7 +75,27 @@ impl Database {
         const CURRENT_VERSION: i64 = 4; // v4: per-job perf fields on scans.
         let target = MIGRATIONS.iter().map(|(v, _)| *v).max().unwrap_or(CURRENT_VERSION).max(CURRENT_VERSION);
 
-        if version < target {
+        // Audit fix (fresh-database wedge): the base SCHEMA above creates
+        // `scans` already INCLUDING the v4 perf columns, and SQLite's
+        // ALTER TABLE ADD COLUMN is not idempotent — running migration v4
+        // against a fresh DB failed with "duplicate column name", rolled
+        // back, halted the chain, and re-ran (re-failing, with an error
+        // log) on every daemon start, so no future v5+ migration would
+        // ever apply on those installs. When the base schema already
+        // carries the migrated columns the DB is at `target` by
+        // construction: record the version WITHOUT re-running the
+        // migration. Genuine pre-v4 DBs (columns absent) still migrate
+        // below. The v4 ALTERs run inside one BEGIN/COMMIT, so the three
+        // columns exist all-or-nothing and probing one is sufficient.
+        let base_schema_current =
+            version < target && column_exists(&conn, "scans", "bytes_scanned");
+        if base_schema_current {
+            let _ = conn.execute(
+                "INSERT INTO schema_version (version) VALUES (?1)",
+                params![target],
+            );
+            info!(from = version, to = target, "base schema already current — version recorded without re-running migrations");
+        } else if version < target {
             // R3-21: wrap each migration in BEGIN/COMMIT so partial DDL
             // failure rolls back cleanly.
             //
@@ -136,11 +156,18 @@ impl Database {
             error!(%e, "failed to insert scan record");
         }
         let _ = self.conn.execute(
-            // Audit fix: tie-break on rowid so same-second timestamps never
-            // evict a newer row (rowid is monotonic insert order).
+            // Audit fix: exclude scan rows still referenced by detections.
+            // With PRAGMA foreign_keys=ON, deleting a scan that has live
+            // detections fails the WHOLE statement; detections are retained
+            // at 20k rows vs scans at 5k, so eviction-age scans routinely
+            // still have detections and this delete silently no-opped —
+            // unbounded scans growth, defeating R9. Skipping referenced
+            // rows bounds scans at RETENTION_ROWS + live detections.
+            // Tie-break on rowid so same-second timestamps never evict a
+            // newer row (rowid is monotonic insert order).
             "DELETE FROM scans WHERE rowid NOT IN (
                 SELECT rowid FROM scans ORDER BY started_at DESC, rowid DESC LIMIT ?1
-            )",
+            ) AND scan_id NOT IN (SELECT scan_id FROM detections)",
             params![RETENTION_ROWS],
         );
     }
@@ -394,16 +421,32 @@ impl Database {
     //  Quarantine
     // ═══════════════════════════════════════════════════════
 
-    pub fn insert_quarantine_item(&self, item: &QuarantineRow) {
-        if let Err(e) = self.conn.execute(
-            "INSERT INTO quarantine (quarantine_id, original_path, vault_path, virus_name, sha256, original_size, quarantined_at, scan_id, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![item.quarantine_id, item.original_path, item.vault_path, item.virus_name, item.sha256, item.original_size, item.quarantined_at, item.scan_id, item.status],
-        ) { error!(%e, "failed to insert quarantine item"); }
+    pub fn insert_quarantine_item(&self, item: &QuarantineRow) -> Result<(), String> {
+        // Returns Result for the same commit-ordering discipline as
+        // update_quarantine_status: callers delete the original file only
+        // after this row is durable. Swallowing a failure here (disk full,
+        // I/O error, locked DB) meant the original was deleted while the
+        // row carrying sha256/original_path/vault_path never landed — the
+        // vault blob became an unlisted, unrestorable, never-GC'd orphan.
+        self.conn
+            .execute(
+                "INSERT INTO quarantine (quarantine_id, original_path, vault_path, virus_name, sha256, original_size, quarantined_at, scan_id, status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![item.quarantine_id, item.original_path, item.vault_path, item.virus_name, item.sha256, item.original_size, item.quarantined_at, item.scan_id, item.status],
+            )
+            .map_err(|e| {
+                error!(%e, "failed to insert quarantine item");
+                format!("DB insert failed: {e}")
+            })
+            .map(|_| ())
     }
 
-    pub fn get_quarantine_item(&self, id: &str) -> Option<QuarantineRow> {
-        self.conn.query_row(
+    pub fn get_quarantine_item(&self, id: &str) -> Result<Option<QuarantineRow>, String> {
+        // Returns Result for the same reason insert_quarantine_item does:
+        // the previous `.ok()` masked real DB errors (locked DB, I/O error,
+        // schema drift) as "not found", sending restore/delete flows down
+        // the wrong branch and hiding storage corruption from the operator.
+        match self.conn.query_row(
             "SELECT quarantine_id, original_path, vault_path, virus_name, sha256, original_size, quarantined_at, scan_id, status FROM quarantine WHERE quarantine_id = ?1",
             params![id],
             |row| Ok(QuarantineRow {
@@ -411,7 +454,14 @@ impl Database {
                 virus_name: row.get(3)?, sha256: row.get(4)?, original_size: row.get(5)?,
                 quarantined_at: row.get(6)?, scan_id: row.get(7)?, status: row.get(8)?,
             }),
-        ).ok()
+        ) {
+            Ok(row) => Ok(Some(row)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => {
+                error!(%e, "failed to read quarantine item");
+                Err(format!("DB read failed: {e}"))
+            }
+        }
     }
 
     pub fn list_quarantine(&self) -> Vec<QuarantineRow> {
@@ -597,6 +647,18 @@ impl Database {
             }),
         ).ok()
     }
+}
+
+/// True if `table` currently has a column named `column` (PRAGMA table_info).
+/// Used to detect that the base SCHEMA already created columns a migration
+/// would ADD, since SQLite has no idempotent `ADD COLUMN`.
+fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
+    conn.prepare(&format!("PRAGMA table_info({table})"))
+        .and_then(|mut stmt| {
+            let names = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            Ok(names.filter_map(|n| n.ok()).any(|n| n == column))
+        })
+        .unwrap_or(false)
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -824,6 +886,46 @@ mod tests {
         assert_eq!(legacy_back.clamav_phase_us, 0);
         assert_eq!(legacy_back.argus_phase_us, 0);
 
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Fresh-database wedge regression: the base SCHEMA already creates the
+    /// v4 perf columns, so a fresh DB must be recorded at the current schema
+    /// version WITHOUT re-running the v4 ALTERs — those fail with
+    /// "duplicate column name" on a fresh DB, halting the migration chain
+    /// for every future version.
+    #[test]
+    fn fresh_db_records_current_schema_version() {
+        let path = tmp_db("fresh-version");
+
+        let version_of = |db: &Database| -> i64 {
+            db.conn
+                .query_row(
+                    "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+
+        let db = Database::open(&path).expect("open fresh db");
+        assert_eq!(version_of(&db), 4, "fresh DB must record the base-schema version");
+        drop(db);
+
+        // Re-open: idempotent — version stays, no failing migration re-runs.
+        let db = Database::open(&path).expect("reopen db");
+        assert_eq!(version_of(&db), 4);
+        // And inserts into the base-schema columns work (guards against a
+        // version stamp that skipped a genuinely-needed migration).
+        db.insert_scan(&ScanRow {
+            scan_id: "post-stamp".into(),
+            scan_type: "file".into(),
+            status: "clean".into(),
+            started_at: 1_700_000_010,
+            ..ScanRow::default()
+        });
+        assert_eq!(db.total_scans(), 1);
         drop(db);
         let _ = std::fs::remove_file(&path);
     }

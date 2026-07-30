@@ -273,6 +273,10 @@ impl YaraEngine {
     }
 
     /// Hot-reload rules from the previously configured directories.
+    ///
+    /// NOTE: compiles on the CALLING thread (via `load_rules`). Callers on
+    /// small-stack threads must use `load_rules_on_large_stack` instead —
+    /// cranelift JIT compilation can exhaust a 1 MB stack.
     pub fn reload(&self) -> Result<u64, String> {
         let dirs = self
             .rule_dirs
@@ -563,6 +567,11 @@ const MAX_RULE_FILE_BYTES: u64 = 4 * 1024 * 1024;
 /// otherwise stall the daemon by dumping thousands of empty `.yar` files.
 const MAX_RULE_FILES: usize = 1000;
 
+/// Supply-chain hardening: cap directory recursion depth. Rule loading may
+/// run on a thread with a small (1 MB) stack — a deeply nested directory
+/// tree dropped into the rules dir could otherwise overflow it.
+const MAX_RULE_DIR_DEPTH: usize = 32;
+
 /// Return true if the file-type entry represents any kind of symbolic link.
 /// On Windows this also covers junctions and symlink-files/dirs, which classic
 /// `is_symlink()` may miss for directory junctions.
@@ -590,7 +599,8 @@ fn is_any_symlink(meta: &std::fs::Metadata) -> bool {
 ///     otherwise redirect rule loading at attacker-controlled content outside
 ///     the daemon's runtime root);
 ///   - enforces a per-file size cap;
-///   - caps total file count.
+///   - caps total file count;
+///   - caps recursion depth (see `MAX_RULE_DIR_DEPTH`).
 fn collect_rule_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     // Refuse if the root itself is a symlink — the whole subtree is then
     // attacker-relocatable.
@@ -606,12 +616,21 @@ fn collect_rule_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     }
 
     let mut files = Vec::new();
-    collect_recursive(dir, &mut files)?;
+    collect_recursive(dir, &mut files, 0)?;
     files.sort(); // Deterministic load order.
     Ok(files)
 }
 
-fn collect_recursive(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
+fn collect_recursive(dir: &Path, files: &mut Vec<PathBuf>, depth: usize) -> Result<(), String> {
+    if depth >= MAX_RULE_DIR_DEPTH {
+        warn!(
+            path = %dir.display(),
+            cap = MAX_RULE_DIR_DEPTH,
+            "YARA rule directory depth cap reached — skipping deeper levels"
+        );
+        return Ok(());
+    }
+
     let entries =
         std::fs::read_dir(dir).map_err(|e| format!("Cannot read {}: {e}", dir.display()))?;
 
@@ -634,7 +653,7 @@ fn collect_recursive(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String>
         }
 
         if lmeta.is_dir() {
-            collect_recursive(&path, files)?;
+            collect_recursive(&path, files, depth + 1)?;
             if files.len() >= MAX_RULE_FILES {
                 warn!(cap = MAX_RULE_FILES, "YARA rule file cap reached — truncating");
                 files.truncate(MAX_RULE_FILES);

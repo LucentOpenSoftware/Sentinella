@@ -22,7 +22,7 @@ fn main() {
 #[cfg(target_os = "windows")]
 mod windows_probe {
     use std::mem::size_of;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
     use windows::Win32::System::Diagnostics::Etw::*;
@@ -31,6 +31,14 @@ mod windows_probe {
     // ═══════════════════════════════════════════════════════════════
     //  Drop guard — ensures StopTraceW is called even on panic
     // ═══════════════════════════════════════════════════════════════
+
+    /// Allocate zeroed storage for an `EVENT_TRACE_PROPERTIES` buffer with
+    /// guaranteed 8-byte alignment. `Vec<u8>` is only 1-byte aligned, but the
+    /// struct contains 8-byte-aligned fields (`WNODE_HEADER.BufferHandle`,
+    /// `CONTROLTRACE_HANDLE`) — casting u8 storage is misaligned-reference UB.
+    fn aligned_props_storage(props_size: usize) -> Vec<u64> {
+        vec![0u64; props_size.div_ceil(8)]
+    }
 
     struct SessionGuard {
         handle: CONTROLTRACE_HANDLE,
@@ -58,7 +66,7 @@ mod windows_probe {
                 return;
             }
             self.active = false;
-            let mut stop_buf = vec![0u8; self.props_size];
+            let mut stop_buf = aligned_props_storage(self.props_size);
             let stop_props =
                 unsafe { &mut *(stop_buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES) };
             stop_props.Wnode.BufferSize = self.props_size as u32;
@@ -199,7 +207,7 @@ mod windows_probe {
 
         // Allocate EVENT_TRACE_PROPERTIES + extra for session name.
         let props_size = size_of::<EVENT_TRACE_PROPERTIES>() + (session_name_wide.len() * 2) + 256;
-        let mut props_buf = vec![0u8; props_size];
+        let mut props_buf = aligned_props_storage(props_size);
         let props = unsafe { &mut *(props_buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES) };
 
         props.Wnode.BufferSize = props_size as u32;
@@ -223,9 +231,13 @@ mod windows_probe {
         // operation it is small but checked_add eliminates a 32-bit-usize wrap
         // that would otherwise let `<= props_buf.len()` succeed with a wrapped
         // tiny end → OOB slice panic. The cost is one branch per session start.
+        // Byte view over the aligned storage for the session-name copy.
+        let props_bytes = unsafe {
+            std::slice::from_raw_parts_mut(props_buf.as_mut_ptr() as *mut u8, props_buf.len() * 8)
+        };
         if let Some(end) = name_offset.checked_add(name_bytes.len()) {
-            if end <= props_buf.len() {
-                props_buf[name_offset..end].copy_from_slice(name_bytes);
+            if end <= props_bytes.len() {
+                props_bytes[name_offset..end].copy_from_slice(name_bytes);
             }
         }
 
@@ -265,7 +277,7 @@ mod windows_probe {
                 stop_stale_session(&session_name_wide, props_size);
 
                 // Rebuild props buffer for retry.
-                let mut retry_buf = vec![0u8; props_size];
+                let mut retry_buf = aligned_props_storage(props_size);
                 let retry_props =
                     unsafe { &mut *(retry_buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES) };
                 retry_props.Wnode.BufferSize = props_size as u32;
@@ -275,8 +287,14 @@ mod windows_probe {
                 retry_props.LoggerNameOffset = size_of::<EVENT_TRACE_PROPERTIES>() as u32;
                 retry_props.EnableFlags = EVENT_TRACE_FLAG(0x0000_0001);
                 let name_off = retry_props.LoggerNameOffset as usize;
-                if name_off + name_bytes.len() <= retry_buf.len() {
-                    retry_buf[name_off..name_off + name_bytes.len()].copy_from_slice(name_bytes);
+                let retry_bytes = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        retry_buf.as_mut_ptr() as *mut u8,
+                        retry_buf.len() * 8,
+                    )
+                };
+                if name_off + name_bytes.len() <= retry_bytes.len() {
+                    retry_bytes[name_off..name_off + name_bytes.len()].copy_from_slice(name_bytes);
                 }
                 let retry_props =
                     unsafe { &mut *(retry_buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES) };
@@ -312,7 +330,7 @@ mod windows_probe {
     }
 
     fn stop_stale_session(session_name_wide: &[u16], props_size: usize) {
-        let mut stop_buf = vec![0u8; props_size];
+        let mut stop_buf = aligned_props_storage(props_size);
         let stop_props = unsafe { &mut *(stop_buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES) };
         stop_props.Wnode.BufferSize = props_size as u32;
         stop_props.LoggerNameOffset = size_of::<EVENT_TRACE_PROPERTIES>() as u32;
@@ -334,8 +352,6 @@ mod windows_probe {
 
     /// Global event counter for the callback.
     static EVENT_COUNT: AtomicU64 = AtomicU64::new(0);
-    /// Global stop flag.
-    static CALLBACK_STOP: AtomicBool = AtomicBool::new(false);
 
     /// Bare extern "system" callback — ETW callbacks cannot capture closures.
     unsafe extern "system" fn probe_callback(event: *mut EVENT_RECORD) {
@@ -363,7 +379,6 @@ mod windows_probe {
 
         // Reset counters.
         EVENT_COUNT.store(0, Ordering::Relaxed);
-        CALLBACK_STOP.store(false, Ordering::Relaxed);
 
         // Build EVENT_TRACE_LOGFILEW for real-time consumption.
         let mut logfile: EVENT_TRACE_LOGFILEW = unsafe { std::mem::zeroed() };
@@ -415,7 +430,8 @@ mod windows_probe {
         let close_result = unsafe { CloseTrace(trace_handle) };
         println!("  CloseTrace result: {}", close_result.0);
 
-        // Wait for the consumer thread (with timeout).
+        // Wait for the consumer thread — blocks until the CloseTrace above
+        // unblocks ProcessTrace (no timeout; CloseTrace guarantees the exit).
         let _ = consumer_thread.join();
         println!("  Consumer thread joined.");
     }

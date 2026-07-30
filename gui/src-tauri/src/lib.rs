@@ -61,6 +61,16 @@ fn spawn_elevated_cli(args: &[&str]) -> Result<bool, String> {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
+    // lpParameters is a single space-joined string parsed by the shell,
+    // so args MUST stay compile-time constant tokens with no whitespace
+    // or quotes — otherwise quoting bugs become argument injection into
+    // an elevated process. All current call sites pass fixed subcommand
+    // names ("enable-realtime", "disable-realtime", "pause-protection").
+    debug_assert!(
+        args.iter()
+            .all(|a| !a.is_empty() && !a.chars().any(|c| c.is_whitespace() || c == '"')),
+        "spawn_elevated_cli args must be constant tokens without whitespace/quotes"
+    );
     let args_str = args.join(" ");
     let args_wide: Vec<u16> = std::ffi::OsStr::new(&args_str)
         .encode_wide()
@@ -196,7 +206,10 @@ async fn cancel_scan() -> Result<Value, String> {
 
 #[tauri::command]
 async fn get_scan_history() -> Result<Value, String> {
-    daemon_client::call_simple("scan.history").await.map_err(Into::into)
+    // Central MethodClass enforcement: scan.history is AuthenticatedRead.
+    daemon_client::call_auth("scan.history", serde_json::json!({}))
+        .await
+        .map_err(Into::into)
 }
 
 // ── Quarantine ──────────────────────────────────────────────────
@@ -291,8 +304,13 @@ async fn start_signature_update() -> Result<Value, String> {
 #[tauri::command]
 async fn export_scan_report() -> Result<Value, String> {
     let engine = daemon_client::call_simple("engine.status").await.map_err(|e| e.to_string())?;
-    let stats = daemon_client::call_simple("stats.runtime").await.map_err(|e| e.to_string())?;
-    let history = daemon_client::call_simple("scan.history").await.map_err(|e| e.to_string())?;
+    // stats.runtime / scan.history are AuthenticatedRead (central policy gate).
+    let stats = daemon_client::call_auth("stats.runtime", serde_json::json!({}))
+        .await
+        .map_err(|e| e.to_string())?;
+    let history = daemon_client::call_auth("scan.history", serde_json::json!({}))
+        .await
+        .map_err(|e| e.to_string())?;
     // R7-LETHAL: quarantine list now requires auth.
     let quarantine = daemon_client::call_auth("quarantine.list", serde_json::json!({}))
         .await
@@ -619,7 +637,10 @@ async fn reload_argus() -> Result<Value, String> {
 /// Get ARGUS intelligence pack info.
 #[tauri::command]
 async fn get_argus_packs() -> Result<Value, String> {
-    daemon_client::call_simple("argus.packs").await.map_err(Into::into)
+    // Central MethodClass enforcement: argus.packs is AuthenticatedRead.
+    daemon_client::call_auth("argus.packs", serde_json::json!({}))
+        .await
+        .map_err(Into::into)
 }
 
 /// Get ARGUS verdicts — by scan_id or recent.
@@ -629,7 +650,11 @@ async fn get_argus_verdicts(scan_id: Option<String>) -> Result<Value, String> {
         Some(id) => serde_json::json!({"scan_id": id}),
         None => serde_json::json!({}),
     };
-    daemon_client::call("argus.verdicts", params).await.map_err(Into::into)
+    // R7-LETHAL parity: daemon now requires auth for argus.verdicts
+    // (verdict history leaks signature names + file paths).
+    daemon_client::call_auth("argus.verdicts", params)
+        .await
+        .map_err(Into::into)
 }
 
 // ── Security ────────────────────────────────────────────────────
@@ -815,7 +840,10 @@ async fn splash_ready(app: tauri::AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 async fn get_runtime_stats() -> Result<Value, String> {
-    daemon_client::call_simple("stats.runtime").await.map_err(Into::into)
+    // Central MethodClass enforcement: stats.runtime is AuthenticatedRead.
+    daemon_client::call_auth("stats.runtime", serde_json::json!({}))
+        .await
+        .map_err(Into::into)
 }
 
 #[tauri::command]
@@ -837,7 +865,10 @@ async fn get_trust_status() -> Result<Value, String> {
 
 #[tauri::command]
 async fn get_signature_sources() -> Result<Value, String> {
-    daemon_client::call_simple("sources.status").await.map_err(Into::into)
+    // Central MethodClass enforcement: sources.status is AuthenticatedRead.
+    daemon_client::call_auth("sources.status", serde_json::json!({}))
+        .await
+        .map_err(Into::into)
 }
 
 #[tauri::command]
@@ -898,8 +929,17 @@ pub fn run() {
     // Correct fix: detect --elevated-restart at the child's main()
     // entry and conditionally skip the single_instance plugin
     // registration. The child becomes its own canonical instance.
+    //
+    // Provenance gate (audit finding): the bypass also requires the
+    // process to actually BE elevated. Without this, any local
+    // unprivileged process could launch `Sentinella.exe --elevated-restart`
+    // repeatedly, spawning unlimited GUI instances (each with its own
+    // supervisor thread); in dev/portable installs two concurrent
+    // supervisors can race a dead daemon spawn and feed the crash-loop
+    // detector. Legitimate use only ever comes from the UAC-approved
+    // relaunch, so gating on is_elevated() loses nothing.
     let elevated_restart =
-        std::env::args().any(|a| a == ELEVATED_RESTART_ARG);
+        std::env::args().any(|a| a == ELEVATED_RESTART_ARG) && is_elevated();
 
     let mut builder = tauri::Builder::default();
     if !elevated_restart {
@@ -920,11 +960,12 @@ pub fn run() {
         }));
     } else {
         log::info!(
-            "elevated restart detected (CLI arg present) — single_instance plugin SKIPPED for this process"
+            "elevated restart detected (CLI arg + process is elevated) — single_instance plugin SKIPPED for this process"
         );
     }
     builder
-        .plugin(tauri_plugin_opener::init())
+        // Note: tauri-plugin-opener was dropped (audit) — nothing in the
+        // frontend uses it; dialog.open covers the open() call sites.
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -975,6 +1016,15 @@ pub fn run() {
                             }
                         }
                         "quick_scan" => {
+                            // Debounce (audit finding): each click spawns a
+                            // thread + pipe connection, so a spam-clicking
+                            // user could multiply threads/runtimes. Allow one
+                            // in-flight quick-scan dispatch at a time.
+                            static QUICK_SCAN_IN_FLIGHT: std::sync::atomic::AtomicBool =
+                                std::sync::atomic::AtomicBool::new(false);
+                            if QUICK_SCAN_IN_FLIGHT.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                                return;
+                            }
                             // Trigger quick scan via IPC (fire and forget).
                             let handle = app.clone();
                             std::thread::spawn(move || {
@@ -982,7 +1032,8 @@ pub fn run() {
                                     if state == "ready" {
                                         // Send scan.start via sync pipe.
                                         let _ = tray_send_command_sync_auth(
-                                            r#"{"jsonrpc":"2.0","id":1,"method":"scan.start","params":{"type":"quick"}}"#
+                                            "scan.start",
+                                            serde_json::json!({"type": "quick"}),
                                         );
                                     }
                                 }
@@ -992,6 +1043,7 @@ pub fn run() {
                                     let _ = window.unminimize();
                                     let _ = window.set_focus();
                                 }
+                                QUICK_SCAN_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
                             });
                         }
                         _ => {}
@@ -1157,13 +1209,7 @@ pub fn run() {
 }
 
 /// Send an authenticated JSON-RPC command to daemon synchronously.
-fn tray_send_command_sync_auth(json_request: &str) -> Option<()> {
-    let request: serde_json::Value = serde_json::from_str(json_request).ok()?;
-    let method = request.get("method")?.as_str()?;
-    let mut params = request
-        .get("params")
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({}));
+fn tray_send_command_sync_auth(method: &str, mut params: serde_json::Value) -> Option<()> {
     match &mut params {
         serde_json::Value::Object(map) => {
             map.insert(
@@ -1188,13 +1234,7 @@ fn tray_check_daemon_sync() -> Option<(String, u64)> {
 }
 
 fn blocking_daemon_call(method: &str, params: serde_json::Value) -> Option<serde_json::Value> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_io()
-        .enable_time()
-        .build()
-        .ok()?;
-
-    rt.block_on(async {
+    crate::daemon_client::blocking_runtime().block_on(async {
         tokio::time::timeout(
             std::time::Duration::from_secs(6),
             daemon_client::call(method, params),

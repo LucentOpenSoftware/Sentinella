@@ -17,8 +17,9 @@
 //!     ├─ cheap reject: not a browser target           → drop
 //!     ├─ cheap reject: module not under user-writable → drop
 //!     ├─ rate limit (max events/sec)                  → drop
-//!     ├─ dedup (pid, module-path) within window       → drop
+//!     ├─ dedup check (pid, module-path) within window → drop
 //!     ├─ ModuleSignerVerifier::verify                 → Trusted → drop
+//!     ├─ dedup record (slot consumed only post-signer)
 //!     ├─ JavaLineageChecker::has_java_ancestor        → false   → drop
 //!     └─ delegate to weedhack_browser_injection::evaluate (CANONICAL gate)
 //!         → Some(WeedHackSignal::BrowserInjectionFromJava)
@@ -266,10 +267,17 @@ impl BrowserImageLoadFilter {
             return None;
         }
 
-        // ── Dedup (pid, module-path) within window. Browsers re-import
-        //    the same DLL on worker spawn; we only want to score it once
-        //    per campaign window.
-        if !self.allow_pid_module(event.target_pid, &event.loaded_module_path, now) {
+        // ── Dedup check (pid, module-path) within window. Browsers
+        //    re-import the same DLL on worker spawn; we only want to
+        //    score it once per campaign window. CHECK ONLY here — the
+        //    slot is consumed by `record_pid_module` after the signer
+        //    check below. Recording before the signer check would let an
+        //    attacker load a legitimately signed DLL from a path (event
+        //    dropped as Trusted but slot consumed), then swap in an
+        //    unsigned DLL at the same path within the window and reload
+        //    it: the second event would be deduped before the signer was
+        //    ever consulted — a clean evasion of this gate.
+        if self.is_pid_module_seen(event.target_pid, &event.loaded_module_path, now) {
             self.events_deduped.fetch_add(1, Ordering::Relaxed);
             return None;
         }
@@ -286,6 +294,10 @@ impl BrowserImageLoadFilter {
             }
             SignerVerdict::Untrusted => {}
         }
+
+        // ── Consume the dedup slot now that the event survived the
+        //    signer check (see the check-only comment above).
+        self.record_pid_module(event.target_pid, &event.loaded_module_path, now);
 
         // ── Lineage check. Java ancestor is mandatory.
         let has_java = lineage.has_java_ancestor(event.target_pid);
@@ -345,7 +357,23 @@ impl BrowserImageLoadFilter {
         true
     }
 
-    fn allow_pid_module(&self, pid: u32, module_path: &str, now: Instant) -> bool {
+    /// Check-only dedup lookup: true when `(pid, module_path)` was
+    /// recorded within the window. Does NOT insert — the companion
+    /// `record_pid_module` consumes the slot once the event survives
+    /// the signer check.
+    fn is_pid_module_seen(&self, pid: u32, module_path: &str, now: Instant) -> bool {
+        let mut map = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Light incremental eviction: drop entries older than window.
+        map.retain(|_, ts| now.duration_since(*ts) < DEDUP_WINDOW);
+
+        map.contains_key(&(pid, module_path.to_string()))
+    }
+
+    /// Record `(pid, module_path)` in the dedup table. Called only after
+    /// the event survives the signer check so rejected-pre-signer events
+    /// never suppress later re-evaluation of the same path.
+    fn record_pid_module(&self, pid: u32, module_path: &str, now: Instant) {
         let mut map = self.seen.lock().unwrap_or_else(|e| e.into_inner());
 
         // Light incremental eviction: drop entries older than window.
@@ -363,13 +391,7 @@ impl BrowserImageLoadFilter {
             }
         }
 
-        if let Some(ts) = map.get(&key) {
-            if now.duration_since(*ts) < DEDUP_WINDOW {
-                return false;
-            }
-        }
         map.insert(key, now);
-        true
     }
 }
 
@@ -482,6 +504,37 @@ mod tests {
         assert!(third.is_none(), "ongoing dedup");
         assert_eq!(f.events_deduped.load(Ordering::Relaxed), 2);
         assert_eq!(f.events_emitted.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn trusted_load_does_not_consume_dedup_slot_for_later_swap() {
+        // Swap-and-reload evasion regression: a signed load from a path
+        // is dropped as Trusted; if it consumed the dedup slot, an
+        // unsigned DLL swapped in at the same path within the window
+        // would be deduped before the signer was consulted. The slot is
+        // only consumed after the signer check, so the second load is
+        // re-evaluated and emits.
+        let f = BrowserImageLoadFilter::new();
+        let path = "C:\\Users\\t\\AppData\\Local\\Temp\\swap.dll";
+        let t0 = Instant::now();
+        let signed = f.process_event_at(
+            raw(123, "chrome.exe", path),
+            &MockVerifier(SignerVerdict::Trusted),
+            &MockLineage(true),
+            t0,
+        );
+        assert!(signed.is_none(), "signed load must drop as Trusted");
+        let swapped = f.process_event_at(
+            raw(123, "chrome.exe", path),
+            &MockVerifier(SignerVerdict::Untrusted),
+            &MockLineage(true),
+            t0 + Duration::from_secs(5),
+        );
+        assert_eq!(
+            swapped,
+            Some(WeedHackSignal::BrowserInjectionFromJava),
+            "unsigned swap within window must be re-evaluated, not deduped"
+        );
     }
 
     #[test]

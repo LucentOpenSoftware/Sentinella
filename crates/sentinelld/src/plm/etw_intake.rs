@@ -42,17 +42,6 @@ impl EtwIntakeDiagnostics {
     }
 }
 
-/// PLM mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PlmMode {
-    /// Real-time ETW process events.
-    Etw,
-    /// Periodic process snapshot polling.
-    Snapshot,
-    /// ETW primary + snapshot periodic cleanup.
-    Hybrid,
-}
-
 /// Try to start ETW process monitoring.
 /// Returns a thread handle if successful, or an error string.
 /// The thread runs until `running` is set to false.
@@ -237,6 +226,12 @@ fn run_etw_session(
 
     let trace_handle = unsafe { OpenTraceW(&mut logfile) };
     if trace_handle.Value == u64::MAX {
+        // R3-10: clear the callback context statics installed above —
+        // the success path zeroes them after ProcessTrace returns; this
+        // early-return branch must do the same so no dangling raw
+        // pointers outlive the session loop.
+        CALLBACK_GRAPH.store(0, Ordering::SeqCst);
+        CALLBACK_DIAG.store(0, Ordering::SeqCst);
         // Stop the session we just started (line ~183) before bailing —
         // otherwise it leaks as an orphaned kernel session until the next
         // run's stale-session cleanup reclaims it.

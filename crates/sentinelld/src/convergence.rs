@@ -110,13 +110,18 @@ impl ConvergenceLedger {
     /// NEVER applied when ClamAV is positive.
     /// No-ops if called after `finalize()`.
     ///
-    /// R4-CV1: callers historically invoke this exactly once per ledger. If
-    /// called multiple times we keep the LARGEST discount so a later
-    /// adversary-controlled path cannot reduce a previously-applied
-    /// strong trust discount, AND so the "trusted, no action" semantic is
-    /// not erased by a zero-discount follow-up. Bumping (not overwriting)
-    /// also means the test `apply_trust_discount(8) + apply_trust_discount(0)`
-    /// still ends with discount=8.
+    /// R4-CV1: all production callers invoke this exactly once per ledger,
+    /// so the merge policy below only matters if a future caller adds a
+    /// second call. On a repeat call we keep the LARGEST discount seen.
+    /// Note the direction of risk honestly: the discount SUBTRACTS from the
+    /// final score (`before_trust.saturating_sub(self.trust_discount)`), so
+    /// a larger discount is the MORE suppressive value — max() is sticky
+    /// toward suppression, not away from it. It exists to make the merge
+    /// deterministic (order-independent) and to keep the tested
+    /// `apply_trust_discount(8) + apply_trust_discount(0)` sequence at
+    /// discount=8, NOT as an integrity defence. Producers of `discount`
+    /// must therefore remain trusted paths (trust-DB lookups), never
+    /// attacker-influenced input — a bogus large discount would stick.
     pub fn apply_trust_discount(&mut self, discount: u32, finding: Option<argus::Finding>) {
         debug_assert!(
             !self.finalized,

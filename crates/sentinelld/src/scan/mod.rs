@@ -43,6 +43,9 @@ const QUICK_SCAN_SKIP_DIRS: &[&str] = &[
 ///
 /// They contain tombstoned or privileged artifacts that can pin in-process
 /// scanners and prevent cancellation from completing.
+///
+/// R13: matched only at DRIVE ROOTS (`C:\$RECYCLE.BIN`, …) — a bare-name
+/// match anywhere in the tree let user content escape every scan profile.
 const ALWAYS_SKIP_SYSTEM_DIRS: &[&str] = &["$recycle.bin", "system volume information"];
 
 /// Check if a file path should be excluded from scanning.
@@ -135,7 +138,17 @@ pub fn should_skip_dir(path: &Path, quick_scan: bool) -> bool {
             .iter()
             .any(|skip| name_lower == *skip)
         {
-            return true;
+            // R13: these pseudo-dirs are anchored to DRIVE ROOTS — the real
+            // ones only exist at `C:\$RECYCLE.BIN` etc. A user-created
+            // directory named "$recycle.bin" deeper in the tree must NOT
+            // escape full/folder scans by name alone.
+            let at_drive_root = path
+                .parent()
+                .map(|parent| parent.parent().is_none())
+                .unwrap_or(false);
+            if at_drive_root {
+                return true;
+            }
         }
         if name_lower.starts_with("html-tmp.")
             || name_lower.starts_with("pdf-tmp.")
@@ -214,13 +227,23 @@ pub fn is_sentinella_path(path: &Path) -> bool {
         }
     }
 
-    // Sentinella binaries by name (fallback).
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
-    if name == "sentinelld.exe" || name == "sentinella.exe" {
-        return true;
+    // Sentinella's own running binary — by canonical FULL PATH, not bare
+    // filename. R11-LETHAL: the previous name-only fallback skipped ANY
+    // file named "sentinelld.exe"/"sentinella.exe" anywhere on disk, so
+    // renaming malware to sentinelld.exe bypassed every scan path.
+    static SELF_EXE: std::sync::OnceLock<Option<std::path::PathBuf>> =
+        std::sync::OnceLock::new();
+    let self_exe = SELF_EXE.get_or_init(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.canonicalize().ok())
+    });
+    if let Some(self_exe) = self_exe {
+        if let Ok(canon) = path.canonicalize() {
+            if &canon == self_exe {
+                return true;
+            }
+        }
     }
 
     // C1 fix: removed global "research_samples" substring bypass.
@@ -382,11 +405,16 @@ pub fn should_skip_file(path: &Path) -> bool {
     }
 
     // Skip lock files and partial downloads.
-    if name.ends_with(".lock")
-        || name.ends_with(".tmp")
-        || name.ends_with(".crdownload")
-        || name.ends_with(".part")
-    {
+    // R13: `.tmp` is skipped only inside REAL temp directories — previously
+    // a payload named `evil.tmp` ANYWHERE escaped every scan profile (a
+    // `.tmp` is still loadable via lolbins/installers). `.lock`/`.part`/
+    // `.crdownload` stay global: they are locks and partial downloads,
+    // not independently launchable, and the completed rename re-triggers
+    // a scan of the final name.
+    if name.ends_with(".lock") || name.ends_with(".crdownload") || name.ends_with(".part") {
+        return true;
+    }
+    if name.ends_with(".tmp") && is_in_real_temp_dir(path) {
         return true;
     }
 
@@ -401,6 +429,41 @@ pub fn should_skip_file(path: &Path) -> bool {
     false
 }
 
+/// Directories that legitimately hold transient tool / ClamAV temp
+/// artifacts, resolved ONCE from the live environment.
+///
+/// R11-LETHAL: the previous domain check was `path.contains("\\temp\\")`
+/// — a substring match satisfied by the commonly world-writable
+/// `C:\temp\` or ANY attacker-created `...\temp\...` directory, so a
+/// file named `esbuild-update.exe`, `go-build123` or `msbuildX.tmp`
+/// there was never scanned. Require PREFIX containment in a real temp
+/// directory (the process %TEMP%, or the daemon's clamav_tmp) instead.
+fn resolved_temp_dirs() -> &'static Vec<std::path::PathBuf> {
+    static TEMP_DIRS: std::sync::OnceLock<Vec<std::path::PathBuf>> = std::sync::OnceLock::new();
+    TEMP_DIRS.get_or_init(|| {
+        let mut dirs = vec![std::env::temp_dir()];
+        let clamav_tmp = crate::paths::paths().clamav_tmp();
+        if !dirs.iter().any(|d| d == &clamav_tmp) {
+            dirs.push(clamav_tmp);
+        }
+        dirs
+    })
+}
+
+/// True if `path` sits inside one of the resolved real temp directories
+/// (prefix match with a path-separator boundary, like `is_excluded`).
+fn is_in_real_temp_dir(path: &Path) -> bool {
+    let p = path.to_string_lossy().to_lowercase();
+    resolved_temp_dirs().iter().any(|dir| {
+        let d = dir.to_string_lossy().to_lowercase();
+        let d = d.trim_end_matches(['\\', '/']);
+        !d.is_empty() && p.starts_with(d) && {
+            let rest = &p[d.len()..];
+            rest.starts_with('\\') || rest.starts_with('/')
+        }
+    })
+}
+
 /// Check if a path is a ClamAV temporary extraction artifact.
 ///
 /// H3 fix: DOMAIN-CONSTRAINED. ClamAV temp patterns only recognized inside
@@ -413,17 +476,8 @@ pub fn should_skip_file(path: &Path) -> bool {
 ///   - `ole2-tmp.<hash>/...`          (OLE2/Office extraction)
 ///   - `clamav-<hash>.tmp`            (generic temp files)
 pub fn is_clamav_temp_artifact(path: &Path) -> bool {
-    let p = path.to_string_lossy().to_lowercase();
-
-    // H3 domain check: must be inside a temp directory.
-    let in_temp = p.contains("\\temp\\")
-        || p.contains("\\tmp\\")
-        || p.contains("/temp/")
-        || p.contains("/tmp/")
-        || p.contains("\\clamav_tmp\\")
-        || p.contains("/clamav_tmp/");
-
-    if !in_temp {
+    // H3/R11 domain check: must be inside a REAL temp directory.
+    if !is_in_real_temp_dir(path) {
         return false;
     }
 
@@ -467,11 +521,9 @@ pub fn is_transient_build_artifact(path: &Path) -> bool {
         .map(|n| n.to_string_lossy().to_lowercase())
         .unwrap_or_default();
 
-    // Domain check: is this file in a temp directory or verified project?
-    let in_temp = p.contains("\\temp\\")
-        || p.contains("\\tmp\\")
-        || p.contains("/temp/")
-        || p.contains("/tmp/");
+    // Domain check: is this file in a REAL temp directory (R11-LETHAL:
+    // prefix containment, not substring) or verified project?
+    let in_temp = is_in_real_temp_dir(path);
     let in_project = is_build_or_dev_path(path); // Already verified project tree.
 
     if !in_temp && !in_project {

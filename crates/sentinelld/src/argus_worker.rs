@@ -140,7 +140,7 @@ pub fn scan_file(
 
     let parsed: WorkerOutput = serde_json::from_slice(&stdout)
         .map_err(|e| format!("ARGUS worker JSON parse failed: {e}"))?;
-    validate_worker_output(&parsed)?;
+    validate_worker_output(&parsed, path)?;
     if !parsed.errors.is_empty() {
         return Err(parsed.errors.join("; "));
     }
@@ -307,9 +307,19 @@ fn read_limited<R: Read>(mut reader: R, limit: usize, name: &str) -> Result<Vec<
     Ok(out)
 }
 
-fn validate_worker_output(parsed: &WorkerOutput) -> Result<(), String> {
+fn validate_worker_output(parsed: &WorkerOutput, requested: &Path) -> Result<(), String> {
     if parsed.path.trim().is_empty() {
         return Err("ARGUS worker JSON missing path".into());
+    }
+    // Worker/daemon desync guard: the reported path must be the file we
+    // asked to scan, or a version-skewed worker would mislabel results.
+    // (argusd echoes the CLI arg verbatim, so a plain compare is exact.)
+    let want = requested.to_string_lossy();
+    if !parsed.path.trim().eq_ignore_ascii_case(&want) {
+        return Err(format!(
+            "ARGUS worker JSON path mismatch: reported {}, requested {want}",
+            parsed.path.trim()
+        ));
     }
     if parsed.score > 100 {
         return Err(format!("ARGUS worker JSON invalid score {}", parsed.score));
@@ -367,7 +377,11 @@ fn resolve_worker_path(configured: &str) -> PathBuf {
     raw
 }
 
-fn project_root_from_target_dir(dir: &Path) -> Option<PathBuf> {
+/// Map a `target/{debug,release}` exe directory back to its project root.
+/// `pub(crate)` so clamav_worker/sandbox_worker enforce the SAME strict
+/// dev-layout policy as `resolve_worker_path` (R9-LETHAL) instead of
+/// walking arbitrary ancestors.
+pub(crate) fn project_root_from_target_dir(dir: &Path) -> Option<PathBuf> {
     let name = dir.file_name()?.to_string_lossy().to_ascii_lowercase();
     if name == "debug" || name == "release" {
         let target = dir.parent()?;

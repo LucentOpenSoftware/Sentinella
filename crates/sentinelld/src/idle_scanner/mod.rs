@@ -97,19 +97,36 @@ impl IdleScanner {
             .name("idle-scanner".into())
             .spawn(move || {
                 idle_scanner_loop(config, engine, app_state, cache, r, fs, st, ct, lp, lc);
-            })
-            .expect("failed to spawn idle scanner thread");
+            });
 
-        info!("idle background scanner started");
-
-        Self {
-            running,
-            files_scanned,
-            state,
-            current_target,
-            last_pause_reason,
-            last_completed,
-            _thread: Some(thread),
+        match thread {
+            Ok(t) => {
+                info!("idle background scanner started");
+                Self {
+                    running,
+                    files_scanned,
+                    state,
+                    current_target,
+                    last_pause_reason,
+                    last_completed,
+                    _thread: Some(t),
+                }
+            }
+            Err(e) => {
+                // Spawn failure (OS resource exhaustion) must degrade, not
+                // abort the daemon: return an inert scanner (running=false).
+                tracing::error!(%e, "failed to spawn idle scanner thread");
+                running.store(false, Ordering::Relaxed);
+                Self {
+                    running,
+                    files_scanned,
+                    state,
+                    current_target,
+                    last_pause_reason,
+                    last_completed,
+                    _thread: None,
+                }
+            }
         }
     }
 
@@ -147,25 +164,88 @@ impl Drop for IdleScanner {
 }
 
 /// Priority-ordered scan targets.
+///
+/// The daemon runs as LocalSystem in session 0, so the process env vars
+/// (USERPROFILE/TEMP/APPDATA/LOCALAPPDATA) expand to the *systemprofile*
+/// tree (`C:\Windows\System32\config\systemprofile`) — scanning those finds
+/// nothing and misses every real user. This is the same bug class the
+/// watcher hit in v0.1.1 (EICAR in the user's Downloads went undetected).
+/// Enumerate real user profiles under `C:\Users\*` exactly like
+/// `AppState::start_watcher` does; fall back to the process env only when
+/// enumeration yields nothing AND the env does not point at systemprofile
+/// (dev/portable mode).
 fn build_scan_targets() -> Vec<PathBuf> {
-    let home = std::env::var("USERPROFILE").unwrap_or_default();
-    let temp = std::env::var("TEMP").unwrap_or_else(|_| format!("{home}\\AppData\\Local\\Temp"));
-    let appdata = std::env::var("APPDATA").unwrap_or_else(|_| format!("{home}\\AppData\\Roaming"));
-    let localappdata =
-        std::env::var("LOCALAPPDATA").unwrap_or_else(|_| format!("{home}\\AppData\\Local"));
+    let mut targets: Vec<PathBuf> = Vec::new();
 
-    [
-        format!("{home}\\Downloads"),
-        format!("{home}\\Desktop"),
-        temp,
-        appdata,
-        localappdata,
-        format!("{home}\\Documents"),
-    ]
-    .into_iter()
-    .map(PathBuf::from)
-    .filter(|p| p.exists())
-    .collect()
+    let skip_users = [
+        "Default",
+        "Default User",
+        "Public",
+        "All Users",
+        "defaultuser0",
+        "WDAGUtilityAccount",
+    ];
+    if let Ok(entries) = std::fs::read_dir("C:\\Users") {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n,
+                None => continue,
+            };
+            if skip_users.iter().any(|s| s.eq_ignore_ascii_case(name)) {
+                continue;
+            }
+            // Priority order preserved per user (downloads/desktop first).
+            targets.push(path.join("Downloads"));
+            targets.push(path.join("Desktop"));
+            targets.push(path.join("AppData\\Local\\Temp"));
+            targets.push(path.join("AppData\\Roaming"));
+            targets.push(path.join("AppData\\Local"));
+            targets.push(path.join("Documents"));
+        }
+    }
+
+    if targets.is_empty() {
+        let home = std::env::var("USERPROFILE").unwrap_or_default();
+        if !home.to_ascii_lowercase().contains("\\config\\systemprofile") {
+            let temp =
+                std::env::var("TEMP").unwrap_or_else(|_| format!("{home}\\AppData\\Local\\Temp"));
+            let appdata =
+                std::env::var("APPDATA").unwrap_or_else(|_| format!("{home}\\AppData\\Roaming"));
+            let localappdata =
+                std::env::var("LOCALAPPDATA").unwrap_or_else(|_| format!("{home}\\AppData\\Local"));
+            targets.extend(
+                [
+                    format!("{home}\\Downloads"),
+                    format!("{home}\\Desktop"),
+                    temp,
+                    appdata,
+                    localappdata,
+                    format!("{home}\\Documents"),
+                ]
+                .into_iter()
+                .map(PathBuf::from),
+            );
+        }
+    }
+
+    targets.into_iter().filter(|p| p.exists()).collect()
+}
+
+/// Map a resource pause reason to the observable scanner state.
+fn pause_state_for(reason: PauseReason) -> IdleScannerState {
+    match reason {
+        PauseReason::Battery => IdleScannerState::PausedBattery,
+        PauseReason::Fullscreen => IdleScannerState::PausedFullscreen,
+        PauseReason::HighCpu => IdleScannerState::PausedCpu,
+        PauseReason::HighDisk => IdleScannerState::PausedDisk,
+        PauseReason::ScanRunning => IdleScannerState::PausedScanRunning,
+        // Reuse CPU state for UI — no dedicated memory-pressure state.
+        PauseReason::MemoryPressure => IdleScannerState::PausedCpu,
+    }
 }
 
 /// Classify file priority for scan order.
@@ -491,7 +571,7 @@ fn idle_scanner_loop(
             // Check memory pressure first — critical pressure pauses idle scanner.
             if app_state.should_pause_idle_for_pressure() {
                 let reason = PauseReason::MemoryPressure;
-                set_state(&state_ref, IdleScannerState::PausedCpu); // Reuse CPU state for UI.
+                set_state(&state_ref, pause_state_for(reason));
                 *last_pause_ref.lock().unwrap_or_else(|e| e.into_inner()) = reason.label().into();
                 std::thread::sleep(Duration::from_secs(reason.sleep_secs()));
                 continue;
@@ -505,15 +585,7 @@ fn idle_scanner_loop(
             let gui_fs_hint = app_state.fresh_gui_fullscreen(15);
             match check_resources(&res_config, scan_active, gui_fs_hint) {
                 Some(reason) => {
-                    let pause_state = match reason {
-                        PauseReason::Battery => IdleScannerState::PausedBattery,
-                        PauseReason::Fullscreen => IdleScannerState::PausedFullscreen,
-                        PauseReason::HighCpu => IdleScannerState::PausedCpu,
-                        PauseReason::HighDisk => IdleScannerState::PausedDisk,
-                        PauseReason::ScanRunning => IdleScannerState::PausedScanRunning,
-                        PauseReason::MemoryPressure => IdleScannerState::PausedCpu,
-                    };
-                    set_state(&state_ref, pause_state);
+                    set_state(&state_ref, pause_state_for(reason));
                     *last_pause_ref.lock().unwrap_or_else(|e| e.into_inner()) =
                         reason.label().into();
                     std::thread::sleep(Duration::from_secs(reason.sleep_secs()));
@@ -528,6 +600,12 @@ fn idle_scanner_loop(
 
         for target_dir in &targets {
             if !running.load(Ordering::Relaxed) {
+                break;
+            }
+            // Per-session file budget already spent — don't walk (expensive
+            // collect_scannable_files) the remaining target dirs just to
+            // break on their first file.
+            if total_this_cycle >= max_files as u64 {
                 break;
             }
 
@@ -565,27 +643,26 @@ fn idle_scanner_loop(
                         "memory_pressure".into();
                     break;
                 }
-                let scan_active = app_state.is_scan_active();
-                let gui_fs_hint = app_state.fresh_gui_fullscreen(15);
-                if let Some(reason) = check_resources(&res_config, scan_active, gui_fs_hint) {
-                    let pause_state = match reason {
-                        PauseReason::Battery => IdleScannerState::PausedBattery,
-                        PauseReason::Fullscreen => IdleScannerState::PausedFullscreen,
-                        PauseReason::HighCpu => IdleScannerState::PausedCpu,
-                        PauseReason::HighDisk => IdleScannerState::PausedDisk,
-                        PauseReason::ScanRunning => IdleScannerState::PausedScanRunning,
-                        PauseReason::MemoryPressure => IdleScannerState::PausedCpu,
-                    };
-                    set_state(&state_ref, pause_state);
-                    *last_pause_ref.lock().unwrap_or_else(|e| e.into_inner()) =
-                        reason.label().into();
-                    std::thread::sleep(Duration::from_secs(reason.sleep_secs()));
-
-                    // After pause, recheck.
+                // Pause in place until the system has capacity again, then
+                // scan THIS file. Previously this slept and `continue`d,
+                // silently dropping the current file from the cycle.
+                loop {
                     if !running.load(Ordering::Relaxed) {
                         break;
                     }
-                    continue; // Re-enter loop, will re-check resources.
+                    let scan_active = app_state.is_scan_active();
+                    let gui_fs_hint = app_state.fresh_gui_fullscreen(15);
+                    let Some(reason) = check_resources(&res_config, scan_active, gui_fs_hint)
+                    else {
+                        break; // Capacity restored → scan this file.
+                    };
+                    set_state(&state_ref, pause_state_for(reason));
+                    *last_pause_ref.lock().unwrap_or_else(|e| e.into_inner()) =
+                        reason.label().into();
+                    std::thread::sleep(Duration::from_secs(reason.sleep_secs()));
+                }
+                if !running.load(Ordering::Relaxed) {
+                    break;
                 }
 
                 // ── Adaptive speed ───────────────────────
@@ -614,6 +691,14 @@ fn idle_scanner_loop(
                     continue; // Already scanned clean.
                 }
 
+                // Quarantine F4 (mirror of watcher): skip files just restored
+                // from quarantine — re-detecting and re-quarantining them
+                // would undo the user's restore in a loop.
+                if app_state.is_restore_suppressed(file_path) {
+                    debug!(file = %file_path.display(), "idle scanner: skip — recently restored");
+                    continue;
+                }
+
                 // ── Verify readable ──────────────────────
                 if std::fs::File::open(file_path).is_err() {
                     continue;
@@ -637,9 +722,11 @@ fn idle_scanner_loop(
                 }
 
                 // ARGUS analysis (skip if total budget exhausted).
+                let mut partial_analysis = false;
                 let mut argus_verdict = if idle_tracker.is_expired() {
                     idle_tracker.record_timeout(argus::budget::TimeoutReason::TotalTimeout);
                     debug!(file = %file_path.display(), "idle budget exhausted, skipping ARGUS");
+                    partial_analysis = true;
                     argus::ArgusVerdict {
                         path: file_path.to_string_lossy().to_string(),
                         file_size: file_meta.len(),
@@ -656,7 +743,12 @@ fn idle_scanner_loop(
                     }
                 } else {
                     let argus_start = std::time::Instant::now();
-                    let v = app_state.argus().analyze_file(file_path);
+                    // Idle profile budget: pass the tracker in so ARGUS
+                    // enforces per-layer/total timeouts instead of running
+                    // with the 60s manual default.
+                    let v = app_state
+                        .argus()
+                        .analyze_file_with_tracker(file_path, &idle_tracker);
                     if idle_tracker
                         .phase_expired(argus_start, idle_tracker.budget().max_yara_duration)
                     {
@@ -754,14 +846,22 @@ fn idle_scanner_loop(
                 ledger.patch_explanation(&mut argus_verdict.explanation, final_score);
 
                 // H7 fix: only clean files build trust.
-                if final_score == 0 && !clam_result.infected {
+                // H4 fix (mirror of watcher): a budget-partial file (ARGUS
+                // skipped) is NOT a known-clean file — it must not earn
+                // trust-graph familiarity (confidence discount on future scans).
+                // Signer-aware (audit cross-cutting): authenticode signer feeds
+                // drift detection — a signer change invalidates prior trust.
+                if final_score == 0 && !clam_result.infected && !partial_analysis {
                     if let Some(tg) = app_state.trust_graph() {
                         let file_key = file_path.to_string_lossy().to_lowercase();
-                        tg.observe(
+                        let drift = tg.observe_with_signer(
                             &file_key,
                             crate::trust_graph::TrustNodeKind::Executable,
-                            None,
+                            argus_verdict.explanation.signer.as_deref(),
                         );
+                        if let Some(d) = drift {
+                            warn!(file = %file_path.display(), drift = %d.explanation, "trust-graph signer drift");
+                        }
                     }
                 }
 
@@ -772,8 +872,19 @@ fn idle_scanner_loop(
                     &app_state.detection_exclusions(),
                 );
 
-                if clam_result.error.is_none() {
-                    cache.record_with_metadata(file_path, &file_meta, !is_threat);
+                // An ARGUS analysis-error verdict (read failure / sharing
+                // violation) is NOT a clean result — never cache it; leaving
+                // the file uncached retries it on the next idle cycle.
+                let argus_incomplete =
+                    crate::ipc::argus_analysis_error(&argus_verdict).is_some();
+                if clam_result.error.is_none() && !argus_incomplete {
+                    // H4 fix (mirror of watcher): partial analysis (ARGUS
+                    // skipped on budget expiry) → NEVER cache as clean; only
+                    // ClamAV positives are recorded. Clean-looking partial
+                    // files stay uncached → retried on the next idle cycle.
+                    if !partial_analysis || is_threat {
+                        cache.record_with_metadata(file_path, &file_meta, !is_threat);
+                    }
                 }
                 total_this_cycle += 1;
                 files_scanned.fetch_add(1, Ordering::Relaxed);

@@ -13,9 +13,9 @@
 //!                 │ ImageLoad EVENT_RECORD
 //!                 v
 //!  ┌────────────────────────────────────┐
-//!  │  handle_image_load_event           │   Hot path. No allocations,
-//!  │  - extract PID + module path       │   no syscalls, no I/O.
-//!  │  - cheap .dll prefilter            │
+//!  │  handle_image_load_event           │   Hot path. No syscalls, no
+//!  │  - extract PID + module path       │   I/O; one bounded String
+//!  │  - cheap .dll prefilter            │   alloc per forwarded event.
 //!  │  - try_send to bounded channel ────┼─→ drop if full → forwarded/dropped counter
 //!  └──────────────┬─────────────────────┘
 //!                 │ ImageLoadRawEvent

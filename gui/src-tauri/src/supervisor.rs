@@ -207,13 +207,9 @@ fn check_user_disabled() -> bool {
 }
 
 fn blocking_daemon_call_simple(method: &str) -> Option<serde_json::Value> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_io()
-        .enable_time()
-        .build()
-        .ok()?;
-
-    rt.block_on(async {
+    // Shared runtime — the supervisor loop calls this every ~5 s; building
+    // a fresh runtime per call was pure churn (audit finding).
+    crate::daemon_client::blocking_runtime().block_on(async {
         tokio::time::timeout(
             Duration::from_secs(6),
             crate::daemon_client::call_simple(method),

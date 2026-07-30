@@ -258,7 +258,13 @@ fn rate_state() -> &'static Mutex<RateState> {
 fn allow_rate_at(now: Instant) -> bool {
     let m = rate_state();
     let mut rs = m.lock().unwrap_or_else(|e| e.into_inner());
-    if now.duration_since(rs.window_start) >= Duration::from_secs(1) {
+    // The `now < window_start` arm only fires for synthetic caller-supplied
+    // timestamps (tests pass far-future `Instant`s to isolate runs); with a
+    // real monotonic clock window_start can never be ahead of now. Without
+    // it, a far-future window_start left behind by a previous caller would
+    // saturate `duration_since` to 0 and rate-limit every real call until
+    // the wall clock caught up.
+    if now < rs.window_start || now.duration_since(rs.window_start) >= Duration::from_secs(1) {
         rs.window_start = now;
         rs.count = 0;
     }

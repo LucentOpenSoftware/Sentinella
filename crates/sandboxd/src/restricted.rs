@@ -36,13 +36,16 @@ pub struct RestrictedLaunch {
 /// breakaway, memory cap) + network block + low integrity are the REAL
 /// containment; the token only reduces privilege, not identity.
 ///
-/// On any token-setup failure this FAILS OPEN to `launch_unrestricted` (full
-/// token), flagged `containment_degraded` by the caller — still Job-contained.
+/// On any token-setup or launch failure this FAILS CLOSED (pid == 0, no
+/// process created; the caller reports `Blocked`). Detonating with sandboxd's
+/// full SYSTEM token — the old fallback — gave the sample unrestricted
+/// SYSTEM privileges for the whole timeout window: a containment failure
+/// must never become a privilege upgrade.
 ///
 /// v1.0 hardening (tracked in HANDOFF): run sandboxd under a dedicated
 /// low-privilege account, or add restricting SIDs, so the sample is identity-
 /// isolated and not merely privilege-disabled SYSTEM.
-pub fn launch_restricted(sample: &Path) -> RestrictedLaunch {
+pub fn launch_restricted(sample: &Path, cwd: &Path) -> RestrictedLaunch {
     let mut errors = Vec::new();
 
     // Get current process token.
@@ -55,8 +58,8 @@ pub fn launch_restricted(sample: &Path) -> RestrictedLaunch {
         )
     };
     if ok.is_err() {
-        errors.push("OpenProcessToken failed — falling back to unrestricted".into());
-        return launch_unrestricted(sample, errors);
+        errors.push("OpenProcessToken failed — FAIL CLOSED, no detonation".into());
+        return failed_launch(errors);
     }
 
     // Create restricted token — strip most privileges.
@@ -76,8 +79,8 @@ pub fn launch_restricted(sample: &Path) -> RestrictedLaunch {
     }
 
     if ok.is_err() {
-        errors.push("CreateRestrictedToken failed — falling back to unrestricted".into());
-        return launch_unrestricted(sample, errors);
+        errors.push("CreateRestrictedToken failed — FAIL CLOSED, no detonation".into());
+        return failed_launch(errors);
     }
 
     // Set low integrity level via raw SetTokenInformation.
@@ -92,7 +95,11 @@ pub fn launch_restricted(sample: &Path) -> RestrictedLaunch {
     };
 
     // Create process suspended with restricted token.
-    let mut cmd_line = to_wide(&sample.to_string_lossy());
+    // Quote the command line: with a NULL lpApplicationName, CreateProcess*
+    // tokenizes an unquoted path on whitespace and may resolve a whitespace
+    // prefix (e.g. `my.exe` for `my file.exe`) instead of the real sample.
+    let mut cmd_line = to_wide(&format!("\"{}\"", sample.to_string_lossy()));
+    let cwd_wide = to_wide(&cwd.to_string_lossy());
     let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
     si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
@@ -107,7 +114,7 @@ pub fn launch_restricted(sample: &Path) -> RestrictedLaunch {
             false,
             CREATE_SUSPENDED | CREATE_NO_WINDOW,
             None,
-            None,
+            windows::core::PCWSTR(cwd_wide.as_ptr()),
             &si,
             &mut pi,
         )
@@ -117,8 +124,8 @@ pub fn launch_restricted(sample: &Path) -> RestrictedLaunch {
     }
 
     if ok.is_err() {
-        errors.push("CreateProcessAsUserW failed — falling back to unrestricted".into());
-        return launch_unrestricted(sample, errors);
+        errors.push("CreateProcessAsUserW failed — FAIL CLOSED, no detonation".into());
+        return failed_launch(errors);
     }
 
     RestrictedLaunch {
@@ -230,48 +237,16 @@ fn set_low_integrity(token: HANDLE) -> Result<(), String> {
     }
 }
 
-fn launch_unrestricted(sample: &Path, mut errors: Vec<String>) -> RestrictedLaunch {
-    // Use CreateProcessW with CREATE_SUSPENDED — process must NOT run
-    // before Job Object + firewall containment is applied.
-    let mut cmd_line = to_wide(&sample.to_string_lossy());
-    let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
-    si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
-    let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
-
-    let ok = unsafe {
-        CreateProcessW(
-            None,
-            windows::core::PWSTR(cmd_line.as_mut_ptr()),
-            None,
-            None,
-            false,
-            CREATE_SUSPENDED | CREATE_NO_WINDOW,
-            None,
-            None,
-            &si,
-            &mut pi,
-        )
-    };
-
-    if ok.is_err() {
-        errors.push("Unrestricted CreateProcessW failed".into());
-        RestrictedLaunch {
-            process_handle: HANDLE::default(),
-            thread_handle: HANDLE::default(),
-            pid: 0,
-            restricted: false,
-            low_integrity: false,
-            errors,
-        }
-    } else {
-        RestrictedLaunch {
-            process_handle: pi.hProcess,
-            thread_handle: pi.hThread,
-            pid: pi.dwProcessId,
-            restricted: false,
-            low_integrity: false,
-            errors,
-        }
+/// Fail-closed launch result: no process was created, pid == 0 signals the
+/// caller to report `Blocked` instead of detonating.
+fn failed_launch(errors: Vec<String>) -> RestrictedLaunch {
+    RestrictedLaunch {
+        process_handle: HANDLE::default(),
+        thread_handle: HANDLE::default(),
+        pid: 0,
+        restricted: false,
+        low_integrity: false,
+        errors,
     }
 }
 
@@ -307,17 +282,17 @@ mod tests {
     }
 
     #[test]
-    fn restricted_launch_nonexistent_file() {
+    fn restricted_launch_nonexistent_file_fails_closed() {
         let fake_path = PathBuf::from(r"C:\__nonexistent_sentinella_test_binary__.exe");
-        let launch = launch_restricted(&fake_path);
-        // The file doesn't exist so all launch paths should fail.
-        // Either pid == 0 or errors are populated (or both).
+        let launch = launch_restricted(&fake_path, std::path::Path::new(r"C:\"));
+        // FAIL CLOSED: launch failure must NEVER fall back to an unrestricted
+        // (full SYSTEM token) process — pid 0 means no process was created.
+        assert_eq!(launch.pid, 0, "fail-closed launch must not create a process");
         assert!(
-            launch.pid == 0 || !launch.errors.is_empty(),
-            "Expected pid 0 or errors for nonexistent binary, got pid={} errors={:?}",
-            launch.pid,
-            launch.errors
+            !launch.errors.is_empty(),
+            "fail-closed launch must record why detonation was refused"
         );
+        assert!(!launch.restricted);
     }
 
     #[test]

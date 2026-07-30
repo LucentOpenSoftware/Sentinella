@@ -290,6 +290,15 @@ impl ArgusEngine {
             }
         };
 
+        // ☠️ TOCTOU follow-up: size gating above used pre-read metadata. On
+        // Unix there are no share modes, so a file growing between stat and
+        // read would be fully loaded regardless of `max_file_size`. Enforce
+        // the cap on what we actually read.
+        if data.len() as u64 > self.config.max_file_size {
+            debug!(path = %path_str, size = data.len(), "Skipped: grew past max file size during read");
+            return self.empty_verdict(&path_str, start);
+        }
+
         // ── Timing: SHA-256 ───────────────────────────────────
         let hash_start = Instant::now();
         let sha256 = {
@@ -355,7 +364,12 @@ impl ArgusEngine {
         // skip. A skipped phase is NOT failure; it's data for convergence.
         let is_pe = data.len() >= 2 && data[0] == 0x4D && data[1] == 0x5A;
         if tracker.is_expired() {
-            tracker.record_timeout(TimeoutReason::StructuralTimeout);
+            // The TOTAL wall-clock budget expired before this phase ran —
+            // record TotalTimeout, not StructuralTimeout (which weights a
+            // phase-level fault that never actually happened).
+            tracker.record_timeout(TimeoutReason::TotalTimeout);
+        } else if tracker.is_cancelled() {
+            debug!(path = %path_str, "Scan cancelled — skipping structural analysis");
         } else if is_pe {
             if let Ok(pe) = goblin::pe::PE::parse(&data) {
                 if self.config.pe_heuristics {
@@ -375,17 +389,23 @@ impl ArgusEngine {
         }
 
         // Layer: Script analysis.
+        // Budget/cancel gate — a skipped phase records TotalTimeout evidence
+        // (surfaced via ScanTiming.timeout_reasons); cancellation just skips.
         if self.config.script_analysis {
-            let ext = path
-                .extension()
-                .map(|e| e.to_string_lossy().to_lowercase())
-                .unwrap_or_default();
-            let is_script = matches!(
-                ext.as_str(),
-                "ps1" | "psm1" | "psd1" | "js" | "jse" | "vbs" | "vbe" | "bat" | "cmd" | "reg"
-            );
-            if is_script {
-                findings.extend(layers::script::analyze(&path_str, &data));
+            if tracker.is_expired() {
+                tracker.record_timeout(TimeoutReason::TotalTimeout);
+            } else if !tracker.is_cancelled() {
+                let ext = path
+                    .extension()
+                    .map(|e| e.to_string_lossy().to_lowercase())
+                    .unwrap_or_default();
+                let is_script = matches!(
+                    ext.as_str(),
+                    "ps1" | "psm1" | "psd1" | "js" | "jse" | "vbs" | "vbe" | "bat" | "cmd" | "reg"
+                );
+                if is_script {
+                    findings.extend(layers::script::analyze(&path_str, &data));
+                }
             }
         }
 
@@ -393,19 +413,31 @@ impl ArgusEngine {
         // Layer routes itself: returns empty findings if `data` isn't a ZIP or
         // if the ZIP doesn't look like a Java archive (no manifest, no .class).
         if self.config.jar_analysis {
-            findings.extend(layers::jar::analyze(&path_str, &data));
+            if tracker.is_expired() {
+                tracker.record_timeout(TimeoutReason::TotalTimeout);
+            } else if !tracker.is_cancelled() {
+                findings.extend(layers::jar::analyze(&path_str, &data));
+            }
         }
 
         // Layer: PDF structural / action / JavaScript analysis (malicious-pdf
         // family, etc.). Layer routes itself via the `%PDF-` header check;
         // returns empty findings on non-PDF input or on unparseable PDFs.
         if self.config.pdf_analysis {
-            findings.extend(layers::pdf::analyze(&path_str, &data));
+            if tracker.is_expired() {
+                tracker.record_timeout(TimeoutReason::TotalTimeout);
+            } else if !tracker.is_cancelled() {
+                findings.extend(layers::pdf::analyze(&path_str, &data));
+            }
         }
 
         // Layer: Pattern detection (works on raw bytes).
         if self.config.pattern_detection {
-            findings.extend(layers::patterns::analyze(&path_str, &data));
+            if tracker.is_expired() {
+                tracker.record_timeout(TimeoutReason::TotalTimeout);
+            } else if !tracker.is_cancelled() {
+                findings.extend(layers::patterns::analyze(&path_str, &data));
+            }
         }
 
         // Layer: YARA rule engine (runs compiled rules against buffer).
@@ -417,8 +449,9 @@ impl ArgusEngine {
         let yara_phase_budget = tracker.budget().max_yara_duration;
         if tracker.is_expired() {
             tracker.record_timeout(TimeoutReason::TotalTimeout);
-        } else if strategy == ScanStrategy::FullAnalysis
-            || strategy == ScanStrategy::LightAnalysis
+        } else if !tracker.is_cancelled()
+            && (strategy == ScanStrategy::FullAnalysis
+                || strategy == ScanStrategy::LightAnalysis)
         {
             findings.extend(self.yara.scan(&data));
             if tracker.phase_expired(yara_start, yara_phase_budget) {
@@ -435,7 +468,7 @@ impl ArgusEngine {
         if is_pe {
             if tracker.is_expired() {
                 tracker.record_timeout(TimeoutReason::TotalTimeout);
-            } else {
+            } else if !tracker.is_cancelled() {
                 let (ac_findings, discount) = layers::authenticode::analyze_with_discount(path);
                 findings.extend(ac_findings);
                 authenticode_discount = discount;
@@ -458,7 +491,10 @@ impl ArgusEngine {
         // multiple signatures (NSIS, InnoSetup, WiX, Electron); running it
         // twice per file (once here, once during aggregation below) doubled
         // the cost for every PE.
-        let installer_detected = is_pe && is_known_installer(&data, &path_str);
+        // NOT gated on `is_pe`: MSI installers are OLE2 compound files (by
+        // definition not PE), and the name-heuristic branch inside
+        // `is_known_installer` already self-gates on the MZ header.
+        let installer_detected = is_known_installer(&data, &path_str);
         let installer_detected_early = installer_detected;
         if installer_detected_early {
             for f in &mut findings {
@@ -535,6 +571,8 @@ impl ArgusEngine {
         // so directory-level burst detection can count partial-confidence hits,
         // not just Malicious (>=76). Low-suspicion noise (1..=25) still maps
         // to ScannedClean to avoid drowning the correlator in benign chatter.
+        // NOTE: burst-detection consumers are not wired up yet — the
+        // correlator is currently write-only outside its own tests.
         let event_type = if score >= 26 {
             crate::correlation::EventType::ScannedSuspicious
         } else {
@@ -590,6 +628,13 @@ impl ArgusEngine {
             );
         }
 
+        // ── Budget outcome evidence ───────────────────────────
+        // Surface the tracker's recorded timeouts in the verdict instead of
+        // dropping them with the tracker — engine-internal timeouts are
+        // evasion-by-exhaustion evidence and must feed the convergence model.
+        let timeout_reasons = tracker.timeouts();
+        let completed_within_budget = !tracker.is_expired() && timeout_reasons.is_empty();
+
         ArgusVerdict {
             path: path_str,
             file_size,
@@ -609,8 +654,8 @@ impl ArgusEngine {
                 yara_us,
                 structural_us: 0, // TODO: instrument per-layer
                 strategy: Some(strategy),
-                timeout_reasons: Vec::new(),
-                completed_within_budget: true,
+                timeout_reasons,
+                completed_within_budget,
             }),
         }
     }
@@ -627,6 +672,16 @@ impl ArgusEngine {
         };
 
         let mime_type = infer::get(data).map(|t| t.mime_type().to_string());
+
+        // Layer: IOC hash matching (O(1) lookup on the already-computed hash).
+        // AMSI/ADS/memory content gets the same known-bad coverage as file
+        // scans — skipping this was a pure false-negative gap.
+        findings.extend(self.ioc.check(&sha256));
+
+        // NOTE: YARA is deliberately not run on buffers. The primary callers
+        // are memory regions (memory_scanner), where rule matches on raw
+        // region bytes are FP-prone, plus AMSI/ADS content. Revisit per-caller
+        // if AMSI/ADS YARA coverage is wanted.
 
         // Run applicable layers on the buffer.
         if self.config.mime_validation {
@@ -667,6 +722,25 @@ impl ArgusEngine {
         // pass through as 0 here.
         let (score, verdict, explanation) = aggregate_score(&mut findings, 0, 0, false);
 
+        // ── Update stats ──────────────────────────────────────
+        // Buffer scans (AMSI, ADS, memory regions) count too — otherwise
+        // they're invisible in ArgusStats.
+        let elapsed_us = start.elapsed().as_micros() as u64;
+        self.files_analyzed.fetch_add(1, Ordering::Relaxed);
+        self.total_findings
+            .fetch_add(findings.len() as u64, Ordering::Relaxed);
+        self.total_analysis_time_us
+            .fetch_add(elapsed_us, Ordering::Relaxed);
+        match verdict {
+            Verdict::Clean => {
+                self.clean_files.fetch_add(1, Ordering::Relaxed);
+            }
+            Verdict::Malicious | Verdict::HighSuspicion => {
+                self.threats_detected.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+
         ArgusVerdict {
             path: name.to_string(),
             file_size: data.len() as u64,
@@ -675,7 +749,7 @@ impl ArgusEngine {
             score,
             verdict,
             findings,
-            analysis_time_us: start.elapsed().as_micros() as u64,
+            analysis_time_us: elapsed_us,
             engine_version: ENGINE_VERSION,
             timestamp: chrono::Utc::now().timestamp(),
             explanation,
@@ -914,6 +988,9 @@ fn aggregate_score(
     const CAP_DECEPTION: u32 = 50;
 
     // Apply per-category caps by proportionally reducing weights.
+    // Floor (not round): rounding up can push the scaled category total past
+    // the cap (e.g. [10,10,11] vs cap 30 → 31). Floor guarantees
+    // sum(floor(w_i * ratio)) <= floor(total * ratio) = cap.
     let apply_cap = |findings: &mut Vec<Finding>, layer: Layer, cap: u32| {
         let total: u32 = findings
             .iter()
@@ -924,7 +1001,7 @@ fn aggregate_score(
             let ratio = cap as f64 / total as f64;
             for f in findings.iter_mut() {
                 if f.layer == layer {
-                    f.weight = (f.weight as f64 * ratio).round() as u32;
+                    f.weight = (f.weight as f64 * ratio).floor() as u32;
                 }
             }
         }
@@ -1321,6 +1398,89 @@ mod tests {
         let data = b"eval(eval(eval(atob('malicious code'))))";
         let verdict = engine.analyze_buffer("suspicious.js", data);
         assert!(verdict.score > 0, "Expected suspicion from eval chains");
+    }
+
+    #[test]
+    fn test_analyze_buffer_ioc_hit() {
+        // Buffer scans (AMSI/ADS/memory) must get IOC coverage too — a
+        // blocklisted hash alone (weight 90) is Malicious.
+        let engine = ArgusEngine::with_defaults();
+        let data = b"known bad payload";
+        let sha256 = {
+            let mut hasher = Sha256::new();
+            hasher.update(data);
+            hex::encode(hasher.finalize())
+        };
+        engine.ioc.add_hash(&sha256);
+
+        let verdict = engine.analyze_buffer("amsi-script-content", data);
+        assert!(
+            verdict
+                .findings
+                .iter()
+                .any(|f| f.layer == Layer::IocCorrelation),
+            "analyze_buffer must surface IOC hits"
+        );
+        assert_eq!(verdict.verdict, Verdict::Malicious);
+    }
+
+    #[test]
+    fn test_budget_timeouts_recorded_in_timing() {
+        // An exhausted tracker must leave evidence in the returned verdict:
+        // timeout_reasons populated, completed_within_budget = false.
+        let engine = ArgusEngine::with_defaults();
+        let dir = std::env::temp_dir().join("argus_test_budget");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sample.exe");
+        std::fs::write(&path, b"MZ budget test content").unwrap();
+
+        let budget = ScanExecutionBudget {
+            max_duration: std::time::Duration::from_millis(1),
+            ..ScanExecutionBudget::realtime()
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let tracker = BudgetTracker::new(budget, cancel);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        let verdict = engine.analyze_file_with_tracker(&path, &tracker);
+        let timing = verdict.timing.expect("file scans must carry timing");
+        assert!(
+            !timing.completed_within_budget,
+            "expired budget must mark completed_within_budget = false"
+        );
+        assert!(
+            timing
+                .timeout_reasons
+                .contains(&TimeoutReason::TotalTimeout),
+            "expired budget must record TotalTimeout, got {:?}",
+            timing.timeout_reasons
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_apply_cap_never_exceeds_cap() {
+        // Rounding regression: [10, 10, 11] vs cap 30 scaled with .round()
+        // lands back on 31 — over the cap. Floor must keep it ≤ cap.
+        let mk = |weight: u32, desc: &str| Finding {
+            layer: Layer::StructuralAnalysis,
+            severity: Severity::Medium,
+            weight,
+            description: desc.into(),
+            technical_detail: None,
+        };
+        let mut findings = vec![mk(10, "S1"), mk(10, "S2"), mk(11, "S3")];
+        let _ = aggregate_score(&mut findings, 0, 0, false);
+        let structural_total: u32 = findings
+            .iter()
+            .filter(|f| f.layer == Layer::StructuralAnalysis)
+            .map(|f| f.weight)
+            .sum();
+        assert!(
+            structural_total <= 30,
+            "category total must never exceed the cap, got {structural_total}"
+        );
     }
 
     #[test]

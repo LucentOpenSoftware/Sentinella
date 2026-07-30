@@ -490,6 +490,11 @@ impl Config {
                 &mut self.idle_scan_fast_delay_max_ms,
             ),
         ] {
+            // A 0ms floor defeats the idle scanner's politeness throttling
+            // (tight scan loop) — clamp to at least 1ms.
+            if *lo == 0 {
+                *lo = 1;
+            }
             if *lo > *hi {
                 std::mem::swap(lo, hi);
             }
@@ -759,6 +764,17 @@ impl Config {
             true
         });
 
+        // Store the normalized form validation checked, so downstream
+        // matchers see the same strings validation approved (bare lowercase
+        // extension, lowercase hex) instead of e.g. ".TXT" surviving
+        // validation but never matching anything.
+        for e in &mut self.excluded_extensions {
+            *e = e.trim().trim_start_matches('.').to_ascii_lowercase();
+        }
+        for h in &mut self.trusted_hashes {
+            *h = h.trim().to_ascii_lowercase();
+        }
+
         // Cap list sizes to prevent abuse.
         const MAX_EXCLUSIONS: usize = 50;
         if self.excluded_paths.len() > MAX_EXCLUSIONS {
@@ -859,30 +875,34 @@ pub fn load(path: Option<&str>) -> anyhow::Result<Config> {
     Ok(config)
 }
 
-/// Load the config AND verify its HMAC sidecar against the runtime-integrity
-/// vault key. Returns `(config, drift)` where `drift=true` means the on-disk
-/// config bytes did not match the sidecar — someone edited the file outside
-/// the daemon (or the sidecar is stale because the daemon last saved before
-/// this hardening shipped). Caller should surface drift via the `health`
-/// IPC and decide whether to refuse start (we don't — fail-loud).
+/// Verify the HMAC sidecar of an ALREADY-LOADED config against the
+/// runtime-integrity vault key. Returns `(config, drift)` where `drift=true`
+/// means the on-disk config bytes did not match the sidecar — someone edited
+/// the file outside the daemon (or the sidecar is stale because the daemon
+/// last saved before this hardening shipped). Caller should surface drift
+/// via the `health` IPC and decide whether to refuse start (we don't —
+/// fail-loud).
+///
+/// Takes the config by value instead of loading it: main() already loaded,
+/// validated, and possibly default-saved it — re-loading here re-read,
+/// re-validated, and re-saved the file a second time for no benefit and
+/// opened a small TOCTOU between the two reads.
 ///
 /// First-start behavior: if the sidecar is missing, we write a fresh one
-/// for the just-loaded file (TOFU) and return `drift=false`. This avoids a
-/// nuisance drift report on every daemon upgrade.
+/// for the on-disk file (TOFU) and return `drift=false`. This avoids a
+/// nuisance drift report on every daemon upgrade — but it also means
+/// "edit config + delete sidecar" re-baselines silently, so the
+/// re-baseline is logged at warn (fail-loud, not silent).
 ///
 /// The vault key is read directly from disk (vault file) instead of taking
 /// an `IntegrityVault` ref so this can be called BEFORE the `AppState` lock
 /// graph is wired. If the vault key isn't present yet (very first daemon
 /// start), we cannot verify and return `drift=false` — the post-save hook
 /// in `Config::save` will lay down a sidecar shortly after.
-pub fn load_verified(path: Option<&str>) -> anyhow::Result<(Config, bool)> {
+pub fn load_verified(path: Option<&str>, config: Config) -> anyhow::Result<(Config, bool)> {
     let config_path = path
         .map(PathBuf::from)
         .unwrap_or_else(|| crate::paths::paths().config_file());
-
-    // Load the config first so a missing-sidecar / missing-key situation
-    // never blocks startup.
-    let config = load(path)?;
 
     // If the config file itself doesn't exist on disk (load() just synthesized
     // defaults + wrote them), there's nothing to verify — Config::save will
@@ -909,7 +929,14 @@ pub fn load_verified(path: Option<&str>) -> anyhow::Result<(Config, bool)> {
     if !hmac_path.exists() {
         // TOFU — record the current content's HMAC so a future edit is
         // detectable. Best-effort: a write failure here is just "no drift
-        // detection until next save".
+        // detection until next save". Logged at warn: after the first
+        // provisioning a missing sidecar means someone deleted it, which
+        // (combined with a config edit) would otherwise re-baseline
+        // silently — keep the fail-loud intent.
+        warn!(
+            config = %config_path.display(),
+            "config HMAC sidecar missing — re-baselining (TOFU); expected only on first start"
+        );
         let _ = write_config_hmac_sidecar(&config_path, &content);
         return Ok((config, false));
     }
@@ -927,7 +954,15 @@ pub fn load_verified(path: Option<&str>) -> anyhow::Result<(Config, bool)> {
                 Ok((config, true))
             }
         }
-        Err(_) => Ok((config, false)),
+        Err(e) => {
+            // Sidecar exists but is unreadable — that is not "no drift".
+            warn!(
+                config = %config_path.display(),
+                error = %e,
+                "config HMAC sidecar unreadable — drift detection unavailable this start"
+            );
+            Ok((config, false))
+        }
     }
 }
 

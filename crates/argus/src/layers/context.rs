@@ -39,8 +39,6 @@ pub fn analyze(path: &Path, existing_score: u32) -> Vec<Finding> {
     let in_downloads = path_str.contains("\\downloads\\") || path_str.contains("/downloads/");
     let in_temp =
         path_str.contains("\\temp\\") || path_str.contains("\\tmp\\") || path_str.contains("/tmp/");
-    let _in_desktop = path_str.contains("\\desktop\\") || path_str.contains("/desktop/");
-    let _in_appdata = path_str.contains("\\appdata\\") || path_str.contains("/appdata/");
 
     if in_temp {
         context_weight += 4;
@@ -81,8 +79,20 @@ pub fn analyze(path: &Path, existing_score: u32) -> Vec<Finding> {
     // the monetizer/referrer scan reuse the same buffer.
     #[cfg(target_os = "windows")]
     {
+        // DoS hardening: a legitimate Zone.Identifier is ~200 bytes, but an
+        // ADS can be arbitrarily large — cap the read so a scanned file
+        // carrying a multi-GB `:Zone.Identifier` stream can't exhaust
+        // daemon memory.
+        const MAX_ZONE_ADS_BYTES: u64 = 4096;
+
         let zone_path = format!("{}:Zone.Identifier", path.display());
-        if let Ok(zone_data) = std::fs::read_to_string(&zone_path) {
+        let zone_data = std::fs::File::open(&zone_path).ok().and_then(|file| {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            file.take(MAX_ZONE_ADS_BYTES).read_to_end(&mut buf).ok()?;
+            Some(String::from_utf8_lossy(&buf).into_owned())
+        });
+        if let Some(zone_data) = zone_data {
             let zone_lower = zone_data.to_lowercase();
             let is_internet_zone =
                 zone_lower.contains("zoneid=3") || zone_lower.contains("zoneid=4");

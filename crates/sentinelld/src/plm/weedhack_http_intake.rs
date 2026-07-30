@@ -174,11 +174,9 @@ pub struct HttpIntakeDiagnostics {
     /// WinINet ETW dormancy described at the top of this file.
     pub body_unavailable: AtomicU64,
     pub dropped: AtomicU64,
-    pub parse_errors: AtomicU64,
     pub deduped: AtomicU64,
     pub rate_limited: AtomicU64,
     pub events_no_java_lineage: AtomicU64,
-    pub non_post: AtomicU64,
 }
 
 impl HttpIntakeDiagnostics {
@@ -191,11 +189,9 @@ impl HttpIntakeDiagnostics {
             emitted: AtomicU64::new(0),
             body_unavailable: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
-            parse_errors: AtomicU64::new(0),
             deduped: AtomicU64::new(0),
             rate_limited: AtomicU64::new(0),
             events_no_java_lineage: AtomicU64::new(0),
-            non_post: AtomicU64::new(0),
         }
     }
 
@@ -208,11 +204,9 @@ impl HttpIntakeDiagnostics {
             "emitted": self.emitted.load(Ordering::Relaxed),
             "body_unavailable": self.body_unavailable.load(Ordering::Relaxed),
             "dropped": self.dropped.load(Ordering::Relaxed),
-            "parse_errors": self.parse_errors.load(Ordering::Relaxed),
             "deduped": self.deduped.load(Ordering::Relaxed),
             "rate_limited": self.rate_limited.load(Ordering::Relaxed),
             "events_no_java_lineage": self.events_no_java_lineage.load(Ordering::Relaxed),
-            "non_post": self.non_post.load(Ordering::Relaxed),
             "max_body_bytes": MAX_BODY_BYTES,
             "channel_capacity": CHANNEL_CAPACITY,
             "max_forwards_per_sec": MAX_FORWARDS_PER_SEC,
@@ -289,7 +283,13 @@ fn rate_state() -> &'static Mutex<RateState> {
 
 fn allow_rate_at(now: Instant) -> bool {
     let mut rs = rate_state().lock().unwrap_or_else(|e| e.into_inner());
-    if now.duration_since(rs.window_start) >= Duration::from_secs(1) {
+    // The `now < window_start` arm only fires for synthetic caller-supplied
+    // timestamps (tests pass far-future `Instant`s to isolate runs); with a
+    // real monotonic clock window_start can never be ahead of now. Without
+    // it, a far-future window_start left behind by a previous caller would
+    // saturate `duration_since` to 0 and rate-limit every real call until
+    // the wall clock caught up.
+    if now < rs.window_start || now.duration_since(rs.window_start) >= Duration::from_secs(1) {
         rs.window_start = now;
         rs.count = 0;
     }
@@ -459,20 +459,6 @@ pub fn process_one_at(args: &HttpIntakeWorkerArgs, event: HttpPostRawEvent, now:
         .selector_hits
         .fetch_add(1, Ordering::Relaxed);
 
-    // ── Dedup (pid, selector) ──
-    if !args.dedup.0.allow(
-        DedupKey {
-            pid: event.pid,
-            marker: "selector",
-        },
-        now,
-    ) {
-        args.etw_diagnostics
-            .deduped
-            .fetch_add(1, Ordering::Relaxed);
-        return;
-    }
-
     // ── Canonical detector. We feed it a synthetic event constructed
     //    from already-extracted fields so the gate stays bit-for-bit
     //    aligned with the existing weedhack_etherhiding evaluator. The
@@ -501,6 +487,25 @@ pub fn process_one_at(args: &HttpIntakeWorkerArgs, event: HttpPostRawEvent, now:
         Some(s) => s,
         None => return,
     };
+
+    // ── Dedup (pid, selector) — gates EMISSION, not evaluation. This
+    //    must run only after the detector confirms: an event the
+    //    detector rejects (e.g. shape+selector match but no Eth-RPC
+    //    host hint) must not consume the slot, or a subsequent
+    //    fully-formed event from the same PID within the window would
+    //    be silently deduped → missed detection. ──
+    if !args.dedup.0.allow(
+        DedupKey {
+            pid: event.pid,
+            marker: "selector",
+        },
+        now,
+    ) {
+        args.etw_diagnostics
+            .deduped
+            .fetch_add(1, Ordering::Relaxed);
+        return;
+    }
 
     args.etw_diagnostics
         .emitted
@@ -1023,7 +1028,6 @@ mod tests {
             "emitted",
             "body_unavailable",
             "dropped",
-            "parse_errors",
             "deduped",
             "rate_limited",
         ] {

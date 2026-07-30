@@ -260,11 +260,11 @@ fn generate_narrative(root: &str, evidence: &[EcosystemEvidence]) -> String {
     }
 
     // Extract actor (filename) from root entity for readability.
-    let actor = root
-        .rsplit('\\')
-        .next()
-        .or_else(|| root.rsplit('/').next())
-        .unwrap_or(root);
+    // Split on BOTH separators in one pass — the old
+    // `rsplit('\\').next().or_else(|| rsplit('/').next())` was dead code
+    // (`rsplit(...).next()` always returns Some), so Unix paths kept their
+    // full path as the "filename".
+    let actor = root.rsplit(['\\', '/']).next().unwrap_or(root);
 
     let has = |src: EvidenceSource| evidence.iter().any(|e| e.source == src);
     let desc_for = |src: EvidenceSource| -> Option<&str> {
@@ -414,9 +414,8 @@ impl EcosystemFingerprint {
 
 fn normalize_root(root_entity: &str) -> String {
     root_entity
-        .rsplit('\\')
+        .rsplit(['\\', '/'])
         .next()
-        .or_else(|| root_entity.rsplit('/').next())
         .unwrap_or(root_entity)
         .to_lowercase()
 }
@@ -550,11 +549,14 @@ impl EcosystemTracker {
         // Prune if too many ecosystems.
         if map.len() > MAX_ECOSYSTEMS {
             // Remove oldest expired/cooling ecosystem first, then oldest active.
+            // Tiebreak on the monotonic last_activity: last_updated has only
+            // second resolution, so ties broke on HashMap iteration order
+            // (nondeterministic).
             let remove_key = map
                 .values()
                 .filter(|e| e.state != EcosystemState::Active)
-                .min_by_key(|e| e.last_updated)
-                .or_else(|| map.values().min_by_key(|e| e.last_updated))
+                .min_by_key(|e| (e.last_updated, e.last_activity))
+                .or_else(|| map.values().min_by_key(|e| (e.last_updated, e.last_activity)))
                 .map(|e| e.root_entity.clone());
 
             if let Some(key) = remove_key {

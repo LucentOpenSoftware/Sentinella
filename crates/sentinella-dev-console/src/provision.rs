@@ -14,12 +14,13 @@ use toml_edit::{value, DocumentMut, Item, Table};
 
 /// Compute the lowercase-hex SHA-256 of a password. Live preview in the UI.
 pub fn sha256_hex(password: &str) -> String {
+    use std::fmt::Write as _;
     let mut h = Sha256::new();
     h.update(password.as_bytes());
     let out = h.finalize();
     let mut s = String::with_capacity(64);
     for b in out {
-        s.push_str(&format!("{b:02x}"));
+        let _ = write!(s, "{b:02x}");
     }
     s
 }

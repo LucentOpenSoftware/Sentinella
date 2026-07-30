@@ -23,8 +23,10 @@
 //! commitments are tracked in `tests/` alongside this module.
 //!
 //! Cost: parses up to `MAX_OBJECTS` PDF objects, decompresses up to
-//! `MAX_STREAM_DECOMPRESSED` per content stream, scans up to
-//! `MAX_JS_SCAN_BYTES` of JS text per object.
+//! `MAX_STREAM_DECOMPRESSED` per content stream and `MAX_TOTAL_DECOMPRESSED`
+//! across the whole file, follows references at most `MAX_REF_FOLLOW_DEPTH`
+//! deep in the string-resolving helpers, scans up to `MAX_JS_SCAN_BYTES` of
+//! JS text per object.
 
 use crate::verdict::{Finding, Layer, Severity};
 use lopdf::{Document, Object, ObjectId};
@@ -40,15 +42,37 @@ fn looks_like_pdf(data: &[u8]) -> bool {
 /// Bounded parser cost.
 const MAX_OBJECTS: usize = 8192;
 const MAX_STREAM_DECOMPRESSED: usize = 8 * 1024 * 1024;
+/// Cumulative decompression budget across ALL streams in one `analyze()`
+/// call. The per-stream cap alone lets `MAX_OBJECTS` streams each inflate to
+/// 8 MiB — ~64 GiB of inflate work from a single crafted file (CPU-bound
+/// DoS of the scan pipeline). Mirrors jar.rs's `MAX_TOTAL_DECOMPRESSED`.
+const MAX_TOTAL_DECOMPRESSED: usize = 64 * 1024 * 1024;
 const MAX_JS_SCAN_BYTES: usize = 512 * 1024;
 
-/// Raw (compressed) input ceiling for the *non-Flate* decompression path.
-/// We only hand a stream to lopdf's unbounded `decompressed_content()` when
-/// its raw input is this small, so even a high-ratio legacy filter (LZW) can
-/// only ever materialise a bounded amount of memory. Streams above this with
-/// a non-Flate / chained / predictor filter are scanned in raw form instead —
-/// reduced detection on rare legacy encodings, but never an OOM.
+/// Depth cap for the reference-following helpers below
+/// (`uri_or_file_looks_unc`, `uri_is_suspicious`, `xfa_content_has_submit`).
+/// Unlike `scan_object` they follow `Object::Reference` chains without a
+/// visited set, so a cyclic PDF object (`5 0 obj 5 0 R`) would otherwise
+/// recurse until the scan thread overflows its stack — a stack overflow is
+/// an abort, not a catchable panic, i.e. a daemon-level DoS from one small
+/// crafted PDF.
+const MAX_REF_FOLLOW_DEPTH: u32 = 8;
+
+/// Raw (compressed) input ceiling for the *non-Flate, non-LZW* decompression
+/// path. We only hand a stream to lopdf's unbounded `decompressed_content()`
+/// when its raw input is this small; the ASCII-family filters expand
+/// sub-linearly, so worst-case materialisation stays near the input size.
+/// Streams above this with a non-Flate / chained / predictor filter are
+/// scanned in raw form instead — reduced detection on rare legacy encodings,
+/// but never an OOM.
 const MAX_NONFLATE_RAW: usize = 64 * 1024;
+
+/// Separate, much tighter raw ceiling for `LZWDecode`. lopdf 0.34 decodes
+/// LZW via weezl's `decode_all` into an uncapped `Vec`, and LZW's worst-case
+/// output grows *quadratically* with the number of input codes — a 64 KiB
+/// LZW stream can materialise ~1 GB before the post-hoc `truncate()` runs.
+/// At 4 KiB of raw input (~4k codes) the worst case stays ~16 MB.
+const MAX_LZW_RAW: usize = 4 * 1024;
 
 /// Decompress a PDF stream's content with a hard output bound, defeating
 /// decompression-bomb DoS (a tiny FlateDecode stream that inflates to
@@ -61,14 +85,23 @@ const MAX_NONFLATE_RAW: usize = 64 * 1024;
 ///     reader, mirroring the discipline the JAR layer already uses. A bomb
 ///     truncates at the cap instead of exhausting memory.
 ///   * Anything else (LZW, ASCII85/Hex, chained filters, or Flate+predictor)
-///     → fall back to lopdf only when the raw input is `<= MAX_NONFLATE_RAW`,
-///     so worst-case expansion stays bounded; otherwise scan the raw bytes.
+///     → fall back to lopdf only when the raw input is under the applicable
+///     ceiling (`MAX_LZW_RAW` for LZW — quadratic expansion — otherwise
+///     `MAX_NONFLATE_RAW`), so worst-case expansion stays bounded; otherwise
+///     scan the raw bytes.
 ///
-/// The returned buffer is always `<= MAX_STREAM_DECOMPRESSED`.
-fn bounded_decompressed(stream: &lopdf::Stream) -> Vec<u8> {
+/// `total_remaining` is the file-wide decompression budget still available
+/// (see `MAX_TOTAL_DECOMPRESSED`); the effective per-call output cap is
+/// `min(MAX_STREAM_DECOMPRESSED, total_remaining)`. The returned buffer is
+/// always `<=` that effective cap.
+fn bounded_decompressed(stream: &lopdf::Stream, total_remaining: usize) -> Vec<u8> {
     use std::io::Read;
 
     let raw = stream.content.as_slice();
+    let cap = MAX_STREAM_DECOMPRESSED.min(total_remaining);
+    if cap == 0 {
+        return Vec::new();
+    }
 
     // Fast path: sole FlateDecode with no DecodeParms predictor.
     if is_sole_flate_no_parms(&stream.dict) {
@@ -76,31 +109,37 @@ fn bounded_decompressed(stream: &lopdf::Stream) -> Vec<u8> {
         // producers emit raw deflate, so fall back to that on zlib failure.
         // `.take(cap + 1)` caps the materialised output regardless of the
         // declared/actual decompressed size — the bomb cannot exceed it.
-        let cap = MAX_STREAM_DECOMPRESSED as u64;
+        let cap64 = cap as u64;
         let mut out = Vec::new();
         if flate2::read::ZlibDecoder::new(raw)
-            .take(cap + 1)
+            .take(cap64 + 1)
             .read_to_end(&mut out)
             .is_ok()
             || !out.is_empty()
         {
-            out.truncate(MAX_STREAM_DECOMPRESSED);
+            out.truncate(cap);
             return out;
         }
         let mut raw_out = Vec::new();
         let _ = flate2::read::DeflateDecoder::new(raw)
-            .take(cap + 1)
+            .take(cap64 + 1)
             .read_to_end(&mut raw_out);
-        raw_out.truncate(MAX_STREAM_DECOMPRESSED);
+        raw_out.truncate(cap);
         return raw_out;
     }
 
     // Non-Flate / chained / predictor path: only let lopdf's unbounded
     // decompressor run when the raw input is itself small enough that any
-    // plausible expansion is bounded.
-    if raw.len() <= MAX_NONFLATE_RAW {
+    // plausible expansion is bounded. LZW gets its own far tighter ceiling —
+    // its worst-case expansion is quadratic in the input size.
+    let raw_cap = if uses_lzw_filter(&stream.dict) {
+        MAX_LZW_RAW
+    } else {
+        MAX_NONFLATE_RAW
+    };
+    if raw.len() <= raw_cap {
         if let Ok(mut plain) = stream.decompressed_content() {
-            plain.truncate(MAX_STREAM_DECOMPRESSED);
+            plain.truncate(cap);
             return plain;
         }
     }
@@ -108,8 +147,25 @@ fn bounded_decompressed(stream: &lopdf::Stream) -> Vec<u8> {
     // Last resort: scan the raw (compressed) bytes, bounded. ASCII-family
     // filters are already readable here; binary filters lose detection but
     // never bomb.
-    let n = raw.len().min(MAX_STREAM_DECOMPRESSED);
+    let n = raw.len().min(cap);
     raw[..n].to_vec()
+}
+
+/// True when the stream's `/Filter` chain includes `LZWDecode` (or the `Lzw`
+/// abbreviation) — the one lopdf decode path whose worst-case output is
+/// quadratic in the input size, so it needs the tighter `MAX_LZW_RAW`
+/// raw-input ceiling.
+fn uses_lzw_filter(dict: &lopdf::Dictionary) -> bool {
+    fn is_lzw(n: &[u8]) -> bool {
+        n == b"LZWDecode" || n == b"Lzw"
+    }
+    match dict.get(b"Filter") {
+        Ok(Object::Name(n)) => is_lzw(n.as_slice()),
+        Ok(Object::Array(items)) => items
+            .iter()
+            .any(|o| o.as_name().ok().is_some_and(is_lzw)),
+        _ => false,
+    }
 }
 
 /// True when the stream's `/Filter` is exactly `FlateDecode` (or the `Fl`
@@ -364,6 +420,10 @@ struct PdfHits {
     embedded_executable: bool,
     xfa_submit: bool,
     remote_image_xobject: bool,
+    /// Cumulative decompressed bytes materialised so far — enforced against
+    /// `MAX_TOTAL_DECOMPRESSED` so a single file can't force ~64 GiB of
+    /// per-stream inflate work.
+    decompressed_total: usize,
 }
 
 /// Recursively walk an object, looking for action dictionaries, JS streams,
@@ -407,9 +467,11 @@ fn scan_object(
             scan_dict(&stream.dict, doc, hit, visited, depth);
 
             // Decompress with a hard output bound (defeats decompression
-            // bombs — see `bounded_decompressed`). Always returns at most
-            // MAX_STREAM_DECOMPRESSED bytes.
-            let plain = bounded_decompressed(stream);
+            // bombs — see `bounded_decompressed`), additionally limited by
+            // the remaining file-wide budget (`MAX_TOTAL_DECOMPRESSED`).
+            let remaining = MAX_TOTAL_DECOMPRESSED.saturating_sub(hit.decompressed_total);
+            let plain = bounded_decompressed(stream, remaining);
+            hit.decompressed_total += plain.len();
             scan_js_content(&plain, hit);
         }
         _ => {}
@@ -430,14 +492,14 @@ fn scan_dict(
                 b"Launch" => hit.launch_action = true,
                 b"GoToE" => {
                     if let Ok(f) = dict.get(b"F") {
-                        if uri_or_file_looks_unc(f, doc) {
+                        if uri_or_file_looks_unc(f, doc, 0) {
                             hit.gotoe_unc = true;
                         }
                     }
                 }
                 b"URI" => {
                     if let Ok(uri) = dict.get(b"URI") {
-                        if uri_is_suspicious(uri, doc) {
+                        if uri_is_suspicious(uri, doc, 0) {
                             hit.uri_action_remote = true;
                         }
                     }
@@ -489,7 +551,7 @@ fn scan_dict(
                 // presence and the JS scan will catch event/submit handlers.
                 // Real XFA-submit needs a content sniff.
                 if let Ok(xfa) = form_dict.get(b"XFA") {
-                    if xfa_content_has_submit(xfa, doc) {
+                    if xfa_content_has_submit(xfa, doc, hit, 0) {
                         hit.xfa_submit = true;
                     }
                 }
@@ -505,11 +567,16 @@ fn scan_dict(
     }
 }
 
-fn uri_or_file_looks_unc(obj: &Object, doc: &Document) -> bool {
+fn uri_or_file_looks_unc(obj: &Object, doc: &Document, depth: u32) -> bool {
+    // Reference chains have no visited set here — cap the follow depth so a
+    // cyclic object graph can't overflow the stack (see MAX_REF_FOLLOW_DEPTH).
+    if depth > MAX_REF_FOLLOW_DEPTH {
+        return false;
+    }
     // Strings may live behind references.
     if let Object::Reference(id) = obj {
         if let Ok(target) = doc.get_object(*id) {
-            return uri_or_file_looks_unc(target, doc);
+            return uri_or_file_looks_unc(target, doc, depth + 1);
         }
     }
     if let Ok(s) = obj.as_str() {
@@ -518,16 +585,19 @@ fn uri_or_file_looks_unc(obj: &Object, doc: &Document) -> bool {
     }
     if let Ok(d) = obj.as_dict() {
         if let Ok(f) = d.get(b"F") {
-            return uri_or_file_looks_unc(f, doc);
+            return uri_or_file_looks_unc(f, doc, depth + 1);
         }
     }
     false
 }
 
-fn uri_is_suspicious(obj: &Object, doc: &Document) -> bool {
+fn uri_is_suspicious(obj: &Object, doc: &Document, depth: u32) -> bool {
+    if depth > MAX_REF_FOLLOW_DEPTH {
+        return false;
+    }
     if let Object::Reference(id) = obj {
         if let Ok(target) = doc.get_object(*id) {
-            return uri_is_suspicious(target, doc);
+            return uri_is_suspicious(target, doc, depth + 1);
         }
     }
     if let Ok(s) = obj.as_str() {
@@ -554,17 +624,27 @@ fn uri_is_suspicious(obj: &Object, doc: &Document) -> bool {
     false
 }
 
-fn xfa_content_has_submit(obj: &Object, doc: &Document) -> bool {
-    // /XFA can be either an array of (name, stream-ref) pairs or a single stream.
+fn xfa_content_has_submit(obj: &Object, doc: &Document, hit: &mut PdfHits, depth: u32) -> bool {
+    // /XFA can be either an array of (name, stream-ref) pairs or a single
+    // stream. Depth-capped like the other reference-following helpers —
+    // mutually-referencing arrays cycle through the Array branch too.
+    if depth > MAX_REF_FOLLOW_DEPTH {
+        return false;
+    }
     match obj {
         Object::Reference(id) => doc
             .get_object(*id)
-            .map(|o| xfa_content_has_submit(o, doc))
+            .map(|o| xfa_content_has_submit(o, doc, hit, depth + 1))
             .unwrap_or(false),
-        Object::Array(items) => items.iter().any(|it| xfa_content_has_submit(it, doc)),
+        Object::Array(items) => items
+            .iter()
+            .any(|it| xfa_content_has_submit(it, doc, hit, depth + 1)),
         Object::Stream(s) => {
-            // Bounded decompression — same bomb-safe path as the JS scan.
-            let scan = bounded_decompressed(s);
+            // Bounded decompression — same bomb-safe path as the JS scan,
+            // drawing from the same file-wide budget.
+            let remaining = MAX_TOTAL_DECOMPRESSED.saturating_sub(hit.decompressed_total);
+            let scan = bounded_decompressed(s, remaining);
+            hit.decompressed_total += scan.len();
             // Look for XFA submission event markers.
             contains_bytes(&scan, b"event activity=\"submit")
                 || contains_bytes(&scan, b"<submit")
@@ -769,13 +849,13 @@ mod tests {
         // We don't have a real Document for the suspicious_uri path, but the
         // non-reference branch doesn't need one — verify just that branch.
         let doc = Document::with_version("1.7");
-        assert!(uri_is_suspicious(&lit("javascript:alert(1)"), &doc));
-        assert!(uri_is_suspicious(&lit("ftp://10.0.0.1/x"), &doc));
-        assert!(uri_is_suspicious(&lit("http://192.168.1.1/c2"), &doc));
-        assert!(uri_is_suspicious(&lit("file:///etc/passwd"), &doc));
-        assert!(uri_is_suspicious(&lit("data:text/html,<script>"), &doc));
+        assert!(uri_is_suspicious(&lit("javascript:alert(1)"), &doc, 0));
+        assert!(uri_is_suspicious(&lit("ftp://10.0.0.1/x"), &doc, 0));
+        assert!(uri_is_suspicious(&lit("http://192.168.1.1/c2"), &doc, 0));
+        assert!(uri_is_suspicious(&lit("file:///etc/passwd"), &doc, 0));
+        assert!(uri_is_suspicious(&lit("data:text/html,<script>"), &doc, 0));
         // Legitimate HTTPS to a hostname — not flagged.
-        assert!(!uri_is_suspicious(&lit("https://example.com/docs"), &doc));
+        assert!(!uri_is_suspicious(&lit("https://example.com/docs"), &doc, 0));
     }
 
     #[test]
@@ -784,10 +864,43 @@ mod tests {
             Object::String(s.as_bytes().to_vec(), lopdf::StringFormat::Literal)
         }
         let doc = Document::with_version("1.7");
-        assert!(uri_or_file_looks_unc(&lit("\\\\attacker.example.com\\share\\foo.pdf"), &doc));
-        assert!(uri_or_file_looks_unc(&lit("//attacker.example.com/share/foo.pdf"), &doc));
-        assert!(!uri_or_file_looks_unc(&lit("local-file.pdf"), &doc));
-        assert!(!uri_or_file_looks_unc(&lit("https://example.com"), &doc));
+        assert!(uri_or_file_looks_unc(&lit("\\\\attacker.example.com\\share\\foo.pdf"), &doc, 0));
+        assert!(uri_or_file_looks_unc(&lit("//attacker.example.com/share/foo.pdf"), &doc, 0));
+        assert!(!uri_or_file_looks_unc(&lit("local-file.pdf"), &doc, 0));
+        assert!(!uri_or_file_looks_unc(&lit("https://example.com"), &doc, 0));
+    }
+
+    /// Cyclic reference graphs must terminate — pre-fix these helpers
+    /// recursed on `Object::Reference` with no depth cap, so `5 0 obj 5 0 R`
+    /// (or two mutually-referencing arrays) overflowed the scan thread's
+    /// stack: a daemon-level DoS from one small crafted PDF.
+    #[test]
+    fn cyclic_reference_helpers_terminate() {
+        let mut doc = Document::with_version("1.7");
+        let self_ref: ObjectId = (5, 0);
+        doc.objects
+            .insert(self_ref, Object::Reference(self_ref));
+
+        assert!(!uri_or_file_looks_unc(&Object::Reference(self_ref), &doc, 0));
+        assert!(!uri_is_suspicious(&Object::Reference(self_ref), &doc, 0));
+        assert!(!xfa_content_has_submit(
+            &Object::Reference(self_ref),
+            &doc,
+            &mut PdfHits::default(),
+            0
+        ));
+
+        // Mutual cycle through the Array branch of xfa_content_has_submit.
+        let a: ObjectId = (6, 0);
+        let b: ObjectId = (7, 0);
+        doc.objects.insert(a, Object::Array(vec![Object::Reference(b)]));
+        doc.objects.insert(b, Object::Array(vec![Object::Reference(a)]));
+        assert!(!xfa_content_has_submit(
+            &Object::Reference(a),
+            &doc,
+            &mut PdfHits::default(),
+            0
+        ));
     }
 
     /// Build a FlateDecode stream whose decompressed size is `plain_len`
@@ -817,7 +930,7 @@ mod tests {
             stream.content.len()
         );
 
-        let out = bounded_decompressed(&stream);
+        let out = bounded_decompressed(&stream, MAX_STREAM_DECOMPRESSED);
         assert!(
             out.len() <= MAX_STREAM_DECOMPRESSED,
             "output must be capped at {MAX_STREAM_DECOMPRESSED}, got {}",

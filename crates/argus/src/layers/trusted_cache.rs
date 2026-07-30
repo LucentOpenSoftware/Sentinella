@@ -106,6 +106,9 @@ impl TrustedCache {
     pub fn invalidate(&self) {
         if let Ok(mut inner) = self.inner.lock() {
             inner.sig_generation += 1;
+            // Drop the now-stale entries immediately — otherwise up to
+            // MAX_ENTRIES dead entries linger until LRU pressure evicts them.
+            inner.entries.clear();
         }
     }
 

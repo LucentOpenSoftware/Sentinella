@@ -11,7 +11,7 @@
 use rusqlite::{Connection, params};
 use serde::Serialize;
 use std::path::Path;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 // ═══════════════════════════════════════════════════════════════
 //  Data structs
@@ -255,7 +255,12 @@ impl CalibrationLog {
 
         match result {
             Ok(()) => {
-                let _ = self.conn.execute_batch("COMMIT");
+                // Surface COMMIT failure like BEGIN: returning Ok after a
+                // failed COMMIT would tell the caller the event persisted
+                // when it didn't.
+                self.conn
+                    .execute_batch("COMMIT")
+                    .map_err(|e| format!("COMMIT failed: {e}"))?;
             }
             Err(e) => {
                 let _ = self.conn.execute_batch("ROLLBACK");
@@ -263,13 +268,29 @@ impl CalibrationLog {
             }
         }
 
-        // Prune oldest detection rows beyond the retention cap.
-        let _ = self.conn.execute(
-            "DELETE FROM detection_events WHERE id NOT IN (
-                SELECT id FROM detection_events ORDER BY timestamp DESC, rowid DESC LIMIT ?1
-            )",
-            params![RETENTION_ROWS],
-        );
+        // Prune oldest detection rows beyond the retention cap. Child
+        // restore_events rows must be removed FIRST: the FK on
+        // restore_events.detection_event_id has no ON DELETE action, so
+        // deleting a referenced detection fails the whole DELETE — and with
+        // the error swallowed the 50k-row cap never worked again.
+        let prune_result = (|| -> rusqlite::Result<()> {
+            self.conn.execute(
+                "DELETE FROM restore_events WHERE detection_event_id NOT IN (
+                    SELECT id FROM detection_events ORDER BY timestamp DESC, rowid DESC LIMIT ?1
+                )",
+                params![RETENTION_ROWS],
+            )?;
+            self.conn.execute(
+                "DELETE FROM detection_events WHERE id NOT IN (
+                    SELECT id FROM detection_events ORDER BY timestamp DESC, rowid DESC LIMIT ?1
+                )",
+                params![RETENTION_ROWS],
+            )?;
+            Ok(())
+        })();
+        if let Err(e) = prune_result {
+            debug!(error = %e, "calibration retention prune failed");
+        }
 
         Ok(())
     }
@@ -280,48 +301,68 @@ impl CalibrationLog {
 
     /// Persist a restore event and update per-layer FP counts.
     pub fn record_restore(&self, event: &RestoreEvent) -> Result<(), String> {
+        // Same transaction discipline as record_detection: without it a
+        // mid-loop failure leaves the restore row committed while layer FP
+        // counters are only partially updated.
         self.conn
-            .execute(
-                "INSERT INTO restore_events \
-                 (id, detection_event_id, timestamp, file_path, file_hash, fp_category, user_notes) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
-                params![
-                    event.id,
-                    event.detection_event_id,
-                    event.timestamp,
-                    event.file_path,
-                    event.file_hash,
-                    event.fp_category,
-                    event.user_notes,
-                ],
-            )
-            .map_err(|e| format!("insert restore_event failed: {e}"))?;
+            .execute_batch("BEGIN")
+            .map_err(|e| format!("BEGIN failed: {e}"))?;
+        let result = (|| -> Result<(), String> {
+            self.conn
+                .execute(
+                    "INSERT INTO restore_events \
+                     (id, detection_event_id, timestamp, file_path, file_hash, fp_category, user_notes) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                    params![
+                        event.id,
+                        event.detection_event_id,
+                        event.timestamp,
+                        event.file_path,
+                        event.file_hash,
+                        event.fp_category,
+                        event.user_notes,
+                    ],
+                )
+                .map_err(|e| format!("insert restore_event failed: {e}"))?;
 
-        // Look up which layers the original detection triggered so we can
-        // increment their FP counters.
-        let layers_json: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT layers_triggered FROM detection_events WHERE id = ?1",
-                params![event.detection_event_id],
-                |row| row.get(0),
-            )
-            .ok();
+            // Look up which layers the original detection triggered so we can
+            // increment their FP counters.
+            let layers_json: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT layers_triggered FROM detection_events WHERE id = ?1",
+                    params![event.detection_event_id],
+                    |row| row.get(0),
+                )
+                .ok();
 
-        if let Some(json) = layers_json {
-            if let Ok(layers) = serde_json::from_str::<Vec<String>>(&json) {
-                for layer in &layers {
-                    let _ = self.conn.execute(
-                        "UPDATE layer_stats \
-                         SET fp_triggers = fp_triggers + 1, last_fp_timestamp = ?1 \
-                         WHERE layer_name = ?2",
-                        params![event.timestamp, layer],
-                    );
+            if let Some(json) = layers_json {
+                if let Ok(layers) = serde_json::from_str::<Vec<String>>(&json) {
+                    for layer in &layers {
+                        self.conn
+                            .execute(
+                                "UPDATE layer_stats \
+                                 SET fp_triggers = fp_triggers + 1, last_fp_timestamp = ?1 \
+                                 WHERE layer_name = ?2",
+                                params![event.timestamp, layer],
+                            )
+                            .map_err(|e| format!("layer_stats FP update failed: {e}"))?;
+                    }
                 }
             }
-        }
+            Ok(())
+        })();
 
-        Ok(())
+        match result {
+            Ok(()) => self
+                .conn
+                .execute_batch("COMMIT")
+                .map_err(|e| format!("COMMIT failed: {e}")),
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
     }
 
     // ───────────────────────────────────────────────────────────
@@ -478,8 +519,10 @@ impl CalibrationLog {
             })
             .unwrap_or(0) as u64;
 
+        // restore_events can outnumber detection_events (multiple restores
+        // per detection), so cap the exported rate at 1.0.
         let fp_rate = if total_detections > 0 {
-            total_restores as f64 / total_detections as f64
+            (total_restores as f64 / total_detections as f64).min(1.0)
         } else {
             0.0
         };

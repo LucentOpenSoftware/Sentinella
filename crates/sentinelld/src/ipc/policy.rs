@@ -335,13 +335,25 @@ pub fn method_registry() -> HashMap<&'static str, MethodPolicy> {
         "runtime.scan_buffer",
         auth_action(1024 * 1024, RateBucket::MemoryScan, true),
     );
+    // memory.scan_process: response includes ModuleInfo.base_address —
+    // a cross-privilege ASLR layout disclosure when the caller is an
+    // unelevated user process. Additionally gated by the v0.1.9 elevation
+    // check (is_challengeable_method) in the dispatcher; auth alone (the
+    // world-readable IPC secret) is not sufficient.
     m.insert(
         "memory.scan_process",
         auth_action(1024, RateBucket::MemoryScan, true),
     );
+    // quarantine.add authenticates via a one-shot challenge token (issued
+    // only to authenticated + elevated callers via security.challenge), NOT
+    // via the `auth` param — its IPC envelope carries `token`, not `auth`.
+    // Declared PrivilegedMutation so the dispatcher's central MethodClass
+    // gate (which validates `auth` for Authenticated* classes) doesn't
+    // reject the legitimate token-only flow. is_challengeable_method and
+    // the v0.1.9 elevation gate already cover it.
     m.insert(
         "quarantine.add",
-        auth_action(4096, RateBucket::QuarantineOps, true),
+        priv_mutation(4096, RateBucket::QuarantineOps),
     );
     m.insert(
         "calibration.report_safe",

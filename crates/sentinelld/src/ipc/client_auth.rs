@@ -11,11 +11,21 @@
 //!
 //! Design for safety (this sits on the critical IPC accept path):
 //!   * The *policy* (`decide`) is a pure function — fully unit-tested.
-//!   * The *resolution* (`resolve_client`) is thin unsafe FFI that returns
-//!     `None` on ANY error, and the caller treats `None` as **fail-open**
-//!     (allow + warn). A transient API quirk must never brick the GUI↔daemon
-//!     channel (WORKING_STATE "DO NOT BREAK" invariant). We only ever
-//!     fail-CLOSED on a *positive* deny from a successfully-resolved identity.
+//!   * The *resolution* (`resolve_client`) is thin unsafe FFI that
+//!     distinguishes two failure classes ([`ResolveOutcome`]):
+//!       - `Unresolved` — we could not even obtain the client PID, or a
+//!         token query on the live, already-opened process failed. Treated
+//!         as a transient API quirk: the caller fails **open** (allow +
+//!         warn), because an OS hiccup must never brick the GUI↔daemon
+//!         channel (WORKING_STATE "DO NOT BREAK" invariant).
+//!       - `ClientGone` — we got the client PID but cannot open the
+//!         process/token, i.e. the client already exited. The caller fails
+//!         **closed**: a legit GUI is long-lived, and serving a connection
+//!         whose recorded client is dead would re-open the dead-PID race
+//!         (short-lived helper connects, duplicates the pipe handle into a
+//!         long-lived unelevated parent, exits → identity resolution fails
+//!         open → the v0.1.9 elevation gate passes for an unelevated
+//!         caller). A dead client at accept time needs no service.
 
 /// Identity of a connecting pipe client, resolved from its process token.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,12 +92,14 @@ pub fn decide(id: &ClientIdentity, active_console: Option<u32>) -> Decision {
 /// This function is the daemon-side gate that closes that hole.
 /// Returns Allow only if the caller is elevated or SYSTEM.
 ///
-/// Fail-open behaviour on `None`: if pipe-identity resolution failed at
-/// connect time (`resolve_client` returned `None` and the WORKING_STATE
-/// invariant kept the connection alive), we still allow — punishing a
-/// legitimate elevated GUI for an OS API quirk would brick the only way
-/// the user has to manage the daemon. The Deny path is for
-/// *positively-resolved* unelevated callers only.
+/// Fail-open behaviour on `None`: if pipe-identity resolution failed
+/// transiently at connect time (`resolve_client` reported
+/// [`ResolveOutcome::Unresolved`] and the WORKING_STATE invariant kept the
+/// connection alive), we still allow — punishing a legitimate elevated GUI
+/// for an OS API quirk would brick the only way the user has to manage the
+/// daemon. A *vanished* client never reaches this point: it is denied at
+/// the connection gate. The Deny path here is for *positively-resolved*
+/// unelevated callers only.
 pub fn require_elevation(id: Option<&ClientIdentity>) -> Decision {
     match id {
         Some(i) if i.well_known_untrusted => Decision::Deny("anonymous/null SID"),
@@ -99,10 +111,10 @@ pub fn require_elevation(id: Option<&ClientIdentity>) -> Decision {
 
 // ─── New v0.1.9 entry point: authorize + return identity ───────────
 //
-// The original `authorize_pipe_client` returns `bool` and drops the
-// resolved `ClientIdentity` — which is exactly the problem the audit
-// flagged. This new entry point lets the caller plumb the identity
-// through to the dispatcher so handler-level elevation checks
+// This entry point supersedes the old `authorize_pipe_client` (which
+// returned a bare `bool` and dropped the resolved `ClientIdentity` —
+// exactly the problem the audit flagged). It lets the caller plumb the
+// identity through to the dispatcher so handler-level elevation checks
 // (`require_elevation`) can run for every challengeable method.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,15 +127,30 @@ pub enum PipeAuth {
     Deny,
 }
 
-/// Resolve + decide for a connected named-pipe handle, returning the
-/// resolved [`ClientIdentity`] on Allow so the dispatcher can run
-/// per-method elevation gates.
+/// Outcome of [`resolve_client`]. See the module docs for the fail-open vs
+/// fail-closed rationale behind each failure class.
 #[cfg(target_os = "windows")]
-pub fn authorize_and_resolve_pipe_client(
-    pipe: std::os::windows::io::RawHandle,
-) -> PipeAuth {
-    match resolve_client(pipe) {
-        Some(id) => match decide(&id, active_console_session()) {
+#[derive(Debug)]
+enum ResolveOutcome {
+    /// Identity fully resolved from the client's process token.
+    Resolved(ClientIdentity),
+    /// Could not obtain the client PID (or a token query on the live,
+    /// already-opened process failed) — transient API quirk, fail OPEN.
+    Unresolved,
+    /// Got the client PID but the process/token could not be opened — the
+    /// client already exited. Fail CLOSED (dead-PID elevation-bypass
+    /// guard): a legit GUI is long-lived, and this is exactly what a
+    /// short-lived helper + `DuplicateHandle` + exit looks like.
+    ClientGone,
+}
+
+/// Map a resolution outcome to a connection-level authorization decision.
+/// Split out as a pure function (the FFI result is already materialized)
+/// so the fail-open/fail-closed contract is unit-testable without pipes.
+#[cfg(target_os = "windows")]
+fn decide_pipe_auth(outcome: ResolveOutcome, active_console: Option<u32>) -> PipeAuth {
+    match outcome {
+        ResolveOutcome::Resolved(id) => match decide(&id, active_console) {
             Decision::Allow => PipeAuth::Allow {
                 identity: Some(id),
             },
@@ -137,7 +164,13 @@ pub fn authorize_and_resolve_pipe_client(
                 PipeAuth::Deny
             }
         },
-        None => {
+        ResolveOutcome::ClientGone => {
+            tracing::warn!(
+                "IPC: pipe client process exited before identity resolution — rejecting (fail-closed dead-PID guard)"
+            );
+            PipeAuth::Deny
+        }
+        ResolveOutcome::Unresolved => {
             tracing::warn!(
                 "IPC: could not resolve pipe client identity — allowing (fail-open), elevation gates will also fail-open for this connection"
             );
@@ -146,44 +179,21 @@ pub fn authorize_and_resolve_pipe_client(
     }
 }
 
+/// Resolve + decide for a connected named-pipe handle, returning the
+/// resolved [`ClientIdentity`] on Allow so the dispatcher can run
+/// per-method elevation gates.
+#[cfg(target_os = "windows")]
+pub fn authorize_and_resolve_pipe_client(
+    pipe: std::os::windows::io::RawHandle,
+) -> PipeAuth {
+    decide_pipe_auth(resolve_client(pipe), active_console_session())
+}
+
 #[cfg(not(target_os = "windows"))]
 pub fn authorize_and_resolve_pipe_client(
     _pipe: std::os::unix::io::RawFd,
 ) -> PipeAuth {
     PipeAuth::Allow { identity: None }
-}
-
-/// Resolve + decide for a connected named-pipe handle. Returns `true` to allow
-/// the connection. On any resolution failure, fail-OPEN (allow + warn) so an
-/// API quirk never bricks a legitimate GUI; only a positively-resolved Deny
-/// rejects the connection.
-#[cfg(target_os = "windows")]
-pub fn authorize_pipe_client(pipe: std::os::windows::io::RawHandle) -> bool {
-    match resolve_client(pipe) {
-        Some(id) => match decide(&id, active_console_session()) {
-            Decision::Allow => true,
-            Decision::Deny(reason) => {
-                tracing::warn!(
-                    sid = id.sid.as_str(),
-                    session = id.session_id,
-                    reason,
-                    "IPC: rejected pipe client (per-connection SID check)"
-                );
-                false
-            }
-        },
-        None => {
-            tracing::warn!(
-                "IPC: could not resolve pipe client identity — allowing (fail-open)"
-            );
-            true
-        }
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-pub fn authorize_pipe_client(_pipe: std::os::unix::io::RawFd) -> bool {
-    true
 }
 
 /// Active physical console session id, or `None` if unavailable
@@ -194,10 +204,11 @@ fn active_console_session() -> Option<u32> {
     if s == u32::MAX { None } else { Some(s) }
 }
 
-/// Resolve the connecting client's identity from the pipe handle. Returns
-/// `None` on any failure (caller fails open).
+/// Resolve the connecting client's identity from the pipe handle.
+/// Failure classes (fail-open vs fail-closed) are documented on
+/// [`ResolveOutcome`] and in the module docs.
 #[cfg(target_os = "windows")]
-fn resolve_client(pipe: std::os::windows::io::RawHandle) -> Option<ClientIdentity> {
+fn resolve_client(pipe: std::os::windows::io::RawHandle) -> ResolveOutcome {
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
     use windows::Win32::Security::{
@@ -213,20 +224,33 @@ fn resolve_client(pipe: std::os::windows::io::RawHandle) -> Option<ClientIdentit
 
         // 1. Connecting process id.
         let mut client_pid: u32 = 0;
-        windows::Win32::System::Pipes::GetNamedPipeClientProcessId(pipe_handle, &mut client_pid)
-            .ok()?;
+        if windows::Win32::System::Pipes::GetNamedPipeClientProcessId(
+            pipe_handle,
+            &mut client_pid,
+        )
+        .is_err()
+        {
+            return ResolveOutcome::Unresolved;
+        }
+        // A successful call never reports PID 0 (System Idle) for a real
+        // pipe client — treat as a bogus/vanished client (fail closed).
         if client_pid == 0 {
-            return None;
+            return ResolveOutcome::ClientGone;
         }
 
-        // 2. Open the process (limited) + its token.
-        let proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, client_pid).ok()?;
+        // 2. Open the process (limited) + its token. From a SYSTEM daemon,
+        //    PROCESS_QUERY_LIMITED_INFORMATION succeeds for any LIVE
+        //    process; failure here means the recorded client already
+        //    exited — the dead-PID bypass signature — so fail CLOSED.
+        let proc = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, client_pid) {
+            Ok(p) => p,
+            Err(_) => return ResolveOutcome::ClientGone,
+        };
         // RAII-ish: ensure handles close on every return path.
         let mut token = HANDLE::default();
-        let token_ok = OpenProcessToken(proc, TOKEN_QUERY, &mut token).is_ok();
-        if !token_ok {
+        if OpenProcessToken(proc, TOKEN_QUERY, &mut token).is_err() {
             let _ = CloseHandle(proc);
-            return None;
+            return ResolveOutcome::ClientGone;
         }
 
         let result = (|| {
@@ -300,7 +324,12 @@ fn resolve_client(pipe: std::os::windows::io::RawHandle) -> Option<ClientIdentit
 
         let _ = CloseHandle(token);
         let _ = CloseHandle(proc);
-        result
+        match result {
+            Some(id) => ResolveOutcome::Resolved(id),
+            // Token queries failing on a live, already-opened process is a
+            // genuine API quirk (not attacker-controllable) → fail-open.
+            None => ResolveOutcome::Unresolved,
+        }
     }
 }
 
@@ -426,5 +455,46 @@ mod tests {
         // where some token call misbehaves. Fail-open here matches the
         // WORKING_STATE invariant the rest of the module already follows.
         assert_eq!(require_elevation(None), Decision::Allow);
+    }
+
+    // ── Dead-PID race regression (audit HIGH) ──
+    //
+    // Attack: a short-lived helper connects to the pipe, duplicates the
+    // pipe client handle into a long-lived UNELEVATED parent
+    // (`DuplicateHandle`), then exits. The daemon's accept-time resolution
+    // then gets the helper's PID from GetNamedPipeClientProcessId but
+    // OpenProcess fails (dead PID). That used to collapse into the same
+    // `None` as an API quirk → fail-open → `require_elevation(None)` →
+    // Allow, so every challengeable kill-vector method passed for an
+    // unelevated caller. `ClientGone` must fail CLOSED; only a true
+    // transient resolution failure may fail open.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn client_gone_fails_closed() {
+        assert_eq!(
+            decide_pipe_auth(ResolveOutcome::ClientGone, Some(1)),
+            PipeAuth::Deny,
+            "a vanished pipe client must be rejected — fail-open here is \
+             the dead-PID elevation-gate bypass"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn unresolved_identity_still_fails_open() {
+        assert_eq!(
+            decide_pipe_auth(ResolveOutcome::Unresolved, Some(1)),
+            PipeAuth::Allow { identity: None }
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn resolved_console_user_allowed_with_identity() {
+        let console_user = id("S-1-5-21-1-2-3-1001", 1, false);
+        match decide_pipe_auth(ResolveOutcome::Resolved(console_user), Some(1)) {
+            PipeAuth::Allow { identity: Some(_) } => {} // expected
+            other => panic!("resolved console user must be allowed with identity: {other:?}"),
+        }
     }
 }
