@@ -43,7 +43,7 @@ the roadmap; v1 accepts this, like every DNS-filtering product does.
 
 ```
  app ──DnsQuery──> Windows DNS Client (DnsCache service)
-                        │  NRPT rule: Namespace "." → 127.0.0.1:5353
+                        │  NRPT rule: Namespace "." → 127.0.0.1 (port 53)
                         ▼
               sentinella DNS guard proxy (this crate)
                         │  filter: allowlist → blocklist(suffix/exact)
@@ -55,11 +55,21 @@ the roadmap; v1 accepts this, like every DNS-filtering product does.
 
 **Name Resolution Policy Table** is Windows' built-in per-namespace DNS
 routing (Win8+). One catch-all rule
-(`Add-DnsClientNrptRule -Namespace "." -NameServers 127.0.0.1:<port>`)
+(`Add-DnsClientNrptRule -Namespace "." -NameServers 127.0.0.1`)
 routes *all* system DNS through the local proxy — no adapter changes,
 no driver, cleanly reversible (`Remove-DnsClientNrptRule`). Verified
 facts (MS Learn + field reports):
 
+- **NRPT NameServers are bare IP addresses — there is no port syntax.**
+  The DNS Client always queries them on port 53, so **the proxy must
+  listen on `127.0.0.1:53`** (verified bindable on a stock Windows 11
+  box, unelevated, no conflict). An earlier revision of this doc wrote
+  `127.0.0.1:5353` and labeled it verified — that was wrong: the
+  citation (Atomic Red Team T1562.001 #76) shows a bare `127.0.0.1`
+  with no port, and no documentation supports a port in NameServers.
+  Consequence: enabling web protection must first check nothing else
+  owns `127.0.0.1:53` (conflict → refuse + loud error, never fight
+  over the port).
 - Loopback NameServers are accepted — Atomic Red Team T1562.001 test
   #76 uses exactly `-NameServers 127.0.0.1` to silence Defender
   endpoints. (This also means malware can use NRPT offensively — see
@@ -106,10 +116,25 @@ NOT the kernel system logger.
 ## 4. Filter engine
 
 - Precedence: `allowlist > blocklist`, exact-host before suffix rules.
+- **Rule kinds are explicit.** Hosts-format entries (`0.0.0.0 host`)
+  are **exact-host rules** (Pi-hole semantics — the entry blocks that
+  host, not its subtree). Suffix rules require an explicit marker
+  (leading dot, `.evil.example`) in user-supplied lists. Rationale:
+  real blocklists contain bare labels (e.g. `127.0.0.1 local` in
+  StevenBlack's preamble); treating every entry as a suffix rule would
+  blackhole entire namespaces (`.local`, or `.com` from a hostile or
+  careless list source) — machine-wide breakage from a data file.
+- Wire-format safety: DNS labels may contain `.` bytes (a single label
+  `microsoft.com` is legal on the wire and collides with the two-label
+  name when joined naively). Names are decoded with RFC 4343 escaping
+  (`\.`) before presentation/filtering, and **the cache key is the raw
+  wire-format name**, never a presentation string — a hostile encoding
+  cannot alias a victim domain (pre-integration finding: a one-UDP-
+  socket process could otherwise blackhole any domain machine-wide).
 - Normalization: case-insensitive ASCII; trailing-dot stripped;
   punycode (`xn--`) matched both as-is and (v2) decoded.
 - Scale: blocklists are 10⁴–10⁶ domains — in-memory HashSet for exact,
-  sorted-suffix structure for suffix matching; no NRPT-per-domain
+  label-boundary candidate generation for suffix; no NRPT-per-domain
   (a rule per blocked domain does not scale; the catch-all + in-proxy
   filtering is why).
 - Sources (all legal, documented in-tree):
@@ -123,12 +148,39 @@ NOT the kernel system logger.
 ## 5. Threat model & failure modes
 
 - **Proxy dies → whole-machine DNS outage** (the catch-all makes us a
-  single point of failure). Mitigations: health watchdog (self-test
-  query every N s); `on_proxy_failure` policy (default: NRPT secondary
-  upstream = fail-open with loud event; alternative: remove rule);
-  NRPT rule re-assert on daemon start; clean rule removal on orderly
-  shutdown; stale-rule cleanup on next start (rule is ours by
-  DisplayName/comment marker + nameserver match).
+  single point of failure). This is THE hazard of the design — an AV
+  that breaks DNS is worse than an AV that misses malware — so the
+  lifecycle is specified here, before integration, not after:
+
+  1. **Bind before rule.** The proxy binds `127.0.0.1:53` (UDP+TCP) and
+     passes a loopback self-test query BEFORE any NRPT rule is
+     installed. Bind failure (port conflict — something else owns 53)
+     → refuse to enable, loud error, no rule.
+  2. **Rule identity by GUID, not DisplayName.** Rules we create record
+     their GUID; reconciliation touches only OUR rule, never a foreign
+     one (admin/GPO rules are surfaced, not deleted).
+  3. **Boot-time reconciler independent of the daemon.** Every
+     mitigation that lives inside sentinelld dies with it — so a
+     Scheduled Task (`Sentinella\DnsReconcile`, boot trigger, SYSTEM)
+     runs a tiny reconciler that is NOT the daemon: if the service is
+     absent/disabled/not-yet-healthy, it removes our rule (by GUID) and
+     exits. The daemon (re)installs the rule only after its own
+     self-test passes. The reconciler is also the uninstall path:
+     uninstalling Sentinella removes the task and the rule in that
+     order.
+  4. **Runtime watchdog (in-daemon, layered under 1–3, never instead
+     of):** self-test query every N s; on sustained failure apply
+     `on_proxy_failure` policy (`fallback` = NRPT secondary upstream,
+     monitored fail-open; `remove_rule` = monitored fail-closed);
+     foreign-rule diff → alert; clean removal on orderly shutdown;
+     stale-rule cleanup by GUID on next start.
+  5. **The 10 ways the listener stops with the rule alive** (crash,
+     kill -9, service stop, service disable, uninstall-gone-wrong,
+     boot-time port conflict, upgrade replace, bluescreen, user renames
+     install dir, defender quarantines binary) — each maps to exactly
+     one of layers 1–4; anything that skips all four leaves a rule
+     pointing at a dead port, which is why layer 3 is not optional.
+
 - **Tampering:** NRPT rules need only admin — same bar as disabling the
   service. Watchdog diffs effective NRPT rules vs expected; foreign or
   missing rules → alert + re-assert. GPO presence → surface "web
@@ -137,9 +189,21 @@ NOT the kernel system logger.
 - **Blocked-domain bypass via direct-IP or DoH:** accepted residual
   (§1). Roadmap: firewall rules for known public DoH resolver IPs
   (opt-in), SNI heuristics if a driver ever lands.
+- **Upstream response forgery / cache poisoning:** the proxy validates
+  every upstream response before accepting or caching it: QR set,
+  **transaction ID matches a per-query RANDOM ID generated upstream-side
+  (the client's ID is never forwarded verbatim)** and question section
+  echoes the query. Together with per-query ephemeral sockets and
+  `connect()` source filtering this restores the standard resolver
+  defense-in-depth; an invalid response is dropped, never cached.
 - **Cache poisoning via upstream:** we are a forwarding resolver — we
   do NOT do DNSSEC validation in v1; upstream choice inherits the
   operator's trust. Documented; DoH upstream option is a v2 item.
+- **Availability:** TCP clients get a SEPARATE, smaller permit pool
+  from UDP with a per-connection total-lifetime cap (not just an idle
+  timeout) — 256 idle loopback connections dribbling bytes must not be
+  able to starve all DNS (and thereby force the fail-open path, which
+  doubles as an on-demand filter bypass).
 - **Log privacy:** query logs are sensitive (browsing history).
   Retention-capped, daemon-local, surfaced only via authenticated IPC
   (same tiering as scan history), never in the unauthenticated tier.
@@ -149,12 +213,12 @@ NOT the kernel system logger.
 ```toml
 [web_protection]
 enabled = false                 # default off until proven on-box
-listen = "127.0.0.1:5353"
+listen = "127.0.0.1:53"         # NRPT queries port 53 — no port syntax exists
 upstream = "system"             # or ["1.1.1.1", "9.9.9.9"]
 on_proxy_failure = "fallback"   # or "remove_rule"
 block_response = "nxdomain"     # or "zero_ip"
-allowlist = []
-extra_blocklists = []           # file paths / source ids
+allowlist = []                  # exact hosts; leading "." = suffix rule
+extra_blocklists = []           # file paths / source ids (hosts format = exact rules)
 log_queries = false             # full query log off by default (privacy)
 ```
 
@@ -174,19 +238,31 @@ acceptance test).
   1M-line file bounded-time load).
 - DNS wire: query parse/build roundtrip; malformed packets (truncated
   header, count lies, compression-pointer loops, oversized); no panics
-  on arbitrary bytes (seeded sweeps — same discipline as framework
-  parsers).
+  on arbitrary bytes (seeded sweeps that provably reach the name
+  parser — a sweep that never reaches it is evidence of nothing);
+  dot-in-label encodings (cache-key injectivity).
+- **Hostile-response validation:** wrong txid dropped; QR-unset
+  dropped; mismatched question dropped; no invalid response is ever
+  cached; fuzz sweeps reach the name parser (assert with coverage
+  markers, not iteration counts).
+- Filter semantics: hosts entries are exact (a `0.0.0.0 local` line
+  does NOT touch `.local`); explicit `.suffix` rules only via the
+  leading-dot marker; allowlist bare labels cannot disable the canary.
 - Proxy behavior with a fake loopback upstream: blocked → NXDOMAIN
   shape; allowed → forwarded byte-faithfully; upstream timeout →
   SERVFAIL, not hang; cache hit/miss/TTL expiry; negative caching;
   bounded in-flight (N+1 concurrent queries → shedding, not unbounded
-  tasks).
+  tasks — and the shed test must ALSO assert healthy queries still
+  forward, since a fully broken proxy also emits SERVFAIL); TCP pool
+  exhaustion does not starve UDP.
 - NRPT lifecycle (opt-in elevated `#[ignore]` tests): add → effective
   (`Get-DnsClientNrptPolicy -Effective`), flush, blocked domain
   NXDOMAINs through the SYSTEM resolver (the real end-to-end), proxy
-  kill → fallback behavior, shutdown → rule gone, restart → stale
-  cleanup. 10-minute operator acceptance: `webprotection.test` +
-  browser to a blocklisted test domain.
+  kill → fallback behavior, shutdown → rule gone, **boot reconciler
+  removes the rule when the daemon is absent**, port-53 conflict →
+  enable refused with no rule installed. 10-minute operator
+  acceptance: `webprotection.test` + browser to a blocklisted test
+  domain.
 - Sentinel test domain: include one always-blocked canary
   (`webguard-test.sentinella.invalid`) so acceptance doesn't depend on
   a live blocklist.
