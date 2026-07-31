@@ -60,8 +60,18 @@ pub struct Query {
     pub id: u16,
     pub opcode: u8,
     pub recursion_desired: bool,
-    /// Presentation form, no trailing dot, labels joined by `.`.
+    /// Presentation form, no trailing dot, labels joined by `.`, with RFC
+    /// 4343 escaping: a `.` or `\` INSIDE a label is emitted as `\.` /
+    /// `\\` (non-printable octets as `\DDD`). This makes the string
+    /// unambiguous — the single wire label `microsoft.com` decodes to
+    /// `microsoft\.com`, which can never collide with the two-label name
+    /// `microsoft.com`. Filtering splits on UNescaped dots only.
     pub qname: String,
+    /// Raw wire-format qname bytes (length-prefixed labels + root). This —
+    /// never the presentation string — is the cache-key ingredient: raw
+    /// bytes are injective by construction, so a hostile dot-in-label
+    /// encoding cannot alias a victim domain's cache entry.
+    pub qname_wire: Vec<u8>,
     pub qtype: u16,
     pub qclass: u16,
     /// Offset just past the question section — the slice
@@ -113,18 +123,27 @@ pub fn parse_query(bytes: &[u8]) -> Result<Query, WireError> {
         opcode,
         recursion_desired,
         qname,
+        qname_wire: bytes[HEADER_LEN..name_end].to_vec(),
         qtype,
         qclass,
         question_end: name_end + 4,
     })
 }
 
-/// Parse a question-section name into presentation form.
+/// Parse a question-section name into presentation form with RFC 4343
+/// escaping (`.` → `\.`, `\` → `\\`, non-printable octets → `\DDD`).
 ///
 /// Compression pointers are *rejected* here: they are not legal in queries
 /// from well-behaved clients, and refusing them removes the entire class of
 /// pointer-loop attacks by construction (a self-pointer can never be
 /// followed because no pointer is ever followed).
+///
+/// WHY escaping matters (security): a `.` byte is legal INSIDE a wire
+/// label, so the single label `microsoft.com` and the two-label name
+/// `microsoft.com` are distinct names that join to the identical naive
+/// string. Joined naively and used as a cache key, a one-socket process
+/// could poison/blackhole any domain machine-wide. The escaped form is
+/// injective; the cache key is the raw wire bytes regardless.
 fn parse_question_name(bytes: &[u8], mut offset: usize) -> Result<(String, usize), WireError> {
     let mut name = String::new();
     // Root label alone costs 1 byte; every label costs 1 + len.
@@ -153,10 +172,27 @@ fn parse_question_name(bytes: &[u8], mut offset: usize) -> Result<(String, usize
         if !name.is_empty() {
             name.push('.');
         }
-        // Labels may carry arbitrary octets; lossy decode is safe here
-        // because the filter normalizes/rejects non-ASCII anyway.
-        name.push_str(&String::from_utf8_lossy(&bytes[offset + 1..end]));
+        push_label_escaped(&mut name, &bytes[offset + 1..end]);
         offset = end;
+    }
+}
+
+/// Append one wire label to a presentation string, escaping per RFC 4343:
+/// `.` → `\.`, `\` → `\\`, octets outside printable ASCII → `\DDD`.
+fn push_label_escaped(out: &mut String, label: &[u8]) {
+    use std::fmt::Write as _;
+    for &byte in label {
+        match byte {
+            b'.' => out.push_str("\\."),
+            b'\\' => out.push_str("\\\\"),
+            0x20..=0x7E => out.push(char::from(byte)),
+            _ => {
+                // Non-printable / non-ASCII octet: decimal escape. Label
+                // bytes are arbitrary octets; lossy UTF-8 decode would be
+                // ambiguous, so never decode — escape.
+                let _ = write!(out, "\\{byte:03}");
+            }
+        }
     }
 }
 
@@ -191,6 +227,10 @@ fn skip_name(bytes: &[u8], mut offset: usize) -> Option<usize> {
 
 /// Extract rcode and the minimum answer TTL from an upstream response.
 /// Returns `None` if the packet is too malformed to walk safely.
+///
+/// NOTE: this performs NO trust validation (any packet with a parsable
+/// layout yields a `ResponseInfo`). Accepting an upstream response for
+/// answering/caching requires [`validate_response`].
 pub fn response_info(bytes: &[u8]) -> Option<ResponseInfo> {
     if bytes.len() < HEADER_LEN {
         return None;
@@ -207,6 +247,56 @@ pub fn response_info(bytes: &[u8]) -> Option<ResponseInfo> {
             return None;
         }
     }
+    walk_answers(bytes, offset, ancount, rcode)
+}
+
+/// Validate an upstream response against the exchange that produced it
+/// (design doc §5 "Upstream response forgery / cache poisoning"):
+///
+/// - QR bit set (it is a response);
+/// - transaction ID equals the per-query ID WE generated for the upstream
+///   exchange (never the client-supplied ID);
+/// - exactly one question, byte-equal to the question we forwarded (name
+///   wire bytes + qtype + qclass).
+///
+/// Anything else returns `None`: the caller drops the packet, counts an
+/// upstream error, and never caches it. On success, returns the rcode/TTL
+/// summary for cache decisions.
+pub fn validate_response(bytes: &[u8], expected_id: u16, question: &[u8]) -> Option<ResponseInfo> {
+    if bytes.len() < HEADER_LEN {
+        return None;
+    }
+    let id = u16::from_be_bytes([bytes[0], bytes[1]]);
+    if id != expected_id {
+        return None;
+    }
+    let flags = u16::from_be_bytes([bytes[2], bytes[3]]);
+    if flags & FLAG_QR == 0 {
+        return None;
+    }
+    let rcode = (flags & 0x000F) as u8;
+    let qdcount = u16::from_be_bytes([bytes[4], bytes[5]]);
+    if qdcount != 1 {
+        return None;
+    }
+    let ancount = u16::from_be_bytes([bytes[6], bytes[7]]) as usize;
+    // The echoed question must be byte-identical to what we sent. A
+    // misbehaving/forging source that rewrites case, re-encodes labels, or
+    // answers a different question is dropped.
+    let echoed = bytes.get(HEADER_LEN..HEADER_LEN.checked_add(question.len())?)?;
+    if echoed != question {
+        return None;
+    }
+    walk_answers(bytes, HEADER_LEN + question.len(), ancount, rcode)
+}
+
+/// Walk the answer section from `offset`, collecting the minimum TTL.
+fn walk_answers(
+    bytes: &[u8],
+    mut offset: usize,
+    ancount: usize,
+    rcode: u8,
+) -> Option<ResponseInfo> {
     let mut min_ttl: Option<u32> = None;
     for _ in 0..ancount {
         offset = skip_name(bytes, offset)?;
@@ -498,7 +588,94 @@ mod tests {
         assert!(!is_truncated_response(&resp));
     }
 
-    /// Deterministic xorshift64 so the sweep is reproducible.
+    #[test]
+    fn dot_inside_label_is_escaped_and_never_collides() {
+        // Single wire label carrying the bytes "microsoft.com" (13 bytes) —
+        // legal on the wire. Naive joining would make it indistinguishable
+        // from the two-label name; RFC 4343 escaping keeps them distinct.
+        let mut hostile = vec![
+            0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0,
+            0x0D, // label length 13
+        ];
+        hostile.extend_from_slice(b"microsoft.com");
+        hostile.extend_from_slice(&[0x00, 0x00, 0x01, 0x00, 0x01]);
+        let q = parse_query(&hostile).expect("hostile encoding still parses");
+        assert_eq!(q.qname, "microsoft\\.com");
+        assert_ne!(q.qname, "microsoft.com", "no collision with the two-label name");
+        assert_eq!(q.qname_wire, &hostile[HEADER_LEN..q.question_end - 4]);
+
+        // The genuine two-label name decodes plainly — and differs.
+        let genuine = build_query(0x2, "microsoft.com", TYPE_A, CLASS_IN).expect("build");
+        let q2 = parse_query(&genuine).expect("parse");
+        assert_eq!(q2.qname, "microsoft.com");
+        assert_ne!(q.qname_wire, q2.qname_wire, "wire keys are injective");
+    }
+
+    #[test]
+    fn backslash_and_nonprintable_octets_are_escaped() {
+        // Label bytes: 'a', '\', 'b', 0x01, 0x7F — must not confuse the
+        // escape scheme or produce lossy UTF-8 replacements.
+        let mut pkt = vec![0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0x05];
+        pkt.extend_from_slice(&[b'a', b'\\', b'b', 0x01, 0x7F]);
+        pkt.extend_from_slice(&[0x00, 0x00, 0x01, 0x00, 0x01]);
+        let q = parse_query(&pkt).expect("parse");
+        assert_eq!(q.qname, "a\\\\b\\001\\127");
+    }
+
+    #[test]
+    fn built_queries_roundtrip_through_escaped_decoder() {
+        for name in ["example.com", "a.b.c.d.example", "xn--nxasmq6b.example"] {
+            let built = build_query(0x1, name, TYPE_A, CLASS_IN).expect("build");
+            let q = parse_query(&built).expect("parse");
+            assert_eq!(q.qname, name, "plain names roundtrip unchanged");
+        }
+    }
+
+    #[test]
+    fn validate_response_accepts_only_the_matching_exchange() {
+        let query = build_query(0xAAAA, "example.com", TYPE_A, CLASS_IN).expect("build");
+        let parsed = parse_query(&query).expect("parse");
+        let question = &query[HEADER_LEN..parsed.question_end];
+
+        // Well-formed response: QR set, matching ID, echoed question.
+        let mut resp = query.clone();
+        resp[2] = 0x81;
+        resp[3] = 0x80;
+        resp[7] = 1; // ancount
+        resp.extend_from_slice(&[0xC0, 0x0C]);
+        resp.extend_from_slice(&TYPE_A.to_be_bytes());
+        resp.extend_from_slice(&CLASS_IN.to_be_bytes());
+        resp.extend_from_slice(&300u32.to_be_bytes());
+        resp.extend_from_slice(&4u16.to_be_bytes());
+        resp.extend_from_slice(&[93, 184, 216, 34]);
+        let info = validate_response(&resp, 0xAAAA, question).expect("valid response accepted");
+        assert_eq!(info.rcode, RCODE_NOERROR);
+        assert_eq!(info.min_ttl, Some(300));
+
+        // Wrong txid → rejected.
+        assert_eq!(validate_response(&resp, 0xBBBB, question), None);
+        // QR unset → rejected.
+        let mut no_qr = resp.clone();
+        no_qr[2] = 0x01;
+        assert_eq!(validate_response(&no_qr, 0xAAAA, question), None);
+        // Question not echoed byte-for-byte → rejected.
+        let mut mangled = resp.clone();
+        mangled[HEADER_LEN + 1] = b'X';
+        assert_eq!(validate_response(&mangled, 0xAAAA, question), None);
+        // Question of a different name entirely → rejected.
+        let other = build_query(0xAAAA, "other.example", TYPE_A, CLASS_IN).expect("build");
+        let other_parsed = parse_query(&other).expect("parse");
+        assert_eq!(
+            validate_response(&resp, 0xAAAA, &other[HEADER_LEN..other_parsed.question_end]),
+            None
+        );
+        // Truncated → rejected, never a panic.
+        for len in 0..resp.len() {
+            let _ = validate_response(&resp[..len], 0xAAAA, question);
+        }
+    }
+
+    /// Deterministic xorshift64 so the sweeps are reproducible.
     struct XorShift(u64);
     impl XorShift {
         fn next(&mut self) -> u64 {
@@ -509,23 +686,81 @@ mod tests {
             self.0 = x;
             x
         }
+        fn byte(&mut self) -> u8 {
+            (self.next() & 0xFF) as u8
+        }
     }
 
+    /// A valid 12-byte query header (QR=0, qdcount=1) — the shared prefix
+    /// that gets sweeps PAST header validation and into the name parser.
+    fn valid_query_header(rng: &mut XorShift) -> Vec<u8> {
+        vec![
+            rng.byte(), rng.byte(), // random txid
+            0x01, 0x00, // flags: RD, QR clear
+            0x00, 0x01, // qdcount = 1
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ]
+    }
+
+    /// Structured sweep: valid header + random question-section bytes.
+    /// Random bytes from offset 12 reach `parse_question_name` immediately,
+    /// unlike a whole-packet random sweep which almost never survives header
+    /// validation. The coverage marker makes a vacuous sweep a loud failure.
     #[test]
-    fn arbitrary_random_bytes_never_panic() {
+    fn structured_sweep_random_question_bytes_never_panic_and_reach_name_parser() {
         let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
-        let mut buf = Vec::new();
+        let mut reached_name_parsing = 0u32;
         for _ in 0..20_000 {
-            let len = (rng.next() % 160) as usize;
-            buf.clear();
-            for _ in 0..len {
-                buf.push((rng.next() & 0xFF) as u8);
+            let mut buf = valid_query_header(&mut rng);
+            let extra = (rng.next() % 300) as usize;
+            for _ in 0..extra {
+                buf.push(rng.byte());
             }
-            // Every public entry point must be total.
-            let _ = parse_query(&buf);
+            match parse_query(&buf) {
+                Ok(_) => reached_name_parsing += 1,
+                // These can only come from inside/after name parsing —
+                // proof the sweep reached it.
+                Err(
+                    WireError::CompressionInQuestion
+                    | WireError::InvalidLabelType
+                    | WireError::NameTooLong,
+                ) => reached_name_parsing += 1,
+                Err(WireError::Truncated) => {}
+                Err(e) => panic!("impossible error past header validation: {e}"),
+            }
             let _ = build_error_response(&buf, RCODE_SERVFAIL);
             let _ = build_zero_ip_response(&buf, 60);
             let _ = response_info(&buf);
+            let _ = is_truncated_response(&buf);
+        }
+        // Coverage marker: with random label-length bytes, essentially every
+        // iteration enters name parsing; demand a solid floor so the sweep
+        // can never silently stop reaching it.
+        assert!(
+            reached_name_parsing >= 1_000,
+            "sweep reached name parsing only {reached_name_parsing} times — vacuous"
+        );
+    }
+
+    /// Structured sweep: fully valid query + random trailing garbage.
+    /// Exercises the "question parsed, junk after it" shape (forwarding and
+    /// response-walking paths must stay total on it).
+    #[test]
+    fn structured_sweep_valid_query_with_trailing_garbage_never_panics() {
+        let mut rng = XorShift(0xDEAD_BEEF_CAFE_F00D);
+        let names = ["example.com", "a.b.example", "x.y.z.w.example"];
+        for (i, name) in names.iter().cycle().take(20_000).enumerate() {
+            let mut buf = build_query(i as u16, name, TYPE_A, CLASS_IN).expect("build");
+            let extra = (rng.next() % 300) as usize;
+            for _ in 0..extra {
+                buf.push(rng.byte());
+            }
+            let q = parse_query(&buf).expect("trailing garbage must not break the question");
+            assert_eq!(q.qname, *name);
+            let _ = build_error_response(&buf, RCODE_SERVFAIL);
+            let _ = build_zero_ip_response(&buf, 60);
+            let _ = response_info(&buf);
+            let _ = validate_response(&buf, i as u16, &buf[HEADER_LEN..q.question_end]);
             let _ = is_truncated_response(&buf);
         }
     }

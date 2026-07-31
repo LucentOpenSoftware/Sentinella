@@ -5,8 +5,15 @@
 //! Design doc §3/§5 invariants implemented here:
 //! - fail-safe: malformed query → FORMERR, dead upstream → SERVFAIL,
 //!   overload → SERVFAIL shed; the machine's DNS never hangs on us;
-//! - bounded everything: in-flight semaphore, cache capacity, upstream
-//!   timeouts, datagram size;
+//! - bounded everything: in-flight semaphores (UDP and a SEPARATE, smaller
+//!   TCP pool with a per-connection total-lifetime cap — dribbling TCP
+//!   clients cannot starve UDP and thereby force the fail-open path, which
+//!   would also bypass filtering: under `on_proxy_failure = "fallback"`,
+//!   load that kills the proxy removes filtering; that policy knob is the
+//!   control), cache capacity, upstream timeouts, datagram size;
+//! - upstream responses are validated before use: QR set, transaction ID
+//!   matching the per-query ID we generated upstream-side (the client's ID
+//!   is never forwarded verbatim), question echoed byte-for-byte;
 //! - no hardcoded public resolver: upstreams come from configuration.
 
 use std::collections::HashMap;
@@ -14,7 +21,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -26,8 +33,15 @@ use crate::filter::{Decision, FilterEngine};
 use crate::wire;
 
 pub const DEFAULT_MAX_IN_FLIGHT: usize = 256;
+/// Separate, smaller permit pool for client TCP connections (design §5):
+/// loopback TCP connections are cheap to hold open, so they must not share
+/// the UDP in-flight budget.
+pub const DEFAULT_TCP_MAX_CONNECTIONS: usize = 32;
 pub const DEFAULT_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(3);
-/// Cache cap on upstream TTLs (design: min(upstream TTL, 300s)).
+/// Internal cache-lifetime cap: we cache a response for at most this long
+/// (min(upstream TTL, 300s)). This clamps only how long WE serve a cached
+/// entry; it never rewrites the TTL bytes inside the cached response,
+/// which are forwarded to clients exactly as the upstream sent them.
 pub const DEFAULT_MAX_TTL: Duration = Duration::from_secs(300);
 /// Negative (NXDOMAIN) cache lifetime (design: min(60s)).
 pub const DEFAULT_NEGATIVE_TTL: Duration = Duration::from_secs(60);
@@ -61,9 +75,17 @@ pub struct ProxyConfig {
     pub max_ttl: Duration,
     pub negative_ttl: Duration,
     pub block_response: BlockResponse,
-    /// Idle timeout on client TCP connections; also bounds how long a dead
-    /// connection can hold an in-flight permit.
+    /// Inter-read idle timeout on client TCP connections.
     pub tcp_idle_timeout: Duration,
+    /// HARD total-lifetime cap on a client TCP connection (design §5): a
+    /// connection is closed once it is this old, no matter how active it
+    /// is — an idle timeout alone lets dribbling connections hold a permit
+    /// forever.
+    pub tcp_max_lifetime: Duration,
+    /// Size of the SEPARATE TCP connection permit pool (design §5).
+    /// Deliberately much smaller than `max_in_flight` and never shared with
+    /// it, so TCP clients cannot starve UDP query handling.
+    pub tcp_max_connections: usize,
 }
 
 impl Default for ProxyConfig {
@@ -77,7 +99,9 @@ impl Default for ProxyConfig {
             max_ttl: DEFAULT_MAX_TTL,
             negative_ttl: DEFAULT_NEGATIVE_TTL,
             block_response: BlockResponse::default(),
-            tcp_idle_timeout: Duration::from_secs(30),
+            tcp_idle_timeout: Duration::from_secs(10),
+            tcp_max_lifetime: Duration::from_secs(60),
+            tcp_max_connections: DEFAULT_TCP_MAX_CONNECTIONS,
         }
     }
 }
@@ -164,7 +188,51 @@ where
     }
 }
 
-type CacheKey = (String, u16, u16);
+/// Cache key: the RAW wire-format qname bytes plus qtype/qclass. Never a
+/// presentation string — raw wire bytes are injective, so a hostile
+/// dot-in-a-label encoding (the single label `microsoft.com`) gets its own
+/// entry and can never alias the two-label victim domain's cached answer.
+type CacheKey = (Vec<u8>, u16, u16);
+
+/// Per-exchange transaction-ID generator for upstream queries.
+///
+/// NOT cryptographic — deliberately dependency-free (the crate has no RNG
+/// dependency): a xorshift64 mixer over an atomic counter, seeded from the
+/// wall clock and process ID. What matters for the threat model (design §5)
+/// is that the ID sequence is not attacker-controlled or trivially
+/// predictable from the client's own ID — the client's txid is never
+/// forwarded verbatim. Combined with the question-echo check and
+/// per-query ephemeral connected sockets this restores the standard
+/// resolver defense-in-depth; DNSSEC validation remains a v2 item.
+struct UpstreamTxids {
+    state: AtomicU64,
+}
+
+impl UpstreamTxids {
+    fn new() -> Self {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9E37_79B9_7F4A_7C15);
+        let seed = nanos ^ u64::from(std::process::id()).rotate_left(32);
+        // xorshift state must be nonzero.
+        Self {
+            state: AtomicU64::new(seed | 1),
+        }
+    }
+
+    fn next(&self) -> u16 {
+        // Each caller mixes a different counter value, so IDs do not repeat
+        // in lockstep even though the mix is deterministic.
+        let mut x = self
+            .state
+            .fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed);
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        (x >> 32) as u16
+    }
+}
 
 struct CacheEntry {
     bytes: Vec<u8>,
@@ -175,7 +243,11 @@ struct State {
     config: ProxyConfig,
     engine: Arc<RwLock<FilterEngine>>,
     cache: Mutex<HashMap<CacheKey, CacheEntry>>,
+    /// Permit pool bounding in-flight UDP queries.
     semaphore: Arc<Semaphore>,
+    /// SEPARATE, smaller pool bounding concurrent client TCP connections.
+    tcp_semaphore: Arc<Semaphore>,
+    txids: UpstreamTxids,
     counters: Arc<Counters>,
     hook: Arc<dyn DecisionHook>,
     upstream_rr: AtomicUsize,
@@ -282,6 +354,8 @@ impl Proxy {
     ) -> io::Result<Self> {
         let state = Arc::new(State {
             semaphore: Arc::new(Semaphore::new(config.max_in_flight)),
+            tcp_semaphore: Arc::new(Semaphore::new(config.tcp_max_connections)),
+            txids: UpstreamTxids::new(),
             config,
             engine: Arc::new(RwLock::new(engine)),
             cache: Mutex::new(HashMap::new()),
@@ -410,7 +484,7 @@ async fn tcp_loop(listener: TcpListener, state: Arc<State>, mut shutdown: watch:
                         continue;
                     }
                 };
-                match state.semaphore.clone().try_acquire_owned() {
+                match state.tcp_semaphore.clone().try_acquire_owned() {
                     Ok(permit) => {
                         let state = Arc::clone(&state);
                         tokio::spawn(async move {
@@ -418,8 +492,9 @@ async fn tcp_loop(listener: TcpListener, state: Arc<State>, mut shutdown: watch:
                         });
                     }
                     Err(_) => {
-                        // No permit: close the connection. Clients retry or
-                        // fall back to UDP; unbounded TCP tasks are worse.
+                        // TCP pool exhausted (separate from UDP by design):
+                        // close the connection. Clients retry or fall back
+                        // to UDP; unbounded TCP tasks are worse.
                         state.counters.bump(&state.counters.shed);
                         drop(stream);
                     }
@@ -429,25 +504,32 @@ async fn tcp_loop(listener: TcpListener, state: Arc<State>, mut shutdown: watch:
     }
 }
 
+/// Serve one client TCP connection. Two independent clocks bound it
+/// (design §5): an inter-read IDLE timeout (`tcp_idle_timeout`) and a HARD
+/// total-lifetime cap (`tcp_max_lifetime`) — without the latter, a
+/// dribbling connection could hold its permit indefinitely.
 async fn tcp_conn(
     mut stream: TcpStream,
     peer: SocketAddr,
     state: Arc<State>,
     _permit: OwnedSemaphorePermit,
 ) {
+    let deadline = tokio::time::Instant::now() + state.config.tcp_max_lifetime;
     loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            debug!(%peer, "TCP connection closed: hard lifetime cap reached");
+            return;
+        }
+        let read_budget = remaining.min(state.config.tcp_idle_timeout);
         let mut len_buf = [0u8; 2];
-        let read_len = timeout(
-            state.config.tcp_idle_timeout,
-            stream.read_exact(&mut len_buf),
-        )
-        .await;
+        let read_len = timeout(read_budget, stream.read_exact(&mut len_buf)).await;
         if !matches!(read_len, Ok(Ok(_))) {
-            return; // EOF, peer error, or idle timeout
+            return; // EOF, peer error, idle timeout, or lifetime cap
         }
         let n = u16::from_be_bytes(len_buf) as usize;
         let mut buf = vec![0u8; n];
-        let read_body = timeout(state.config.tcp_idle_timeout, stream.read_exact(&mut buf)).await;
+        let read_body = timeout(read_budget, stream.read_exact(&mut buf)).await;
         if !matches!(read_body, Ok(Ok(_))) {
             return;
         }
@@ -490,28 +572,28 @@ async fn handle_query(
         };
     }
 
-    // Cache key uses the normalized name so case/trailing-dot variants hit.
-    let cache_key = FilterEngine::normalize_name(&query.qname)
-        .map(|name| (name, query.qtype, query.qclass));
-    if let Some(key) = &cache_key
-        && let Some(resp) = state.cache_get(key, query.id)
-    {
+    // Cache key: raw wire-format qname bytes (injective — see CacheKey) so
+    // case variants do NOT collapse; upstreams answer case-insensitively
+    // but keying on bytes is the safe direction (no aliasing, ever).
+    let cache_key: CacheKey = (query.qname_wire.clone(), query.qtype, query.qclass);
+    if let Some(resp) = state.cache_get(&cache_key, query.id) {
         state.counters.bump(&state.counters.cache_hits);
         state.emit(client, &query, QueryOutcome::CacheHit);
         return Some(resp);
     }
 
-    match forward(state, bytes, via_tcp).await {
+    match forward(state, bytes, &query, via_tcp).await {
         Ok(mut resp) => {
             state.counters.bump(&state.counters.forwarded);
-            // Defensive: answer with the client's ID even if the upstream
-            // echoed something else.
+            // Restore the client's original txid: the wire bytes went
+            // upstream with OUR generated ID (see forward).
             if resp.len() >= 2 {
                 resp[0..2].copy_from_slice(&query.id.to_be_bytes());
             }
-            if let Some(key) = &cache_key {
-                state.cache_store(key, &resp);
-            }
+            // Only validated responses reach this point (forward drops
+            // anything failing txid/QR/question checks), so caching here
+            // can never poison the cache with a forgery.
+            state.cache_store(&cache_key, &resp);
             state.emit(client, &query, QueryOutcome::Forwarded);
             Some(resp)
         }
@@ -526,12 +608,38 @@ async fn handle_query(
 
 /// Forward to the upstream pool: UDP first, TCP when the client is TCP or
 /// the UDP answer comes back truncated (TC bit).
-async fn forward(state: &Arc<State>, query: &[u8], via_tcp: bool) -> io::Result<Vec<u8>> {
+///
+/// The packet goes out with a freshly GENERATED transaction ID (never the
+/// client's verbatim), and every response is validated
+/// ([`wire::validate_response`]: QR set, our txid, question echoed
+/// byte-for-byte) before it is accepted. An invalid response is dropped —
+/// counted as an upstream error by the caller, never answered, never
+/// cached.
+async fn forward(
+    state: &Arc<State>,
+    query_bytes: &[u8],
+    query: &wire::Query,
+    via_tcp: bool,
+) -> io::Result<Vec<u8>> {
     let upstream = state
         .pick_upstream()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no upstream configured"))?;
+    let upstream_id = state.txids.next();
+    let mut forwarded = query_bytes.to_vec();
+    forwarded[0..2].copy_from_slice(&upstream_id.to_be_bytes());
+    let question = &forwarded[wire::HEADER_LEN..query.question_end];
+
+    let invalid = || {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "upstream response failed validation (txid/QR/question)",
+        )
+    };
     if !via_tcp {
-        match udp_exchange(upstream, query, state.config.upstream_timeout).await {
+        match udp_exchange(upstream, &forwarded, state.config.upstream_timeout).await {
+            Ok(resp) if wire::validate_response(&resp, upstream_id, question).is_none() => {
+                return Err(invalid());
+            }
             Ok(resp) if !wire::is_truncated_response(&resp) => return Ok(resp),
             Ok(_) => {
                 debug!(%upstream, "TC bit set, retrying over TCP");
@@ -544,7 +652,11 @@ async fn forward(state: &Arc<State>, query: &[u8], via_tcp: bool) -> io::Result<
             }
         }
     }
-    tcp_exchange(upstream, query, state.config.upstream_timeout).await
+    let resp = tcp_exchange(upstream, &forwarded, state.config.upstream_timeout).await?;
+    if wire::validate_response(&resp, upstream_id, question).is_none() {
+        return Err(invalid());
+    }
+    Ok(resp)
 }
 
 async fn udp_exchange(upstream: SocketAddr, query: &[u8], wait: Duration) -> io::Result<Vec<u8>> {

@@ -4,10 +4,20 @@
 //! Semantics (design doc §4):
 //! - precedence: allowlist beats blocklist, always (an operator must be able
 //!   to un-break a false positive without editing third-party lists);
+//! - rule kinds are explicit: hosts-format entries (`0.0.0.0 host`) are
+//!   EXACT-host rules (Pi-hole semantics — the entry blocks that host, not
+//!   its subtree; a `0.0.0.0 local` line must never blackhole `.local`).
+//!   Suffix rules exist only via an explicit leading-dot marker
+//!   (`.evil.example`) in user-supplied lists, or the `add_allow` /
+//!   `add_block` API used by the daemon's IPC layer;
 //! - a suffix rule `evil.example` matches `evil.example` itself and any
 //!   subdomain (`a.b.evil.example`) but never a superstring
 //!   (`notevil.example`);
-//! - an exact rule matches only the host itself.
+//! - an exact rule matches only the host itself;
+//! - query names arrive RFC 4343-escaped from the wire layer (a `.` inside
+//!   a label appears as `\.`); suffix cuts happen only at UNescaped dots,
+//!   so the single label `microsoft.com` (`microsoft\.com`) can never
+//!   suffix-match the two-label rule `microsoft.com`.
 
 use std::collections::HashSet;
 use std::io::{self, BufRead};
@@ -57,7 +67,12 @@ impl FilterEngine {
     /// New engine containing only the always-blocked canary domain.
     pub fn new() -> Self {
         let mut engine = Self::default();
-        engine.block_suffix.insert(CANARY_DOMAIN.to_string());
+        // WHY exact (design doc §4/§7): the canary must not be disabled by
+        // a bare-label allowlist entry. With exact semantics, allowlisting
+        // `invalid` or `sentinella.invalid` cannot match it — only an
+        // exact allow of the canary itself (or an explicit leading-dot
+        // suffix rule on a parent) overrides it.
+        engine.block_exact.insert(CANARY_DOMAIN.to_string());
         engine
     }
 
@@ -65,19 +80,64 @@ impl FilterEngine {
     /// trailing dots, lowercase ASCII, reject empty names, empty labels,
     /// non-ASCII input, and names over 253 bytes.
     ///
+    /// Escape-aware (RFC 4343): `\` followed by any byte is a literal
+    /// escaped character within a label; label boundaries are UNescaped
+    /// dots only. An escape at the very end of the name is malformed and
+    /// rejected. This is what keeps the single wire label `microsoft.com`
+    /// (presented as `microsoft\.com`) from matching the two-label rule
+    /// `microsoft.com`.
+    ///
     /// Returns `None` for anything that cannot be a valid DNS name; callers
     /// treat that as "no rule can match" (fail-open to the upstream), never
     /// as a block decision based on garbage.
     pub fn normalize_name(name: &str) -> Option<String> {
-        let trimmed = name.trim_end_matches('.');
+        // Strip one trailing root dot — but only an UNescaped one: `foo\.`
+        // is a label ending in a dot, not a rooted name.
+        let bytes = name.as_bytes();
+        let mut end = bytes.len();
+        if end > 0 && bytes[end - 1] == b'.' {
+            let mut backslashes = 0usize;
+            let mut i = end - 1;
+            while i > 0 && bytes[i - 1] == b'\\' {
+                backslashes += 1;
+                i -= 1;
+            }
+            if backslashes.is_multiple_of(2) {
+                end -= 1;
+            }
+        }
+        let trimmed = &name[..end];
         if trimmed.is_empty() || trimmed.len() > MAX_NAME_LEN {
             return None;
         }
         if !trimmed.is_ascii() {
             return None;
         }
-        if trimmed.split('.').any(|label| label.is_empty()) {
-            return None;
+        let mut label_len = 0usize;
+        let mut escaped = false;
+        for byte in trimmed.bytes() {
+            if escaped {
+                // Escaped byte is label content, never a boundary.
+                escaped = false;
+                label_len += 1;
+                continue;
+            }
+            match byte {
+                b'\\' => {
+                    escaped = true;
+                    label_len += 1;
+                }
+                b'.' => {
+                    if label_len == 0 {
+                        return None; // empty label
+                    }
+                    label_len = 0;
+                }
+                _ => label_len += 1,
+            }
+        }
+        if escaped || label_len == 0 {
+            return None; // dangling escape or trailing empty label
         }
         Some(trimmed.to_ascii_lowercase())
     }
@@ -161,6 +221,13 @@ impl FilterEngine {
     /// lines, full-line `#` comments, and lines without a valid leading IP
     /// are skipped. Multiple hostnames on one line each become a rule.
     ///
+    /// Rule kinds (design doc §4 — Pi-hole semantics): each host becomes an
+    /// EXACT-host rule (the entry blocks that host only, never its
+    /// subtree — a `127.0.0.1 local` preamble line must not blackhole
+    /// `.local`). The one exception is the explicit suffix marker: a host
+    /// written with a leading dot (`.evil.example`) becomes a suffix rule
+    /// matching the host and all subdomains.
+    ///
     /// Runs in O(lines): one pass, hash inserts only — no per-line rescans,
     /// so a 10⁶-line list loads in seconds.
     pub fn load_hosts<R: BufRead>(&mut self, kind: ListKind, reader: R) -> io::Result<HostsLoadStats> {
@@ -220,9 +287,18 @@ impl FilterEngine {
         }
         let mut added = 0u64;
         for host in tokens {
-            let ok = match kind {
-                ListKind::Allow => self.add_allow(host),
-                ListKind::Block => self.add_block(host),
+            // Hosts entries are EXACT rules (Pi-hole semantics); only the
+            // explicit leading-dot marker requests a suffix rule.
+            let ok = if let Some(suffix) = host.strip_prefix('.') {
+                match kind {
+                    ListKind::Allow => self.add_allow(suffix),
+                    ListKind::Block => self.add_block(suffix),
+                }
+            } else {
+                match kind {
+                    ListKind::Allow => self.add_allow_exact(host),
+                    ListKind::Block => self.add_block_exact(host),
+                }
             };
             if ok {
                 added += 1;
@@ -232,15 +308,24 @@ impl FilterEngine {
     }
 }
 
-/// Does `name` or any of its parent suffixes (cut at label boundaries)
-/// appear in `set`? This is what keeps `evil.example` from matching
-/// `notevil.example`: cuts only happen after a dot.
+/// Does `name` or any of its parent suffixes appear in `set`? Cuts happen
+/// only at UNescaped dots — this is what keeps `evil.example` from matching
+/// `notevil.example`, and the escaped single label `microsoft\.com` from
+/// matching the two-label rule `microsoft.com`.
 fn suffix_match(set: &HashSet<String>, name: &str) -> bool {
     if set.contains(name) {
         return true;
     }
-    for (i, byte) in name.bytes().enumerate() {
-        if byte == b'.' && set.contains(&name[i + 1..]) {
+    let bytes = name.as_bytes();
+    let mut escaped = false;
+    for (i, &byte) in bytes.iter().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if byte == b'\\' {
+            escaped = true;
+        } else if byte == b'.' && set.contains(&name[i + 1..]) {
             return true;
         }
     }
@@ -286,7 +371,75 @@ mod tests {
     fn canary_is_blocked_with_empty_blocklist() {
         let engine = FilterEngine::new();
         assert_eq!(engine.decide(CANARY_DOMAIN), Decision::Block);
-        assert_eq!(engine.decide("sub.webguard-test.sentinella.invalid"), Decision::Block);
+        // The canary is an EXACT rule (design doc §4/§7): its subdomains
+        // are not covered — and cannot be covered accidentally, which is
+        // the point (see canary_survives_bare_label_allowlist).
+        assert_eq!(engine.decide("sub.webguard-test.sentinella.invalid"), Decision::Allow);
+    }
+
+    #[test]
+    fn canary_survives_bare_label_allowlist() {
+        let mut engine = FilterEngine::new();
+        // Exact allowlist entries on parent/bare labels cannot reach the
+        // canary — this is what keeps a `0.0.0.0 invalid`-style line in an
+        // allowlist from silently disabling the acceptance-test domain.
+        assert!(engine.add_allow_exact("invalid"));
+        assert!(engine.add_allow_exact("sentinella.invalid"));
+        assert_eq!(engine.decide(CANARY_DOMAIN), Decision::Block);
+        // Documented escape hatch: an exact allow of the canary itself DOES
+        // override (allowlist always wins for the exact host).
+        assert!(engine.add_allow_exact(CANARY_DOMAIN));
+        assert_eq!(engine.decide(CANARY_DOMAIN), Decision::Allow);
+    }
+
+    #[test]
+    fn hosts_entries_are_exact_rules_not_suffix() {
+        // Regression: routing every hosts token to suffix rules made
+        // `127.0.0.1 local` blackhole the whole `.local` namespace (AD,
+        // GPO, mDNS) and `0.0.0.0 com` would blackhole `.com`.
+        let mut engine = FilterEngine::new();
+        let stats = load(&mut engine, ListKind::Block, "0.0.0.0 local\n127.0.0.1 com\n");
+        assert_eq!(stats.rules_added, 2);
+        assert_eq!(engine.decide("local"), Decision::Block, "the host itself is blocked");
+        assert_eq!(engine.decide("com"), Decision::Block, "the host itself is blocked");
+        assert_eq!(engine.decide("foo.local"), Decision::Allow, "subtree untouched");
+        assert_eq!(engine.decide("corp.example.local"), Decision::Allow);
+        assert_eq!(engine.decide("anything.com"), Decision::Allow, ".com survives");
+    }
+
+    #[test]
+    fn leading_dot_marker_creates_suffix_rule() {
+        let mut engine = FilterEngine::new();
+        let stats = load(
+            &mut engine,
+            ListKind::Block,
+            "0.0.0.0 .evil.example\n0.0.0.0 exact-only.example\n",
+        );
+        assert_eq!(stats.rules_added, 2);
+        assert_eq!(engine.decide("evil.example"), Decision::Block);
+        assert_eq!(engine.decide("a.b.evil.example"), Decision::Block);
+        assert_eq!(engine.decide("notevil.example"), Decision::Allow);
+        assert_eq!(engine.decide("exact-only.example"), Decision::Block);
+        assert_eq!(engine.decide("sub.exact-only.example"), Decision::Allow);
+    }
+
+    #[test]
+    fn escaped_dot_in_label_never_matches_two_label_rule() {
+        // The wire decoder presents the single label "microsoft.com" as
+        // `microsoft\.com`. Suffix cuts happen at UNescaped dots only, so
+        // it must match neither the two-label rule `microsoft.com` nor the
+        // suffix rule `com`-under-`soft.com` style parents.
+        let mut engine = FilterEngine::new();
+        assert!(engine.add_block("microsoft.com"));
+        assert!(engine.add_block("soft.com"));
+        assert_eq!(engine.decide("microsoft.com"), Decision::Block);
+        assert_eq!(engine.decide("www.microsoft.com"), Decision::Block);
+        assert_eq!(engine.decide("microsoft\\.com"), Decision::Allow, "hostile single label");
+        assert_eq!(engine.decide("micro\\.soft.com"), Decision::Allow, "escaped dot is no boundary");
+        // Escaped form still normalizes (it is a valid presentation name).
+        assert!(FilterEngine::normalize_name("microsoft\\.com").is_some());
+        // Dangling escape is malformed → unnormalizable → fail-open Allow.
+        assert_eq!(FilterEngine::normalize_name("dangling\\"), None);
     }
 
     #[test]
