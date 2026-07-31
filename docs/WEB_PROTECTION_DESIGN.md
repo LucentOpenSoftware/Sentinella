@@ -1,6 +1,12 @@
 # Web Protection — Platform Design (v1: DNS-layer filtering)
 
-Status: design registered, implementation started. Scope: "lightweight
+Status: design registered; `dnsguard` crate implemented including the
+round-2 adversarial hardening (hard TCP cap on reads AND writes,
+RFC 2181 truncation for oversized UDP answers, clean upstream queries,
+case-insensitive echo + stray-datagram tolerance, wire-length
+normalization, 3-step self-test, empty-upstream refusal — all covered
+by tests verified to fail on the pre-fix code). Daemon/NRPT wiring and
+installer lifecycle remain the integration round. Scope: "lightweight
 and functional" — domain-level web protection without a kernel driver,
 without HTTPS inspection, without a browser extension. Closes the Tier-1
 "Web protection" gap from `docs/COMPETITIVE_GAP_ESET.md`.
@@ -84,7 +90,9 @@ facts (MS Learn + field reports):
   (`Clear-DnsClientCache`).
 
 **The proxy** (new crate `crates/dnsguard`, running inside sentinelld):
-UDP+TCP listener on 127.0.0.1:5353; minimal hand-rolled DNS message
+UDP+TCP listener on 127.0.0.1:53 (see the NRPT port erratum above —
+there is no port syntax, so 53 is the only choice); minimal hand-rolled
+DNS message
 parse/build (no dependency, bounded, total functions — same discipline
 as the PE parsers); filter decision; blocked → NXDOMAIN (policy option
 `0.0.0.0` for compatibility with clients that mishandle NXDOMAIN);
@@ -153,9 +161,19 @@ NOT the kernel system logger.
   lifecycle is specified here, before integration, not after:
 
   1. **Bind before rule.** The proxy binds `127.0.0.1:53` (UDP+TCP) and
-     passes a loopback self-test query BEFORE any NRPT rule is
-     installed. Bind failure (port conflict — something else owns 53)
-     → refuse to enable, loud error, no rule.
+     passes a THREE-STEP self-test BEFORE any NRPT rule is installed
+     (`Proxy::self_test`, implemented): (i) the filter engine decides
+     the always-blocked canary as Block — the canary NXDOMAINs on ANY
+     box (`.invalid` is reserved), so only a local engine decision
+     proves the plumbing is ours and not a box where we were never
+     installed; (ii) a LIVE query for a real resolvable name
+     (`health_check_name`, default `example.com`) forwarded to a
+     configured upstream returns NOERROR; (iii) the canary queried
+     through the listener returns NXDOMAIN. Bind failure (port
+     conflict — something else owns 53) or any failed step → refuse to
+     enable, loud error, no rule. Binding with an EMPTY upstream list
+     is refused outright: a resolver with no upstream is a lie (it
+     would pass bind while SERVFAILing every real query).
   2. **Rule identity by GUID, not DisplayName.** Rules we create record
      their GUID; reconciliation touches only OUR rule, never a foreign
      one (admin/GPO rules are surfaced, not deleted).
@@ -165,11 +183,20 @@ NOT the kernel system logger.
      runs a tiny reconciler that is NOT the daemon: if the service is
      absent/disabled/not-yet-healthy, it removes our rule (by GUID) and
      exits. The daemon (re)installs the rule only after its own
-     self-test passes. The reconciler is also the uninstall path:
-     uninstalling Sentinella removes the task and the rule in that
-     order.
+     self-test passes. The reconciler is also the uninstall path —
+     but the ORDER matters: uninstalling Sentinella must remove the
+     RULE first (and rule removal must succeed or the uninstall aborts
+     loudly), THEN the task, then the binaries. The reverse order
+     destroys the only out-of-process remover first; any interruption
+     between steps would strand a catch-all rule with no listener, no
+     reconciler, and no product to clean it up. (The MSI has no
+     CustomAction for this today — wiring it is installer work for the
+     integration round.)
   4. **Runtime watchdog (in-daemon, layered under 1–3, never instead
-     of):** self-test query every N s; on sustained failure apply
+     of):** the 3-step self-test every N s, probed against the PUBLIC
+     socket `127.0.0.1:53` — NOT `proxy.local_addr()`: a health check
+     aimed at the address the proxy CHOSE validates the wrong thing;
+     the DNS Client uses port 53. On sustained failure apply
      `on_proxy_failure` policy (`fallback` = NRPT secondary upstream,
      monitored fail-open; `remove_rule` = monitored fail-closed);
      foreign-rule diff → alert; clean removal on orderly shutdown;
@@ -192,10 +219,30 @@ NOT the kernel system logger.
 - **Upstream response forgery / cache poisoning:** the proxy validates
   every upstream response before accepting or caching it: QR set,
   **transaction ID matches a per-query RANDOM ID generated upstream-side
-  (the client's ID is never forwarded verbatim)** and question section
-  echoes the query. Together with per-query ephemeral sockets and
+  (the client's ID is never forwarded verbatim)** and the question
+  section echoes the query (qname compared ASCII-case-insensitively per
+  RFC 4343 — home CPE forwarders normalize case and byte-exactness
+  breaks behind them — qtype/qclass exact). Upstream queries are
+  rebuilt CLEAN: fresh txid, RD=1, the question only, zeroed counts,
+  NO additional records and no EDNS0 — client-controlled bytes (flag
+  games, ECS, OPT payloads) never leave the machine, and ECS in
+  particular would otherwise steer an answer we then cache
+  machine-wide. Together with per-query ephemeral sockets and
   `connect()` source filtering this restores the standard resolver
-  defense-in-depth; an invalid response is dropped, never cached.
+  defense-in-depth; an invalid response is dropped, never cached. The
+  UDP receive loop tolerates stray/invalid datagrams within the
+  exchange deadline (only the deadline gives up).
+- **Oversized answers vs UDP clients:** an answer fetched via the TCP
+  fallback can be up to 65535 bytes; replaying it whole to a UDP client
+  yields a datagram the client OS drops (WSAEMSGSIZE) with TC clear —
+  a hard failure with no retry signal, sticky for the cache lifetime,
+  triggered by ordinary traffic with no attacker. The proxy therefore
+  serves any UDP answer over the payload limit as an RFC 2181-style
+  TRUNCATED response (TC set, question only, zeroed answer counts) so
+  the client retries over TCP. v1 treats every UDP client as 512 bytes
+  (we strip EDNS0 from forwarded queries, so no client UDP size is ever
+  negotiated — documented limitation); the full answer is cached and
+  served to TCP clients.
 - **Cache poisoning via upstream:** we are a forwarding resolver — we
   do NOT do DNSSEC validation in v1; upstream choice inherits the
   operator's trust. Documented; DoH upstream option is a v2 item.
@@ -203,7 +250,11 @@ NOT the kernel system logger.
   from UDP with a per-connection total-lifetime cap (not just an idle
   timeout) — 256 idle loopback connections dribbling bytes must not be
   able to starve all DNS (and thereby force the fail-open path, which
-  doubles as an on-demand filter bypass).
+  doubles as an on-demand filter bypass). The cap bounds EVERY socket
+  operation on the connection, reads AND writes (a pipelining client
+  that never reads would otherwise park `write_all` on a full kernel
+  send buffer and hold its permit forever — reproduced: probes still
+  blocked at 2× the promised cap).
 - **Log privacy:** query logs are sensitive (browsing history).
   Retention-capped, daemon-local, surfaced only via authenticated IPC
   (same tiering as scan history), never in the unauthenticated tier.
@@ -226,9 +277,11 @@ IPC: `webprotection.status` (AuthenticatedRead: enabled, rule present,
 proxy healthy, counts, upstream in use), `webprotection.set_enabled`
 (PrivilegedMutation, challenge-gated), `webprotection.block_add` /
 `.block_remove` / `.allow_add` (PrivilegedMutation),
-`webprotection.test` (AuthenticatedAction: resolves a given name
-through the proxy and reports the decision — the 60-second operator
-acceptance test).
+`webprotection.test` (AuthenticatedAction: runs the 3-step self-test
+against `127.0.0.1:53` — canary decided Block by the engine, live
+`health_check_name` query NOERROR from an upstream, canary NXDOMAIN
+through the listener — and reports each step; acceptance = all three
+green. The 60-second operator acceptance test).
 
 ## 7. Test plan
 
@@ -254,7 +307,37 @@ acceptance test).
   bounded in-flight (N+1 concurrent queries → shedding, not unbounded
   tasks — and the shed test must ALSO assert healthy queries still
   forward, since a fully broken proxy also emits SERVFAIL); TCP pool
-  exhaustion does not starve UDP.
+  exhaustion does not starve UDP (the test must PROVE exhaustion —
+  small configured pools, a fresh TCP probe refused — and verify UDP
+  forward+block while TCP permits are gone).
+- **TCP hard-cap write path:** a pipelining client that never reads
+  (enough queued large answers to fill kernel buffers) must still be
+  killed at `tcp_max_lifetime` — kill counter moves, freed permit
+  serves a fresh client. This test is verified to FAIL on the
+  pre-fix code (unbounded `write_all`), as is the starvation test
+  against a merged-pool shape.
+- **Oversized answers:** a ~60KB answer fetched via TCP fallback is
+  cached whole; UDP clients get TC=1, ≤512 bytes, question intact,
+  zeroed answer counts; TCP clients get the full answer; one upstream
+  fetch total. Verified to FAIL pre-fix (oversized datagram, TC clear).
+- **Clean upstream queries:** a client query carrying EDNS0 OPT + ECS
+  is forwarded with ARCOUNT=0 and no OPT; the cached answer is keyed
+  on the question only (a different ECS hits the same entry). Verified
+  to FAIL pre-fix (verbatim client packet upstream).
+- **Case-insensitive question echo:** a case-normalizing upstream
+  (lowercased qname echo) is accepted; a real letter change is still
+  dropped. Verified to FAIL pre-fix (byte-exact echo → SERVFAIL).
+- **Stray-datagram tolerance:** garbage / wrong-txid datagrams before
+  the real answer do not kill the exchange. Verified to FAIL pre-fix
+  (single recv → SERVFAIL).
+- **Self-test / health:** `self_test` green against a fake upstream;
+  empty upstream list refused at bind; dead upstream →
+  `upstream_ok=false` with engine/filter steps still green.
+- **Wire-length vs presentation-length normalization:** a wire-legal
+  name whose ESCAPED form exceeds 253 chars (61×0x00 label) is still
+  decided (blocked via its suffix rule, never fail-open None);
+  wire-illegal names (label > 63, name > 255 wire bytes) are rejected.
+  Verified to FAIL pre-fix (escaped-string measurement → Allow).
 - NRPT lifecycle (opt-in elevated `#[ignore]` tests): add → effective
   (`Get-DnsClientNrptPolicy -Effective`), flush, blocked domain
   NXDOMAINs through the SYSTEM resolver (the real end-to-end), proxy

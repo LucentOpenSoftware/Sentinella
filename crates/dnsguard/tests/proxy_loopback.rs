@@ -153,6 +153,12 @@ fn config_for(upstreams: Vec<SocketAddr>) -> ProxyConfig {
     }
 }
 
+/// A blackhole "upstream" (RFC 863 discard port) for tests whose queries
+/// never leave the proxy (bind refuses an EMPTY upstream list).
+fn dead_upstream() -> SocketAddr {
+    "127.0.0.1:9".parse().expect("literal addr")
+}
+
 /// One-shot UDP query against the proxy from an ephemeral client socket.
 async fn udp_query(addr: SocketAddr, query: &[u8], wait: Duration) -> Vec<u8> {
     let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind client");
@@ -169,7 +175,7 @@ async fn udp_query(addr: SocketAddr, query: &[u8], wait: Duration) -> Vec<u8> {
 async fn blocked_domain_responds_nxdomain_with_matching_id_and_question() {
     let mut engine = FilterEngine::new();
     engine.add_block("evil.example");
-    let proxy = start_proxy(engine, config_for(vec![])).await;
+    let proxy = start_proxy(engine, config_for(vec![dead_upstream()])).await;
 
     let query = wire::build_query(0x1234, "evil.example", TYPE_A, CLASS_IN).expect("build");
     let resp = udp_query(proxy.addr, &query, Duration::from_secs(2)).await;
@@ -236,7 +242,7 @@ async fn canary_is_blocked_even_with_empty_blocklist() {
 async fn zero_ip_policy_answers_zero_a_record() {
     let mut engine = FilterEngine::new();
     engine.add_block("evil.example");
-    let mut config = config_for(vec![]);
+    let mut config = config_for(vec![dead_upstream()]);
     config.block_response = BlockResponse::ZeroIp;
     let proxy = start_proxy(engine, config).await;
 
@@ -669,7 +675,10 @@ async fn qr_unset_response_is_dropped_and_never_cached() {
 #[tokio::test]
 async fn mismatched_question_response_is_dropped_and_never_cached() {
     assert_bad_response_dropped_and_not_cached("mismatched-q.example", |resp| {
-        resp[wire::HEADER_LEN + 1] ^= 0x20; // case-flip a question name byte
+        // WHY not `^= 0x20`: a case flip is LEGAL (RFC 4343 — qname echo is
+        // case-insensitive; case-normalizing upstreams must be accepted).
+        // A real letter change breaks the question under any comparison.
+        resp[wire::HEADER_LEN + 1] = b'z';
     })
     .await;
 }
@@ -719,18 +728,45 @@ async fn spawn_dribblers(addr: SocketAddr, n: usize, interval: Duration) -> Vec<
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dribbling_tcp_connections_do_not_starve_udp() {
-    // 40 dribbling TCP connections against a 32-permit TCP pool: UDP query
-    // handling (the machine's actual DNS path) must be completely
-    // unaffected — forwarding AND blocking both keep working.
+    // Exhaustion MUST be real for this test to certify anything (a pool
+    // with free permits left proves nothing): tiny pools — 8 UDP in-flight
+    // permits, 8 TCP connection permits — and 16 dribblers, so the TCP
+    // pool is provably saturated. If the TCP pool were ever merged with
+    // the UDP pool (or sized from it), the dribblers would eat the 8
+    // shared permits and the UDP assertions below would fail.
     let (upstream, _calls) = spawn_udp_upstream(|q| Some(canned_a_response(q, 60, false))).await;
     let mut engine = FilterEngine::new();
     engine.add_block("evil.example");
-    let proxy = start_proxy(engine, config_for(vec![upstream])).await;
+    let mut config = config_for(vec![upstream]);
+    config.max_in_flight = 8;
+    config.tcp_max_connections = 8;
+    let proxy = start_proxy(engine, config).await;
 
-    let dribblers = spawn_dribblers(proxy.addr, 40, Duration::from_millis(200)).await;
+    let dribblers = spawn_dribblers(proxy.addr, 16, Duration::from_millis(200)).await;
     // Give the dribblers a moment to occupy the TCP pool.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
+    // Proof of exhaustion: a fresh TCP connection gets NO service (the
+    // pool is full, so it is closed without an answer — or the connect is
+    // refused outright). Without this the test could pass with every
+    // dribbler stuck outside the pool.
+    if let Ok(mut stream) = TcpStream::connect(proxy.addr).await {
+        let query = wire::build_query(9, "fine.example", TYPE_A, CLASS_IN).expect("build");
+        let _ = stream
+            .write_all(&(query.len() as u16).to_be_bytes())
+            .await;
+        let _ = stream.write_all(&query).await;
+        let mut len_buf = [0u8; 2];
+        let answered =
+            tokio::time::timeout(Duration::from_secs(1), stream.read_exact(&mut len_buf)).await;
+        assert!(
+            !matches!(answered, Ok(Ok(_))),
+            "TCP pool must be exhausted — no permit for a fresh connection"
+        );
+    }
+
+    // UDP — the machine's actual DNS path — is completely unaffected:
+    // forwarding AND blocking both keep working.
     let allowed = wire::build_query(1, "fine.example", TYPE_A, CLASS_IN).expect("build");
     let resp = udp_query(proxy.addr, &allowed, Duration::from_secs(2)).await;
     assert_eq!(rcode_of(&resp), RCODE_NOERROR, "UDP forwarding unaffected by TCP pressure");
@@ -788,4 +824,426 @@ async fn tcp_hard_lifetime_cap_closes_dribbling_connection() {
         "connection must be closed by the hard lifetime cap"
     );
     proxy.stop().await;
+}
+
+const TYPE_TXT: u16 = 16;
+
+/// Canned NOERROR response with ONE TXT record carrying `rdata_len` bytes
+/// of rdata (chunked into ≤255-byte character-strings, as the wire format
+/// requires) — the oversized-answer fixture.
+fn canned_big_txt_response(query: &[u8], ttl: u32, rdata_len: usize) -> Vec<u8> {
+    let q = wire::parse_query(query).expect("test queries are valid");
+    let mut out = Vec::new();
+    out.extend_from_slice(&q.id.to_be_bytes());
+    out.extend_from_slice(&0x8180u16.to_be_bytes()); // QR|RD|RA, NOERROR
+    out.extend_from_slice(&1u16.to_be_bytes()); // qdcount
+    out.extend_from_slice(&1u16.to_be_bytes()); // ancount
+    out.extend_from_slice(&[0, 0, 0, 0]); // ns/ar
+    out.extend_from_slice(&query[wire::HEADER_LEN..q.question_end]);
+    out.extend_from_slice(&[0xC0, 0x0C]); // name → question
+    out.extend_from_slice(&TYPE_TXT.to_be_bytes());
+    out.extend_from_slice(&CLASS_IN.to_be_bytes());
+    out.extend_from_slice(&ttl.to_be_bytes());
+    out.extend_from_slice(&(rdata_len as u16).to_be_bytes());
+    let mut remaining = rdata_len;
+    while remaining > 0 {
+        let chunk = remaining.min(255);
+        out.push(chunk as u8);
+        out.extend(std::iter::repeat_n(b'x', chunk));
+        remaining -= chunk;
+    }
+    out
+}
+
+/// Fake upstream speaking DNS-over-TCP (framed) with a per-query responder.
+/// Returns the address and a connection counter.
+async fn spawn_tcp_upstream_with<F>(responder: F) -> (SocketAddr, Arc<AtomicUsize>)
+where
+    F: Fn(&[u8]) -> Vec<u8> + Send + Sync + 'static,
+{
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind tcp upstream");
+    let addr = listener.local_addr().expect("addr");
+    let conns = Arc::new(AtomicUsize::new(0));
+    let conns_task = Arc::clone(&conns);
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            conns_task.fetch_add(1, Ordering::SeqCst);
+            let mut len_buf = [0u8; 2];
+            if stream.read_exact(&mut len_buf).await.is_err() {
+                continue;
+            }
+            let n = u16::from_be_bytes(len_buf) as usize;
+            let mut buf = vec![0u8; n];
+            if stream.read_exact(&mut buf).await.is_err() {
+                continue;
+            }
+            let resp = responder(&buf);
+            let framed = (resp.len() as u16).to_be_bytes();
+            let _ = stream.write_all(&framed).await;
+            let _ = stream.write_all(&resp).await;
+        }
+    });
+    (addr, conns)
+}
+
+/// Build a query from raw wire labels (bytes taken verbatim per label).
+fn raw_label_query(id: u16, labels: &[&[u8]], qtype: u16) -> Vec<u8> {
+    let mut v = vec![
+        (id >> 8) as u8, (id & 0xFF) as u8, // id
+        0x01, 0x00, // flags: RD
+        0x00, 0x01, // qdcount
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    for label in labels {
+        assert!(label.len() <= 63, "test label must fit one wire label");
+        v.push(label.len() as u8);
+        v.extend_from_slice(label);
+    }
+    v.push(0); // root
+    v.extend_from_slice(&qtype.to_be_bytes());
+    v.extend_from_slice(&CLASS_IN.to_be_bytes());
+    v
+}
+
+/// One framed TCP query against the proxy; returns the response body.
+async fn tcp_query(stream: &mut TcpStream, query: &[u8], wait: Duration) -> Vec<u8> {
+    stream
+        .write_all(&(query.len() as u16).to_be_bytes())
+        .await
+        .expect("write len");
+    stream.write_all(query).await.expect("write query");
+    let mut len_buf = [0u8; 2];
+    tokio::time::timeout(wait, stream.read_exact(&mut len_buf))
+        .await
+        .expect("no response")
+        .expect("read len");
+    let n = u16::from_be_bytes(len_buf) as usize;
+    let mut buf = vec![0u8; n];
+    tokio::time::timeout(wait, stream.read_exact(&mut buf))
+        .await
+        .expect("short response")
+        .expect("read body");
+    buf
+}
+
+#[tokio::test]
+async fn tcp_hard_lifetime_cap_kills_connection_blocked_on_write() {
+    // The WRITE-path half of the hard cap (the read-path half is
+    // tcp_hard_lifetime_cap_closes_dribbling_connection): the client sends
+    // a query and then NEVER reads, so the 60KB answer fills the kernel
+    // send buffer and an unbounded write_all would park forever, holding
+    // the (single) TCP permit. The cap must kill the connection anyway:
+    // the kill counter moves AND the freed permit serves a fresh client.
+    //
+    // Verified to FAIL on the pre-fix code: with an unbounded write the
+    // permit is never freed, the fresh probe connection is closed at
+    // accept, and tcp_query times out.
+    let (upstream, _conns) = spawn_tcp_upstream_with(|q| {
+        let parsed = wire::parse_query(q).expect("valid");
+        if parsed.qtype == TYPE_TXT {
+            canned_big_txt_response(q, 300, 60_000)
+        } else {
+            canned_a_response(q, 60, false)
+        }
+    })
+    .await;
+    let mut config = config_for(vec![upstream]);
+    config.tcp_idle_timeout = Duration::from_secs(60);
+    config.tcp_max_lifetime = Duration::from_millis(500);
+    config.tcp_max_connections = 1; // permit starvation is observable
+    let proxy = start_proxy(FilterEngine::new(), config).await;
+
+    // The blocker: PIPELINES 100 queries for the 60KB TXT answer (~6MB of
+    // response traffic) and then never reads — far beyond any loopback
+    // send/receive buffer autotuning, so the server's write side is
+    // guaranteed to park once the buffers fill. (A single 60KB answer is
+    // NOT enough: Windows loopback autotuning absorbs it and the test
+    // cannot tell a bounded write from an unbounded one.)
+    let mut blocker = TcpStream::connect(proxy.addr).await.expect("connect");
+    let mut pipeline = Vec::new();
+    for i in 0..100u16 {
+        let query =
+            wire::build_query(0x1000 + i, "huge-txt.example", TYPE_TXT, CLASS_IN).expect("build");
+        pipeline.extend_from_slice(&(query.len() as u16).to_be_bytes());
+        pipeline.extend_from_slice(&query);
+    }
+    blocker.write_all(&pipeline).await.expect("write pipeline");
+    // Deliberately no read.
+
+    // Well past the hard cap: the connection must be dead, permit freed.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let kills = proxy.counters.snapshot().tcp_lifetime_kills;
+    assert!(kills >= 1, "blocked-on-write connection must be killed by the cap");
+
+    // The freed permit serves a fresh client (fails on pre-fix code: the
+    // pool is still exhausted, the probe is closed at accept).
+    let mut fresh = TcpStream::connect(proxy.addr).await.expect("connect");
+    let probe = wire::build_query(0x2020, "after-kill.example", TYPE_A, CLASS_IN).expect("build");
+    let resp = tcp_query(&mut fresh, &probe, Duration::from_secs(2)).await;
+    assert_eq!(rcode_of(&resp), RCODE_NOERROR, "fresh connection served after the kill");
+    drop(blocker);
+    proxy.stop().await;
+}
+
+#[tokio::test]
+async fn tcp_fetched_oversized_answer_is_truncated_for_udp_full_for_tcp() {
+    // RFC 2181-style truncation: an answer fetched via the TCP fallback
+    // (here ~60KB) must NOT be replayed whole to UDP clients (the OS
+    // drops the oversized datagram with TC clear — a hard failure with no
+    // retry signal). UDP gets TC=1, ≤512 bytes, question intact, zero
+    // answers; TCP clients get the full answer; the full answer is what
+    // is cached (exactly ONE upstream TCP fetch for all three queries).
+    //
+    // Verified to FAIL on the pre-fix code: the UDP client received the
+    // whole 60KB datagram with TC clear.
+    let (udp, tcp, addr) = bind_udp_tcp_pair().await;
+    let tcp_conns = Arc::new(AtomicUsize::new(0));
+    tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        while let Ok((n, peer)) = udp.recv_from(&mut buf).await {
+            // UDP side: always truncated, no answers — forces TCP fallback.
+            let resp = canned_a_response(&buf[..n], 0, true);
+            let _ = udp.send_to(&resp, peer).await;
+        }
+    });
+    tokio::spawn({
+        let tcp_conns = Arc::clone(&tcp_conns);
+        async move {
+            while let Ok((mut stream, _)) = tcp.accept().await {
+                tcp_conns.fetch_add(1, Ordering::SeqCst);
+                let mut len_buf = [0u8; 2];
+                if stream.read_exact(&mut len_buf).await.is_err() {
+                    continue;
+                }
+                let n = u16::from_be_bytes(len_buf) as usize;
+                let mut buf = vec![0u8; n];
+                if stream.read_exact(&mut buf).await.is_err() {
+                    continue;
+                }
+                let resp = canned_big_txt_response(&buf, 300, 60_000);
+                let framed = (resp.len() as u16).to_be_bytes();
+                let _ = stream.write_all(&framed).await;
+                let _ = stream.write_all(&resp).await;
+            }
+        }
+    });
+
+    let proxy = start_proxy(FilterEngine::new(), config_for(vec![addr])).await;
+    let query = wire::build_query(0xAAAA, "huge-txt.example", TYPE_TXT, CLASS_IN).expect("build");
+    let parsed = wire::parse_query(&query).expect("parse");
+    let question = &query[wire::HEADER_LEN..parsed.question_end];
+
+    // UDP client: truncated response, never the oversized answer.
+    let resp = udp_query(proxy.addr, &query, Duration::from_secs(2)).await;
+    assert!(resp.len() <= 512, "UDP answer must fit the payload limit: {}", resp.len());
+    let flags = u16::from_be_bytes([resp[2], resp[3]]);
+    assert_ne!(flags & wire::FLAG_TC, 0, "TC bit set so the client retries over TCP");
+    assert_eq!(&resp[6..12], &[0; 6], "AN/NS/AR zeroed");
+    assert_eq!(&resp[wire::HEADER_LEN..], question, "question intact");
+    assert_eq!(tcp_conns.load(Ordering::SeqCst), 1, "fetched once over TCP");
+
+    // TCP client (cache hit): the FULL 60KB answer.
+    let mut stream = TcpStream::connect(proxy.addr).await.expect("connect");
+    let query2 = wire::build_query(0xBBBB, "huge-txt.example", TYPE_TXT, CLASS_IN).expect("build");
+    let resp = tcp_query(&mut stream, &query2, Duration::from_secs(2)).await;
+    assert!(resp.len() > 60_000, "TCP client gets the full answer: {}", resp.len());
+    assert_eq!(rcode_of(&resp), RCODE_NOERROR);
+    assert_eq!(tcp_conns.load(Ordering::SeqCst), 1, "served from cache, not refetched");
+
+    // UDP again (cache hit): still a proper truncation, still no refetch.
+    let query3 = wire::build_query(0xCCCC, "huge-txt.example", TYPE_TXT, CLASS_IN).expect("build");
+    let resp = udp_query(proxy.addr, &query3, Duration::from_secs(2)).await;
+    assert!(resp.len() <= 512);
+    assert_ne!(u16::from_be_bytes([resp[2], resp[3]]) & wire::FLAG_TC, 0, "TC set from cache too");
+    assert_eq!(tcp_conns.load(Ordering::SeqCst), 1);
+    proxy.stop().await;
+}
+
+#[tokio::test]
+async fn edns_ecs_additional_section_is_stripped_before_forwarding() {
+    // Client-controlled bytes beyond the question must never reach the
+    // upstream: the forwarded packet is rebuilt CLEAN (question only,
+    // ARCOUNT=0, no OPT/ECS). ECS in particular would steer the answer we
+    // then cache machine-wide.
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_task = Arc::clone(&seen);
+    let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind upstream");
+    let upstream = sock.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
+            let arcount = u16::from_be_bytes([buf[10], buf[11]]);
+            seen_task.lock().expect("mutex").push((arcount, n));
+            let _ = sock.send_to(&canned_a_response(&buf[..n], 300, false), peer).await;
+        }
+    });
+    let proxy = start_proxy(FilterEngine::new(), config_for(vec![upstream])).await;
+
+    // Client query with an EDNS0 OPT additional record carrying ECS.
+    let mut query = wire::build_query(0x7777, "ecs.example", TYPE_A, CLASS_IN).expect("build");
+    let parsed = wire::parse_query(&query).expect("parse");
+    let question_len = parsed.question_end - wire::HEADER_LEN;
+    query[11] = 1; // arcount = 1
+    query.extend_from_slice(&[
+        0x00, // name: root
+        0x00, 0x29, // type OPT (41)
+        0x10, 0x00, // class: 4096 UDP payload
+        0, 0, 0, 0, // ttl
+        0x00, 0x0B, // rdlength 11
+        0x00, 0x08, // OPTION-CODE: ECS (8)
+        0x00, 0x07, // OPTION-LENGTH 7
+        0x00, 0x01, // FAMILY: IPv4
+        24, 0, // source /24, scope 0
+        203, 0, 113, // 203.0.113.0/24
+    ]);
+
+    let resp = udp_query(proxy.addr, &query, Duration::from_secs(2)).await;
+    assert_eq!(rcode_of(&resp), RCODE_NOERROR);
+    {
+        let seen = seen.lock().expect("mutex");
+        let &(arcount, len) = seen.last().expect("upstream saw the query");
+        assert_eq!(arcount, 0, "forwarded query must have ARCOUNT=0 (no OPT/ECS)");
+        assert_eq!(
+            len,
+            wire::HEADER_LEN + question_len,
+            "forwarded query is exactly header + question — nothing else"
+        );
+    }
+
+    // The cached answer is keyed on the question only: a second client
+    // with a DIFFERENT ECS gets the same cached entry (no per-ECS fork).
+    let mut query2 = wire::build_query(0x7778, "ecs.example", TYPE_A, CLASS_IN).expect("build");
+    query2[11] = 1;
+    query2.extend_from_slice(&[
+        0x00, 0x00, 0x29, 0x10, 0x00, 0, 0, 0, 0, 0x00, 0x0B, 0x00, 0x08, 0x00, 0x07, 0x00, 0x01,
+        24, 0, 198, 51, 100, // a different ECS prefix
+    ]);
+    let resp = udp_query(proxy.addr, &query2, Duration::from_secs(2)).await;
+    assert_eq!(rcode_of(&resp), RCODE_NOERROR);
+    assert_eq!(seen.lock().expect("mutex").len(), 1, "second query served from cache");
+    assert_eq!(proxy.counters.snapshot().cache_hits, 1);
+    proxy.stop().await;
+}
+
+#[tokio::test]
+async fn case_normalizing_upstream_answer_is_accepted() {
+    // Home CPE forwarders lowercase the echoed question; RFC 4343 says
+    // qname comparison is case-insensitive. Verified to FAIL on the
+    // pre-fix (byte-exact echo) code with SERVFAIL.
+    let (upstream, calls) = spawn_udp_upstream(|q| {
+        let mut resp = canned_a_response(q, 60, false);
+        let parsed = wire::parse_query(q).expect("valid");
+        for byte in &mut resp[wire::HEADER_LEN..parsed.question_end - 4] {
+            *byte = byte.to_ascii_lowercase();
+        }
+        Some(resp)
+    })
+    .await;
+    let proxy = start_proxy(FilterEngine::new(), config_for(vec![upstream])).await;
+
+    let query = wire::build_query(0x5151, "MiXeD-CaSe.example", TYPE_A, CLASS_IN).expect("build");
+    let resp = udp_query(proxy.addr, &query, Duration::from_secs(2)).await;
+    assert_eq!(rcode_of(&resp), RCODE_NOERROR, "case-only echo difference must be accepted");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(proxy.counters.snapshot().upstream_errors, 0);
+    proxy.stop().await;
+}
+
+#[tokio::test]
+async fn stray_datagrams_before_the_real_answer_are_tolerated() {
+    // One stray/invalid datagram must not kill a healthy exchange: the
+    // upstream first sends sub-header garbage, then a valid answer with
+    // the WRONG txid, then the real answer — the exchange succeeds.
+    // Verified to FAIL on the pre-fix (single-recv) code: the garbage
+    // datagram ended the exchange with SERVFAIL.
+    let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind upstream");
+    let upstream = sock.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
+            let query = buf[..n].to_vec();
+            let mut wrong_txid = canned_a_response(&query, 60, false);
+            wrong_txid[0] ^= 0xFF;
+            let _ = sock.send_to(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00], peer).await; // garbage
+            let _ = sock.send_to(&wrong_txid, peer).await; // wrong txid
+            let _ = sock.send_to(&canned_a_response(&query, 60, false), peer).await; // real
+        }
+    });
+    let proxy = start_proxy(FilterEngine::new(), config_for(vec![upstream])).await;
+
+    let query = wire::build_query(0x6161, "stray.example", TYPE_A, CLASS_IN).expect("build");
+    let resp = udp_query(proxy.addr, &query, Duration::from_secs(2)).await;
+    assert_eq!(rcode_of(&resp), RCODE_NOERROR, "stray datagrams dropped, real answer accepted");
+    assert_eq!(id_of(&resp), 0x6161);
+    assert_eq!(proxy.counters.snapshot().upstream_errors, 0);
+    proxy.stop().await;
+}
+
+#[tokio::test]
+async fn wire_legal_name_with_escaped_label_past_253_chars_is_blocked() {
+    // End-to-end regression for the Block→Allow fail-open: the label of
+    // 61 × 0x00 octets is wire-legal but escapes to 244 presentation
+    // chars (255 with the suffix) — the filter must still decide it
+    // against the suffix rule, never return None and fail open.
+    let mut engine = FilterEngine::new();
+    engine.add_block("c2.example");
+    let (upstream, calls) = spawn_udp_upstream(|q| Some(canned_a_response(q, 60, false))).await;
+    let proxy = start_proxy(engine, config_for(vec![upstream])).await;
+
+    let query = raw_label_query(0x7171, &[&[0u8; 61], b"c2", b"example"], TYPE_A);
+    let resp = udp_query(proxy.addr, &query, Duration::from_secs(2)).await;
+    assert_eq!(rcode_of(&resp), RCODE_NXDOMAIN, "wire-legal name must reach the block decision");
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "blocked name never goes upstream");
+    proxy.stop().await;
+}
+
+#[tokio::test]
+async fn bind_refuses_empty_upstream_list() {
+    // A resolver with no upstream is a lie: it would pass bind and the
+    // filter self-test while SERVFAILing every real query.
+    let result = Proxy::bind(
+        config_for(vec![]),
+        FilterEngine::new(),
+        Arc::new(NoopDecisionHook),
+    )
+    .await;
+    assert!(result.is_err(), "empty upstream list must be refused at bind");
+}
+
+#[tokio::test]
+async fn self_test_is_green_against_a_healthy_fake_upstream() {
+    let (upstream, _calls) = spawn_udp_upstream(|q| Some(canned_a_response(q, 60, false))).await;
+    let proxy = Proxy::bind(
+        config_for(vec![upstream]),
+        FilterEngine::new(),
+        Arc::new(NoopDecisionHook),
+    )
+    .await
+    .expect("bind");
+    let report = proxy.self_test().await;
+    assert!(report.engine_ok, "{report:?}");
+    assert!(report.upstream_ok, "{report:?}");
+    assert!(report.filter_ok, "{report:?}");
+    assert!(report.ok(), "{report:?}");
+    assert!(report.detail.is_empty(), "{report:?}");
+}
+
+#[tokio::test]
+async fn self_test_reports_dead_upstream_but_healthy_filter() {
+    // The discard port never answers: upstream_ok must be false while the
+    // engine and listener (filter) steps stay green — the report
+    // distinguishes "plumbing works" from "upstream dead".
+    let proxy = Proxy::bind(
+        config_for(vec![dead_upstream()]),
+        FilterEngine::new(),
+        Arc::new(NoopDecisionHook),
+    )
+    .await
+    .expect("bind");
+    let report = proxy.self_test().await;
+    assert!(report.engine_ok, "{report:?}");
+    assert!(!report.upstream_ok, "dead upstream must be reported: {report:?}");
+    assert!(report.filter_ok, "{report:?}");
+    assert!(!report.ok());
+    assert!(!report.detail.is_empty());
 }

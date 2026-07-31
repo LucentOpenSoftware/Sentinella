@@ -31,9 +31,15 @@ pub const RCODE_NXDOMAIN: u8 = 3;
 
 const FLAG_QR: u16 = 0x8000;
 const FLAG_OPCODE_MASK: u16 = 0x7800;
-const FLAG_TC: u16 = 0x0200;
+pub const FLAG_TC: u16 = 0x0200;
 const FLAG_RD: u16 = 0x0100;
 const FLAG_RA: u16 = 0x0080;
+
+/// Classic DNS-over-UDP payload limit without EDNS0 (RFC 1035 §4.2.1).
+/// v1 serves EVERY UDP client against this limit: we strip EDNS0 from
+/// forwarded queries (no OPT reaches the upstream, no client UDP-size is
+/// negotiated), so 512 is the only size we may assume.
+pub const MAX_UDP_PAYLOAD: usize = 512;
 
 /// Errors that make a packet unusable as a query. The proxy maps every one
 /// of these to a FORMERR response (or drops the packet if not even a header
@@ -256,8 +262,15 @@ pub fn response_info(bytes: &[u8]) -> Option<ResponseInfo> {
 /// - QR bit set (it is a response);
 /// - transaction ID equals the per-query ID WE generated for the upstream
 ///   exchange (never the client-supplied ID);
-/// - exactly one question, byte-equal to the question we forwarded (name
-///   wire bytes + qtype + qclass).
+/// - exactly one question, matching the question we forwarded: the qname
+///   wire bytes compared ASCII-case-insensitively (RFC 4343 — DNS names
+///   preserve case but compare case-insensitively; home CPE forwarders
+///   normalize case, and byte-exactness would break behind them), qtype
+///   and qclass compared exactly.
+///
+/// Case-insensitivity here cannot weaken the label structure: label
+/// length bytes are ≤ 63 and ASCII letters are ≥ 65, so a length byte can
+/// never alias a letter (or vice versa) under case folding.
 ///
 /// Anything else returns `None`: the caller drops the packet, counts an
 /// upstream error, and never caches it. On success, returns the rcode/TTL
@@ -280,11 +293,17 @@ pub fn validate_response(bytes: &[u8], expected_id: u16, question: &[u8]) -> Opt
         return None;
     }
     let ancount = u16::from_be_bytes([bytes[6], bytes[7]]) as usize;
-    // The echoed question must be byte-identical to what we sent. A
-    // misbehaving/forging source that rewrites case, re-encodes labels, or
-    // answers a different question is dropped.
+    // The echoed question must match what we sent: qname case-insensitive
+    // (see doc header), qtype/qclass byte-exact. A misbehaving/forging
+    // source that re-encodes labels or answers a different question is
+    // dropped.
+    if question.len() < 4 {
+        return None;
+    }
     let echoed = bytes.get(HEADER_LEN..HEADER_LEN.checked_add(question.len())?)?;
-    if echoed != question {
+    let (echoed_name, echoed_tail) = echoed.split_at(echoed.len() - 4);
+    let (question_name, question_tail) = question.split_at(question.len() - 4);
+    if !echoed_name.eq_ignore_ascii_case(question_name) || echoed_tail != question_tail {
         return None;
     }
     walk_answers(bytes, HEADER_LEN + question.len(), ancount, rcode)
@@ -355,6 +374,63 @@ pub fn build_query(id: u16, qname: &str, qtype: u16, qclass: u16) -> Option<Vec<
     out.push(0);
     out.extend_from_slice(&qtype.to_be_bytes());
     out.extend_from_slice(&qclass.to_be_bytes());
+    Some(out)
+}
+
+/// Build the CLEAN query we send upstream for a client query: a fresh
+/// (caller-generated) transaction ID, standard flags (RD=1, nothing
+/// else), QDCOUNT=1, zeroed AN/NS/AR counts, and exactly the question
+/// section — NO additional records, no EDNS0 OPT. Client-controlled bytes
+/// beyond the question (flags, additional-section ECS cookies, OPT
+/// payloads) never leave the machine: an ECS option would steer the
+/// answer we then cache machine-wide, and a forged additional section
+/// would ride our upstream trust.
+///
+/// `question` must be the exact wire question slice (name + qtype +
+/// qclass) from a successfully parsed query.
+pub fn build_upstream_query(id: u16, question: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(HEADER_LEN + question.len());
+    out.extend_from_slice(&id.to_be_bytes());
+    out.extend_from_slice(&FLAG_RD.to_be_bytes());
+    out.extend_from_slice(&1u16.to_be_bytes()); // qdcount
+    out.extend_from_slice(&[0, 0, 0, 0, 0, 0]); // an/ns/ar — always zero
+    out.extend_from_slice(question);
+    out
+}
+
+/// Build a TRUNCATED response (TC bit set, question section only,
+/// ANCOUNT/NSCOUNT/ARCOUNT zeroed) for a UDP client whose full answer
+/// exceeds the UDP payload limit — RFC 2181-style truncation so the
+/// client retries over TCP. WHY: replaying a large (e.g. TCP-fetched,
+/// up to 65535-byte) answer to a UDP client produces an oversized
+/// datagram the OS drops (WSAEMSGSIZE on Windows) with TC clear — the
+/// client gets a hard failure with no retry signal, sticky for the cache
+/// lifetime. This fires with NO attacker via ordinary TC-fallback
+/// traffic.
+///
+/// Returns `None` when the request is shorter than a header (nothing to
+/// echo an ID from) — total over arbitrary input.
+pub fn build_truncated_response(request: &[u8]) -> Option<Vec<u8>> {
+    if request.len() < HEADER_LEN {
+        return None;
+    }
+    let flags_in = u16::from_be_bytes([request[2], request[3]]);
+    let flags = FLAG_QR
+        | (flags_in & FLAG_OPCODE_MASK)
+        | (flags_in & FLAG_RD)
+        | FLAG_RA
+        | FLAG_TC; // rcode NOERROR; TC is the whole point
+    let question = parse_query(request)
+        .ok()
+        .map(|q| &request[HEADER_LEN..q.question_end]);
+    let mut out = Vec::with_capacity(HEADER_LEN + question.map_or(0, <[u8]>::len));
+    out.extend_from_slice(&request[0..2]); // same ID
+    out.extend_from_slice(&flags.to_be_bytes());
+    out.extend_from_slice(&u16::from(question.is_some()).to_be_bytes());
+    out.extend_from_slice(&[0, 0, 0, 0, 0, 0]); // an/ns/ar zeroed
+    if let Some(question) = question {
+        out.extend_from_slice(question);
+    }
     Some(out)
 }
 
@@ -673,6 +749,77 @@ mod tests {
         for len in 0..resp.len() {
             let _ = validate_response(&resp[..len], 0xAAAA, question);
         }
+    }
+
+    #[test]
+    fn upstream_query_is_clean_question_only() {
+        // Client query with a suspicious flag byte and an OPT additional
+        // record: the upstream query must carry ONLY the question —
+        // fresh id slot, RD=1 flags, zeroed AN/NS/AR, nothing trailing.
+        let mut client = build_query(0xBEEF, "example.com", TYPE_A, CLASS_IN).expect("build");
+        client[2] |= 0x7F; // every non-QR high flag bit (opcode/AA/TC/RD)
+        client[3] = 0x5A; // low flag byte garbage
+        client[11] = 1; // arcount = 1
+        client.extend_from_slice(&[0x00, 0x00, 0x29, 0x10, 0x00, 0, 0, 0, 0, 0, 0]); // OPT
+        let parsed = parse_query(&client).expect("question parses");
+        let question = &client[HEADER_LEN..parsed.question_end];
+        let clean = build_upstream_query(0x1234, question);
+        assert_eq!(&clean[0..2], &[0x12, 0x34]);
+        assert_eq!(&clean[2..4], &FLAG_RD.to_be_bytes(), "RD=1, nothing else");
+        assert_eq!(&clean[4..6], &[0, 1], "qdcount 1");
+        assert_eq!(&clean[6..12], &[0; 6], "AN/NS/AR zeroed");
+        assert_eq!(clean.len(), HEADER_LEN + question.len(), "no trailing bytes");
+        assert_eq!(&clean[HEADER_LEN..], question);
+    }
+
+    #[test]
+    fn truncated_response_has_tc_question_and_zero_counts() {
+        let query = build_query(0x4242, "big.example", TYPE_A, CLASS_IN).expect("build");
+        let resp = build_truncated_response(&query).expect("truncated response");
+        assert!(resp.len() <= MAX_UDP_PAYLOAD);
+        assert_eq!(&resp[0..2], &[0x42, 0x42], "same ID");
+        let flags = u16::from_be_bytes([resp[2], resp[3]]);
+        assert_ne!(flags & FLAG_TC, 0, "TC set");
+        assert_ne!(flags & FLAG_QR, 0, "QR set");
+        assert_eq!(flags & 0x000F, 0, "NOERROR");
+        assert_eq!(&resp[6..12], &[0; 6], "AN/NS/AR zeroed");
+        assert_eq!(&resp[HEADER_LEN..], &query[HEADER_LEN..], "question intact");
+        assert!(is_truncated_response(&resp));
+        // Total on short input.
+        assert_eq!(build_truncated_response(&query[..5]), None);
+    }
+
+    #[test]
+    fn validate_response_echo_is_case_insensitive_on_qname_only() {
+        let query = build_query(0xAAAA, "ExAmPle.CoM", TYPE_A, CLASS_IN).expect("build");
+        let parsed = parse_query(&query).expect("parse");
+        let question = &query[HEADER_LEN..parsed.question_end];
+        // Upstream lowercases the echoed question name (home CPE style).
+        let mut resp = query.clone();
+        resp[2] = 0x81;
+        resp[3] = 0x80;
+        for byte in &mut resp[HEADER_LEN..parsed.question_end - 4] {
+            *byte = byte.to_ascii_lowercase();
+        }
+        resp.extend_from_slice(&[0xC0, 0x0C]);
+        resp.extend_from_slice(&TYPE_A.to_be_bytes());
+        resp.extend_from_slice(&CLASS_IN.to_be_bytes());
+        resp.extend_from_slice(&300u32.to_be_bytes());
+        resp.extend_from_slice(&4u16.to_be_bytes());
+        resp.extend_from_slice(&[93, 184, 216, 34]);
+        let info =
+            validate_response(&resp, 0xAAAA, question).expect("case-only diff must be accepted");
+        assert_eq!(info.rcode, RCODE_NOERROR);
+
+        // A REAL name change is still rejected.
+        let mut mangled = resp.clone();
+        mangled[HEADER_LEN + 1] = b'z'; // 'e' → 'z': differs case-insensitively
+        assert_eq!(validate_response(&mangled, 0xAAAA, question), None);
+        // qtype/qclass remain exact.
+        let mut bad_type = resp.clone();
+        let qtype_off = parsed.question_end - 4;
+        bad_type[qtype_off + 1] ^= 0x01;
+        assert_eq!(validate_response(&bad_type, 0xAAAA, question), None);
     }
 
     /// Deterministic xorshift64 so the sweeps are reproducible.

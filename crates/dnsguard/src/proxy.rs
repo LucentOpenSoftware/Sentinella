@@ -12,8 +12,11 @@
 //!   load that kills the proxy removes filtering; that policy knob is the
 //!   control), cache capacity, upstream timeouts, datagram size;
 //! - upstream responses are validated before use: QR set, transaction ID
-//!   matching the per-query ID we generated upstream-side (the client's ID
-//!   is never forwarded verbatim), question echoed byte-for-byte;
+//!   matching the per-query ID we generated upstream-side, question echoed
+//!   (qname case-insensitive per RFC 4343, qtype/qclass exact); upstream
+//!   queries are rebuilt CLEAN (fresh txid, RD=1, question only, no
+//!   additional records/EDNS) so client-controlled bytes never leave the
+//!   machine;
 //! - no hardcoded public resolver: upstreams come from configuration.
 
 use std::collections::HashMap;
@@ -80,18 +83,29 @@ pub struct ProxyConfig {
     /// HARD total-lifetime cap on a client TCP connection (design §5): a
     /// connection is closed once it is this old, no matter how active it
     /// is — an idle timeout alone lets dribbling connections hold a permit
-    /// forever.
+    /// forever. EVERY socket operation on the connection — both reads and
+    /// the response WRITES — is bounded by the time remaining until this
+    /// deadline, so a pipelining client that never reads (kernel send
+    /// buffer full, `write_all` parked) cannot hold its permit past the
+    /// cap either.
     pub tcp_max_lifetime: Duration,
     /// Size of the SEPARATE TCP connection permit pool (design §5).
     /// Deliberately much smaller than `max_in_flight` and never shared with
     /// it, so TCP clients cannot starve UDP query handling.
     pub tcp_max_connections: usize,
+    /// Name the [`Proxy::self_test`] upstream probe resolves
+    /// (default `example.com` — IANA-reserved, stable, guaranteed to
+    /// exist). Must NOT be a name the filter could block.
+    pub health_check_name: String,
 }
 
 impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
-            listen: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5353),
+            // NRPT NameServers have no port syntax — the DNS Client always
+            // queries port 53, so production MUST listen on 127.0.0.1:53
+            // (tests override with port 0 for an ephemeral port).
+            listen: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 53),
             upstreams: Vec::new(),
             upstream_timeout: DEFAULT_UPSTREAM_TIMEOUT,
             max_in_flight: DEFAULT_MAX_IN_FLIGHT,
@@ -102,6 +116,7 @@ impl Default for ProxyConfig {
             tcp_idle_timeout: Duration::from_secs(10),
             tcp_max_lifetime: Duration::from_secs(60),
             tcp_max_connections: DEFAULT_TCP_MAX_CONNECTIONS,
+            health_check_name: "example.com".to_string(),
         }
     }
 }
@@ -115,6 +130,8 @@ pub struct Counters {
     pub cache_hits: AtomicU64,
     pub upstream_errors: AtomicU64,
     pub shed: AtomicU64,
+    /// Client TCP connections force-closed by the hard lifetime cap.
+    pub tcp_lifetime_kills: AtomicU64,
 }
 
 /// Point-in-time copy of [`Counters`].
@@ -126,6 +143,7 @@ pub struct CountersSnapshot {
     pub cache_hits: u64,
     pub upstream_errors: u64,
     pub shed: u64,
+    pub tcp_lifetime_kills: u64,
 }
 
 impl Counters {
@@ -137,6 +155,7 @@ impl Counters {
             cache_hits: self.cache_hits.load(Ordering::Relaxed),
             upstream_errors: self.upstream_errors.load(Ordering::Relaxed),
             shed: self.shed.load(Ordering::Relaxed),
+            tcp_lifetime_kills: self.tcp_lifetime_kills.load(Ordering::Relaxed),
         }
     }
 
@@ -337,7 +356,7 @@ impl State {
 
 /// A bound proxy, ready to [`run`](Proxy::run).
 pub struct Proxy {
-    udp: UdpSocket,
+    udp: Arc<UdpSocket>,
     tcp: TcpListener,
     state: Arc<State>,
     local_addr: SocketAddr,
@@ -347,11 +366,22 @@ impl Proxy {
     /// Bind UDP and TCP on `config.listen`. With port 0 the UDP socket picks
     /// an ephemeral port and TCP follows it onto the same port (retrying on
     /// collision) so both protocols share one address.
+    ///
+    /// Refuses an EMPTY upstream list: a resolver with no upstream is a lie
+    /// — it would pass bind and the filter self-test while SERVFAILing every
+    /// real query, and the NRPT catch-all would then blackhole the machine's
+    /// DNS behind a "healthy" status.
     pub async fn bind(
         config: ProxyConfig,
         engine: FilterEngine,
         hook: Arc<dyn DecisionHook>,
     ) -> io::Result<Self> {
+        if config.upstreams.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "no upstream configured: a resolver with no upstream is a lie",
+            ));
+        }
         let state = Arc::new(State {
             semaphore: Arc::new(Semaphore::new(config.max_in_flight)),
             tcp_semaphore: Arc::new(Semaphore::new(config.tcp_max_connections)),
@@ -374,7 +404,7 @@ impl Proxy {
                     let local_addr = SocketAddr::new(state.config.listen.ip(), port);
                     info!(%local_addr, upstreams = state.config.upstreams.len(), "dnsguard bound");
                     return Ok(Self {
-                        udp,
+                        udp: Arc::new(udp),
                         tcp,
                         state,
                         local_addr,
@@ -404,14 +434,125 @@ impl Proxy {
         Arc::clone(&self.state.engine)
     }
 
+    /// Three-step health check (design §5 self-test layer). Call BEFORE
+    /// `run` (and before the NRPT rule is installed): it temporarily
+    /// serves the UDP socket itself for step (iii).
+    ///
+    /// 1. `engine_ok` — the filter decides the always-blocked canary
+    ///    ([`crate::filter::CANARY_DOMAIN`]) as Block. The canary
+    ///    NXDOMAINs on ANY box (`.invalid` is reserved), so only a local
+    ///    engine decision proves the plumbing is actually ours.
+    /// 2. `upstream_ok` — a LIVE query for `config.health_check_name`
+    ///    (default `example.com`) forwarded to a configured upstream
+    ///    comes back NOERROR.
+    /// 3. `filter_ok` — the canary queried through the actual UDP
+    ///    listener comes back NXDOMAIN (end-to-end through parse →
+    ///    decide → respond).
+    ///
+    /// The daemon/reconciler must probe the PUBLIC socket
+    /// (`127.0.0.1:53`), not [`Proxy::local_addr`] — a health check aimed
+    /// at the address the proxy CHOSE validates the wrong thing; the DNS
+    /// Client uses port 53.
+    pub async fn self_test(&self) -> SelfTestReport {
+        let mut report = SelfTestReport {
+            engine_ok: false,
+            upstream_ok: false,
+            filter_ok: false,
+            detail: String::new(),
+        };
+        use std::fmt::Write as _;
+
+        // (i) engine decision on the canary.
+        report.engine_ok = self.state.decide(crate::filter::CANARY_DOMAIN) == Decision::Block;
+        if !report.engine_ok {
+            let _ = write!(report.detail, "canary not decided Block by engine; ");
+        }
+
+        // (ii) live upstream query for the health-check name.
+        let upstream_probe = wire::build_query(
+            self.state.txids.next(),
+            &self.state.config.health_check_name,
+            wire::TYPE_A,
+            wire::CLASS_IN,
+        )
+        .and_then(|bytes| wire::parse_query(&bytes).ok().map(|q| (bytes, q)));
+        match upstream_probe {
+            Some((bytes, query)) => match forward(&self.state, &bytes, &query, false).await {
+                Ok(resp) => {
+                    report.upstream_ok = wire::response_info(&resp)
+                        .is_some_and(|info| info.rcode == wire::RCODE_NOERROR);
+                    if !report.upstream_ok {
+                        let _ = write!(
+                            report.detail,
+                            "upstream answered health check with non-NOERROR; "
+                        );
+                    }
+                }
+                Err(e) => {
+                    let _ = write!(report.detail, "upstream health check failed: {e}; ");
+                }
+            },
+            None => {
+                let _ = write!(
+                    report.detail,
+                    "health_check_name {:?} cannot be encoded; ",
+                    self.state.config.health_check_name
+                );
+            }
+        }
+
+        // (iii) canary through the listener: serve the UDP socket on a
+        // private shutdown channel, query the canary, expect NXDOMAIN.
+        let (tx, rx) = watch::channel(false);
+        let loop_task = tokio::spawn(udp_loop(
+            Arc::clone(&self.udp),
+            Arc::clone(&self.state),
+            rx,
+        ));
+        let probe = wire::build_query(
+            self.state.txids.next(),
+            crate::filter::CANARY_DOMAIN,
+            wire::TYPE_A,
+            wire::CLASS_IN,
+        );
+        if let Some(probe) = probe {
+            let sock = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).await;
+            let answered = match sock {
+                Ok(sock) => match sock.send_to(&probe, self.local_addr).await {
+                    Ok(_) => {
+                        let mut buf = [0u8; MAX_DATAGRAM];
+                        match timeout(self.state.config.upstream_timeout, sock.recv(&mut buf)).await
+                        {
+                            Ok(Ok(n)) => {
+                                let resp = &buf[..n];
+                                resp.len() >= wire::HEADER_LEN
+                                    && (u16::from_be_bytes([resp[2], resp[3]]) & 0x000F) as u8
+                                        == wire::RCODE_NXDOMAIN
+                            }
+                            _ => false,
+                        }
+                    }
+                    Err(_) => false,
+                },
+                Err(_) => false,
+            };
+            report.filter_ok = answered;
+        }
+        if !report.filter_ok {
+            let _ = write!(report.detail, "canary through listener did not return NXDOMAIN; ");
+        }
+        let _ = tx.send(true);
+        loop_task.abort();
+        report
+    }
+
     /// Serve until `shutdown` is set to `true` (or its sender is dropped).
     /// Stops accepting new work; in-flight queries finish on their own,
     /// bounded by the upstream timeout.
     pub async fn run(self, mut shutdown: watch::Receiver<bool>) -> io::Result<()> {
         info!(addr = %self.local_addr, "dnsguard proxy starting");
-        let udp = Arc::new(self.udp);
         let udp_task = tokio::spawn(udp_loop(
-            udp,
+            self.udp,
             Arc::clone(&self.state),
             shutdown.clone(),
         ));
@@ -422,6 +563,27 @@ impl Proxy {
         udp_task.abort();
         tcp_task.abort();
         Ok(())
+    }
+}
+
+/// Outcome of [`Proxy::self_test`] — the daemon/reconciler health surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelfTestReport {
+    /// The filter engine decides the canary as Block.
+    pub engine_ok: bool,
+    /// A live query for `health_check_name` returns NOERROR from an
+    /// upstream.
+    pub upstream_ok: bool,
+    /// The canary queried through the listener returns NXDOMAIN.
+    pub filter_ok: bool,
+    /// Human-readable failure detail (empty when all steps passed).
+    pub detail: String,
+}
+
+impl SelfTestReport {
+    /// All three steps passed.
+    pub fn ok(&self) -> bool {
+        self.engine_ok && self.upstream_ok && self.filter_ok
     }
 }
 
@@ -446,6 +608,22 @@ async fn udp_loop(sock: Arc<UdpSocket>, state: Arc<State>, mut shutdown: watch::
                         tokio::spawn(async move {
                             let _permit = permit; // released when the query completes
                             if let Some(resp) = handle_query(&state, &bytes, peer, false).await {
+                                // UDP payload limit (v1: a flat 512 — we
+                                // strip EDNS0 from forwarded queries, so no
+                                // client UDP size is ever negotiated; see
+                                // wire::MAX_UDP_PAYLOAD). An oversized
+                                // answer — e.g. a TCP-fallback answer of up
+                                // to 65535 bytes replayed from cache —
+                                // would be dropped by the client OS with TC
+                                // clear and no retry signal. Emit an RFC
+                                // 2181-style truncated response instead so
+                                // the client retries over TCP, where the
+                                // full answer is served.
+                                let resp = if resp.len() > wire::MAX_UDP_PAYLOAD {
+                                    wire::build_truncated_response(&bytes).unwrap_or(resp)
+                                } else {
+                                    resp
+                                };
                                 let _ = sock.send_to(&resp, peer).await;
                             }
                         });
@@ -507,7 +685,11 @@ async fn tcp_loop(listener: TcpListener, state: Arc<State>, mut shutdown: watch:
 /// Serve one client TCP connection. Two independent clocks bound it
 /// (design §5): an inter-read IDLE timeout (`tcp_idle_timeout`) and a HARD
 /// total-lifetime cap (`tcp_max_lifetime`) — without the latter, a
-/// dribbling connection could hold its permit indefinitely.
+/// dribbling connection could hold its permit indefinitely. The deadline
+/// is computed once and EVERY socket operation — reads AND the response
+/// writes — gets `timeout = remaining`; an unbounded `write_all` lets a
+/// pipelining client that never reads park the connection (and its
+/// permit) forever on a full kernel send buffer.
 async fn tcp_conn(
     mut stream: TcpStream,
     peer: SocketAddr,
@@ -519,27 +701,51 @@ async fn tcp_conn(
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             debug!(%peer, "TCP connection closed: hard lifetime cap reached");
+            state.counters.bump(&state.counters.tcp_lifetime_kills);
             return;
         }
         let read_budget = remaining.min(state.config.tcp_idle_timeout);
         let mut len_buf = [0u8; 2];
         let read_len = timeout(read_budget, stream.read_exact(&mut len_buf)).await;
         if !matches!(read_len, Ok(Ok(_))) {
+            if read_len.is_err() && deadline <= tokio::time::Instant::now() {
+                state.counters.bump(&state.counters.tcp_lifetime_kills);
+            }
             return; // EOF, peer error, idle timeout, or lifetime cap
         }
         let n = u16::from_be_bytes(len_buf) as usize;
         let mut buf = vec![0u8; n];
         let read_body = timeout(read_budget, stream.read_exact(&mut buf)).await;
         if !matches!(read_body, Ok(Ok(_))) {
+            if read_body.is_err() && deadline <= tokio::time::Instant::now() {
+                state.counters.bump(&state.counters.tcp_lifetime_kills);
+            }
             return;
         }
         let Some(resp) = handle_query(&state, &buf, peer, true).await else {
             return; // not even a header: nothing safe to answer
         };
+        // The writes are bounded by the SAME connection deadline — a
+        // client that stops reading must not hold the permit past the
+        // hard cap while `write_all` waits for send-buffer space.
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            debug!(%peer, "TCP connection closed: hard lifetime cap reached");
+            state.counters.bump(&state.counters.tcp_lifetime_kills);
+            return;
+        }
         let framed_len = (resp.len() as u16).to_be_bytes();
-        if stream.write_all(&framed_len).await.is_err()
-            || stream.write_all(&resp).await.is_err()
-        {
+        let written = timeout(remaining, async {
+            stream.write_all(&framed_len).await?;
+            stream.write_all(&resp).await
+        })
+        .await;
+        if !matches!(written, Ok(Ok(()))) {
+            if written.is_err() {
+                // Elapsed timeout means the deadline expired mid-write.
+                debug!(%peer, "TCP connection closed: hard lifetime cap reached mid-write");
+                state.counters.bump(&state.counters.tcp_lifetime_kills);
+            }
             return;
         }
     }
@@ -609,10 +815,16 @@ async fn handle_query(
 /// Forward to the upstream pool: UDP first, TCP when the client is TCP or
 /// the UDP answer comes back truncated (TC bit).
 ///
-/// The packet goes out with a freshly GENERATED transaction ID (never the
-/// client's verbatim), and every response is validated
-/// ([`wire::validate_response`]: QR set, our txid, question echoed
-/// byte-for-byte) before it is accepted. An invalid response is dropped —
+/// The upstream sees a CLEAN query built from scratch
+/// ([`wire::build_upstream_query`]): a freshly GENERATED transaction ID
+/// (never the client's verbatim), standard flags (RD=1 only), the
+/// question section, and NOTHING else — the client's flag byte,
+/// additional sections, and any EDNS0 OPT (including ECS, which would
+/// steer the answer we then cache machine-wide) are never forwarded.
+///
+/// Every response is validated ([`wire::validate_response`]: QR set, our
+/// txid, question echoed — qname case-insensitive per RFC 4343, qtype/
+/// qclass exact) before it is accepted. An invalid response is dropped —
 /// counted as an upstream error by the caller, never answered, never
 /// cached.
 async fn forward(
@@ -625,9 +837,8 @@ async fn forward(
         .pick_upstream()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no upstream configured"))?;
     let upstream_id = state.txids.next();
-    let mut forwarded = query_bytes.to_vec();
-    forwarded[0..2].copy_from_slice(&upstream_id.to_be_bytes());
-    let question = &forwarded[wire::HEADER_LEN..query.question_end];
+    let question = &query_bytes[wire::HEADER_LEN..query.question_end];
+    let forwarded = wire::build_upstream_query(upstream_id, question);
 
     let invalid = || {
         io::Error::new(
@@ -636,7 +847,7 @@ async fn forward(
         )
     };
     if !via_tcp {
-        match udp_exchange(upstream, &forwarded, state.config.upstream_timeout).await {
+        match udp_exchange(upstream, &forwarded, upstream_id, state.config.upstream_timeout).await {
             Ok(resp) if wire::validate_response(&resp, upstream_id, question).is_none() => {
                 return Err(invalid());
             }
@@ -659,7 +870,12 @@ async fn forward(
     Ok(resp)
 }
 
-async fn udp_exchange(upstream: SocketAddr, query: &[u8], wait: Duration) -> io::Result<Vec<u8>> {
+async fn udp_exchange(
+    upstream: SocketAddr,
+    query: &[u8],
+    expected_id: u16,
+    wait: Duration,
+) -> io::Result<Vec<u8>> {
     // Ephemeral socket per query: no shared-socket ID demultiplexing, and
     // the in-flight semaphore bounds how many exist at once.
     let bind_addr = if upstream.is_ipv4() {
@@ -671,11 +887,30 @@ async fn udp_exchange(upstream: SocketAddr, query: &[u8], wait: Duration) -> io:
     sock.connect(upstream).await?;
     sock.send(query).await?;
     let mut buf = vec![0u8; MAX_DATAGRAM];
-    let n = timeout(wait, sock.recv(&mut buf))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "upstream UDP timeout"))??;
-    buf.truncate(n);
-    Ok(buf)
+    // Receive LOOP within the exchange deadline: a stray/invalid datagram
+    // (off-path garbage, a late answer from a previous exchange, a packet
+    // with the wrong txid) is dropped and we keep waiting — one stray
+    // datagram must not kill a healthy exchange. Only the deadline gives
+    // up. Deeper validation (QR, question echo) happens in the caller.
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "upstream UDP timeout"));
+        }
+        let n = timeout(remaining, sock.recv(&mut buf))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "upstream UDP timeout"))??;
+        if n < wire::HEADER_LEN {
+            continue; // not even a header: stray garbage, keep waiting
+        }
+        let id = u16::from_be_bytes([buf[0], buf[1]]);
+        if id != expected_id {
+            continue; // not ours: stray or spoof attempt, keep waiting
+        }
+        buf.truncate(n);
+        return Ok(buf);
+    }
 }
 
 async fn tcp_exchange(upstream: SocketAddr, query: &[u8], wait: Duration) -> io::Result<Vec<u8>> {

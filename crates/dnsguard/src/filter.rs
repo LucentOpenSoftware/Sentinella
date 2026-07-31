@@ -23,6 +23,8 @@ use std::collections::HashSet;
 use std::io::{self, BufRead};
 use std::net::IpAddr;
 
+use crate::wire;
+
 /// Always-blocked sentinel domain (design doc §7): lets operator acceptance
 /// tests verify the pipeline end to end without depending on a live
 /// blocklist. `.invalid` is reserved by RFC 2606, so it can never collide
@@ -30,7 +32,11 @@ use std::net::IpAddr;
 pub const CANARY_DOMAIN: &str = "webguard-test.sentinella.invalid";
 
 /// Maximum DNS name length per RFC 1035 (presentation form, without the
-/// trailing dot).
+/// trailing dot). NOTE: this limits only *plain* presentation names; the
+/// authoritative validation in [`FilterEngine::normalize_name`] is done
+/// in WIRE units (labels ≤ 63 octets, total ≤ 255 wire bytes, computed on
+/// the UNescaped bytes), because the escaped presentation form is up to
+/// 4× longer than the wire name it represents.
 pub const MAX_NAME_LEN: usize = 253;
 
 /// Hard cap on hosts-file lines ingested in one load. WHY: blocklists are
@@ -78,7 +84,7 @@ impl FilterEngine {
 
     /// Normalize a presentation-form domain name for matching: strip
     /// trailing dots, lowercase ASCII, reject empty names, empty labels,
-    /// non-ASCII input, and names over 253 bytes.
+    /// and non-ASCII input.
     ///
     /// Escape-aware (RFC 4343): `\` followed by any byte is a literal
     /// escaped character within a label; label boundaries are UNescaped
@@ -87,9 +93,20 @@ impl FilterEngine {
     /// (presented as `microsoft\.com`) from matching the two-label rule
     /// `microsoft.com`.
     ///
-    /// Returns `None` for anything that cannot be a valid DNS name; callers
-    /// treat that as "no rule can match" (fail-open to the upstream), never
-    /// as a block decision based on garbage.
+    /// Length validation is done in WIRE units on the UNescaped bytes —
+    /// labels ≤ 63 octets, total name ≤ 255 wire bytes — never against
+    /// the escaped presentation string. WHY: escaping inflates one wire
+    /// octet to up to 4 presentation chars (`\DDD`), so measuring the
+    /// escaped string against 253 rejects names that are perfectly legal
+    /// on the wire (a 61×0x00 label escapes to 244 chars); rejecting a
+    /// wire-legal name here used to make `decide` fail OPEN and let a
+    /// blocked suffix through. The escaped string is for matching only.
+    ///
+    /// Returns `None` for anything that cannot be a WIRE-LEGAL DNS name.
+    /// A wire-legal name ALWAYS normalizes (never `None`), so `decide`
+    /// always produces a real decision for any name that can arrive from
+    /// the wire layer; `None` is reserved for names no wire packet could
+    /// carry (operator/list input mistakes).
     pub fn normalize_name(name: &str) -> Option<String> {
         // Strip one trailing root dot — but only an UNescaped one: `foo\.`
         // is a label ending in a dot, not a rooted name.
@@ -107,37 +124,59 @@ impl FilterEngine {
             }
         }
         let trimmed = &name[..end];
-        if trimmed.is_empty() || trimmed.len() > MAX_NAME_LEN {
+        if trimmed.is_empty() || !trimmed.is_ascii() {
             return None;
         }
-        if !trimmed.is_ascii() {
-            return None;
-        }
-        let mut label_len = 0usize;
-        let mut escaped = false;
-        for byte in trimmed.bytes() {
-            if escaped {
-                // Escaped byte is label content, never a boundary.
-                escaped = false;
-                label_len += 1;
-                continue;
-            }
-            match byte {
+        // Wire-format accounting on UNescaped octets. Escape forms per
+        // RFC 4343 (and what the wire layer emits): `\DDD` (backslash +
+        // exactly three decimal digits) or `\X` (backslash + one char) —
+        // both are exactly ONE wire octet; an unescaped `.` is a label
+        // boundary. Root label costs 1 byte; every label costs
+        // 1 (length) + octets.
+        let bytes = trimmed.as_bytes();
+        let mut wire_len = 1usize;
+        let mut label_octets = 0usize;
+        let mut i = 0usize;
+        while i < bytes.len() {
+            match bytes[i] {
                 b'\\' => {
-                    escaped = true;
-                    label_len += 1;
+                    let is_decimal_escape = i + 3 < bytes.len()
+                        && bytes[i + 1].is_ascii_digit()
+                        && bytes[i + 2].is_ascii_digit()
+                        && bytes[i + 3].is_ascii_digit();
+                    i += if is_decimal_escape { 4 } else { 2 };
+                    label_octets += 1;
                 }
                 b'.' => {
-                    if label_len == 0 {
+                    if label_octets == 0 {
                         return None; // empty label
                     }
-                    label_len = 0;
+                    if label_octets > wire::MAX_LABEL_LEN {
+                        return None; // overlong label
+                    }
+                    wire_len += 1 + label_octets;
+                    if wire_len > wire::MAX_NAME_WIRE_LEN {
+                        return None; // overlong name
+                    }
+                    label_octets = 0;
+                    i += 1;
                 }
-                _ => label_len += 1,
+                _ => {
+                    label_octets += 1;
+                    i += 1;
+                }
             }
         }
-        if escaped || label_len == 0 {
-            return None; // dangling escape or trailing empty label
+        if i > bytes.len() || label_octets == 0 {
+            // Dangling escape at end of name, or trailing empty label.
+            return None;
+        }
+        if label_octets > wire::MAX_LABEL_LEN {
+            return None;
+        }
+        wire_len += 1 + label_octets;
+        if wire_len > wire::MAX_NAME_WIRE_LEN {
+            return None;
         }
         Some(trimmed.to_ascii_lowercase())
     }
@@ -493,16 +532,56 @@ mod tests {
     }
 
     #[test]
-    fn normalization_rejects_empty_and_overlong_names() {
+    fn normalization_rejects_empty_and_wire_illegal_names() {
         assert_eq!(FilterEngine::normalize_name(""), None);
         assert_eq!(FilterEngine::normalize_name("."), None);
         assert_eq!(FilterEngine::normalize_name("a..b"), None);
-        let overlong = format!("{}.example", "a".repeat(MAX_NAME_LEN));
-        assert_eq!(FilterEngine::normalize_name(&overlong), None);
-        let at_limit = "a".repeat(MAX_NAME_LEN);
+        // Validation is in WIRE units (labels ≤ 63, total ≤ 255), not
+        // against the presentation length: a 253-char single label is
+        // wire-ILLEGAL (label > 63) even though it fits 253 presentation
+        // chars — the pre-fix code accepted it.
+        let overlong_label = "a".repeat(MAX_NAME_LEN);
+        assert_eq!(FilterEngine::normalize_name(&overlong_label), None);
+        // Wire-legal at the limit: 63/63/63/61 octet labels = 255 wire
+        // bytes exactly (252 presentation chars).
+        let at_limit = format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(61)
+        );
         assert!(FilterEngine::normalize_name(&at_limit).is_some());
+        // One octet over: 4×63 labels = 257 wire bytes.
+        let overlong_name = format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(63)
+        );
+        assert_eq!(FilterEngine::normalize_name(&overlong_name), None);
         let engine = FilterEngine::new();
-        assert_eq!(engine.decide(&overlong), Decision::Allow);
+        assert_eq!(engine.decide(&overlong_name), Decision::Allow);
+    }
+
+    #[test]
+    fn wire_legal_escaped_name_past_253_presentation_chars_still_decides() {
+        // Regression (Block→Allow fail-open): a label of 61 × 0x00 octets
+        // is WIRE-LEGAL (≤ 63) but escapes to 244 presentation chars
+        // (`\000` × 61); with a suffix the escaped string passes 253
+        // chars, and measuring THAT string against 253 made normalize
+        // return None → decide → Allow, defeating the suffix block.
+        let escaped_label = "\\000".repeat(61);
+        let name = format!("{escaped_label}.c2.example");
+        assert!(name.len() > MAX_NAME_LEN, "escaped form exceeds 253 chars");
+        // Wire-legal names ALWAYS normalize — never None.
+        let normalized = FilterEngine::normalize_name(&name)
+            .expect("wire-legal name must normalize");
+        assert_eq!(normalized, name);
+        // …and the suffix rule decides it: Block, not fail-open Allow.
+        let engine = engine_with_block(&["c2.example"]);
+        assert_eq!(engine.decide(&name), Decision::Block);
     }
 
     #[test]
