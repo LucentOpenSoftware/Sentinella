@@ -13,6 +13,7 @@ members = [
     "crates/etw_probe",
     "crates/sentinella-dev-console",
     "crates/dnsguard",
+    "crates/nrpt",
 ]
 exclude = ["gui/src-tauri", "third_party", "fuzz"]
 
@@ -42,3 +43,4 @@ sentinella-ipc-proto = { path = "crates/sentinella-ipc-proto" }
 sentinella-common = { path = "crates/sentinella-common" }
 argus = { path = "crates/argus" }
 dnsguard = { path = "crates/dnsguard" }
+nrpt = { path = "crates/nrpt" }
