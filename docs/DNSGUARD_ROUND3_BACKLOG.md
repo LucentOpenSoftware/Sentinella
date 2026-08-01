@@ -517,35 +517,47 @@ as written, because what it claimed at the time is part of the history.
 | Test count | 107 (59 lib + 48 integration) | 109 at `4f4e31a` (59 + 50). |
 | Doc scope | §5.3 removal ladder + §4 + §7 updated | §1, §5.1, §5.4 and the §6 IPC contract were left byte-identical and still specified the **pre-round-3** three-step self-test and "canary → NXDOMAIN". §6 is the contract the wiring implements `webprotection.test` from; written as specified it would have accepted NXDOMAIN as green — which every stock resolver returns for a `.invalid` name — putting the vacuity L12 removed from the code straight back at the IPC layer. Fixed in `80a7607`. |
 
-## Still open (5)
+## Still open (2)
 
-Confirmed by the review, not fixed. Severities are the skeptic's
-corrected values.
+Three of the original five are now fixed, each revert-verified:
 
-1. **SERVFAIL is in the OPT-strip retry trigger set** (MEDIUM). SERVFAIL
-   is the ordinary soft-failure rcode of the whole DNS, not an
-   EDNS-unsupported signal. Every EDNS query against a SERVFAILing
-   upstream costs two round trips, each with a fresh `upstream_timeout`,
-   with the in-flight permit held across both — measured **8.83 s for one
-   query**, 20% shed at 40 queries.
-2. **The SERVFAIL-triggered OPT strip caches a signature-less answer in
-   the DO=1 slot** (MEDIUM) — the exact invariant the `(DO,CD)` cache
-   fork was introduced to guarantee, and which the `CacheKey` doc comment
-   states as an invariant. One transient upstream SERVFAIL silently
-   downgrades DNSSEC for every DO=1 client for up to `max_ttl`.
-3. **The FORMERR/EDNS fallback does not exist on the TCP path** (LOW).
-   The retry is nested inside `if !via_tcp`. Sink fixed, sibling left —
-   and reachable in normal operation, because truncation is what routes
-   clients onto TCP in the first place.
-4. **`set_upstreams` is structurally unreachable** (MEDIUM). `run` takes
-   `self` by value and nothing exposes the upstreams `RwLock`, unlike
-   `engine_handle()`. The natural wiring does not compile
-   (`error[E0382]: borrow of moved value`). L08's row says "Class closed?
-   Yes"; the mutator the wiring needs cannot be called.
-5. **The byte budget is charged after the line is materialized**
+- ~~**`set_upstreams` structurally unreachable**~~ — fixed in `c5274d5`.
+  `Proxy::upstreams_handle()` returns a handle captured before `run`,
+  carrying the same validation as `bind` so it cannot be bypassed.
+  Revert-verified in both directions: reverting the write reds the test,
+  removing the accessor makes it not compile — which is the defect
+  exactly, since the wiring pattern was unwriteable rather than broken.
+- ~~**SERVFAIL in the OPT-strip retry trigger set**~~ — fixed in the
+  DNSSEC commit. Only FORMERR triggers the fallback now (RFC 6891
+  §6.2.2); RFC 8906 §5 warns against reading SERVFAIL as an EDNS signal.
+  Revert-verified: the upstream sees 2 exchanges instead of 1.
+- ~~**Signature-less answers cached in the DO=1 slot**~~ — fixed in the
+  same commit. A fallback answer is filed in the DO=0 slot (same CD)
+  rather than the client's DO=1 slot, so a later self-validating stub
+  misses and re-asks instead of being handed an unsigned answer from the
+  slot that promises signatures. DO=0 clients still get the hit — the
+  answer is a valid non-DNSSEC answer, not garbage. Revert-verified:
+  filing it in the client's own slot gives `cache_hits: 1` where 0 is
+  required.
+
+Remaining, confirmed by the review and not fixed. Severities are the
+skeptic's corrected values.
+
+1. **The FORMERR/EDNS fallback does not exist on the TCP path** (LOW).
+   The retry is nested inside `if !via_tcp`, so a client arriving over
+   TCP gets a pre-EDNS upstream's FORMERR relayed verbatim. Sink fixed,
+   sibling left — and reachable in normal operation, not only by
+   deliberate TCP clients, because truncation is what routes clients onto
+   TCP in the first place: a >512-byte name plus a pre-EDNS upstream is
+   enough. Measured: UDP EDNS client -> rcode 0 (retry worked), TCP EDNS
+   client -> rcode 1, with the fake upstream seeing exactly ONE query.
+2. **The byte budget is charged after the line is materialized**
    (MEDIUM). `reader.lines()` allocates the whole line before the budget
-   comparison runs: a one-long-line source pulled **64 MiB under a
-   1024-byte budget** and reported `bytes_read: 0`.
+   comparison runs, so `MAX_HOSTS_BYTES` bounds what is ACCOUNTED, never
+   what is ALLOCATED. A one-long-line source — a broken CDN response, an
+   HTML error page, a gzip served as text/plain — pulled **64 MiB under a
+   1024-byte budget** and reported `bytes_read: 0`, so the loader's own
+   promise of honest reporting fails in the same breath.
 
 Plus **15 unverified** lower-severity findings from the same review
 (EDNS-capability not in the cache key, the `(DO,CD)` fork against a

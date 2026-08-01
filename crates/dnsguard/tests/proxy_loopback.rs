@@ -2365,3 +2365,111 @@ async fn upstreams_can_be_replaced_while_the_proxy_is_serving() {
     let _ = tx.send(true);
     let _ = task.await;
 }
+
+/// REGRESSION (round-3 closure review, finding 1). SERVFAIL must NOT
+/// trigger the EDNS fallback. It is the ordinary soft-failure rcode of the
+/// whole DNS — lame delegations, bogus DNSSEC, cold or loaded resolvers,
+/// RRL — not an EDNS-unsupported signal (RFC 8906 §5 warns against
+/// treating it as one). With SERVFAIL in the trigger set, every EDNS query
+/// against a SERVFAILing upstream cost TWO full exchanges, each with a
+/// fresh upstream_timeout and the in-flight permit held across both:
+/// measured 8.83 s for a single query and 20% shed at 40 concurrent.
+#[tokio::test]
+async fn servfail_does_not_trigger_the_edns_opt_strip_retry() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_task = Arc::clone(&calls);
+    let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind upstream");
+    let upstream = sock.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
+            calls_task.fetch_add(1, Ordering::SeqCst);
+            // A plain, question-echoing SERVFAIL — the ordinary shape.
+            let mut resp = canned_a_response(&buf[..n], 60, false);
+            resp[3] = 0x82; // RA | SERVFAIL
+            resp[7] = 0; // ancount = 0
+            resp.truncate(resp.len() - 16);
+            let _ = sock.send_to(&resp, peer).await;
+        }
+    });
+    let proxy = start_proxy(FilterEngine::new(), config_for(vec![upstream])).await;
+
+    let query = edns_query(0x6001, "servfailing.example", TYPE_A, 4096, true, false);
+    let resp = udp_query(proxy.addr, &query, Duration::from_secs(3)).await;
+    assert_eq!(rcode_of(&resp), RCODE_SERVFAIL, "SERVFAIL is relayed as-is");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a SERVFAIL must cost ONE upstream exchange, not a second OPT-stripped retry"
+    );
+    proxy.stop().await;
+}
+
+/// REGRESSION (round-3 closure review, finding 2). An answer fetched
+/// through the EDNS fallback was obtained with the OPT — and therefore the
+/// client's DO bit — stripped, so it carries no RRSIGs. Filing it under
+/// the DO=1 key handed the NEXT self-validating stub a signature-less
+/// answer from the slot that promises signatures. That is the invariant
+/// the (DO,CD) cache fork was introduced to guarantee: the fork closed the
+/// cross-slot case and left the in-slot case open, so ONE transient
+/// upstream failure downgraded DNSSEC for every DO=1 client for max_ttl.
+///
+/// The answer is still a valid NON-DNSSEC answer, so it belongs in the
+/// DO=0 slot rather than being dropped — both halves are asserted.
+#[tokio::test]
+async fn edns_stripped_answer_is_not_cached_in_the_dnssec_slot() {
+    let opt_queries = Arc::new(AtomicUsize::new(0));
+    let opt_task = Arc::clone(&opt_queries);
+    let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind upstream");
+    let upstream = sock.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
+            if u16::from_be_bytes([buf[10], buf[11]]) > 0 {
+                opt_task.fetch_add(1, Ordering::SeqCst);
+                // Pre-EDNS responder: FORMERR anything carrying an OPT.
+                let mut resp = canned_a_response(&buf[..n], 300, false);
+                resp[3] = 0x81; // RA | FORMERR
+                resp[7] = 0;
+                resp.truncate(resp.len() - 16);
+                let _ = sock.send_to(&resp, peer).await;
+            } else {
+                let _ = sock.send_to(&canned_a_response(&buf[..n], 300, false), peer).await;
+            }
+        }
+    });
+    let proxy = start_proxy(FilterEngine::new(), config_for(vec![upstream])).await;
+    let name = "nosig.example";
+
+    // A DO=1 client triggers the fallback and is served directly.
+    let q1 = edns_query(0x7001, name, TYPE_A, 4096, true, false);
+    assert_eq!(rcode_of(&udp_query(proxy.addr, &q1, Duration::from_secs(3)).await), RCODE_NOERROR);
+    let after_first = opt_queries.load(Ordering::SeqCst);
+    assert_eq!(after_first, 1, "the DO=1 query reached the upstream once with an OPT");
+    assert_eq!(proxy.counters.snapshot().cache_hits, 0);
+
+    // A SECOND DO=1 client for the same name must NOT be served the
+    // signature-less answer from cache — it must re-ask.
+    let q2 = edns_query(0x7002, name, TYPE_A, 4096, true, false);
+    assert_eq!(rcode_of(&udp_query(proxy.addr, &q2, Duration::from_secs(3)).await), RCODE_NOERROR);
+    assert_eq!(
+        proxy.counters.snapshot().cache_hits,
+        0,
+        "a DO=1 client was served a signature-less answer from the DNSSEC cache slot"
+    );
+    assert!(
+        opt_queries.load(Ordering::SeqCst) > after_first,
+        "the second DO=1 query must reach the upstream again, not hit cache"
+    );
+
+    // ...but the answer is a perfectly good NON-DNSSEC answer, so a DO=0
+    // client SHOULD get it from cache rather than us dropping it entirely.
+    let q3 = edns_query(0x7003, name, TYPE_A, 4096, false, false);
+    assert_eq!(rcode_of(&udp_query(proxy.addr, &q3, Duration::from_secs(3)).await), RCODE_NOERROR);
+    assert_eq!(
+        proxy.counters.snapshot().cache_hits,
+        1,
+        "the stripped answer belongs in the DO=0 slot, not the bin"
+    );
+    proxy.stop().await;
+}

@@ -679,8 +679,8 @@ impl Proxy {
             Some((bytes, query)) => {
                 for up in &upstreams {
                     match forward_via(&self.state, &bytes, &query, false, *up).await {
-                        Ok(resp)
-                            if wire::response_info(&resp)
+                        Ok(fw)
+                            if wire::response_info(&fw.bytes)
                                 .is_some_and(|info| info.rcode == wire::RCODE_NOERROR) =>
                         {
                             report.upstreams_healthy += 1;
@@ -1511,7 +1511,8 @@ async fn handle_query(
     }
 
     match forward(state, bytes, &query, via_tcp).await {
-        Ok(mut resp) => {
+        Ok(fw) => {
+            let mut resp = fw.bytes;
             if !synthetic {
                 state.counters.bump(&state.counters.forwarded);
             }
@@ -1532,7 +1533,33 @@ async fn handle_query(
             // Only validated responses reach this point (forward drops
             // anything failing txid/QR/question checks), so caching here
             // can never poison the cache with a forgery.
-            state.cache_store(&cache_key, &resp);
+            //
+            // CACHE SLOT (round-3 closure review, finding 2): an answer
+            // fetched through the EDNS fallback was obtained with the OPT
+            // — and therefore the client's DO bit — stripped, so it carries
+            // no RRSIGs. Filing it under the DO=1 key would hand the NEXT
+            // self-validating stub a signature-less answer from the slot
+            // that promises signatures, and its validation would spuriously
+            // fail. That is precisely the invariant the (DO,CD) cache fork
+            // exists to guarantee, and the fork alone did not deliver it:
+            // it closed the cross-slot case and left the in-slot case open,
+            // so ONE transient upstream failure downgraded DNSSEC for every
+            // DO=1 client for up to max_ttl.
+            //
+            // The answer is still perfectly good as a NON-DNSSEC answer, so
+            // it is filed in the DO=0 slot (same CD) rather than dropped:
+            // DO=0 clients get the cache hit they should, and DO=1 clients
+            // miss and re-ask. The client that triggered the fallback is
+            // served directly, once — with no signatures, because against a
+            // pre-EDNS upstream there are none to be had.
+            let store_key = if fw.edns_stripped && query.dnssec_ok {
+                let mut k = cache_key.clone();
+                k.3 &= !1; // clear the DO bit of the slot discriminator
+                k
+            } else {
+                cache_key.clone()
+            };
+            state.cache_store(&store_key, &resp);
             if !synthetic {
                 state.emit(client, &query, QueryOutcome::Forwarded);
             }
@@ -1573,11 +1600,37 @@ async fn forward(
     query_bytes: &[u8],
     query: &wire::Query,
     via_tcp: bool,
-) -> io::Result<Vec<u8>> {
+) -> io::Result<Forwarded> {
     let upstream = state
         .pick_upstream()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no upstream configured"))?;
     forward_via(state, query_bytes, query, via_tcp, upstream).await
+}
+
+/// One upstream answer, plus how we had to obtain it.
+struct Forwarded {
+    bytes: Vec<u8>,
+    /// The answer came from the EDNS fallback, i.e. it was re-fetched with
+    /// the OPT record — and therefore the client's DO bit — STRIPPED. Such
+    /// an answer carries no RRSIGs, so it must never be filed in a
+    /// DNSSEC-requesting cache slot. See the store-key choice in
+    /// `handle_query`.
+    edns_stripped: bool,
+}
+
+impl Forwarded {
+    fn intact(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            edns_stripped: false,
+        }
+    }
+    fn edns_stripped(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            edns_stripped: true,
+        }
+    }
 }
 
 /// [`forward`] against a SPECIFIC upstream.
@@ -1594,7 +1647,7 @@ async fn forward_via(
     query: &wire::Query,
     via_tcp: bool,
     upstream: SocketAddr,
-) -> io::Result<Vec<u8>> {
+) -> io::Result<Forwarded> {
     let upstream_id = state.txids.next();
     let question = &query_bytes[wire::HEADER_LEN..query.question_end];
     let edns = query.edns_udp_size.map(|size| (size, query.dnssec_ok));
@@ -1611,16 +1664,29 @@ async fn forward_via(
             Ok(resp) if wire::validate_response(&resp, upstream_id, question).is_none() => {
                 return Err(invalid());
             }
-            // RFC 6891 §6.1.3: a responder that does not implement EDNS
-            // answers FORMERR (or SERVFAIL) to a query with an OPT record,
-            // and the requester MUST retry without EDNS. Retry once, plain;
-            // without this every EDNS client behind a pre-EDNS upstream
-            // would hard-fail.
+            // RFC 6891 §6.2.2: a responder that does not implement EDNS
+            // answers FORMERR to a query carrying an OPT record, and the
+            // requester retries without EDNS. Retry once, plain; without
+            // this every EDNS client behind a pre-EDNS upstream hard-fails.
+            //
+            // SERVFAIL IS DELIBERATELY NOT IN THIS SET (round-3 closure
+            // review). It is the ordinary soft-failure rcode of the whole
+            // DNS — lame delegations, DNSSEC-bogus names, cold or loaded
+            // resolvers, response-rate limiting — not an EDNS-unsupported
+            // signal, and RFC 8906 §5 warns against treating it as one.
+            // Including it cost every EDNS query against a SERVFAILing
+            // upstream TWO full exchanges, each with a fresh
+            // `upstream_timeout` and the in-flight permit held across both:
+            // measured 8.83 s for a single query and 20% shed at 40
+            // concurrent. It also fed finding 2 below, since the retry
+            // strips DO. (NOTIMP is the other legacy no-EDNS signal; it is
+            // not included either, for want of evidence that any upstream
+            // we target needs it — every rcode added here doubles upstream
+            // load for that rcode.)
             Ok(resp)
                 if edns.is_some()
-                    && wire::response_info(&resp).is_some_and(|info| {
-                        info.rcode == wire::RCODE_FORMERR || info.rcode == wire::RCODE_SERVFAIL
-                    }) =>
+                    && wire::response_info(&resp)
+                        .is_some_and(|info| info.rcode == wire::RCODE_FORMERR) =>
             {
                 debug!(%upstream, "EDNS query refused: retrying without OPT");
                 let plain = wire::build_upstream_query(upstream_id, question, query.checking_disabled, None);
@@ -1629,16 +1695,16 @@ async fn forward_via(
                     return Err(invalid());
                 }
                 if !wire::is_truncated_response(&resp) {
-                    return Ok(resp);
+                    return Ok(Forwarded::edns_stripped(resp));
                 }
                 debug!(%upstream, "TC bit set, retrying over TCP");
                 let resp = tcp_exchange(upstream, &plain, state.config.upstream_timeout).await?;
                 if wire::validate_response(&resp, upstream_id, question).is_none() {
                     return Err(invalid());
                 }
-                return Ok(resp);
+                return Ok(Forwarded::edns_stripped(resp));
             }
-            Ok(resp) if !wire::is_truncated_response(&resp) => return Ok(resp),
+            Ok(resp) if !wire::is_truncated_response(&resp) => return Ok(Forwarded::intact(resp)),
             Ok(_) => {
                 debug!(%upstream, "TC bit set, retrying over TCP");
             }
@@ -1654,7 +1720,7 @@ async fn forward_via(
     if wire::validate_response(&resp, upstream_id, question).is_none() {
         return Err(invalid());
     }
-    Ok(resp)
+    Ok(Forwarded::intact(resp))
 }
 
 async fn udp_exchange(

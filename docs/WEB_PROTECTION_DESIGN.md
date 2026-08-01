@@ -535,6 +535,20 @@ only, and tolerate concurrent user traffic.
   answer is keyed on the question plus DO/CD posture (a different ECS
   hits the same entry). Verified to FAIL pre-fix (verbatim client
   packet upstream).
+- **EDNS fallback, narrowly:** only FORMERR triggers the retry without
+  an OPT (RFC 6891 §6.2.2). SERVFAIL does NOT — it is the ordinary
+  soft-failure rcode of the whole DNS and RFC 8906 §5 warns against
+  reading it as an EDNS signal; treating it as one cost every EDNS query
+  against a SERVFAILing upstream two full exchanges with the in-flight
+  permit held across both (8.83 s for one query, 20% shed at 40
+  concurrent).
+  A fallback answer was fetched with the OPT — and so the DO bit —
+  stripped, so it carries no RRSIGs and is filed in the **DO=0** cache
+  slot, never the client's DO=1 slot. The (DO,CD) fork alone did not
+  give this: it closed the cross-slot case and left the in-slot case
+  open, so one transient upstream failure downgraded DNSSEC for every
+  DO=1 client for up to `max_ttl`. DO=0 clients still get the cache hit;
+  DO=1 clients miss and re-ask. Both verified to FAIL pre-fix.
 - **Case-insensitive question echo:** a case-normalizing upstream
   (lowercased qname echo) is accepted; a real letter change is still
   dropped. Verified to FAIL pre-fix (byte-exact echo → SERVFAIL).
