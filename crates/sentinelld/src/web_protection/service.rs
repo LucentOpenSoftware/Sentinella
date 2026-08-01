@@ -65,6 +65,9 @@ pub struct WebProtectionHandle {
     rules_loaded: u64,
     counters: Option<Arc<Counters>>,
     engine: Option<Arc<RwLock<FilterEngine>>>,
+    /// The NRPT rule GUID in force, if one was installed. `None` means no
+    /// rule — which is a normal, safe state, not a failure.
+    rule_guid: Option<String>,
 }
 
 impl WebProtectionHandle {
@@ -73,9 +76,9 @@ impl WebProtectionHandle {
         let snap = self.counters.as_ref().map(|c| c.snapshot());
         WebProtectionStatus {
             enabled: self.enabled,
-            // Still genuinely unknown: no NRPT code exists in this commit,
-            // and `Some(false)` would be an assertion we cannot support.
-            nrpt_installed: None,
+            // Read from the system, never inferred from config. `None`
+            // still means "could not tell", which is not `Some(false)`.
+            nrpt_installed: super::rule::installed_now(self.rule_guid.as_deref()),
             state: self.state,
             listen: self.listen.map(|a| a.to_string()),
             upstreams: self.resolved_upstreams.iter().map(|a| a.to_string()).collect(),
@@ -101,6 +104,7 @@ impl WebProtectionHandle {
 /// serving loops to stop.
 pub struct WebProtection {
     handle: Arc<WebProtectionHandle>,
+    watchdog: Option<tokio::task::JoinHandle<()>>,
     #[allow(dead_code)] // consumed by the network-change re-read in commit C
     upstreams_handle: Option<UpstreamsHandle>,
 
@@ -143,7 +147,9 @@ impl WebProtection {
                 rules_loaded: 0,
                 counters: None,
                 engine: None,
+                rule_guid: None,
             }),
+            watchdog: None,
             upstreams_handle: None,
             shutdown: None,
             task: None,
@@ -258,7 +264,9 @@ impl WebProtection {
                     // did not load" apart from "the upstream is dead".
                     counters: None,
                     engine: Some(engine_handle),
+                    rule_guid: None,
                 }),
+                watchdog: None,
                 upstreams_handle: None,
                 shutdown: None,
                 task: None,
@@ -267,11 +275,39 @@ impl WebProtection {
 
         let (tx, rx) = watch::channel(false);
         let task = tokio::spawn(proxy.run(rx));
+
+        // ONLY NOW, with the self-test passed and the listener serving, may
+        // a rule be installed. `install` enforces the other hard
+        // precondition itself — the boot reconciler's task must exist,
+        // because it is the only thing that removes the rule when this
+        // process is not around to.
+        //
+        // A refusal here is SAFE: it costs filtering, never DNS. So it is a
+        // warning and the proxy keeps serving; anyone who wants to use it
+        // can still point a resolver at it by hand.
+        let (rule_guid, watchdog) = match super::rule::install(bound, nrpt::recorded_guid(&nrpt::default_state_file())) {
+            Ok(guid) => {
+                let wd = super::rule::spawn_watchdog(
+                    guid.clone(),
+                    bound,
+                    Arc::clone(&counters),
+                    cfg,
+                    tx.subscribe(),
+                );
+                (Some(guid), Some(wd))
+            }
+            Err(e) => {
+                warn!(%e, "web protection: serving, but NO NRPT rule installed — the machine's DNS does not go through this proxy");
+                (None, None)
+            }
+        };
+
         info!(
             %bound,
             upstreams = report.upstreams_total,
             rules = rules_loaded,
-            "web protection: serving (no NRPT rule — nothing is pointed here yet)"
+            nrpt = rule_guid.is_some(),
+            "web protection: serving"
         );
 
         Self {
@@ -286,7 +322,9 @@ impl WebProtection {
                 rules_loaded,
                 counters: Some(counters),
                 engine: Some(engine_handle),
+                rule_guid,
             }),
+            watchdog,
             upstreams_handle: Some(upstreams_handle),
             shutdown: Some(tx),
             task: Some(task),
@@ -303,10 +341,25 @@ impl WebProtection {
     /// where the machine's DNS points at a listener that is going away. The
     /// join is bounded because the SCM stop budget is 30 s in total.
     pub async fn stop(&mut self) {
+        // RULE FIRST, SOCKETS SECOND. Between these two the machine
+        // resolves through its normal upstreams while we are still
+        // answering, which is harmless. The reverse order leaves a window
+        // where the rule points at sockets that are already closed — the
+        // exact state this whole design exists to prevent, reached during
+        // an ORDERLY shutdown, which would be an embarrassing way to get
+        // there.
+        if let Some(guid) = self.handle.rule_guid.clone()
+            && let Err(e) = super::rule::remove(&guid)
+        {
+            error!(%e, %guid, "web protection: could not remove the NRPT rule on shutdown —                    the boot reconciler will remove it at next startup");
+        }
         let Some(tx) = self.shutdown.take() else {
             return;
         };
         let _ = tx.send(true);
+        if let Some(wd) = self.watchdog.take() {
+            wd.abort();
+        }
         if let Some(task) = self.task.take() {
             match tokio::time::timeout(std::time::Duration::from_secs(5), task).await {
                 Ok(Ok(_)) => info!("web protection: stopped"),

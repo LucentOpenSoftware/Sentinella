@@ -14,6 +14,7 @@ sentinella-ipc-proto = { workspace = true }
 sentinella-common = { workspace = true }
 argus = { workspace = true }
 dnsguard = { workspace = true }
+nrpt = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

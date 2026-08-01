@@ -42,6 +42,7 @@
 //! of that sequence can leave a live rule with no remover.
 
 pub mod config;
+pub mod rule;
 pub mod service;
 pub mod status;
 pub mod upstreams;
