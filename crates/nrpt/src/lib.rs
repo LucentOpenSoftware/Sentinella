@@ -56,6 +56,18 @@ mod registry {
     pub fn list_subkeys(_path: &str) -> Result<Vec<String>, Error> {
         Err(Error::Unsupported)
     }
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_rule(
+        _path: &str,
+        _guid: &str,
+        _namespace: &str,
+        _servers: &str,
+        _config_options: u32,
+        _version: u32,
+        _comment: &str,
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
 }
 
 /// Where local (non-GPO) NRPT rules live.
@@ -138,6 +150,81 @@ pub fn remove_rule(guid: &str) -> Result<(), Error> {
         Err(Error::NoPolicyContainer) => Ok(()),
         other => other,
     }
+}
+
+/// The catch-all namespace: every name on the machine.
+pub const NAMESPACE_ALL: &str = ".";
+
+/// NRPT rule schema version the DNS Client expects.
+const RULE_VERSION: u32 = 2;
+
+/// ConfigOptions bit meaning "generic DNS servers are configured". Without
+/// it the DNS Client ignores `GenericDNSServers` and the rule routes
+/// nothing — a rule that exists, looks installed, and does nothing.
+const CONFIG_OPTION_DNS_SERVERS: u32 = 0x8;
+
+/// Install a rule routing `namespace` to `servers`.
+///
+/// # THE PRECONDITION
+///
+/// The caller MUST have recorded the GUID (see [`record_guid`]) and MUST
+/// have verified the boot reconciler's task exists (see
+/// [`reconciler_task_installed`]) before calling this. Neither is checked
+/// here, because this function is the primitive and the policy belongs
+/// with the caller — but installing a rule without both is exactly the
+/// state the whole design exists to prevent: a machine whose DNS points at
+/// us with nothing able to undo it.
+pub fn install_rule(guid: &str, namespace: &str, servers: &[std::net::IpAddr]) -> Result<(), Error> {
+    validate_guid(guid)?;
+    if servers.is_empty() {
+        // A rule with no servers routes the namespace into a black hole.
+        return Err(Error::Registry(
+            "refusing to install a rule with no DNS servers".into(),
+        ));
+    }
+    if namespace.is_empty() {
+        return Err(Error::Registry("refusing to install an empty namespace".into()));
+    }
+    let joined = servers
+        .iter()
+        .map(|a| a.to_string())
+        .collect::<Vec<_>>()
+        .join(";");
+    registry::write_rule(
+        DNS_POLICY_CONFIG,
+        guid,
+        namespace,
+        &joined,
+        CONFIG_OPTION_DNS_SERVERS,
+        RULE_VERSION,
+        // Diagnostic only, for an administrator reading the registry or
+        // Get-DnsClientNrptRule. Never an identity.
+        "Sentinella web protection - removed automatically if the local DNS proxy stops answering",
+    )
+}
+
+/// Is the boot reconciler's scheduled task registered?
+///
+/// Checked by looking for the task's definition file rather than by
+/// spawning `schtasks /Query`: this is called on the daemon's startup path,
+/// and this product's own ARGUS treats schtasks invocation as a persistence
+/// signal — there is no reason to make our own detection noisier to answer
+/// a question the filesystem already answers.
+///
+/// A wrong answer here is asymmetric, which is why the simple check is the
+/// right one: a false "missing" costs FILTERING (we refuse to install a
+/// rule), while a false "present" would cost DNS. The cheap check fails in
+/// the safe direction.
+pub fn reconciler_task_installed() -> bool {
+    let Ok(root) = std::env::var("SystemRoot") else {
+        return false;
+    };
+    std::path::Path::new(&root)
+        .join("System32")
+        .join("Tasks")
+        .join("Sentinella")
+        .join("DnsReconcile")
+        .exists()
 }
 
 /// Every rule GUID currently present — ours and other people's.
@@ -298,6 +385,95 @@ mod tests {
         clear_guid(&f).unwrap();
         clear_guid(&f).expect("clearing an absent record must succeed");
         assert_eq!(recorded_guid(&f), None);
+    }
+
+    /// A rule with no servers routes its whole namespace into a black
+    /// hole. On the catch-all namespace that is the machine's entire DNS,
+    /// so it is refused at the primitive rather than trusted to callers.
+    #[test]
+    fn refuses_a_rule_that_would_black_hole_the_namespace() {
+        assert!(matches!(
+            install_rule(GOOD, NAMESPACE_ALL, &[]),
+            Err(Error::Registry(_))
+        ));
+        assert!(matches!(
+            install_rule(GOOD, "", &["1.1.1.1".parse().unwrap()]),
+            Err(Error::Registry(_))
+        ));
+    }
+
+    /// Same guarantee as the delete path: the GUID names a registry key,
+    /// so validation happens before anything reaches the registry.
+    #[test]
+    fn install_validates_the_guid_first() {
+        assert!(matches!(
+            install_rule(r"..\..\evil", NAMESPACE_ALL, &["1.1.1.1".parse().unwrap()]),
+            Err(Error::MalformedGuid(_))
+        ));
+    }
+
+    /// The precondition check must be cheap and must never panic, whatever
+    /// the environment looks like. A false "missing" only costs filtering.
+    #[test]
+    fn task_check_is_total() {
+        let _ = reconciler_task_installed();
+    }
+
+    /// The ONLY test that exercises the write path against the real
+    /// registry, and it is deliberately harmless.
+    ///
+    /// It installs a rule for `.sentinella-selftest.invalid`, a namespace
+    /// that resolves nothing and that no process will ever query, and
+    /// removes it again. It does NOT use the catch-all namespace: a
+    /// catch-all pointing at a proxy that is not running is exactly the
+    /// machine-breaking state this crate exists to prevent, and a test is
+    /// not a reason to create it even briefly.
+    ///
+    ///   cargo test -p nrpt real_write_cycle -- --ignored --nocapture
+    ///
+    /// Requires Administrator/SYSTEM. Cleans up on every exit path.
+    #[test]
+    #[ignore = "writes to HKLM: run deliberately, requires elevation"]
+    fn real_write_cycle_on_a_harmless_namespace() {
+        const TEST_GUID: &str = "{5E27E11A-0000-4000-8000-5E27E11A0001}";
+        const TEST_NS: &str = ".sentinella-selftest.invalid";
+        let server: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+
+        match install_rule(TEST_GUID, TEST_NS, &[server]) {
+            Ok(()) => println!("installed test rule {TEST_GUID} for {TEST_NS}"),
+            Err(Error::AccessDenied(d)) => {
+                println!("SKIPPED - needs elevation: {d}");
+                return;
+            }
+            Err(e) => panic!("install failed: {e}"),
+        }
+
+        // Always tear down, even if an assertion below fails.
+        let cleanup = || {
+            let r = remove_rule(TEST_GUID);
+            println!("cleanup: {r:?}");
+            assert!(
+                !rule_exists(TEST_GUID).unwrap_or(true),
+                "TEST RULE SURVIVED CLEANUP - remove it by hand: {TEST_GUID}"
+            );
+        };
+
+        let present = rule_exists(TEST_GUID);
+        if present != Ok(true) {
+            cleanup();
+            panic!("rule was installed but does not read back: {present:?}");
+        }
+        println!("rule reads back as present");
+
+        let listed = list_rules().unwrap_or_default();
+        if !listed.iter().any(|g| g.eq_ignore_ascii_case(TEST_GUID)) {
+            cleanup();
+            panic!("rule is not in the enumeration: {listed:?}");
+        }
+        println!("rule appears in the enumeration");
+
+        cleanup();
+        println!("removed; registry is back to its previous state");
     }
 
     /// Read-only look at the real machine. IGNORED because it depends on

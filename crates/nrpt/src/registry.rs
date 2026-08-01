@@ -20,8 +20,9 @@ use windows::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, WIN32_ERROR,
 };
 use windows::Win32::System::Registry::{
-    HKEY, HKEY_LOCAL_MACHINE, KEY_ENUMERATE_SUB_KEYS, KEY_READ, RegCloseKey, RegDeleteKeyExW,
-    RegEnumKeyExW, RegOpenKeyExW, KEY_WOW64_64KEY,
+    HKEY, HKEY_LOCAL_MACHINE, KEY_ENUMERATE_SUB_KEYS, KEY_READ, KEY_WOW64_64KEY, KEY_WRITE,
+    REG_DWORD, REG_MULTI_SZ, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey, RegCreateKeyExW,
+    RegDeleteKeyExW, RegEnumKeyExW, RegOpenKeyExW, RegSetValueExW,
 };
 
 use super::Error;
@@ -169,4 +170,142 @@ pub fn list_subkeys(path: &str) -> Result<Vec<String>, Error> {
         }
     }
     Ok(out)
+}
+
+/// Create (or open) the rule subkey and write its values in one shot.
+///
+/// ORDER MATTERS INSIDE HERE TOO. The values are written BEFORE the key is
+/// considered complete by anything reading it, and the DNS Client only
+/// consults the policy when it reloads — so a half-written rule cannot be
+/// observed as a routing decision. What it CAN be observed as is a key with
+/// our GUID, which is why the caller records the GUID first: the reconciler
+/// must be able to name and delete even a rule that was interrupted
+/// mid-write.
+pub fn write_rule(
+    path: &str,
+    guid: &str,
+    namespace: &str,
+    servers: &str,
+    config_options: u32,
+    version: u32,
+    comment: &str,
+) -> Result<(), Error> {
+    let mut parent = HKEY::default();
+    let rc = unsafe {
+        RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            windows::core::PCWSTR(wide(path).as_ptr()),
+            0,
+            KEY_WRITE | KEY_WOW64_64KEY,
+            &mut parent,
+        )
+    };
+    // The container does not exist on a machine that has never had a rule.
+    // Creating it is legitimate: it is a standard Windows key, and the DNS
+    // Client tolerates its absence and its presence equally.
+    let parent = if rc == ERROR_SUCCESS {
+        Key(parent)
+    } else if rc == ERROR_FILE_NOT_FOUND {
+        Key(create_key(HKEY_LOCAL_MACHINE, path)?)
+    } else {
+        return Err(map_err(rc, path));
+    };
+
+    let child = Key(create_key(parent.0, guid)?);
+
+    set_multi_sz(child.0, "Name", &[namespace])?;
+    set_sz(child.0, "GenericDNSServers", servers)?;
+    set_dword(child.0, "ConfigOptions", config_options)?;
+    set_dword(child.0, "Version", version)?;
+    if !comment.is_empty() {
+        // Diagnostic only. NEVER an identity: matching on this string is
+        // the check-then-act failure the crate docs refuse.
+        set_sz(child.0, "Comment", comment)?;
+    }
+    Ok(())
+}
+
+fn create_key(parent: HKEY, name: &str) -> Result<HKEY, Error> {
+    let mut h = HKEY::default();
+    let rc = unsafe {
+        RegCreateKeyExW(
+            parent,
+            windows::core::PCWSTR(wide(name).as_ptr()),
+            0,
+            windows::core::PCWSTR::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_WRITE | KEY_READ | KEY_WOW64_64KEY,
+            None,
+            &mut h,
+            None,
+        )
+    };
+    if rc != ERROR_SUCCESS {
+        return Err(map_err(rc, name));
+    }
+    Ok(h)
+}
+
+fn set_sz(key: HKEY, name: &str, value: &str) -> Result<(), Error> {
+    let data = wide(value);
+    let bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(&data[..]))
+    };
+    let rc = unsafe {
+        RegSetValueExW(
+            key,
+            windows::core::PCWSTR(wide(name).as_ptr()),
+            0,
+            REG_SZ,
+            Some(bytes),
+        )
+    };
+    if rc != ERROR_SUCCESS {
+        return Err(map_err(rc, name));
+    }
+    Ok(())
+}
+
+/// REG_MULTI_SZ: each string NUL-terminated, the whole block terminated by
+/// one more NUL. An empty list still needs the final terminator, and
+/// getting that wrong yields a value Windows reads as garbage.
+fn set_multi_sz(key: HKEY, name: &str, values: &[&str]) -> Result<(), Error> {
+    let mut data: Vec<u16> = Vec::new();
+    for v in values {
+        data.extend(v.encode_utf16());
+        data.push(0);
+    }
+    data.push(0);
+    let bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(&data[..]))
+    };
+    let rc = unsafe {
+        RegSetValueExW(
+            key,
+            windows::core::PCWSTR(wide(name).as_ptr()),
+            0,
+            REG_MULTI_SZ,
+            Some(bytes),
+        )
+    };
+    if rc != ERROR_SUCCESS {
+        return Err(map_err(rc, name));
+    }
+    Ok(())
+}
+
+fn set_dword(key: HKEY, name: &str, value: u32) -> Result<(), Error> {
+    let rc = unsafe {
+        RegSetValueExW(
+            key,
+            windows::core::PCWSTR(wide(name).as_ptr()),
+            0,
+            REG_DWORD,
+            Some(&value.to_ne_bytes()),
+        )
+    };
+    if rc != ERROR_SUCCESS {
+        return Err(map_err(rc, name));
+    }
+    Ok(())
 }
