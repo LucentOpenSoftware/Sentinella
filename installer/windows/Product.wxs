@@ -99,6 +99,19 @@
           Remove="uninstall"
           Wait="yes" />
       </Component>
+      <!-- The boot-time NRPT reconciler. Its scheduled task is created by
+           the CustomActions below rather than by the daemon at runtime:
+           the reconciler is INFRASTRUCTURE and must exist before the first
+           DNS policy rule can, which makes install time the only correct
+           moment. It also keeps the product from writing its own
+           persistence while running - a cleaner shape for any EDR watching,
+           including our own ARGUS, whose schtasks detection stays honest
+           because it needs no exception for us. -->
+      <Component Id="DnsReconcilerExe">
+        <File Id="DnsReconcilerExeFile"
+              Source="$(var.BuildDir)\sentinella-dnsreconcile.exe"
+              KeyPath="yes" />
+      </Component>
       <Component Id="ArgusWorkerExe">
         <File Source="$(var.BuildDir)\argusd.exe" />
       </Component>
@@ -178,6 +191,96 @@
         <File Source="..\..\LICENSE" Name="LICENSE.txt" />
       </Component>
     </ComponentGroup>
+
+
+    <!-- ═══════════════════════════════════════════════════════════
+         DNS RECONCILER TASK  (web protection lifecycle)
+         ═══════════════════════════════════════════════════════════
+
+         WHY ANY OF THIS EXISTS. Web protection points the whole machine's
+         DNS at our local proxy with a Name Resolution Policy Table rule.
+         That rule lives in the registry and SURVIVES REBOOTS, while the
+         daemon that serves it is delayed-auto start. So the dangerous
+         state is not "the proxy crashed" - it is "the rule is installed
+         and nothing is answering", which is a machine with no name
+         resolution at all, on every subsequent boot, for a user who cannot
+         search for the fix because search does not resolve.
+
+         The reconciler runs at boot, before the daemon, and removes the
+         rule unless the proxy answers with our signature. It is the ONLY
+         thing that removes rules. Which is why its task is created HERE,
+         at install: it must exist before the first rule can, and no rule
+         is ever installed by a build that lacks it.
+
+         The binary registers its own task (via its install-task flag)
+         rather than this file shipping task XML. The XML must name the executable's
+         absolute path, which is only known at install time; asking the
+         binary to do it replaces install-time templating with a
+         current_exe() call. The settings it writes are not the schtasks
+         command-line defaults, deliberately - see crates/
+         sentinella-dnsreconcile/src/task.rs, where DisallowStartIfOnBatteries
+         alone would stop a laptop from ever reconciling. -->
+
+    <CustomAction Id="InstallDnsReconcileTask"
+                  FileRef="DnsReconcilerExeFile"
+                  ExeCommand="--install-task"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check" />
+
+    <!-- Rollback: if the install fails after the task was created, take it
+         away again. An orphaned task is harmless (it removes rules that do
+         not exist and exits 0), but leaving one behind after a failed
+         install is the kind of litter that makes the next install's state
+         ambiguous. -->
+    <CustomAction Id="RollbackDnsReconcileTask"
+                  FileRef="DnsReconcilerExeFile"
+                  ExeCommand="--remove-task"
+                  Execute="rollback"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <!-- UNINSTALL, IN THIS ORDER: rule, then task, then binaries.
+         Any other order strands something. Removing the task first would
+         delete the remover while a rule is still live; removing the
+         binaries first would delete the thing that knows how to remove the
+         rule. Both actions are therefore sequenced BEFORE RemoveFiles,
+         while the executable still exists. -->
+    <CustomAction Id="RemoveNrptRule"
+                  FileRef="DnsReconcilerExeFile"
+                  ExeCommand="--remove"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <!-- Return="ignore" above is NOT a decision to proceed regardless: the
+         binary itself refuses to unregister the task while a rule is still
+         installed, and exits non-zero. That check lives in the binary
+         rather than in this sequencing precisely because sequencing is
+         what a future edit gets wrong. If rule removal failed, this action
+         fails too, the task survives, and the next boot retries - which is
+         the intended ladder. -->
+    <CustomAction Id="RemoveDnsReconcileTask"
+                  FileRef="DnsReconcilerExeFile"
+                  ExeCommand="--remove-task"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="RollbackDnsReconcileTask"
+              Before="InstallDnsReconcileTask"
+              Condition="NOT Installed" />
+      <Custom Action="InstallDnsReconcileTask"
+              After="InstallFiles"
+              Condition="NOT Installed" />
+      <Custom Action="RemoveNrptRule"
+              Before="RemoveFiles"
+              Condition="REMOVE=&quot;ALL&quot;" />
+      <Custom Action="RemoveDnsReconcileTask"
+              After="RemoveNrptRule"
+              Condition="REMOVE=&quot;ALL&quot;" />
+    </InstallExecuteSequence>
 
   </Package>
 </Wix>

@@ -29,6 +29,8 @@
 //! proof the proxy works, and this process is deliberately too dumb to
 //! obtain that proof.
 
+mod task;
+
 use std::io::Write;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
@@ -64,6 +66,8 @@ fn main() {
         None => Mode::Reconcile,
         Some("--dry-run") => Mode::DryRun,
         Some("--remove") => Mode::ForceRemove,
+        Some("--install-task") => return install_task(),
+        Some("--remove-task") => return remove_task(),
         Some("--help" | "-h") => {
             println!("{USAGE}");
             return;
@@ -82,10 +86,72 @@ sentinella-dnsreconcile - removes Sentinella's NRPT rule unless the proxy is ali
   (no args)   reconcile: remove the rule unless 127.0.0.1:53 answers as ours
   --dry-run   report what would happen, change nothing
   --remove    remove the rule unconditionally (the uninstall path)
+
+  --install-task  register the boot-time Scheduled Task (installer only)
+  --remove-task   unregister it (uninstaller only)
+
   --help      this text
 
 Exit 0 = the system is in the intended state. Exit 1 = it is not and we
 could not fix it (almost always: not running as SYSTEM/Administrator).";
+
+/// Installer entry point. Separate from reconciliation on purpose: this
+/// binary must be able to register its own task WITHOUT touching NRPT
+/// state, so the MSI can create the task before any rule can exist.
+fn install_task() {
+    match task::install() {
+        Ok(()) => println!("registered {}", task::TASK_NAME),
+        Err(e) => {
+            eprintln!("sentinella-dnsreconcile: cannot register task: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Uninstaller entry point.
+///
+/// REFUSES while a rule is still live. The uninstall ladder is meant to
+/// remove the RULE first (`--remove`) and the task second, but that
+/// ordering lives in MSI sequencing — which a future edit, a partial
+/// uninstall, or someone running this by hand can all get wrong. Deleting
+/// the remover while a rule is still installed is precisely the state this
+/// design exists to prevent, so the refusal belongs HERE, where it holds
+/// regardless of who is calling and in what order.
+fn remove_task() {
+    let state_file = nrpt::default_state_file();
+    if let Some(guid) = nrpt::recorded_guid(&state_file) {
+        match nrpt::rule_exists(&guid) {
+            Ok(true) => {
+                let msg = format!(
+                    "refusing to unregister {}: NRPT rule {guid} is still installed.                      Remove the rule first (--remove); deleting the task now would                      leave this machine's DNS pointed at a proxy with nothing able                      to undo it.",
+                    task::TASK_NAME
+                );
+                log(&state_file, &msg);
+                eprintln!("sentinella-dnsreconcile: {msg}");
+                std::process::exit(1);
+            }
+            // Unreadable registry is not "confirmed absent". Same reasoning
+            // as the reconcile path: refuse rather than act on a guess.
+            Err(e) => {
+                let msg = format!("refusing to unregister {}: cannot confirm the rule is gone ({e})", task::TASK_NAME);
+                log(&state_file, &msg);
+                eprintln!("sentinella-dnsreconcile: {msg}");
+                std::process::exit(1);
+            }
+            Ok(false) => {}
+        }
+    }
+    match task::remove() {
+        Ok(()) => {
+            log(&state_file, "unregistered the boot reconciler task");
+            println!("unregistered {}", task::TASK_NAME);
+        }
+        Err(e) => {
+            eprintln!("sentinella-dnsreconcile: cannot unregister task: {e}");
+            std::process::exit(1);
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
