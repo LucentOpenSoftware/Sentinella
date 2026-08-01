@@ -320,8 +320,13 @@ green. The 60-second operator acceptance test).
   tasks — and the shed test must ALSO assert healthy queries still
   forward, since a fully broken proxy also emits SERVFAIL); TCP pool
   exhaustion does not starve UDP (the test must PROVE exhaustion —
-  small configured pools, a fresh TCP probe refused — and verify UDP
-  forward+block while TCP permits are gone).
+  small configured pools, the dedicated `tcp_pool_full` counter
+  moving — and verify UDP forward+block while TCP permits are gone,
+  plus that the pool-full TCP client is answered SERVFAIL, never a
+  bare reset). Note the precise boundary: UDP answers within the
+  client's negotiated payload size (EDNS0-aware) never touch the TCP
+  pool; only an oversized answer truncates onto TCP, and there the
+  retry is fail-safe.
 - **TCP hard-cap write path:** a pipelining client that never reads
   (enough queued large answers to fill kernel buffers) must still be
   killed at `tcp_max_lifetime` — kill counter moves, freed permit
@@ -333,9 +338,13 @@ green. The 60-second operator acceptance test).
   zeroed answer counts; TCP clients get the full answer; one upstream
   fetch total. Verified to FAIL pre-fix (oversized datagram, TC clear).
 - **Clean upstream queries:** a client query carrying EDNS0 OPT + ECS
-  is forwarded with ARCOUNT=0 and no OPT; the cached answer is keyed
-  on the question only (a different ECS hits the same entry). Verified
-  to FAIL pre-fix (verbatim client packet upstream).
+  is forwarded with the client's option payload STRIPPED — the only
+  OPT that leaves the machine is self-constructed (clamped UDP size +
+  the client's DO bit, empty rdata; round-3 L01 decision: DO/CD are
+  relayed, AD is cleared on every response, ECS never is); the cached
+  answer is keyed on the question plus DO/CD posture (a different ECS
+  hits the same entry). Verified to FAIL pre-fix (verbatim client
+  packet upstream).
 - **Case-insensitive question echo:** a case-normalizing upstream
   (lowercased qname echo) is accepted; a real letter change is still
   dropped. Verified to FAIL pre-fix (byte-exact echo → SERVFAIL).

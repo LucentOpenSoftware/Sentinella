@@ -28,6 +28,7 @@ pub const RCODE_NOERROR: u8 = 0;
 pub const RCODE_FORMERR: u8 = 1;
 pub const RCODE_SERVFAIL: u8 = 2;
 pub const RCODE_NXDOMAIN: u8 = 3;
+pub const RCODE_NOTIMP: u8 = 4;
 
 const FLAG_QR: u16 = 0x8000;
 const FLAG_OPCODE_MASK: u16 = 0x7800;
@@ -40,12 +41,36 @@ pub const FLAG_AA: u16 = 0x0400;
 pub const FLAG_TC: u16 = 0x0200;
 const FLAG_RD: u16 = 0x0100;
 const FLAG_RA: u16 = 0x0080;
+/// Authentic-data bit (RFC 4035 §3.2.3). We are a non-validating forwarder:
+/// AD is CLEARED on every response we emit (see
+/// [`rewrite_response_flags_for_client`]) because relaying the upstream's AD
+/// verbatim would assert an authentication we never performed — over
+/// loopback, the one channel where a stub is entitled to trust AD.
+const FLAG_AD: u16 = 0x0020;
+/// Checking-disabled bit (RFC 4035 §3.1.6): a self-validating stub sets it
+/// to suspend upstream validation. Relayed verbatim to the upstream and
+/// echoed back to the client, exactly like RD.
+const FLAG_CD: u16 = 0x0010;
 
 /// Classic DNS-over-UDP payload limit without EDNS0 (RFC 1035 §4.2.1).
-/// v1 serves EVERY UDP client against this limit: we strip EDNS0 from
-/// forwarded queries (no OPT reaches the upstream, no client UDP-size is
-/// negotiated), so 512 is the only size we may assume.
+/// This is the DEFAULT, applied only to clients that sent no EDNS0 OPT;
+/// clients that advertise a larger buffer via EDNS0 are served up to that
+/// size (clamped to [`MAX_EDNS_UDP_PAYLOAD`]) before truncation kicks in.
 pub const MAX_UDP_PAYLOAD: usize = 512;
+/// Largest EDNS0-advertised UDP payload we honour toward a client (and
+/// advertise upstream). Matches the proxy's datagram buffer; anything
+/// beyond still truncates to TCP. RFC 6891 §6.2.5 recommends 4096 as the
+/// upper end of the useful range.
+pub const MAX_EDNS_UDP_PAYLOAD: usize = 4096;
+/// Smallest payload size honourable per RFC 6891 §6.2.3: advertised values
+/// below 512 MUST be treated as 512.
+const MIN_EDNS_UDP_PAYLOAD: usize = 512;
+
+/// Clamp a client-advertised EDNS0 UDP payload size to the range we serve:
+/// `[512, 4096]` per RFC 6891 and our datagram buffer.
+pub fn clamp_edns_udp_size(size: u16) -> usize {
+    usize::from(size).clamp(MIN_EDNS_UDP_PAYLOAD, MAX_EDNS_UDP_PAYLOAD)
+}
 
 /// Errors that make a packet unusable as a query. The proxy maps every one
 /// of these to a FORMERR response (or drops the packet if not even a header
@@ -89,6 +114,16 @@ pub struct Query {
     /// Offset just past the question section — the slice
     /// `HEADER_LEN..question_end` is the exact question bytes to echo.
     pub question_end: usize,
+    /// Checking-disabled bit from the client's header (RFC 4035 §3.1.6).
+    pub checking_disabled: bool,
+    /// DNSSEC-OK bit from the client's EDNS0 OPT record (RFC 3225 §3).
+    /// Always false when the query carries no OPT (the bit lives there).
+    pub dnssec_ok: bool,
+    /// UDP payload size advertised by the client's EDNS0 OPT record (RFC
+    /// 6891), unclamped — apply [`clamp_edns_udp_size`] before use. `None`
+    /// when the query carries no (parseable) OPT record, meaning the client
+    /// gets the classic 512-byte limit.
+    pub edns_udp_size: Option<u16>,
 }
 
 /// Summary of an upstream response used for cache decisions.
@@ -120,6 +155,7 @@ pub fn parse_query(bytes: &[u8]) -> Result<Query, WireError> {
     }
     let opcode = ((flags & FLAG_OPCODE_MASK) >> 11) as u8;
     let recursion_desired = flags & FLAG_RD != 0;
+    let checking_disabled = flags & FLAG_CD != 0;
     let qdcount = u16::from_be_bytes([bytes[4], bytes[5]]);
     // WHY exactly 1: multi-question DNS has no interoperable semantics
     // (RFC 9619 reserves QDCOUNT > 1); answering would guess. FORMERR is
@@ -130,6 +166,14 @@ pub fn parse_query(bytes: &[u8]) -> Result<Query, WireError> {
     let (qname, name_end) = parse_question_name(bytes, HEADER_LEN)?;
     let qtype = read_u16(bytes, name_end).ok_or(WireError::Truncated)?;
     let qclass = read_u16(bytes, name_end + 2).ok_or(WireError::Truncated)?;
+    let question_end = name_end + 4;
+    let (dnssec_ok, edns_udp_size) = find_opt(
+        bytes,
+        question_end,
+        u16::from_be_bytes([bytes[6], bytes[7]]),
+        u16::from_be_bytes([bytes[8], bytes[9]]),
+        u16::from_be_bytes([bytes[10], bytes[11]]),
+    );
     Ok(Query {
         id,
         opcode,
@@ -138,8 +182,61 @@ pub fn parse_query(bytes: &[u8]) -> Result<Query, WireError> {
         qname_wire: bytes[HEADER_LEN..name_end].to_vec(),
         qtype,
         qclass,
-        question_end: name_end + 4,
+        question_end,
+        checking_disabled,
+        dnssec_ok,
+        edns_udp_size,
     })
+}
+
+/// Walk the answer/authority/additional sections of a QUERY looking for the
+/// EDNS0 OPT pseudo-record (RFC 6891), returning its DO bit and advertised
+/// UDP payload size. Queries normally carry AN=NS=0 and one OPT in AR, but
+/// every count is honoured so a hostile count cannot hide the OPT we would
+/// otherwise relay decisions on.
+///
+/// Total and bounded: every step goes through [`skip_name`] or an explicit
+/// bounds check, each record consumes at least 11 bytes (1-byte root name +
+/// 10-byte fixed fields), so iteration is bounded by the packet length.
+/// Any malformed trailing record yields `(false, None)` — trailing garbage
+/// must not invalidate an otherwise good question (the codec has always
+/// tolerated it), it simply means "no EDNS negotiated".
+fn find_opt(
+    bytes: &[u8],
+    mut offset: usize,
+    ancount: u16,
+    nscount: u16,
+    arcount: u16,
+) -> (bool, Option<u16>) {
+    // Bounded by construction: each iteration advances `offset` past at
+    // least one record or returns.
+    let records = usize::from(ancount) + usize::from(nscount) + usize::from(arcount);
+    for _ in 0..records {
+        let Some(after_name) = skip_name(bytes, offset) else {
+            return (false, None);
+        };
+        let Some(fixed) = bytes.get(after_name..after_name + 10) else {
+            return (false, None);
+        };
+        let rtype = u16::from_be_bytes([fixed[0], fixed[1]]);
+        let class = u16::from_be_bytes([fixed[2], fixed[3]]);
+        // TTL field: extended-rcode(8) | version(8) | flags(16); DO is the
+        // top flag bit (RFC 3225 §3).
+        let flags = u16::from_be_bytes([fixed[6], fixed[7]]);
+        let rdlength = usize::from(u16::from_be_bytes([fixed[8], fixed[9]]));
+        let data_end = match after_name.checked_add(10).and_then(|o| o.checked_add(rdlength)) {
+            Some(end) if end <= bytes.len() => end,
+            _ => return (false, None),
+        };
+        if rtype == 41 {
+            // OPT: class is the requestor's UDP payload size. First OPT
+            // wins; anything after it is ignored (a second OPT is malformed
+            // per RFC 6891 §6.1.1, but not ours to police here).
+            return (flags & 0x8000 != 0, Some(class));
+        }
+        offset = data_end;
+    }
+    (false, None)
 }
 
 /// Parse a question-section name into presentation form with RFC 4343
@@ -354,6 +451,42 @@ pub fn is_truncated_response(bytes: &[u8]) -> bool {
     bytes.len() >= HEADER_LEN && u16::from_be_bytes([bytes[2], bytes[3]]) & FLAG_TC != 0
 }
 
+/// Rewrite the client-facing header flags of a RELAYED upstream response in
+/// place. The upstream answered the CLEAN query we rebuilt, so its flag
+/// echo describes our exchange, not the client's; three bits must be
+/// corrected before the response is served or cached:
+///
+/// - **RD** is set to the CLIENT's value (RFC 1035 §4.1.1: RD is copied
+///   from query to response). We force RD=1 upstream, so without this a
+///   `+norecurse` client is told it asked for recursion — and the relayed
+///   path would disagree with the blocked/error paths, which echo the
+///   client's RD (L04).
+/// - **CD** is set to the CLIENT's value (RFC 4035 §3.1.6), same argument.
+/// - **AD** is CLEARED unconditionally (RFC 4035 §3.2.3, RFC 6840 §5.7):
+///   AD asserts the responder authenticated the answer. We validate
+///   nothing (txid + question echo over plaintext UDP is not
+///   authentication), so relaying the upstream's AD verbatim would be a
+///   lie told over loopback — the one channel where a stub is entitled to
+///   trust AD (L01). Clients that need authenticated data must validate
+///   themselves; relaying CD/DO (which we do) makes that possible.
+///
+/// Total over arbitrary input: packets shorter than a header are left
+/// untouched.
+pub fn rewrite_response_flags_for_client(resp: &mut [u8], recursion_desired: bool, checking_disabled: bool) {
+    if resp.len() < HEADER_LEN {
+        return;
+    }
+    let mut flags = u16::from_be_bytes([resp[2], resp[3]]);
+    flags &= !(FLAG_AD | FLAG_RD | FLAG_CD);
+    if recursion_desired {
+        flags |= FLAG_RD;
+    }
+    if checking_disabled {
+        flags |= FLAG_CD;
+    }
+    resp[2..4].copy_from_slice(&flags.to_be_bytes());
+}
+
 /// Build a standard query packet. Returns `None` for names that cannot be
 /// encoded (empty labels, label > 63, name > 255 wire bytes).
 pub fn build_query(id: u16, qname: &str, qtype: u16, qclass: u16) -> Option<Vec<u8>> {
@@ -384,29 +517,54 @@ pub fn build_query(id: u16, qname: &str, qtype: u16, qclass: u16) -> Option<Vec<
 }
 
 /// Build the CLEAN query we send upstream for a client query: a fresh
-/// (caller-generated) transaction ID, standard flags (RD=1, nothing
-/// else), QDCOUNT=1, zeroed AN/NS/AR counts, and exactly the question
-/// section — NO additional records, no EDNS0 OPT. Client-controlled bytes
-/// beyond the question (flags, additional-section ECS cookies, OPT
-/// payloads) never leave the machine: an ECS option would steer the
-/// answer we then cache machine-wide, and a forged additional section
-/// would ride our upstream trust.
+/// (caller-generated) transaction ID, flags rebuilt from scratch (RD=1
+/// always — we are a recursive forwarder; CD relayed verbatim from the
+/// client per RFC 4035 §3.1.6 so a self-validating stub can suspend
+/// upstream validation), QDCOUNT=1, zeroed AN/NS counts, and exactly the
+/// question section.
+///
+/// EDNS0 policy (decided in round 3, L01): when the client sent an OPT
+/// record, we send exactly ONE OPT upstream carrying the client's
+/// advertised UDP size (clamped to `[512, 4096]` — we must be able to
+/// buffer what we ask for, and RFC 6891 §6.2.3 floors sub-512 values) and
+/// the client's DO bit (RFC 3225), so a client asking for DNSSEC records
+/// gets them instead of a silent downgrade. NOTHING ELSE is relayed: no
+/// ECS (it would steer the answer we then cache machine-wide), no cookies,
+/// no client options of any kind — the OPT we emit is one we constructed.
+/// `edns` is `(udp_size, dnssec_ok)`; `None` means the client sent no OPT
+/// and the upstream query carries ARCOUNT=0, exactly as before.
 ///
 /// `question` must be the exact wire question slice (name + qtype +
 /// qclass) from a successfully parsed query.
-pub fn build_upstream_query(id: u16, question: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(HEADER_LEN + question.len());
+pub fn build_upstream_query(
+    id: u16,
+    question: &[u8],
+    checking_disabled: bool,
+    edns: Option<(u16, bool)>,
+) -> Vec<u8> {
+    let flags = FLAG_RD | if checking_disabled { FLAG_CD } else { 0 };
+    let mut out = Vec::with_capacity(HEADER_LEN + question.len() + 11);
     out.extend_from_slice(&id.to_be_bytes());
-    out.extend_from_slice(&FLAG_RD.to_be_bytes());
+    out.extend_from_slice(&flags.to_be_bytes());
     out.extend_from_slice(&1u16.to_be_bytes()); // qdcount
-    out.extend_from_slice(&[0, 0, 0, 0, 0, 0]); // an/ns/ar — always zero
+    out.extend_from_slice(&[0, 0, 0, 0]); // an/ns — always zero
+    out.extend_from_slice(&u16::from(edns.is_some()).to_be_bytes()); // arcount
     out.extend_from_slice(question);
+    if let Some((udp_size, dnssec_ok)) = edns {
+        let size = clamp_edns_udp_size(udp_size) as u16;
+        out.push(0); // name: root
+        out.extend_from_slice(&41u16.to_be_bytes()); // type: OPT
+        out.extend_from_slice(&size.to_be_bytes()); // class: our UDP size
+        // ttl: extended-rcode 0 | version 0 | flags (DO only).
+        out.extend_from_slice(&[0, 0, if dnssec_ok { 0x80 } else { 0 }, 0]);
+        out.extend_from_slice(&[0, 0]); // rdlength: no options
+    }
     out
 }
 
 /// Build a TRUNCATED response (TC bit set, question section only,
 /// ANCOUNT/NSCOUNT/ARCOUNT zeroed) for a UDP client whose full answer
-/// exceeds the UDP payload limit — RFC 2181-style truncation so the
+/// exceeds its UDP payload limit — RFC 2181-style truncation so the
 /// client retries over TCP. WHY: replaying a large (e.g. TCP-fetched,
 /// up to 65535-byte) answer to a UDP client produces an oversized
 /// datagram the OS drops (WSAEMSGSIZE on Windows) with TC clear — the
@@ -414,9 +572,17 @@ pub fn build_upstream_query(id: u16, question: &[u8]) -> Vec<u8> {
 /// lifetime. This fires with NO attacker via ordinary TC-fallback
 /// traffic.
 ///
+/// `rcode` must be the RCODE of the full answer being truncated (L02): a
+/// truncated NXDOMAIN must keep rcode=3 — hardcoding NOERROR turns a
+/// cached negative answer into "name exists, no records" for any client
+/// that reads TC=1/NOERROR/ANCOUNT=0 as NODATA, for the whole negative
+/// cache window.
+///
 /// Returns `None` when the request is shorter than a header (nothing to
-/// echo an ID from) — total over arbitrary input.
-pub fn build_truncated_response(request: &[u8]) -> Option<Vec<u8>> {
+/// echo an ID from) — total over arbitrary input. Callers must treat
+/// `None` as an error path (SERVFAIL or drop), NEVER as "send the full
+/// oversized response" (L03).
+pub fn build_truncated_response(request: &[u8], rcode: u8) -> Option<Vec<u8>> {
     if request.len() < HEADER_LEN {
         return None;
     }
@@ -424,8 +590,10 @@ pub fn build_truncated_response(request: &[u8]) -> Option<Vec<u8>> {
     let flags = FLAG_QR
         | (flags_in & FLAG_OPCODE_MASK)
         | (flags_in & FLAG_RD)
+        | (flags_in & FLAG_CD)
         | FLAG_RA
-        | FLAG_TC; // rcode NOERROR; TC is the whole point
+        | FLAG_TC
+        | u16::from(rcode & 0x0F);
     let question = parse_query(request)
         .ok()
         .map(|q| &request[HEADER_LEN..q.question_end]);
@@ -460,6 +628,7 @@ pub fn build_error_response(request: &[u8], rcode: u8, aa: bool) -> Option<Vec<u
     let flags = FLAG_QR
         | (flags_in & FLAG_OPCODE_MASK)
         | (flags_in & FLAG_RD)
+        | (flags_in & FLAG_CD)
         | FLAG_RA
         | if aa { FLAG_AA } else { 0 }
         | u16::from(rcode & 0x0F);
@@ -494,7 +663,12 @@ pub fn build_zero_ip_response(request: &[u8], ttl: u32) -> Option<Vec<u8>> {
         _ => return build_error_response(request, RCODE_NXDOMAIN, true),
     };
     let flags_in = u16::from_be_bytes([request[2], request[3]]);
-    let flags = FLAG_QR | (flags_in & FLAG_OPCODE_MASK) | (flags_in & FLAG_RD) | FLAG_RA | FLAG_AA;
+    let flags = FLAG_QR
+        | (flags_in & FLAG_OPCODE_MASK)
+        | (flags_in & FLAG_RD)
+        | (flags_in & FLAG_CD)
+        | FLAG_RA
+        | FLAG_AA;
     let question = &request[HEADER_LEN..query.question_end];
     let mut out = Vec::with_capacity(HEADER_LEN + question.len() + 16 + rdata.len());
     out.extend_from_slice(&request[0..2]);
@@ -802,8 +976,9 @@ mod tests {
     #[test]
     fn upstream_query_is_clean_question_only() {
         // Client query with a suspicious flag byte and an OPT additional
-        // record: the upstream query must carry ONLY the question —
-        // fresh id slot, RD=1 flags, zeroed AN/NS/AR, nothing trailing.
+        // record: with `edns = None` the upstream query must carry ONLY the
+        // question — fresh id slot, RD=1 flags, zeroed AN/NS/AR, nothing
+        // trailing (the client in this case sent no OPT we honour).
         let mut client = build_query(0xBEEF, "example.com", TYPE_A, CLASS_IN).expect("build");
         client[2] |= 0x7F; // every non-QR high flag bit (opcode/AA/TC/RD)
         client[3] = 0x5A; // low flag byte garbage
@@ -811,7 +986,7 @@ mod tests {
         client.extend_from_slice(&[0x00, 0x00, 0x29, 0x10, 0x00, 0, 0, 0, 0, 0, 0]); // OPT
         let parsed = parse_query(&client).expect("question parses");
         let question = &client[HEADER_LEN..parsed.question_end];
-        let clean = build_upstream_query(0x1234, question);
+        let clean = build_upstream_query(0x1234, question, false, None);
         assert_eq!(&clean[0..2], &[0x12, 0x34]);
         assert_eq!(&clean[2..4], &FLAG_RD.to_be_bytes(), "RD=1, nothing else");
         assert_eq!(&clean[4..6], &[0, 1], "qdcount 1");
@@ -821,9 +996,109 @@ mod tests {
     }
 
     #[test]
+    fn upstream_query_relays_cd_and_a_minimal_self_built_opt() {
+        // L01: CD is relayed verbatim; the client's OPT becomes ONE OPT we
+        // constructed — clamped size + DO bit, no options, no ECS.
+        let query = build_query(0xBEEF, "example.com", TYPE_A, CLASS_IN).expect("build");
+        let parsed = parse_query(&query).expect("parse");
+        let question = &query[HEADER_LEN..parsed.question_end];
+
+        let clean = build_upstream_query(0x1234, question, true, Some((1232, true)));
+        let flags = u16::from_be_bytes([clean[2], clean[3]]);
+        assert_ne!(flags & FLAG_RD, 0, "RD always set");
+        assert_ne!(flags & FLAG_CD, 0, "client CD relayed");
+        assert_eq!(&clean[10..12], &[0, 1], "arcount 1");
+        let opt = &clean[HEADER_LEN + question.len()..];
+        assert_eq!(
+            opt,
+            &[0x00, 0x00, 0x29, 0x04, 0xD0, 0, 0, 0x80, 0, 0, 0],
+            "one OPT: root name, type 41, size 1232, DO set, empty rdata"
+        );
+
+        // Without DO the flags byte of the OPT ttl is zero.
+        let clean = build_upstream_query(0x1234, question, false, Some((1232, false)));
+        let opt = &clean[HEADER_LEN + question.len()..];
+        assert_eq!(opt[7], 0, "DO clear");
+        assert_eq!(u16::from_be_bytes([clean[2], clean[3]]) & FLAG_CD, 0, "CD clear");
+
+        // Sizes are clamped both ways: 65535 → 4096 (our buffer), 200 → 512
+        // (RFC 6891 §6.2.3 floor).
+        let clean = build_upstream_query(0x1234, question, false, Some((u16::MAX, false)));
+        let n = clean.len();
+        assert_eq!(&clean[n - 8..n - 6], &4096u16.to_be_bytes(), "size capped at 4096");
+        let clean = build_upstream_query(0x1234, question, false, Some((200, false)));
+        let n = clean.len();
+        assert_eq!(&clean[n - 8..n - 6], &512u16.to_be_bytes(), "size floored at 512");
+    }
+
+    #[test]
+    fn parse_query_extracts_edns_size_do_and_cd() {
+        let mut query = build_query(0xBEEF, "example.com", TYPE_A, CLASS_IN).expect("build");
+        query[3] |= 0x10; // CD
+        query[11] = 1; // arcount = 1
+        query.extend_from_slice(&[
+            0x00, // name: root
+            0x00, 0x29, // type OPT (41)
+            0x04, 0xD0, // class: 1232 UDP payload
+            0, 0, 0x80, 0, // ttl: DO bit set
+            0x00, 0x00, // rdlength 0
+        ]);
+        let q = parse_query(&query).expect("parse");
+        assert!(q.checking_disabled);
+        assert!(q.dnssec_ok);
+        assert_eq!(q.edns_udp_size, Some(1232));
+
+        // No OPT at all: defaults, CD still read from the header.
+        let mut plain = build_query(1, "example.com", TYPE_A, CLASS_IN).expect("build");
+        plain[3] |= 0x10;
+        let q = parse_query(&plain).expect("parse");
+        assert!(q.checking_disabled);
+        assert!(!q.dnssec_ok);
+        assert_eq!(q.edns_udp_size, None);
+    }
+
+    #[test]
+    fn edns_opt_is_found_past_other_records_and_garbage_yields_none() {
+        // An (unusual but wire-legal) query carrying a junk additional
+        // record BEFORE the OPT: the walker must skip it and find the OPT.
+        let mut query = build_query(1, "example.com", TYPE_A, CLASS_IN).expect("build");
+        query[11] = 2; // arcount = 2
+        query.extend_from_slice(&[
+            0x00, // name: root
+            0x00, 0x01, // type A
+            0x00, 0x01, // class IN
+            0, 0, 0, 0, // ttl
+            0x00, 0x04, // rdlength 4
+            127, 0, 0, 1, // rdata
+        ]);
+        query.extend_from_slice(&[
+            0x00, 0x00, 0x29, 0x10, 0x00, 0, 0, 0x80, 0, 0x00, 0x00,
+        ]);
+        let q = parse_query(&query).expect("parse");
+        assert_eq!(q.edns_udp_size, Some(4096));
+        assert!(q.dnssec_ok);
+
+        // Truncated/garbage additional records: parse still succeeds, EDNS
+        // simply absent (trailing garbage must not invalidate the question).
+        let mut query = build_query(1, "example.com", TYPE_A, CLASS_IN).expect("build");
+        query[11] = 1;
+        query.extend_from_slice(&[0x00, 0x00, 0x29, 0x10]); // claims OPT, truncated
+        let q = parse_query(&query).expect("parse despite trailing garbage");
+        assert_eq!(q.edns_udp_size, None);
+        assert!(!q.dnssec_ok);
+
+        // A record whose rdlength overruns the packet: same story.
+        let mut query = build_query(1, "example.com", TYPE_A, CLASS_IN).expect("build");
+        query[11] = 1;
+        query.extend_from_slice(&[0x00, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0xFF, 0xFF]);
+        let q = parse_query(&query).expect("parse despite overrun");
+        assert_eq!(q.edns_udp_size, None);
+    }
+
+    #[test]
     fn truncated_response_has_tc_question_and_zero_counts() {
         let query = build_query(0x4242, "big.example", TYPE_A, CLASS_IN).expect("build");
-        let resp = build_truncated_response(&query).expect("truncated response");
+        let resp = build_truncated_response(&query, RCODE_NOERROR).expect("truncated response");
         assert!(resp.len() <= MAX_UDP_PAYLOAD);
         assert_eq!(&resp[0..2], &[0x42, 0x42], "same ID");
         let flags = u16::from_be_bytes([resp[2], resp[3]]);
@@ -834,7 +1109,58 @@ mod tests {
         assert_eq!(&resp[HEADER_LEN..], &query[HEADER_LEN..], "question intact");
         assert!(is_truncated_response(&resp));
         // Total on short input.
-        assert_eq!(build_truncated_response(&query[..5]), None);
+        assert_eq!(build_truncated_response(&query[..5], RCODE_NOERROR), None);
+    }
+
+    #[test]
+    fn truncated_response_preserves_the_real_rcode() {
+        // L02: a truncated NXDOMAIN must keep rcode=3 — a hardcoded NOERROR
+        // reads as NODATA ("exists, no records") to a client that does not
+        // retry, for the whole negative-cache window. The OLD implementation
+        // hardcoded NOERROR and the OLD test (asserting only `flags & 0xF
+        // == 0` on a NOERROR input) passed on it — this test pins rcode
+        // passthrough for every rcode, so a hardcoded-NOERROR builder fails.
+        let query = build_query(0x4242, "gone.example", TYPE_A, CLASS_IN).expect("build");
+        for rcode in [RCODE_NOERROR, RCODE_FORMERR, RCODE_SERVFAIL, RCODE_NXDOMAIN, 5u8] {
+            let resp = build_truncated_response(&query, rcode).expect("truncated response");
+            let flags = u16::from_be_bytes([resp[2], resp[3]]);
+            assert_eq!(flags & 0x000F, u16::from(rcode), "rcode {rcode} must pass through");
+            assert_ne!(flags & FLAG_TC, 0, "TC set regardless of rcode");
+        }
+    }
+
+    #[test]
+    fn rewrite_response_flags_echoes_rd_cd_and_clears_ad() {
+        // Relayed upstream response: QR|RD|RA|AD set (upstream validated
+        // and says so). The client asked with RD=0, CD=1.
+        let query = build_query(0x1, "example.com", TYPE_A, CLASS_IN).expect("build");
+        let mut resp = query.clone();
+        resp[2] = 0x85; // QR|AA|RD
+        resp[3] = 0xA0; // RA|AD
+        rewrite_response_flags_for_client(&mut resp, false, true);
+        let flags = u16::from_be_bytes([resp[2], resp[3]]);
+        assert_eq!(flags & FLAG_AD, 0, "AD always cleared (we validate nothing)");
+        assert_eq!(flags & FLAG_RD, 0, "client RD=0 echoed");
+        assert_ne!(flags & FLAG_CD, 0, "client CD=1 echoed");
+        assert_ne!(flags & FLAG_QR, 0, "QR untouched");
+        assert_ne!(flags & FLAG_AA, 0, "upstream AA untouched");
+        assert_ne!(flags & FLAG_RA, 0, "RA untouched");
+        assert_eq!(flags & 0x000F, 0, "rcode untouched");
+
+        // RD=1, CD=0 client: RD echoed set, CD stays clear, AD cleared.
+        let mut resp = query.clone();
+        resp[2] = 0x81;
+        resp[3] = 0xB0; // RA|AD|CD
+        rewrite_response_flags_for_client(&mut resp, true, false);
+        let flags = u16::from_be_bytes([resp[2], resp[3]]);
+        assert_ne!(flags & FLAG_RD, 0);
+        assert_eq!(flags & FLAG_CD, 0, "client CD=0 echoed (upstream CD stripped)");
+        assert_eq!(flags & FLAG_AD, 0);
+
+        // Total on short input: untouched, no panic.
+        let mut short = vec![0u8; 4];
+        rewrite_response_flags_for_client(&mut short, true, true);
+        assert_eq!(short, vec![0u8; 4]);
     }
 
     #[test]
@@ -939,7 +1265,9 @@ mod tests {
 
     /// Structured sweep: fully valid query + random trailing garbage.
     /// Exercises the "question parsed, junk after it" shape (forwarding and
-    /// response-walking paths must stay total on it).
+    /// response-walking paths must stay total on it). A random ARCOUNT is
+    /// set so the EDNS0 OPT walker in `parse_query` actually walks the
+    /// garbage — a sweep that never enters it is evidence of nothing.
     #[test]
     fn structured_sweep_valid_query_with_trailing_garbage_never_panics() {
         let mut rng = XorShift(0xDEAD_BEEF_CAFE_F00D);
@@ -950,6 +1278,7 @@ mod tests {
             for _ in 0..extra {
                 buf.push(rng.byte());
             }
+            buf[11] = (rng.next() % 4) as u8; // arcount 0..=3 over the garbage
             let q = parse_query(&buf).expect("trailing garbage must not break the question");
             assert_eq!(q.qname, *name);
             let _ = build_error_response(&buf, RCODE_SERVFAIL, false);
