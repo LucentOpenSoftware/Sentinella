@@ -20,11 +20,13 @@
 //! - no hardcoded public resolver: upstreams come from configuration.
 
 use std::collections::HashMap;
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hasher};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -215,41 +217,38 @@ type CacheKey = (Vec<u8>, u16, u16);
 
 /// Per-exchange transaction-ID generator for upstream queries.
 ///
-/// NOT cryptographic — deliberately dependency-free (the crate has no RNG
-/// dependency): a xorshift64 mixer over an atomic counter, seeded from the
-/// wall clock and process ID. What matters for the threat model (design §5)
-/// is that the ID sequence is not attacker-controlled or trivially
-/// predictable from the client's own ID — the client's txid is never
-/// forwarded verbatim. Combined with the question-echo check and
-/// per-query ephemeral connected sockets this restores the standard
-/// resolver defense-in-depth; DNSSEC validation remains a v2 item.
+/// A keyed PRF (SipHash-1-3, reached through `RandomState`) over a counter.
+/// The 128-bit key comes from the OS CSPRNG, drawn by std on first use —
+/// which is how this stays dependency-free without inventing its own
+/// entropy. Still NOT a CSPRNG: do not describe the output as "random".
+/// What it does give is the property the threat model actually needs — the
+/// sequence is not derivable from observed outputs.
+///
+/// WHY NOT THE PREVIOUS SHAPE: a Weyl counter (`fetch_add(GOLDEN)`) pushed
+/// through an invertible GF(2)-linear xorshift, seeded once with
+/// `nanos ^ pid.rotate_left(32)`. `rotate_left(32)` puts the pid in the HIGH
+/// 32 bits, so the low 32 bits of the seed were wall-clock nanoseconds and
+/// nothing else. With 100 ns clock granularity a +/-1 s window is 2e7
+/// candidates: two observed IDs plus the pid recovered the state by brute
+/// force in 22.7 ms (measured) and predicted every subsequent ID.
 struct UpstreamTxids {
-    state: AtomicU64,
+    counter: AtomicU64,
+    key: RandomState,
 }
 
 impl UpstreamTxids {
     fn new() -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0x9E37_79B9_7F4A_7C15);
-        let seed = nanos ^ u64::from(std::process::id()).rotate_left(32);
-        // xorshift state must be nonzero.
         Self {
-            state: AtomicU64::new(seed | 1),
+            counter: AtomicU64::new(0),
+            key: RandomState::new(),
         }
     }
 
     fn next(&self) -> u16 {
-        // Each caller mixes a different counter value, so IDs do not repeat
-        // in lockstep even though the mix is deterministic.
-        let mut x = self
-            .state
-            .fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed);
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        (x >> 32) as u16
+        let n = self.counter.fetch_add(1, Ordering::Relaxed);
+        let mut h = self.key.build_hasher();
+        h.write_u64(n);
+        (h.finish() >> 32) as u16
     }
 }
 
@@ -443,8 +442,8 @@ impl Proxy {
     ///    NXDOMAINs on ANY box (`.invalid` is reserved), so only a local
     ///    engine decision proves the plumbing is actually ours.
     /// 2. `upstream_ok` — a LIVE query for `config.health_check_name`
-    ///    (default `example.com`) forwarded to a configured upstream
-    ///    comes back NOERROR.
+    ///    (default `example.com`) comes back NOERROR from EVERY configured
+    ///    upstream. `upstreams_healthy`/`upstreams_total` carry the detail.
     /// 3. `filter_ok` — the canary queried through the actual UDP
     ///    listener comes back NXDOMAIN (end-to-end through parse →
     ///    decide → respond).
@@ -458,6 +457,8 @@ impl Proxy {
             engine_ok: false,
             upstream_ok: false,
             filter_ok: false,
+            upstreams_healthy: 0,
+            upstreams_total: 0,
             detail: String::new(),
         };
         use std::fmt::Write as _;
@@ -476,22 +477,38 @@ impl Proxy {
             wire::CLASS_IN,
         )
         .and_then(|bytes| wire::parse_query(&bytes).ok().map(|q| (bytes, q)));
+        // EVERY configured upstream is probed, not just the round-robin
+        // head: `forward` has no failover, so a single unreachable server in
+        // the adapter's list breaks its share of the machine's DNS while a
+        // head-only probe stays green. `upstream_ok` therefore means ALL of
+        // them answered; the counts let the daemon tell "all good" apart
+        // from "one of two dead".
+        let upstreams = self.state.config.upstreams.clone();
+        report.upstreams_total = upstreams.len();
         match upstream_probe {
-            Some((bytes, query)) => match forward(&self.state, &bytes, &query, false).await {
-                Ok(resp) => {
-                    report.upstream_ok = wire::response_info(&resp)
-                        .is_some_and(|info| info.rcode == wire::RCODE_NOERROR);
-                    if !report.upstream_ok {
-                        let _ = write!(
-                            report.detail,
-                            "upstream answered health check with non-NOERROR; "
-                        );
+            Some((bytes, query)) => {
+                for up in &upstreams {
+                    match forward_via(&self.state, &bytes, &query, false, *up).await {
+                        Ok(resp)
+                            if wire::response_info(&resp)
+                                .is_some_and(|info| info.rcode == wire::RCODE_NOERROR) =>
+                        {
+                            report.upstreams_healthy += 1;
+                        }
+                        Ok(_) => {
+                            let _ = write!(
+                                report.detail,
+                                "upstream {up} answered health check with non-NOERROR; "
+                            );
+                        }
+                        Err(e) => {
+                            let _ = write!(report.detail, "upstream {up} health check failed: {e}; ");
+                        }
                     }
                 }
-                Err(e) => {
-                    let _ = write!(report.detail, "upstream health check failed: {e}; ");
-                }
-            },
+                report.upstream_ok = report.upstreams_total > 0
+                    && report.upstreams_healthy == report.upstreams_total;
+            }
             None => {
                 let _ = write!(
                     report.detail,
@@ -571,11 +588,18 @@ impl Proxy {
 pub struct SelfTestReport {
     /// The filter engine decides the canary as Block.
     pub engine_ok: bool,
-    /// A live query for `health_check_name` returns NOERROR from an
-    /// upstream.
+    /// A live query for `health_check_name` returned NOERROR from EVERY
+    /// configured upstream. False if any one of them is unreachable —
+    /// `forward` does not fail over, so a dead upstream is a real partial
+    /// outage, not a redundancy the proxy can absorb.
     pub upstream_ok: bool,
     /// The canary queried through the listener returns NXDOMAIN.
     pub filter_ok: bool,
+    /// Configured upstreams that answered the health check with NOERROR.
+    pub upstreams_healthy: usize,
+    /// Configured upstreams probed. `healthy < total` is a partial DNS
+    /// outage for the whole machine and must not read as green.
+    pub upstreams_total: usize,
     /// Human-readable failure detail (empty when all steps passed).
     pub detail: String,
 }
@@ -684,70 +708,82 @@ async fn tcp_loop(listener: TcpListener, state: Arc<State>, mut shutdown: watch:
 
 /// Serve one client TCP connection. Two independent clocks bound it
 /// (design §5): an inter-read IDLE timeout (`tcp_idle_timeout`) and a HARD
-/// total-lifetime cap (`tcp_max_lifetime`) — without the latter, a
-/// dribbling connection could hold its permit indefinitely. The deadline
-/// is computed once and EVERY socket operation — reads AND the response
-/// writes — gets `timeout = remaining`; an unbounded `write_all` lets a
-/// pipelining client that never reads park the connection (and its
-/// permit) forever on a full kernel send buffer.
+/// total-lifetime cap (`tcp_max_lifetime`).
+///
+/// INVARIANT: the SUM of every wait on this connection is <= the hard cap.
+/// Each await re-derives its budget from `deadline`. Computing one budget
+/// and sharing it across two awaits is NOT equivalent: a client can land the
+/// first await's completion just under the deadline and then start a second
+/// full-length wait. That is not hypothetical — sharing one `read_budget`
+/// between the length-prefix read and the body read measured 1.99x the cap
+/// (split the 2-byte prefix across the deadline), and 6.99x once an
+/// unbounded `handle_query` chained a slow upstream onto it.
 async fn tcp_conn(
     mut stream: TcpStream,
     peer: SocketAddr,
     state: Arc<State>,
     _permit: OwnedSemaphorePermit,
 ) {
+    /// Lifetime left, or `None` once the hard cap is spent.
+    fn left(deadline: tokio::time::Instant) -> Option<Duration> {
+        let d = deadline.saturating_duration_since(tokio::time::Instant::now());
+        (!d.is_zero()).then_some(d)
+    }
+
     let deadline = tokio::time::Instant::now() + state.config.tcp_max_lifetime;
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            debug!(%peer, "TCP connection closed: hard lifetime cap reached");
-            state.counters.bump(&state.counters.tcp_lifetime_kills);
-            return;
-        }
-        let read_budget = remaining.min(state.config.tcp_idle_timeout);
+    let idle = state.config.tcp_idle_timeout;
+
+    // (1) 2-byte length prefix — the loop condition is also this step's
+    // budget check, so a spent cap ends the connection before any new read.
+    while let Some(budget) = left(deadline) {
         let mut len_buf = [0u8; 2];
-        let read_len = timeout(read_budget, stream.read_exact(&mut len_buf)).await;
-        if !matches!(read_len, Ok(Ok(_))) {
-            if read_len.is_err() && deadline <= tokio::time::Instant::now() {
-                state.counters.bump(&state.counters.tcp_lifetime_kills);
-            }
-            return; // EOF, peer error, idle timeout, or lifetime cap
+        if !matches!(
+            timeout(budget.min(idle), stream.read_exact(&mut len_buf)).await,
+            Ok(Ok(_))
+        ) {
+            break; // EOF, peer error, idle timeout, or lifetime cap
         }
-        let n = u16::from_be_bytes(len_buf) as usize;
-        let mut buf = vec![0u8; n];
-        let read_body = timeout(read_budget, stream.read_exact(&mut buf)).await;
-        if !matches!(read_body, Ok(Ok(_))) {
-            if read_body.is_err() && deadline <= tokio::time::Instant::now() {
-                state.counters.bump(&state.counters.tcp_lifetime_kills);
-            }
-            return;
+
+        // (2) message body.
+        let Some(budget) = left(deadline) else { break };
+        let mut buf = vec![0u8; u16::from_be_bytes(len_buf) as usize];
+        if !matches!(
+            timeout(budget.min(idle), stream.read_exact(&mut buf)).await,
+            Ok(Ok(_))
+        ) {
+            break;
         }
-        let Some(resp) = handle_query(&state, &buf, peer, true).await else {
-            return; // not even a header: nothing safe to answer
+
+        // (3) resolve. Without the deadline this await is bounded only by
+        // `upstream_timeout`, which then chains onto the read waits above.
+        let Some(budget) = left(deadline) else { break };
+        let Ok(Some(resp)) = timeout(budget, handle_query(&state, &buf, peer, true)).await else {
+            break; // over budget, or not even a header to echo an ID for
         };
-        // The writes are bounded by the SAME connection deadline — a
-        // client that stops reading must not hold the permit past the
-        // hard cap while `write_all` waits for send-buffer space.
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            debug!(%peer, "TCP connection closed: hard lifetime cap reached");
-            state.counters.bump(&state.counters.tcp_lifetime_kills);
-            return;
-        }
+
+        // (4) write back. An unbounded `write_all` lets a pipelining client
+        // that never reads park the permit forever on a full send buffer.
+        let Some(budget) = left(deadline) else { break };
         let framed_len = (resp.len() as u16).to_be_bytes();
-        let written = timeout(remaining, async {
+        let written = timeout(budget, async {
             stream.write_all(&framed_len).await?;
             stream.write_all(&resp).await
         })
         .await;
         if !matches!(written, Ok(Ok(()))) {
-            if written.is_err() {
-                // Elapsed timeout means the deadline expired mid-write.
-                debug!(%peer, "TCP connection closed: hard lifetime cap reached mid-write");
-                state.counters.bump(&state.counters.tcp_lifetime_kills);
-            }
-            return;
+            break;
         }
+    }
+
+    // ONE exit point, so the counter cannot disagree with the clock. Each
+    // site used to bump on `timeout_elapsed && deadline_passed`, which
+    // reported a successful cap kill for a connection that had ALREADY
+    // outlived the cap — and `tcp_lifetime_kills` is exactly what the
+    // certifying test asserts on, so the test passed on the very connection
+    // that proved the bug.
+    if tokio::time::Instant::now() >= deadline {
+        debug!(%peer, "TCP connection closed: hard lifetime cap reached");
+        state.counters.bump(&state.counters.tcp_lifetime_kills);
     }
 }
 
@@ -836,6 +872,24 @@ async fn forward(
     let upstream = state
         .pick_upstream()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no upstream configured"))?;
+    forward_via(state, query_bytes, query, via_tcp, upstream).await
+}
+
+/// [`forward`] against a SPECIFIC upstream.
+///
+/// Split out so the health check can probe EVERY configured upstream rather
+/// than whichever one round-robin happens to hand it. `forward` has no
+/// failover: one dead server in a two-server adapter list SERVFAILs its
+/// share of the machine's queries, and a head-only probe reported that as
+/// green (`engine_ok`/`upstream_ok`/`filter_ok` all true, empty detail,
+/// while 4 of 8 real names SERVFAILed).
+async fn forward_via(
+    state: &Arc<State>,
+    query_bytes: &[u8],
+    query: &wire::Query,
+    via_tcp: bool,
+    upstream: SocketAddr,
+) -> io::Result<Vec<u8>> {
     let upstream_id = state.txids.next();
     let question = &query_bytes[wire::HEADER_LEN..query.question_end];
     let forwarded = wire::build_upstream_query(upstream_id, question);

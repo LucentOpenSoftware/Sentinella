@@ -218,8 +218,8 @@ NOT the kernel system logger.
   (opt-in), SNI heuristics if a driver ever lands.
 - **Upstream response forgery / cache poisoning:** the proxy validates
   every upstream response before accepting or caching it: QR set,
-  **transaction ID matches a per-query RANDOM ID generated upstream-side
-  (the client's ID is never forwarded verbatim)** and the question
+  **transaction ID matches a per-query ID generated upstream-side (the
+  client's ID is never forwarded verbatim)** and the question
   section echoes the query (qname compared ASCII-case-insensitively per
   RFC 4343 — home CPE forwarders normalize case and byte-exactness
   breaks behind them — qtype/qclass exact). Upstream queries are
@@ -232,6 +232,18 @@ NOT the kernel system logger.
   defense-in-depth; an invalid response is dropped, never cached. The
   UDP receive loop tolerates stray/invalid datagrams within the
   exchange deadline (only the deadline gives up).
+  The upstream ID is a keyed PRF (SipHash-1-3 over a counter, key from
+  the OS CSPRNG via `RandomState`) — **not** a CSPRNG, and this document
+  must not call it "random". An earlier revision did, over a Weyl
+  counter through an invertible xorshift seeded with
+  `nanos ^ pid.rotate_left(32)`; because `rotate_left(32)` left the low
+  32 seed bits as wall-clock nanoseconds alone, two observed IDs plus
+  the pid recovered the full state by brute force in 22.7 ms and
+  predicted every subsequent ID. The property claimed here is only that
+  the sequence is not derivable from observed outputs. Note also that
+  the second entropy source a resolver normally leans on — ephemeral
+  source-port randomness — is weak on Windows, so the ID carries more
+  weight here than the textbook analysis assumes.
 - **Oversized answers vs UDP clients:** an answer fetched via the TCP
   fallback can be up to 65535 bytes; replaying it whole to a UDP client
   yields a datagram the client OS drops (WSAEMSGSIZE) with TC clear —

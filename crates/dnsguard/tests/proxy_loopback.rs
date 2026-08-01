@@ -1247,3 +1247,87 @@ async fn self_test_reports_dead_upstream_but_healthy_filter() {
     assert!(!report.ok());
     assert!(!report.detail.is_empty());
 }
+
+/// REGRESSION (round-3 HIGH). The hard lifetime cap was computed once into a
+/// single `read_budget` shared by the length-prefix read AND the body read,
+/// so a client that landed the second prefix byte just under the deadline
+/// started a FRESH full-length body wait. Measured at 1.99x the cap.
+///
+/// The idle timeout is set FAR above the cap so that if the connection dies
+/// on time, only the cap can have done it. On the pre-fix code this test
+/// fails on the elapsed-time assertion (~740ms against a 400ms cap); the
+/// counter assertion alone would NOT have caught it, because the old code
+/// bumped `tcp_lifetime_kills` for the very connection that outlived the cap.
+#[tokio::test]
+async fn split_length_prefix_cannot_extend_the_hard_lifetime_cap() {
+    const CAP: Duration = Duration::from_millis(400);
+    let (upstream, _calls) = spawn_udp_upstream(|q| Some(canned_a_response(q, 60, false))).await;
+    let proxy = start_proxy(
+        FilterEngine::new(),
+        ProxyConfig {
+            tcp_max_lifetime: CAP,
+            tcp_idle_timeout: Duration::from_secs(10),
+            ..config_for(vec![upstream])
+        },
+    )
+    .await;
+
+    let started = tokio::time::Instant::now();
+    let mut stream = TcpStream::connect(proxy.addr).await.expect("connect");
+    // Byte 1 of the 2-byte length prefix now...
+    stream.write_all(&[0x00]).await.expect("write len hi");
+    // ...byte 2 just under the deadline, then never send the body at all.
+    tokio::time::sleep(CAP.mul_f32(0.85)).await;
+    stream.write_all(&[0x20]).await.expect("write len lo");
+
+    // The server dropping its side is what ends this read.
+    let mut sink = [0u8; 1];
+    let _ = tokio::time::timeout(CAP * 4, stream.read(&mut sink)).await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < CAP.mul_f32(1.5),
+        "connection lived {elapsed:?} against a {CAP:?} hard cap — the body \
+         read started a fresh budget instead of the remaining lifetime"
+    );
+    let snap = proxy.counters.snapshot();
+    assert!(
+        snap.tcp_lifetime_kills >= 1,
+        "a cap kill must be counted: {snap:?}"
+    );
+    proxy.stop().await;
+}
+
+/// REGRESSION (round-3 HIGH). `self_test` step (ii) probed only the
+/// round-robin HEAD, so `[live, dead]` reported engine/upstream/filter all
+/// green with an EMPTY detail while `forward` — which has no failover —
+/// SERVFAILed every query that round-robin sent to the dead server.
+///
+/// The live upstream is deliberately FIRST: the old head-only probe would
+/// have picked it and passed.
+#[tokio::test]
+async fn self_test_is_red_when_only_one_of_two_upstreams_answers() {
+    let (live, _calls) = spawn_udp_upstream(|q| Some(canned_a_response(q, 60, false))).await;
+    let proxy = Proxy::bind(
+        config_for(vec![live, dead_upstream()]),
+        FilterEngine::new(),
+        Arc::new(NoopDecisionHook),
+    )
+    .await
+    .expect("bind");
+
+    let report = proxy.self_test().await;
+    assert!(report.engine_ok, "{report:?}");
+    assert!(report.filter_ok, "{report:?}");
+    assert!(
+        !report.upstream_ok,
+        "one dead upstream is a real partial outage, not green: {report:?}"
+    );
+    assert_eq!(report.upstreams_total, 2, "{report:?}");
+    assert_eq!(report.upstreams_healthy, 1, "{report:?}");
+    assert!(!report.ok(), "{report:?}");
+    assert!(
+        report.detail.contains(&dead_upstream().to_string()),
+        "the detail must name WHICH upstream is dead: {report:?}"
+    );
+}
