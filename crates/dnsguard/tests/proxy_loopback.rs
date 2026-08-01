@@ -2473,3 +2473,57 @@ async fn edns_stripped_answer_is_not_cached_in_the_dnssec_slot() {
     );
     proxy.stop().await;
 }
+
+/// REGRESSION (round-3 closure review, finding 3). The EDNS fallback lived
+/// only inside `if !via_tcp`, so the TCP tail of `forward_via` relayed a
+/// pre-EDNS upstream's FORMERR verbatim — sink fixed, sibling left.
+///
+/// Reachable in ordinary operation, not just by deliberate TCP clients:
+/// that tail is also where the TC->TCP escalation lands, so a >512-byte
+/// name behind such an upstream hard-failed for every client.
+#[tokio::test]
+async fn formerr_over_tcp_is_also_retried_without_opt() {
+    let shapes = Arc::new(AtomicUsize::new(0)); // bit0: saw OPT, bit1: saw plain
+    let shapes_resp = Arc::clone(&shapes);
+    let (upstream, _calls) = spawn_udp_upstream(move |q: &[u8]| {
+        if u16::from_be_bytes([q[10], q[11]]) > 0 {
+            shapes_resp.fetch_or(1, Ordering::SeqCst);
+            let mut resp = canned_a_response(q, 60, false);
+            resp[3] = 0x81; // RA | FORMERR
+            resp[7] = 0; // ancount = 0
+            resp.truncate(resp.len() - 16);
+            Some(resp)
+        } else {
+            shapes_resp.fetch_or(2, Ordering::SeqCst);
+            Some(canned_a_response(q, 60, false))
+        }
+    })
+    .await;
+    let proxy = start_proxy(FilterEngine::new(), config_for(vec![upstream])).await;
+
+    // A TCP client, so forward_via goes straight to the tail.
+    let query = edns_query(0x8001, "pre-edns-over-tcp.example", TYPE_A, 4096, true, false);
+    let mut stream = TcpStream::connect(proxy.addr).await.expect("connect");
+    let framed = (query.len() as u16).to_be_bytes();
+    stream.write_all(&framed).await.expect("write len");
+    stream.write_all(&query).await.expect("write body");
+    let mut len_buf = [0u8; 2];
+    tokio::time::timeout(Duration::from_secs(3), stream.read_exact(&mut len_buf))
+        .await
+        .expect("no length prefix")
+        .expect("read len");
+    let mut resp = vec![0u8; u16::from_be_bytes(len_buf) as usize];
+    stream.read_exact(&mut resp).await.expect("read body");
+
+    assert_eq!(
+        rcode_of(&resp),
+        RCODE_NOERROR,
+        "FORMERR over TCP must be retried plain, not relayed to the client"
+    );
+    assert_eq!(
+        shapes.load(Ordering::SeqCst),
+        3,
+        "upstream must have seen the OPT query AND the plain TCP retry"
+    );
+    proxy.stop().await;
+}

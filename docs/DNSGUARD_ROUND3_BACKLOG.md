@@ -517,47 +517,42 @@ as written, because what it claimed at the time is part of the history.
 | Test count | 107 (59 lib + 48 integration) | 109 at `4f4e31a` (59 + 50). |
 | Doc scope | §5.3 removal ladder + §4 + §7 updated | §1, §5.1, §5.4 and the §6 IPC contract were left byte-identical and still specified the **pre-round-3** three-step self-test and "canary → NXDOMAIN". §6 is the contract the wiring implements `webprotection.test` from; written as specified it would have accepted NXDOMAIN as green — which every stock resolver returns for a `.invalid` name — putting the vacuity L12 removed from the code straight back at the IPC layer. Fixed in `80a7607`. |
 
-## Still open (2)
+## Still open (0) — all five closed
 
-Three of the original five are now fixed, each revert-verified:
+Every confirmed finding from the post-closure review is now fixed, each
+revert-verified (revert the fix -> the named test goes red -> re-apply ->
+green). In commit order:
 
-- ~~**`set_upstreams` structurally unreachable**~~ — fixed in `c5274d5`.
+- **`set_upstreams` structurally unreachable** — `c5274d5`.
   `Proxy::upstreams_handle()` returns a handle captured before `run`,
-  carrying the same validation as `bind` so it cannot be bypassed.
-  Revert-verified in both directions: reverting the write reds the test,
-  removing the accessor makes it not compile — which is the defect
-  exactly, since the wiring pattern was unwriteable rather than broken.
-- ~~**SERVFAIL in the OPT-strip retry trigger set**~~ — fixed in the
-  DNSSEC commit. Only FORMERR triggers the fallback now (RFC 6891
-  §6.2.2); RFC 8906 §5 warns against reading SERVFAIL as an EDNS signal.
-  Revert-verified: the upstream sees 2 exchanges instead of 1.
-- ~~**Signature-less answers cached in the DO=1 slot**~~ — fixed in the
-  same commit. A fallback answer is filed in the DO=0 slot (same CD)
-  rather than the client's DO=1 slot, so a later self-validating stub
-  misses and re-asks instead of being handed an unsigned answer from the
-  slot that promises signatures. DO=0 clients still get the hit — the
-  answer is a valid non-DNSSEC answer, not garbage. Revert-verified:
-  filing it in the client's own slot gives `cache_hits: 1` where 0 is
+  carrying `bind`'s validation so it cannot be bypassed. Revert-verified
+  both ways: reverting the write reds the test, removing the accessor
+  makes it not compile — the defect exactly, since the wiring pattern was
+  unwriteable rather than broken.
+- **SERVFAIL in the OPT-strip retry trigger set** — `d2c9d57`. Only
+  FORMERR triggers the fallback now (RFC 6891 §6.2.2); RFC 8906 §5 warns
+  against reading SERVFAIL as an EDNS signal. Revert-verified: the
+  upstream sees 2 exchanges where 1 is required.
+- **Signature-less answers cached in the DO=1 slot** — `d2c9d57`. A
+  fallback answer is filed in the DO=0 slot (same CD), so a later
+  self-validating stub misses and re-asks instead of being handed an
+  unsigned answer from the slot that promises signatures. DO=0 clients
+  still get the hit. Revert-verified: `cache_hits: 1` where 0 is
   required.
+- **The FORMERR fallback missing on the TCP path** — this commit. The
+  retry lived only inside `if !via_tcp`, so the TCP tail relayed a
+  pre-EDNS upstream's FORMERR verbatim. That tail is also where the
+  TC->TCP escalation lands, so a >512-byte name behind such an upstream
+  hard-failed for every client, not only deliberate TCP ones.
+  Revert-verified: the client receives rcode 1 instead of 0.
+- **The byte budget charged after materialization** — this commit. The
+  source is now bounded with `take(max_bytes + 1)`, so the cap is
+  physical rather than an after-the-fact tally, and a cut final line is
+  reported as `truncated`. Revert-verified: **8 MiB pulled under a
+  1024-byte budget** (8192x), versus 1025 with the fix.
 
-Remaining, confirmed by the review and not fixed. Severities are the
-skeptic's corrected values.
-
-1. **The FORMERR/EDNS fallback does not exist on the TCP path** (LOW).
-   The retry is nested inside `if !via_tcp`, so a client arriving over
-   TCP gets a pre-EDNS upstream's FORMERR relayed verbatim. Sink fixed,
-   sibling left — and reachable in normal operation, not only by
-   deliberate TCP clients, because truncation is what routes clients onto
-   TCP in the first place: a >512-byte name plus a pre-EDNS upstream is
-   enough. Measured: UDP EDNS client -> rcode 0 (retry worked), TCP EDNS
-   client -> rcode 1, with the fake upstream seeing exactly ONE query.
-2. **The byte budget is charged after the line is materialized**
-   (MEDIUM). `reader.lines()` allocates the whole line before the budget
-   comparison runs, so `MAX_HOSTS_BYTES` bounds what is ACCOUNTED, never
-   what is ALLOCATED. A one-long-line source — a broken CDN response, an
-   HTML error page, a gzip served as text/plain — pulled **64 MiB under a
-   1024-byte budget** and reported `bytes_read: 0`, so the loader's own
-   promise of honest reporting fails in the same breath.
+What is NOT closed is the unverified tail below. It is the honest
+remainder of this round.
 
 Plus **15 unverified** lower-severity findings from the same review
 (EDNS-capability not in the cache key, the `(DO,CD)` fork against a

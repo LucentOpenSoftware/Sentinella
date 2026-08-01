@@ -1720,6 +1720,27 @@ async fn forward_via(
     if wire::validate_response(&resp, upstream_id, question).is_none() {
         return Err(invalid());
     }
+    // The SAME EDNS fallback as the UDP path (round-3 closure review): a
+    // pre-EDNS upstream FORMERRs our OPT over TCP too. The retry used to
+    // live only inside the `!via_tcp` block above, so this tail relayed
+    // the FORMERR verbatim — sink fixed, sibling left.
+    //
+    // It is reachable in ordinary operation, not just by deliberate TCP
+    // clients: this tail is also where the TC->TCP escalation lands, so a
+    // >512-byte name behind a pre-EDNS upstream hard-failed for EVERY
+    // client, including plain UDP ones.
+    if edns.is_some()
+        && wire::response_info(&resp).is_some_and(|info| info.rcode == wire::RCODE_FORMERR)
+    {
+        debug!(%upstream, "EDNS query refused over TCP: retrying without OPT");
+        let plain =
+            wire::build_upstream_query(upstream_id, question, query.checking_disabled, None);
+        let resp = tcp_exchange(upstream, &plain, state.config.upstream_timeout).await?;
+        if wire::validate_response(&resp, upstream_id, question).is_none() {
+            return Err(invalid());
+        }
+        return Ok(Forwarded::edns_stripped(resp));
+    }
     Ok(Forwarded::intact(resp))
 }
 

@@ -22,7 +22,7 @@
 //!   suffix-match the two-label rule `microsoft.com`.
 
 use std::collections::HashSet;
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, Read};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -430,7 +430,20 @@ impl FilterEngine {
         mut parse: impl FnMut(&mut Self, &str) -> (u64, u64),
     ) -> io::Result<HostsLoadStats> {
         let mut stats = HostsLoadStats::default();
-        for line in reader.lines() {
+        // BOUND THE SOURCE, not just the accounting (round-3 closure
+        // review). `reader.lines()` allocates a whole line into a `String`
+        // BEFORE control returns here, so a budget checked afterwards
+        // bounds what is COUNTED and never what is ALLOCATED: a
+        // newline-free 64 MiB body — a broken CDN response, an HTML error
+        // page, a gzip served as text/plain — was materialized in full
+        // under a 1024-byte budget, and then reported `bytes_read: 0`.
+        //
+        // `take` makes the cap physical. The most one line can now cost is
+        // `max_bytes + 1`, and that extra byte is exactly what lets us tell
+        // "the input ended at the budget" from "there was more" without
+        // reading the more.
+        let mut limited = reader.take(max_bytes.saturating_add(1));
+        for line in limited.by_ref().lines() {
             let line = line?;
             // +1 for the newline the line iterator stripped.
             let line_bytes = line.len() as u64 + 1;
@@ -446,6 +459,14 @@ impl FilterEngine {
             if added == 0 {
                 stats.lines_skipped += 1;
             }
+        }
+        // The source had at least `max_bytes + 1` bytes, so `take` cut it
+        // and the last line we saw may be a fragment. Report honestly even
+        // when the per-line accounting happened to land exactly on the
+        // budget — silently truncating a blocklist hides protection gaps,
+        // which is the principle this loader states for the line cap.
+        if limited.limit() == 0 {
+            stats.truncated = true;
         }
         if stats.truncated {
             tracing::warn!(
@@ -581,6 +602,70 @@ pub struct HostsLoadStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `BufRead` that records how many bytes were actually taken from the
+    /// SOURCE, so a memory-budget claim can be measured rather than
+    /// asserted.
+    struct Counting<R> {
+        inner: R,
+        consumed: std::sync::Arc<AtomicU64>,
+    }
+
+    impl<R: Read> Read for Counting<R> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.consumed.fetch_add(n as u64, Ordering::SeqCst);
+            Ok(n)
+        }
+    }
+
+    impl<R: BufRead> BufRead for Counting<R> {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            self.inner.fill_buf()
+        }
+        fn consume(&mut self, amt: usize) {
+            self.consumed.fetch_add(amt as u64, Ordering::SeqCst);
+            self.inner.consume(amt);
+        }
+    }
+
+    /// REGRESSION (round-3 closure review, finding 4). `MAX_HOSTS_BYTES`
+    /// bounded what was ACCOUNTED, never what was ALLOCATED:
+    /// `reader.lines()` materializes a whole line into a `String` before
+    /// control returns to the budget check, so a newline-free body — a
+    /// broken CDN response, an HTML error page, a gzip served as
+    /// text/plain — was pulled in full under any budget, and then reported
+    /// `bytes_read: 0`, failing the honest-reporting promise in the same
+    /// breath.
+    ///
+    /// Revert-checked: without the `take`, `consumed` is the whole 8 MiB.
+    #[test]
+    fn byte_budget_bounds_what_is_allocated_not_just_what_is_counted() {
+        const BUDGET: u64 = 1024;
+        // One line, no newline anywhere — the pathological shape.
+        let hostile = vec![b'a'; 8 * 1024 * 1024];
+        let consumed = std::sync::Arc::new(AtomicU64::new(0));
+        let reader = Counting {
+            inner: io::Cursor::new(hostile),
+            consumed: std::sync::Arc::clone(&consumed),
+        };
+
+        let mut engine = FilterEngine::new();
+        let stats = engine
+            .load_hosts_with_limit(ListKind::Block, reader, u64::MAX, BUDGET)
+            .expect("load must not error");
+
+        let pulled = consumed.load(Ordering::SeqCst);
+        assert!(
+            pulled <= BUDGET + 1,
+            "pulled {pulled} bytes from the source under a {BUDGET}-byte budget"
+        );
+        assert!(
+            stats.truncated,
+            "hitting the budget must be reported, not silent: {stats:?}"
+        );
+        assert_eq!(stats.rules_added, 0, "no rule can come from a cut fragment");
+    }
 
     fn engine_with_block(rules: &[&str]) -> FilterEngine {
         let mut engine = FilterEngine::new();
