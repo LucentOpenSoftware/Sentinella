@@ -31,11 +31,30 @@ use tracing::warn;
 pub const BLOCK_RESPONSE_NXDOMAIN: &str = "nxdomain";
 pub const BLOCK_RESPONSE_ZERO_IP: &str = "zero_ip";
 
-/// What happens when the proxy stops answering while a rule is live.
-/// Consumed by the reconciler work (commit C), declared here so the config
-/// surface is complete and a user's setting is never silently dropped.
-pub const ON_FAILURE_REMOVE_RULE: &str = "remove_rule";
-pub const ON_FAILURE_FALLBACK: &str = "fallback";
+// on_proxy_failure USED TO LIVE HERE, with values "remove_rule" and
+// "fallback". It has been REMOVED, and the option must not come back in
+// that shape.
+//
+// "fallback" was documented as "fail open: unfiltered DNS via the NRPT
+// secondary". There is no NRPT secondary. The rule this daemon installs
+// carries exactly ONE server - our own proxy (see rule.rs) - and an NRPT
+// rule overrides the adapter's DNS configuration for every matching name.
+// That is the entire purpose of NRPT. So leaving the rule in place when
+// the proxy has died does not yield unfiltered DNS; it yields NO DNS.
+//
+// The polarity was therefore inverted: the option a careful operator picks
+// BECAUSE it sounds like the safe one was the one that broke the machine.
+// A single-server catch-all rule has no coherent "fail open" mode, so
+// there is nothing to choose between and the key is gone.
+//
+// Making it real would mean writing the discovered system upstreams into
+// GenericDNSServers as additional entries - at which cost the DNS Client
+// would use them OPPORTUNISTICALLY while the proxy is healthy, which is a
+// silent filtering bypass. That trade is worse than not having the option.
+
+/// The only port an NRPT rule can route to: `NameServers` has no port
+/// syntax, so the Windows DNS Client always queries 53.
+pub const DNS_PORT: u16 = 53;
 
 /// Upstream source: `"system"` means discover from the active adapters.
 pub const UPSTREAM_SYSTEM: &str = "system";
@@ -56,11 +75,10 @@ pub struct WebProtectionConfig {
     /// from the system, never from this field.
     pub enabled: bool,
 
-    /// Address the proxy listens on. Production MUST be `127.0.0.1:53`:
-    /// NRPT `NameServers` carries no port syntax, so the Windows DNS
-    /// Client always queries 53. A non-53 port is accepted here only
-    /// because the integration tests need an ephemeral one, and it is
-    /// refused in combination with `enabled` — see [`Self::validate`].
+    /// Address the proxy listens on. MUST be loopback on port 53 when
+    /// `enabled`: NRPT `NameServers` carries no port syntax, so the DNS
+    /// Client always queries 53, and the rule records only the IP. Any
+    /// other port forces `enabled = false` — see [`Self::validate`].
     pub listen: String,
 
     /// `"system"` to discover from active adapters, or explicit
@@ -70,12 +88,6 @@ pub struct WebProtectionConfig {
 
     /// `"nxdomain"` (default) or `"zero_ip"`.
     pub block_response: String,
-
-    /// `"remove_rule"` (fail closed: filtering off, DNS restored) or
-    /// `"fallback"` (fail open: unfiltered DNS via the NRPT secondary).
-    /// Default is `remove_rule`, matching the degrade-to-no-filtering
-    /// principle above.
-    pub on_proxy_failure: String,
 
     /// Name the self-test resolves to prove the serving path works.
     /// MUST be a name you never intend to block: the self-test requires
@@ -107,7 +119,6 @@ impl Default for WebProtectionConfig {
             listen: "127.0.0.1:53".into(),
             upstreams: vec![UPSTREAM_SYSTEM.into()],
             block_response: BLOCK_RESPONSE_NXDOMAIN.into(),
-            on_proxy_failure: ON_FAILURE_REMOVE_RULE.into(),
             health_check_name: "example.com".into(),
             blocklists: Vec::new(),
             allowlist: Vec::new(),
@@ -135,17 +146,6 @@ impl WebProtectionConfig {
             );
             self.block_response = BLOCK_RESPONSE_NXDOMAIN.into();
         }
-        if !matches!(
-            self.on_proxy_failure.as_str(),
-            ON_FAILURE_REMOVE_RULE | ON_FAILURE_FALLBACK
-        ) {
-            warn!(
-                value = %self.on_proxy_failure,
-                "web_protection.on_proxy_failure invalid — using remove_rule"
-            );
-            self.on_proxy_failure = ON_FAILURE_REMOVE_RULE.into();
-        }
-
         if !self.enabled {
             return;
         }
@@ -169,11 +169,19 @@ impl WebProtectionConfig {
             // for the whole network.
             return Err(format!("listen {addr} is not a loopback address"));
         }
-        // Port 0 means "pick one", which cannot be reached through NRPT
-        // (no port syntax) and would let a later commit install a rule
-        // pointing at 53 while we listen somewhere else entirely.
-        if addr.port() == 0 {
-            return Err("listen port 0 cannot be reached through NRPT".into());
+        // PORT 53, EXACTLY. NRPT `NameServers` carries no port syntax, so
+        // the Windows DNS Client always queries 53 - and `install` writes
+        // only the IP into the rule, discarding whatever port we bound.
+        // Listening anywhere else therefore installs a rule pointing at a
+        // port with nothing on it, and the watchdog would not notice
+        // because it probes the address we BOUND, not the one the DNS
+        // Client uses. Every other port is refused here, and `install`
+        // refuses again as a second gate.
+        if addr.port() != DNS_PORT {
+            return Err(format!(
+                "listen port {} cannot be reached through NRPT - it carries no port syntax,                  so the DNS Client always queries {DNS_PORT}",
+                addr.port()
+            ));
         }
 
         if self.upstreams.is_empty() {
@@ -248,6 +256,7 @@ mod tests {
             ("garbage listen", |c| c.listen = "not-an-address".into()),
             ("non-loopback listen", |c| c.listen = "0.0.0.0:53".into()),
             ("port 0", |c| c.listen = "127.0.0.1:0".into()),
+            ("non-53 port", |c| c.listen = "127.0.0.1:5353".into()),
             ("empty upstreams", |c| c.upstreams.clear()),
             ("garbage upstream", |c| c.upstreams = vec!["1.1.1.1".into()]),
             ("self-referential upstream", |c| {
@@ -282,16 +291,35 @@ mod tests {
         assert!(c.enabled);
     }
 
-    /// Enum-ish fields DO follow the crate's clamp convention: they cannot
+    /// `block_response` DOES follow the crate's clamp convention: it cannot
     /// produce a live-but-wrong proxy, only a differently-shaped answer.
     #[test]
-    fn enum_fields_clamp_without_disabling() {
+    fn block_response_clamps_without_disabling() {
         let mut c = enabled();
         c.block_response = "explode".into();
-        c.on_proxy_failure = "panic".into();
         c.validate();
         assert!(c.enabled, "an unknown enum value must not disable the feature");
         assert_eq!(c.block_response, BLOCK_RESPONSE_NXDOMAIN);
-        assert_eq!(c.on_proxy_failure, ON_FAILURE_REMOVE_RULE);
+    }
+
+    /// REGRESSION. A non-53 listen used to survive validation. The rule
+    /// records only the IP, so the DNS Client would query 53 where nothing
+    /// listens — while the watchdog probed the port we BOUND and reported
+    /// healthy. Both doc comments claimed this was already enforced.
+    #[test]
+    fn only_port_53_can_be_enabled() {
+        for bad in ["127.0.0.1:5353", "127.0.0.1:5300", "[::1]:4444", "127.0.0.2:1"] {
+            let mut c = enabled();
+            c.listen = bad.into();
+            c.validate();
+            assert!(!c.enabled, "{bad}: NRPT cannot route to a non-53 port");
+        }
+        // ...and loopback:53 in either family stays enabled.
+        for good in ["127.0.0.1:53", "[::1]:53"] {
+            let mut c = enabled();
+            c.listen = good.into();
+            c.validate();
+            assert!(c.enabled, "{good}: must remain usable");
+        }
     }
 }

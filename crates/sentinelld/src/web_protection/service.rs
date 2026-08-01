@@ -291,7 +291,8 @@ impl WebProtection {
                     guid.clone(),
                     bound,
                     Arc::clone(&counters),
-                    cfg,
+                    Arc::clone(&engine_handle),
+                    cfg.health_check_name.clone(),
                     tx.subscribe(),
                 );
                 (Some(guid), Some(wd))
