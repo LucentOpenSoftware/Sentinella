@@ -5,8 +5,12 @@
 //! Design doc §3/§5 invariants implemented here:
 //! - fail-safe: malformed query → FORMERR, dead upstream → SERVFAIL,
 //!   overload → SERVFAIL shed, TCP-pool exhaustion → a bounded FIFO wait
-//!   then SERVFAIL (NEVER a bare connection reset on the path truncation
-//!   sent the client to); the machine's DNS never hangs on us;
+//!   then SERVFAIL, so the path truncation sent the client to answers
+//!   rather than resetting. The one remaining bare close is when the WAIT
+//!   QUEUE is also full (`tcp_max_queued` waiters already pending), which
+//!   is a connect flood rather than pool pressure — not "never", and the
+//!   accept loop counts it in `tcp_pool_full`; the machine's DNS never
+//!   hangs on us;
 //! - bounded everything: in-flight semaphores (UDP and a SEPARATE TCP pool
 //!   with a per-connection total-lifetime cap and a bounded accept queue —
 //!   dribbling TCP clients cannot starve UDP and thereby force the
@@ -200,8 +204,11 @@ pub struct Counters {
     /// are synthesized unconditionally (never a filter decision, never
     /// user traffic), so counting them as user-facing "blocked" would make
     /// the GUI/IPC "domains blocked" figure include probes no client ever
-    /// issued. The self-test asserts a delta of EXACTLY 1 on this counter
-    /// across its canary probe — a signal no upstream can fake.
+    /// issued. The self-test asserts a delta equal to the number of canary
+    /// probes it actually got SERVED — the UDP one in step (iii) plus the
+    /// TCP one in step (iv), so up to 2, and fewer when a probe failed
+    /// (a starved TCP pool SERVFAILs before the query is ever counted).
+    /// A signal no upstream can fake.
     pub canary_probes: AtomicU64,
 }
 
@@ -590,10 +597,12 @@ impl Proxy {
     ///    unconditionally, under BOTH `block_response` policies, so it
     ///    identifies this listener positively and can never be satisfied
     ///    by an upstream answer or a cached entry (the canary never
-    ///    reaches either); (b) `counters.canary_probes` moved by EXACTLY 1
-    ///    across the probe while the user-facing `queries`/`blocked` did
-    ///    not move — a counter delta no upstream can fake, and proof the
-    ///    probe did not pollute user statistics; (c) the engine decides
+    ///    reaches either); (b) `counters.canary_probes` moved by exactly
+    ///    the number of canary probes SERVED (the UDP one here plus the
+    ///    TCP one of step (iv), so up to 2) while the user-facing
+    ///    `queries`/`blocked` did not move — a counter delta no upstream
+    ///    can fake, and proof the probe did not pollute user statistics;
+    ///    (c) the engine decides
     ///    `health_check_name` as `Allow` AND it resolves POSITIVELY
     ///    (NOERROR with at least one answer) through the LISTENER — a proxy
     ///    that answers the canary but SERVFAILs everything else fails here,
@@ -876,8 +885,10 @@ pub struct SelfTestReport {
     /// End-to-end through the listener: the canary returns the LOCAL
     /// signature (0.0.0.0 A, AA=1 — impossible to satisfy from an upstream
     /// or the cache, under either `block_response` policy), the
-    /// `canary_probes` counter moved by exactly 1 while the user-facing
-    /// counters did not move, and `health_check_name` is decided `Allow`
+    /// `canary_probes` counter moved by exactly the number of canary
+    /// probes served (up to 2: UDP here, TCP in step (iv)) while the
+    /// user-facing counters did not move, and `health_check_name` is
+    /// decided `Allow`
     /// AND resolves POSITIVELY through the listener. False when the serving
     /// path is broken, when real names do not resolve through it (e.g.
     /// every upstream dead), or when the filter blocks the health-check
@@ -1149,8 +1160,10 @@ async fn shed(state: &Arc<State>, bytes: &[u8], peer: SocketAddr, sock: &UdpSock
 /// cannot tell the OS resolver apart from a squatter process; only the OS
 /// can (per-process socket accounting needs platform APIs this crate may
 /// not take on). What actually prevents one peer from monopolizing freed
-/// permits is the FIFO order plus the lifetime cap, and what makes
-/// exhaustion survivable is the fail-safe SERVFAIL.
+/// permits is the FIFO order plus the lifetime cap, and what makes POOL
+/// exhaustion survivable is the fail-safe SERVFAIL. QUEUE exhaustion —
+/// `tcp_max_queued` connections already waiting — is still a bare close;
+/// that is a connect flood, not pool pressure, and it is counted.
 async fn tcp_loop(listener: Arc<TcpListener>, state: Arc<State>, mut shutdown: watch::Receiver<bool>, synthetic: bool) {
     loop {
         tokio::select! {

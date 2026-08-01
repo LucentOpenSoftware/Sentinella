@@ -1,12 +1,14 @@
 # Web Protection — Platform Design (v1: DNS-layer filtering)
 
 Status: design registered; `dnsguard` crate implemented including the
-round-2 adversarial hardening (hard TCP cap on reads AND writes,
-RFC 2181 truncation for oversized UDP answers, clean upstream queries,
-case-insensitive echo + stray-datagram tolerance, wire-length
-normalization, 3-step self-test, empty-upstream refusal — all covered
-by tests verified to fail on the pre-fix code). Daemon/NRPT wiring and
-installer lifecycle remain the integration round. Scope: "lightweight
+round-2 and round-3 adversarial hardening (hard TCP cap on reads AND
+writes, EDNS-aware truncation, clean upstream queries with DO/CD relayed
+and every other client-controlled byte stripped, AD cleared on every
+response we emit, case-insensitive echo + stray-datagram tolerance,
+wire-length normalization, self-identifying canary, FOUR-step self-test,
+empty-upstream refusal — each covered by a test verified to fail on the
+pre-fix code). Daemon/NRPT wiring and installer lifecycle remain the
+integration round. Scope: "lightweight
 and functional" — domain-level web protection without a kernel driver,
 without HTTPS inspection, without a browser extension. Closes the Tier-1
 "Web protection" gap from `docs/COMPETITIVE_GAP_ESET.md`.
@@ -176,19 +178,75 @@ NOT the kernel system logger.
   lifecycle is specified here, before integration, not after:
 
   1. **Bind before rule.** The proxy binds `127.0.0.1:53` (UDP+TCP) and
-     passes a THREE-STEP self-test BEFORE any NRPT rule is installed
-     (`Proxy::self_test`, implemented): (i) the filter engine decides
-     the always-blocked canary as Block — the canary NXDOMAINs on ANY
-     box (`.invalid` is reserved), so only a local engine decision
-     proves the plumbing is ours and not a box where we were never
-     installed; (ii) a LIVE query for a real resolvable name
-     (`health_check_name`, default `example.com`) forwarded to a
-     configured upstream returns NOERROR; (iii) the canary queried
-     through the listener returns NXDOMAIN. Bind failure (port
-     conflict — something else owns 53) or any failed step → refuse to
-     enable, loud error, no rule. Binding with an EMPTY upstream list
-     is refused outright: a resolver with no upstream is a lie (it
-     would pass bind while SERVFAILing every real query).
+     passes a FOUR-step self-test BEFORE any NRPT rule is installed
+     (`Proxy::self_test`, implemented; `SelfTestReport::ok()` is the
+     conjunction of all four):
+     - **(i) `engine_ok`** — the filter engine decides the canary
+       (`webguard-test.sentinella.invalid`) as Block. It is blocked by
+       default only in `FilterEngine::new()`; `FilterEngine::default()`
+       carries no rules at all, and an EXACT allowlist entry for the canary
+       still overrides it. That is exactly why this is a checked step and
+       not an invariant.
+     - **(ii) `upstream_ok`** — a LIVE query for a real resolvable name
+       (`health_check_name`, default `example.com`) returns NOERROR from
+       **every** configured upstream, not just the first. `forward` does
+       NOT fail over, so one dead server in a two-server adapter list is a
+       real partial outage; `upstreams_healthy`/`upstreams_total` carry the
+       detail.
+     - **(iii) `filter_ok`** — all of: **(a)** the canary queried through
+       the UDP listener **with qtype A** comes back with the LOCAL
+       SIGNATURE — the probe's own transaction ID echoed, NOERROR, AA=1,
+       ANCOUNT=1, A `0.0.0.0` (all five, as `is_canary_signature` checks
+       them; dropping the txid echo admits a stale or off-path datagram,
+       and dropping ANCOUNT=1 admits a multi-answer response that merely
+       ends in four zero bytes). The serving path short-circuits the canary
+       BY NAME unconditionally — under both `block_response` policies,
+       independent of the engine's own canary rule, and before
+       decide/cache/forward — but the answer is qtype-dependent: **A**
+       yields `0.0.0.0`, AAAA yields `::`, any other qtype yields NXDOMAIN
+       with AA=1. Probe with A.
+       What this proves, precisely: `.invalid` has no root delegation, so
+       any stock resolver NXDOMAINs it (RFC 6761 §6.4 makes that a SHOULD)
+       — an NXDOMAIN is obtainable with the product uninstalled and proves
+       nothing. The signature is not relayed or cached, so it can only have
+       been SYNTHESIZED by whatever process owns the probed socket. Note
+       the limit: that identifies *a local zero-IP blocker on that socket*,
+       not this binary. Another blocking resolver squatting `127.0.0.1:53`
+       with a zero-IP policy produces the same bytes. Pair the signature
+       with a counter delta (below) before concluding the listener is ours.
+       **(b)** `canary_probes` moved by exactly the number of canary probes
+       whose reply matched the signature (the UDP one here plus the TCP one
+       in step (iv), so up to 2 — a starved TCP pool SERVFAILs or drops
+       before `handle_query` runs, so that probe is neither answered nor
+       counted; a probe served but lost in flight makes the delta disagree
+       and reds the step, which is the fail-closed direction) while the
+       user-facing `queries`/`blocked` counters did not move at all:
+       synthetic traffic must never appear as user browsing activity.
+       **(c)** the engine decides `health_check_name` as **Allow** AND it
+       resolves POSITIVELY through the listener. Both halves are required:
+       a `zero_ip` block answer is NOERROR with an A record, so without the
+       engine check a filter blocking the health name reads as a
+       resolution — one bad suffix rule then blackholes the machine with
+       every step green. Checking the decision rather than the answer's
+       shape is deliberate: an upstream authoritative for the operator's
+       chosen name legitimately sets AA=1, so an `AA == 0` test would
+       reject a healthy proxy.
+     - **(iv) `tcp_ok`** — the canary returns the LOCAL SIGNATURE through
+       the **TCP** listener. Truncation routes oversized answers onto
+       DNS-over-TCP, so a health surface probing only UDP can stay green
+       while the accept loop, queue, permit pool or framing is dead.
+
+     Bind failure (port conflict — something else owns 53) or any failed
+     step MUST make the daemon refuse to enable: loud error, no rule.
+     **That is a requirement on the integration round, not existing code.**
+     Nothing outside the crate's own tests calls `Proxy::self_test`, and no
+     NRPT install path exists at HEAD; the crate supplies only the verdict
+     (an `io::Error` from `bind`, and `SelfTestReport::ok()`). Acting on it
+     is the wiring's job. By contrast, the next sentence IS implemented, so
+     do not read the two with equal authority: binding with an EMPTY
+     upstream list is refused outright in `bind`, because a resolver with
+     no upstream is a lie (it would pass bind while SERVFAILing every real
+     query).
   2. **Rule identity by GUID, not DisplayName.** Rules we create record
      their GUID; reconciliation touches only OUR rule, never a foreign
      one (admin/GPO rules are surfaced, not deleted).
@@ -230,10 +288,62 @@ NOT the kernel system logger.
      and a foreign GPO rule never blocks the uninstall; only failure to
      remove our own rule does.
   4. **Runtime watchdog (in-daemon, layered under 1–3, never instead
-     of):** the 3-step self-test every N s, probed against the PUBLIC
-     socket `127.0.0.1:53` — NOT `proxy.local_addr()`: a health check
-     aimed at the address the proxy CHOSE validates the wrong thing;
-     the DNS Client uses port 53. On sustained failure apply
+     of):** an EXTERNAL probe every N s against the PUBLIC socket
+     `127.0.0.1:53` — NOT `proxy.local_addr()`. In the shipped
+     configuration the two are EQUAL: `local_addr()` just echoes
+     `config.listen` back, and only a port-0 listen (test-only) makes them
+     differ. The reason to hardcode `127.0.0.1:53` anyway is that
+     `local_addr()` is derived from OUR config rather than from the address
+     the DNS Client queries — NRPT NameServers carry no port syntax, so the
+     DNS Client always uses 53. A watchdog trusting `local_addr()` would
+     certify whatever the config said: a proxy misconfigured onto another
+     port would report perfectly healthy while every real query went
+     nowhere.
+     **It cannot be `Proxy::self_test` on a timer, and must not be
+     written as one.** `Proxy::run` takes `self` by value, so once the
+     daemon spawns the serving future no `&Proxy` survives. The type
+     system therefore rules out running the self-test AFTER the serving
+     loop — but only that: it does not make the self-test mandatory, and
+     `SelfTestReport` is not `#[must_use]`, so `bind(...).run(...)` with
+     no self-test at all compiles silently. Keeping the NRPT rule
+     downstream of `SelfTestReport::ok()` remains the daemon's obligation.
+
+     The daemon must CAPTURE the long-lived handles before it hands the
+     Proxy to `run` — `counters()` and `engine_handle()` are `&self`
+     methods, so the watchdog is given the returned
+     `Arc<Counters>`/`Arc<RwLock<FilterEngine>>`, never a `&Proxy`:
+     ```rust
+     let engine = proxy.engine_handle();
+     let counters = proxy.counters();
+     tokio::spawn(proxy.run(rx));
+     ```
+     What the external watchdog can then reproduce is DIFFERENT from the
+     four steps, not strictly stronger — better in one way, blind in two:
+     - Stronger: it probes the PUBLIC socket the DNS Client actually uses,
+       so it can detect a port-53 impostor. `engine_handle()` reproduces
+       step (i) exactly; UDP and TCP canary probes reproduce (iii)(a) and
+       (iv) — though `is_canary_signature`, `probe_exchange` and
+       `tcp_probe_exchange` are all PRIVATE, so the wiring must either
+       export a `check_canary_signature` or re-implement the five-part
+       predicate against the pub `wire` constants.
+     - Blind: it does NOT reproduce step (ii) (`upstream_ok` — every
+       configured upstream answering NOERROR; `forward_via` is private and
+       has no public wrapper, so the daemon must probe its own upstream
+       list directly, and must probe EVERY entry because `forward` has no
+       failover) and does NOT reproduce step (iii)(c). **Schedule those
+       two separately**, or a machine whose upstreams have all died reads
+       green forever: the canary is short-circuited before forward and
+       never touches an upstream.
+     - `counters()` deltas are what rule out an impostor, because a
+       matching signature alone can be forged. The canary bumps
+       `canary_probes` for REAL client queries too, not only the
+       self-test's synthetic path, so a delta proves our process served a
+       canary in that window. Treat it as strong corroboration, not proof
+       of provenance for one datagram: the counter carries no per-probe
+       identity, and under UDP overload a probe is shed before it is
+       counted, so a loaded-but-healthy proxy yields delta 0. Require
+       signature AND delta together, and act only on SUSTAINED failure.
+     On sustained failure apply
      `on_proxy_failure` policy (`fallback` = NRPT secondary upstream,
      monitored fail-open; `remove_rule` = monitored fail-closed);
      foreign-rule diff → alert; clean removal on orderly shutdown;
@@ -260,11 +370,15 @@ NOT the kernel system logger.
   section echoes the query (qname compared ASCII-case-insensitively per
   RFC 4343 — home CPE forwarders normalize case and byte-exactness
   breaks behind them — qtype/qclass exact). Upstream queries are
-  rebuilt CLEAN: fresh txid, RD=1, the question only, zeroed counts,
-  NO additional records and no EDNS0 — client-controlled bytes (flag
-  games, ECS, OPT payloads) never leave the machine, and ECS in
-  particular would otherwise steer an answer we then cache
-  machine-wide. Together with per-query ephemeral sockets and
+  rebuilt CLEAN: fresh txid, RD=1, the question only, zeroed AN/NS
+  counts. EXACTLY TWO client-controlled bits leave the machine (round-3
+  L01): the CD bit in the header (RFC 4035 §3.1.6), and — only when the
+  client itself sent an OPT — ONE self-constructed OPT record carrying
+  the client's clamped UDP size and DO bit, with empty rdata. No client
+  OPT PAYLOAD is ever relayed: no ECS, no cookies, no options. ECS in
+  particular would otherwise steer an answer we then cache machine-wide.
+  AD is cleared on every response we emit, in the other direction,
+  because we validate nothing. Together with per-query ephemeral sockets and
   `connect()` source filtering this restores the standard resolver
   defense-in-depth; an invalid response is dropped, never cached. The
   UDP receive loop tolerates stray/invalid datagrams within the
@@ -288,10 +402,12 @@ NOT the kernel system logger.
   triggered by ordinary traffic with no attacker. The proxy therefore
   serves any UDP answer over the payload limit as an RFC 2181-style
   TRUNCATED response (TC set, question only, zeroed answer counts) so
-  the client retries over TCP. v1 treats every UDP client as 512 bytes
-  (we strip EDNS0 from forwarded queries, so no client UDP size is ever
-  negotiated — documented limitation); the full answer is cached and
-  served to TCP clients.
+  the client retries over TCP. The payload limit is the CLIENT's own
+  EDNS0-advertised size clamped to [512, 4096]; a client that sent no OPT
+  is treated as 512 (RFC 1035). Only an answer exceeding THAT limit is
+  truncated (round 3, A1) — which is what keeps ordinary 513–4096-byte
+  answers off the bounded TCP pool instead of routing every one of them
+  through it. The full answer is cached and served to TCP clients.
 - **Cache poisoning via upstream:** we are a forwarding resolver — we
   do NOT do DNSSEC validation in v1; upstream choice inherits the
   operator's trust. Documented; DoH upstream option is a v2 item.
@@ -327,11 +443,39 @@ IPC: `webprotection.status` (AuthenticatedRead: enabled, rule present,
 proxy healthy, counts, upstream in use), `webprotection.set_enabled`
 (PrivilegedMutation, challenge-gated), `webprotection.block_add` /
 `.block_remove` / `.allow_add` (PrivilegedMutation),
-`webprotection.test` (AuthenticatedAction: runs the 3-step self-test
-against `127.0.0.1:53` — canary decided Block by the engine, live
-`health_check_name` query NOERROR from an upstream, canary NXDOMAIN
-through the listener — and reports each step; acceptance = all three
-green. The 60-second operator acceptance test).
+`webprotection.test` (AuthenticatedAction: the FOUR-step check against
+`127.0.0.1:53`, reported step by step; acceptance = all four green. The
+60-second operator acceptance test). **It is a RE-IMPLEMENTATION of the
+four steps, not a call into `Proxy::self_test`** — `run` takes `self` by
+value so no `&Proxy` survives it, and self_test's private serving loop
+must never race the real one. Steps (i), (iii) and (iv) are reproducible
+from the handles the daemon captured before `run` (§5 layer 4); step (ii)
+has NO dnsguard API (`forward_via` is private), so the daemon probes its
+own configured upstream list directly, and must probe EVERY entry because
+`forward` has no failover.
+- (i) canary decided Block by the engine.
+- (ii) live `health_check_name` NOERROR from EVERY configured upstream.
+- (iii) canary returns the LOCAL SIGNATURE over UDP — txid echoed +
+  NOERROR + AA=1 + ANCOUNT=1 + A `0.0.0.0`, all five — and
+  `health_check_name` is both decided Allow and resolves positively
+  through the listener.
+- (iv) canary returns the local signature over TCP.
+
+**The signature, not NXDOMAIN, is the acceptance signal.** An earlier
+revision specified "canary → NXDOMAIN through the listener"; that is
+vacuous — `.invalid` has no root delegation, so any stock resolver
+NXDOMAINs it (RFC 6761 §6.4 makes that a SHOULD; measured on a box with
+no Sentinella installed and zero NRPT rules). An implementation of this
+endpoint that accepts NXDOMAIN re-introduces that hole at the IPC layer.
+
+**Counter caveat for the implementer:** only the CANARY probe is
+counter-clean. It moves `canary_probes` and never `queries`/`blocked`,
+even on the live serving path. The `health_check_name` probe is NOT: run
+against the live listener it legitimately increments `queries` plus
+`forwarded`/`cache_hits` and emits a query-log event, because the
+`synthetic` marking exists only inside `Proxy::self_test`'s private loop,
+which cannot run while the proxy is serving. Assert on `canary_probes`
+only, and tolerate concurrent user traffic.
 
 ## 7. Test plan
 
@@ -391,7 +535,17 @@ green. The 60-second operator acceptance test).
   (single recv → SERVFAIL).
 - **Self-test / health:** `self_test` green against a fake upstream;
   empty upstream list refused at bind; dead upstream →
-  `upstream_ok=false` with engine/filter steps still green.
+  `upstream_ok=false` AND `filter_ok=false` (step (iii)(c) requires a
+  POSITIVE resolution through the listener, which a dead upstream cannot
+  produce) with `engine_ok` still green and `detail` naming which
+  sub-checks failed; ONE dead
+  upstream out of two → `upstream_ok=false` (no failover exists, so a
+  head-only probe would have called this green); `block_response =
+  "zero_ip"` **crossed with** a filter that blocks `health_check_name` →
+  `filter_ok=false` (the two axes must be tested together: a zero-IP
+  block answer is NOERROR with an A record, so a green report here means
+  the gate cannot see a machine-wide blackhole); TCP listener dead →
+  `tcp_ok=false` while the UDP steps stay green.
 - **Wire-length vs presentation-length normalization:** a wire-legal
   name whose ESCAPED form exceeds 253 chars (61×0x00 label) is still
   decided (blocked via its suffix rule, never fail-open None);
