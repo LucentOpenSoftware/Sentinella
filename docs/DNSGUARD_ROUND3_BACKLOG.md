@@ -435,3 +435,52 @@ everything else fails. Pairs with A3 and L07.
 `L03`, `L15`, `L17` are latent-shape items with no live trigger. They are
 worth doing because each one is aimed squarely at the next commit, but do not
 let them displace the list above.
+
+---
+
+# CLOSURE — Round 3 (2026-07-31)
+
+Three implementation groups, three commits, every behavioral fix
+revert-verified (fix applied → test green → fix reverted → named test
+fails → re-applied → green; the revert table is in each agent's report).
+Final: **107 tests green (59 lib + 48 integration), clippy
+`--all-targets` 0 warnings.**
+
+| Item | Final state | Commit | Class closed? |
+|---|---|---|---|
+| A1 truncation ↔ TCP pool | **CONFIRMADO, fixed** (EDNS-size truncation, FIFO+SERVFAIL, pool 128, false statements corrected; per-source-IP cap REFUTADO with evidence — all clients are 127.0.0.1) | `01e488a` | Yes for EDNS clients; residual: non-EDNS stub >512B uses (fail-safe) TCP retry |
+| A2 TCP starvation + green health | **CONFIRMADO, fixed** (bounded FIFO, `tcp_pool_full` counter, step (iv) TCP canary probe; agent's own test refuted its first step-(iv) design) | `01e488a` | Yes, except brute-capacity squat — documented as un-eliminable without OS per-process accounting (out of scope) |
+| A3 zero_ip → self_test red | **CONFIRMADO, fixed** (step (iii) asserts configured-policy-agnostic canary signature) | `660306f` | Yes |
+| L01 AD/DO/CD | **CONFIRMADO, decided + fixed**: AD always cleared (we validate nothing), CD/DO relayed in one self-built OPT (never ECS), cache forked on (DO,CD), FORMERR→retry-without-OPT | `01e488a` | Yes |
+| L02 hardcoded NOERROR in truncation | **CONFIRMADO, fixed** (real rcode passed; vacuous test strengthened) | `01e488a` | Yes |
+| L03 fail-open truncation fallback | **CONFIRMADO (latent), fixed** (SERVFAIL/drop, never oversized) | `01e488a` | Yes (no live trigger existed) |
+| L04 RD/OPCODE rewrite | **CONFIRMADO, fixed** (NOTIMP gate, RD echoed to client, paths agree) | `01e488a` | Yes |
+| L05/L09 health_check_name comment + escapes | **CONFIRMADO, fixed** (truthful comment, bind-time validation) | `660306f` | Yes |
+| L06 skippable premise assertion | **YA CORREGIDO** (Grupo 2 rewrite: counter-based premise, hoisted connect) | `01e488a` | Yes |
+| L07 step (iii) can't tell our block from upstream NXDOMAIN | **CONFIRMADO, fixed** (canary short-circuit before cache/forward + AA=1 + counter delta) | `660306f` | Yes — canary never leaks upstream by construction |
+| L08 self-referential upstream + no mutator | **CONFIRMADO, fixed** (validated `set_upstreams`, loopback-on-listen-port rejected) | `660306f` | Yes; LAN-IP+wildcard case documented for the daemon |
+| L10 self_test pollutes counters/hook | **CONFIRMADO, fixed** (synthetic flag, `canary_probes` counter) | `660306f` | Yes |
+| L11 NRPT removal ladder | **CONFIRMADO, fixed** (doc: cmdlet → registry delete → leave reconciler + blocked uninstall) | `540a6cb` | Yes (doc-only) |
+| L12 acceptance canary vacuous | **CONFIRMADO, fixed** (zero-IP signature no stock resolver produces + positive-resolution requirement) | `660306f` | Yes |
+| L13 unbounded stored-string memory | **CONFIRMADO, fixed** (MAX_HOSTS_BYTES, honest `truncated`, `bytes_read`) | `540a6cb` | Yes; HashSet overhead (~1.5–2×) documented |
+| L14 no reachable suffix rule | **CONFIRMADO, fixed** (`DomainListPolicy` per-source, doc consequence stated) | `540a6cb` | Yes |
+| L15 root-name invariant lie | **CONFIRMADO, fixed** (comment weakened, `unnormalizable_queries` counter) | `540a6cb` | Yes |
+| L16 leading-dot has no public API | **CONFIRMADO, fixed** (`add_allow_rule`/`add_block_rule`, one shared impl) | `540a6cb` | Yes |
+| L17 dead MAX_NAME_LEN trap | **CONFIRMADO, fixed** (renamed informational-only) | `540a6cb` | Yes |
+| L18a partial-malformed lines invisible | **CONFIRMADO, fixed** (`hosts_rejected` + warn) | `540a6cb` | Yes |
+| L18b counter half of L10 | **YA CORREGIDO** (Grupo 1) | `660306f` | Yes |
+
+**Refutaciones emitidas en esta ronda:** la propuesta de per-source-IP cap
+(A1(c)) quedó parcialmente refutada con evidencia y se sustituyó por
+FIFO+SERVFAIL; la primera forma del paso (iv) (resolver health_check_name
+por TCP) fue refutada por el propio test del implementador (la caché de
+(iii) la satisfacía con el path TCP muerto). Ningún item del backlog
+resultó REFUTADO en total.
+
+**Residuals (documented, not backlog classes):** brute-capacity local
+DoS (OS accounting out of scope); non-EDNS stub >512B (fail-safe retry);
+step (iv) does not probe TCP-upstream reachability (visible via
+`upstream_errors`); wiring must propagate `hosts_rejected`/`truncated`/
+`unnormalizable_queries` to the health surface.
+
+## Verdict: **Round 3 — completamente cerrado.**
