@@ -12,8 +12,8 @@
 //! Design invariants enforced across the crate:
 //! - no `unsafe`, no DNS-library dependency — the wire codec is hand-rolled
 //!   and every function is total over arbitrary byte input;
-//! - everything is bounded (blocklist line cap, in-flight semaphore, cache
-//!   capacity, upstream timeouts);
+//! - everything is bounded (blocklist line AND byte budgets, in-flight
+//!   semaphore, cache capacity, upstream timeouts);
 //! - fail-safe: malformed input gets FORMERR, dead upstreams get SERVFAIL,
 //!   never a hang and never a panic.
 

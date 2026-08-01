@@ -8,8 +8,10 @@
 //!   EXACT-host rules (Pi-hole semantics — the entry blocks that host, not
 //!   its subtree; a `0.0.0.0 local` line must never blackhole `.local`).
 //!   Suffix rules exist only via an explicit leading-dot marker
-//!   (`.evil.example`) in user-supplied lists, or the `add_allow` /
-//!   `add_block` API used by the daemon's IPC layer;
+//!   (`.evil.example`) in user-supplied lists, the `add_allow` /
+//!   `add_block` API used by the daemon's IPC layer, the marker-aware
+//!   `add_allow_rule` / `add_block_rule` config entry points, or a
+//!   plain-domain-list load with a per-source suffix policy (§4);
 //! - a suffix rule `evil.example` matches `evil.example` itself and any
 //!   subdomain (`a.b.evil.example`) but never a superstring
 //!   (`notevil.example`);
@@ -22,6 +24,7 @@
 use std::collections::HashSet;
 use std::io::{self, BufRead};
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::wire;
 
@@ -31,24 +34,55 @@ use crate::wire;
 /// with a real name.
 pub const CANARY_DOMAIN: &str = "webguard-test.sentinella.invalid";
 
-/// Maximum DNS name length per RFC 1035 (presentation form, without the
-/// trailing dot). NOTE: this limits only *plain* presentation names; the
-/// authoritative validation in [`FilterEngine::normalize_name`] is done
-/// in WIRE units (labels ≤ 63 octets, total ≤ 255 wire bytes, computed on
-/// the UNescaped bytes), because the escaped presentation form is up to
-/// 4× longer than the wire name it represents.
-pub const MAX_NAME_LEN: usize = 253;
+/// INFORMATIONAL ONLY — enforces nothing. Maximum length of a *plain*
+/// presentation-form DNS name per RFC 1035 (without the trailing dot).
+/// The authoritative validation in [`FilterEngine::normalize_name`] is
+/// done in WIRE units (labels ≤ 63 octets, total ≤ 255 wire bytes,
+/// computed on the UNescaped bytes), because the escaped presentation
+/// form is up to 4× longer than the wire name it represents. Do NOT use
+/// this constant to validate input (e.g. `if name.len() > ... { reject }`
+/// at an IPC boundary): that re-creates the escape-expansion fail-open
+/// bug at a new layer — wire-legal names can be far longer than this.
+pub const MAX_PLAIN_PRESENTATION_LEN: usize = 253;
 
 /// Hard cap on hosts-file lines ingested in one load. WHY: blocklists are
-/// attacker-influenceable downloads; a bounded load keeps memory and load
-/// time predictable regardless of what a source serves.
+/// attacker-influenceable downloads; bounding BOTH the line count and the
+/// total byte volume ([`MAX_HOSTS_BYTES`]) keeps memory and load time
+/// predictable regardless of what a source serves. A line cap alone does
+/// not bound memory: one escaped name costs up to ~4 presentation chars
+/// per stored wire octet, so 2M maximal lines would be gigabytes.
 pub const MAX_HOSTS_LINES: u64 = 2_000_000;
+
+/// Hard cap on input bytes ingested in one load (line bytes including the
+/// newline). The stored rule strings are substrings of the input, so this
+/// also bounds the rules' memory to well under this figure plus HashSet
+/// overhead. 256 MiB comfortably fits the largest legitimate lists
+/// (2M lines × ~40 average bytes ≈ 80 MiB) while capping the worst case
+/// a hostile or broken source can make us allocate.
+pub const MAX_HOSTS_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Which list a rule belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListKind {
     Allow,
     Block,
+}
+
+/// Default rule kind for the unmarked entries of a plain domain list
+/// (one domain per line, e.g. the URLhaus domain list). The policy is a
+/// property of the SOURCE, declared in config — never of the data.
+///
+/// `Suffix` is the correct choice for C2/malware-domain feeds, where
+/// subdomain wildcarding is the normal shape (an exact-only load of such
+/// a feed leaves `anything.evil-c2.example` unblocked). It is
+/// FALSE-POSITIVE-PRONE for generic lists: one bad or stale entry
+/// blackholes the entry's whole subtree. Default to `Exact` unless the
+/// source is a dedicated malware-domain feed. An explicit leading-dot
+/// marker in the data always requests a suffix rule regardless of policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DomainListPolicy {
+    Exact,
+    Suffix,
 }
 
 /// Filter decision for a query name.
@@ -67,6 +101,12 @@ pub struct FilterEngine {
     allow_suffix: HashSet<String>,
     block_exact: HashSet<String>,
     block_suffix: HashSet<String>,
+    /// Query names `decide` could not normalize and therefore failed OPEN
+    /// on. Reachable from the wire (the root name is wire-legal — see
+    /// [`normalize_name`](Self::normalize_name)), so this must be VISIBLE,
+    /// not silent: a future Block→Allow regression in normalization shows
+    /// up here instead of passing unnoticed.
+    unnormalizable_queries: AtomicU64,
 }
 
 impl FilterEngine {
@@ -102,11 +142,15 @@ impl FilterEngine {
     /// wire-legal name here used to make `decide` fail OPEN and let a
     /// blocked suffix through. The escaped string is for matching only.
     ///
-    /// Returns `None` for anything that cannot be a WIRE-LEGAL DNS name.
-    /// A wire-legal name ALWAYS normalizes (never `None`), so `decide`
-    /// always produces a real decision for any name that can arrive from
-    /// the wire layer; `None` is reserved for names no wire packet could
-    /// carry (operator/list input mistakes).
+    /// Returns `None` for anything that cannot be a WIRE-LEGAL DNS name —
+    /// with ONE wire-legal exception: the root name. A root-label-only
+    /// question is legal on the wire (root NS priming looks exactly like
+    /// this) and arrives here as `""`, which this function rejects.
+    /// Every OTHER wire-legal name normalizes (never `None`); apart from
+    /// the root, `None` is reserved for names no wire packet could carry
+    /// (operator/list input mistakes). `decide` fails open on `None` and
+    /// counts it in [`unnormalizable_query_count`](Self::unnormalizable_query_count),
+    /// so the exception is observable rather than silent.
     pub fn normalize_name(name: &str) -> Option<String> {
         // Strip one trailing root dot — but only an UNescaped one: `foo\.`
         // is a label ending in a dot, not a rooted name.
@@ -228,9 +272,13 @@ impl FilterEngine {
 
     /// Decide a query name. Unnormalizable names are allowed (forwarded
     /// upstream); the wire layer, not the filter, is responsible for
-    /// rejecting malformed packets.
+    /// rejecting malformed packets. The fail-open branch is COUNTED
+    /// ([`unnormalizable_query_count`](Self::unnormalizable_query_count)):
+    /// the root name reaches it legitimately, and any OTHER name reaching
+    /// it is a Block→Allow regression that must be visible, not silent.
     pub fn decide(&self, qname: &str) -> Decision {
         let Some(name) = Self::normalize_name(qname) else {
+            self.unnormalizable_queries.fetch_add(1, Ordering::Relaxed);
             return Decision::Allow;
         };
         // WHY this order: allowlist wins unconditionally. Within each list,
@@ -253,6 +301,51 @@ impl FilterEngine {
             + self.block_suffix.len()
     }
 
+    /// Query names `decide` failed open on because they did not normalize
+    /// (the wire-legal root name, or a normalization regression).
+    pub fn unnormalizable_query_count(&self) -> u64 {
+        self.unnormalizable_queries.load(Ordering::Relaxed)
+    }
+
+    /// Add one rule expressed in the USER/CONFIG surface syntax: a bare
+    /// name is an exact-host rule, a leading-dot name (`.evil.example`)
+    /// is a suffix rule. This is THE shared implementation of the
+    /// leading-dot marker — the hosts loader, the domain-list loader, and
+    /// the daemon's config/IPC path all go through it, so the marker
+    /// means exactly one thing everywhere.
+    ///
+    /// Returns `false` when the name failed normalization. `false` from
+    /// config input is a LOUD CONFIG ERROR (the operator's rule vanished)
+    /// — the daemon must surface it as such, never log-and-continue.
+    fn add_rule(&mut self, kind: ListKind, token: &str) -> bool {
+        if let Some(suffix) = token.strip_prefix('.') {
+            match kind {
+                ListKind::Allow => self.add_allow(suffix),
+                ListKind::Block => self.add_block(suffix),
+            }
+        } else {
+            match kind {
+                ListKind::Allow => self.add_allow_exact(token),
+                ListKind::Block => self.add_block_exact(token),
+            }
+        }
+    }
+
+    /// Add one allowlist rule in config syntax (bare = exact, leading dot
+    /// = suffix). This is the entry point for the TOML `allowlist` — a
+    /// plain `add_allow_exact` call on `".evil.example"` would reject the
+    /// marker as an empty label and the rule would silently vanish.
+    /// `false` = malformed config value; treat as a loud config error.
+    pub fn add_allow_rule(&mut self, token: &str) -> bool {
+        self.add_rule(ListKind::Allow, token)
+    }
+
+    /// Add one blocklist rule in config syntax — see
+    /// [`add_allow_rule`](Self::add_allow_rule).
+    pub fn add_block_rule(&mut self, token: &str) -> bool {
+        self.add_rule(ListKind::Block, token)
+    }
+
     /// Load a hosts-format file into the given list with the default line
     /// cap ([`MAX_HOSTS_LINES`]). Accepted line shape:
     /// `<ip> <host> [<host>...] [# comment]` where `<ip>` is any literal
@@ -268,48 +361,114 @@ impl FilterEngine {
     /// matching the host and all subdomains.
     ///
     /// Runs in O(lines): one pass, hash inserts only — no per-line rescans,
-    /// so a 10⁶-line list loads in seconds.
+    /// so a 10⁶-line list loads in seconds. Bounded by BOTH
+    /// [`MAX_HOSTS_LINES`] and [`MAX_HOSTS_BYTES`]: a line cap alone does
+    /// not bound memory, because escaping inflates one stored wire octet
+    /// to up to 4 presentation chars.
     pub fn load_hosts<R: BufRead>(&mut self, kind: ListKind, reader: R) -> io::Result<HostsLoadStats> {
-        self.load_hosts_with_limit(kind, reader, MAX_HOSTS_LINES)
+        self.load_hosts_with_limit(kind, reader, MAX_HOSTS_LINES, MAX_HOSTS_BYTES)
     }
 
-    /// Like [`load_hosts`](Self::load_hosts) with an explicit line cap
-    /// (exposed so tests can exercise truncation without a 2M-line fixture).
+    /// Like [`load_hosts`](Self::load_hosts) with explicit caps (exposed
+    /// so tests can exercise truncation without a 2M-line fixture). The
+    /// byte budget counts input bytes (including newlines); the stored
+    /// rules are substrings of the input, so this bounds their memory too.
     pub fn load_hosts_with_limit<R: BufRead>(
         &mut self,
         kind: ListKind,
         reader: R,
         max_lines: u64,
+        max_bytes: u64,
+    ) -> io::Result<HostsLoadStats> {
+        self.ingest_lines(reader, max_lines, max_bytes, |engine, line| {
+            engine.parse_hosts_line(kind, line)
+        })
+    }
+
+    /// Load a plain domain list (one domain per line, `#` comments, blank
+    /// lines — e.g. the URLhaus domain list) into the given list with the
+    /// default caps. Unlike the hosts loader there is no leading IP token
+    /// and no multi-host lines; a line with interior whitespace is
+    /// malformed and counted in `hosts_rejected`.
+    ///
+    /// `policy` is a property of the SOURCE (declared in config), not of
+    /// the data — see [`DomainListPolicy`] for the exact/suffix trade-off.
+    pub fn load_domain_list<R: BufRead>(
+        &mut self,
+        kind: ListKind,
+        reader: R,
+        policy: DomainListPolicy,
+    ) -> io::Result<HostsLoadStats> {
+        self.load_domain_list_with_limit(kind, reader, policy, MAX_HOSTS_LINES, MAX_HOSTS_BYTES)
+    }
+
+    /// Like [`load_domain_list`](Self::load_domain_list) with explicit
+    /// caps (test hook, same rationale as [`load_hosts_with_limit`](Self::load_hosts_with_limit)).
+    pub fn load_domain_list_with_limit<R: BufRead>(
+        &mut self,
+        kind: ListKind,
+        reader: R,
+        policy: DomainListPolicy,
+        max_lines: u64,
+        max_bytes: u64,
+    ) -> io::Result<HostsLoadStats> {
+        self.ingest_lines(reader, max_lines, max_bytes, |engine, line| {
+            engine.parse_domain_list_line(kind, line, policy)
+        })
+    }
+
+    /// Shared ingest loop for both list formats: enforces the line and
+    /// byte budgets and reports honestly — `truncated` when a budget cut
+    /// the input short, `hosts_rejected` when individual entries were
+    /// malformed. Silently truncating or silently dropping entries would
+    /// hide protection gaps.
+    fn ingest_lines<R: BufRead>(
+        &mut self,
+        reader: R,
+        max_lines: u64,
+        max_bytes: u64,
+        mut parse: impl FnMut(&mut Self, &str) -> (u64, u64),
     ) -> io::Result<HostsLoadStats> {
         let mut stats = HostsLoadStats::default();
         for line in reader.lines() {
             let line = line?;
-            if stats.lines_read >= max_lines {
-                // WHY: stop ingesting but report honestly — silently
-                // truncating a blocklist would hide protection gaps.
+            // +1 for the newline the line iterator stripped.
+            let line_bytes = line.len() as u64 + 1;
+            if stats.lines_read >= max_lines || stats.bytes_read + line_bytes > max_bytes {
                 stats.truncated = true;
                 break;
             }
             stats.lines_read += 1;
-            let added = self.parse_hosts_line(kind, &line);
+            stats.bytes_read += line_bytes;
+            let (added, rejected) = parse(self, &line);
+            stats.rules_added += added;
+            stats.hosts_rejected += rejected;
             if added == 0 {
                 stats.lines_skipped += 1;
-            } else {
-                stats.rules_added += added;
             }
         }
         if stats.truncated {
             tracing::warn!(
                 max_lines,
+                max_bytes,
+                lines_read = stats.lines_read,
+                bytes_read = stats.bytes_read,
                 rules_added = stats.rules_added,
-                "hosts file exceeded line cap; remaining lines ignored"
+                "blocklist exceeded a load budget; remaining input ignored"
+            );
+        }
+        if stats.hosts_rejected != 0 {
+            tracing::warn!(
+                hosts_rejected = stats.hosts_rejected,
+                rules_added = stats.rules_added,
+                "blocklist contained malformed entries that were dropped"
             );
         }
         Ok(stats)
     }
 
-    /// Parse one hosts line; returns the number of rules added.
-    fn parse_hosts_line(&mut self, kind: ListKind, line: &str) -> u64 {
+    /// Parse one hosts line; returns `(rules added, hosts rejected)`.
+    fn parse_hosts_line(&mut self, kind: ListKind, line: &str) -> (u64, u64) {
         // Strip inline comments first: everything from '#' onward is dead.
         let body = match line.find('#') {
             Some(i) => &line[..i],
@@ -317,33 +476,61 @@ impl FilterEngine {
         };
         let mut tokens = body.split_whitespace();
         let Some(ip) = tokens.next() else {
-            return 0;
+            return (0, 0);
         };
         // The first token must be an IP literal; this rejects plain
         // domain-list lines and garbage alike.
         if ip.parse::<IpAddr>().is_err() {
-            return 0;
+            return (0, 0);
         }
         let mut added = 0u64;
+        let mut rejected = 0u64;
         for host in tokens {
             // Hosts entries are EXACT rules (Pi-hole semantics); only the
             // explicit leading-dot marker requests a suffix rule.
-            let ok = if let Some(suffix) = host.strip_prefix('.') {
-                match kind {
-                    ListKind::Allow => self.add_allow(suffix),
-                    ListKind::Block => self.add_block(suffix),
-                }
-            } else {
-                match kind {
-                    ListKind::Allow => self.add_allow_exact(host),
-                    ListKind::Block => self.add_block_exact(host),
-                }
-            };
-            if ok {
+            if self.add_rule(kind, host) {
                 added += 1;
+            } else {
+                rejected += 1;
             }
         }
-        added
+        (added, rejected)
+    }
+
+    /// Parse one domain-list line; returns `(rules added, hosts rejected)`.
+    fn parse_domain_list_line(
+        &mut self,
+        kind: ListKind,
+        line: &str,
+        policy: DomainListPolicy,
+    ) -> (u64, u64) {
+        let body = match line.find('#') {
+            Some(i) => &line[..i],
+            None => line,
+        };
+        let mut tokens = body.split_whitespace();
+        let Some(token) = tokens.next() else {
+            return (0, 0); // blank or comment-only line
+        };
+        if tokens.next().is_some() {
+            // Not one-domain-per-line: refuse to guess which token is the
+            // domain (a space is a WIRE-LEGAL label octet, so normalizing
+            // the whole line would silently store garbage).
+            return (0, 1);
+        }
+        let ok = if token.starts_with('.') || policy == DomainListPolicy::Suffix {
+            let name = token.strip_prefix('.').unwrap_or(token);
+            match kind {
+                ListKind::Allow => self.add_allow(name),
+                ListKind::Block => self.add_block(name),
+            }
+        } else {
+            match kind {
+                ListKind::Allow => self.add_allow_exact(token),
+                ListKind::Block => self.add_block_exact(token),
+            }
+        };
+        if ok { (1, 0) } else { (0, 1) }
     }
 }
 
@@ -371,13 +558,23 @@ fn suffix_match(set: &HashSet<String>, name: &str) -> bool {
     false
 }
 
-/// Load statistics for one hosts-file ingest.
+/// Load statistics for one list ingest (hosts format or domain list).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct HostsLoadStats {
     pub lines_read: u64,
+    /// Input bytes ingested (including newlines); bounded by the byte
+    /// budget — together with `lines_read` this makes the memory of a
+    /// load predictable regardless of what a source serves.
+    pub bytes_read: u64,
     pub rules_added: u64,
     pub lines_skipped: u64,
-    /// True when the input exceeded the line cap and was cut short.
+    /// Individual host entries dropped as malformed while their line
+    /// still produced at least one rule (so the line is NOT in
+    /// `lines_skipped`). Non-zero means part of a list silently did not
+    /// become protection — the loader warns when this moves.
+    pub hosts_rejected: u64,
+    /// True when the input exceeded a budget (line cap or byte budget)
+    /// and was cut short.
     pub truncated: bool,
 }
 
@@ -540,7 +737,7 @@ mod tests {
         // against the presentation length: a 253-char single label is
         // wire-ILLEGAL (label > 63) even though it fits 253 presentation
         // chars — the pre-fix code accepted it.
-        let overlong_label = "a".repeat(MAX_NAME_LEN);
+        let overlong_label = "a".repeat(MAX_PLAIN_PRESENTATION_LEN);
         assert_eq!(FilterEngine::normalize_name(&overlong_label), None);
         // Wire-legal at the limit: 63/63/63/61 octet labels = 255 wire
         // bytes exactly (252 presentation chars).
@@ -574,8 +771,8 @@ mod tests {
         // return None → decide → Allow, defeating the suffix block.
         let escaped_label = "\\000".repeat(61);
         let name = format!("{escaped_label}.c2.example");
-        assert!(name.len() > MAX_NAME_LEN, "escaped form exceeds 253 chars");
-        // Wire-legal names ALWAYS normalize — never None.
+        assert!(name.len() > MAX_PLAIN_PRESENTATION_LEN, "escaped form exceeds 253 chars");
+        // Every NON-ROOT wire-legal name normalizes — never None.
         let normalized = FilterEngine::normalize_name(&name)
             .expect("wire-legal name must normalize");
         assert_eq!(normalized, name);
@@ -634,7 +831,7 @@ mod tests {
         let mut engine = FilterEngine::new();
         let input = "0.0.0.0 a.example\n0.0.0.0 b.example\n0.0.0.0 c.example\n";
         let stats = engine
-            .load_hosts_with_limit(ListKind::Block, io::BufReader::new(input.as_bytes()), 2)
+            .load_hosts_with_limit(ListKind::Block, io::BufReader::new(input.as_bytes()), 2, u64::MAX)
             .expect("load");
         assert!(stats.truncated);
         assert_eq!(stats.lines_read, 2);
@@ -662,5 +859,210 @@ mod tests {
             "1M-line load took {elapsed:?} — likely quadratic"
         );
         assert_eq!(engine.decide("d999999.example"), Decision::Block);
+    }
+
+    // ---------------------------------------------------------------
+    // Round 3, Grupo 3: L13 (byte budget), L14 (domain-list loader),
+    // L15 (root-name counter), L16 (config rule API), L18a (rejected
+    // host accounting).
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn hosts_loader_respects_byte_budget() {
+        // L13: a line cap alone does not bound memory — escaping inflates
+        // one stored wire octet to up to 4 presentation chars, so 2M
+        // maximal lines were gigabytes loading with truncated:false.
+        // Revert-check: remove the byte-budget comparison in
+        // `ingest_lines` and this loads all three lines, failing
+        // `assert!(stats.truncated)`.
+        // Wire-LEGAL but long: 63/63/63/50-octet labels (244 wire bytes,
+        // 242 presentation chars) — the byte budget, not normalization,
+        // must be what stops the load.
+        let long_name = format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(50)
+        );
+        let input = format!(
+            "0.0.0.0 first.example\n0.0.0.0 {long_name}\n0.0.0.0 third.example\n"
+        );
+        let input_bytes = input.len() as u64;
+        let mut engine = FilterEngine::new();
+        // Budget fits the first two lines but not the third.
+        let stats = engine
+            .load_hosts_with_limit(
+                ListKind::Block,
+                io::BufReader::new(input.as_bytes()),
+                u64::MAX,
+                input_bytes - 20,
+            )
+            .expect("load");
+        assert!(stats.truncated, "byte budget cut the input short");
+        assert_eq!(stats.rules_added, 2);
+        assert!(stats.bytes_read <= input_bytes - 20, "budget honoured: {stats:?}");
+        assert!(stats.bytes_read > 0, "bytes ingested are reported");
+        assert_eq!(engine.decide("first.example"), Decision::Block);
+        assert_eq!(engine.decide("third.example"), Decision::Allow, "never ingested");
+    }
+
+    #[test]
+    fn byte_budget_binds_what_line_cap_alone_cannot() {
+        // The measured L13 shape: maximal escaped names (~4 presentation
+        // chars per wire octet). With only the line cap these all load;
+        // a byte budget stops them. Uses the default MAX_HOSTS_BYTES as
+        // an upper sanity bound on what "predictable memory" means.
+        let escaped = "\\000".repeat(61); // 61 wire octets, 244 chars
+        let line = format!("0.0.0.0 {escaped}.c2.example\n");
+        let mut input = String::new();
+        for _ in 0..20_000 {
+            input.push_str(&line);
+        }
+        let mut engine = FilterEngine::new();
+        let stats = engine
+            .load_hosts_with_limit(
+                ListKind::Block,
+                io::BufReader::new(input.as_bytes()),
+                u64::MAX, // line cap out of the way: bytes are the binder
+                1024 * 1024,
+            )
+            .expect("load");
+        assert!(stats.truncated);
+        assert!(stats.bytes_read <= 1024 * 1024);
+        assert!(stats.rules_added < 20_000, "cut short by bytes, not lines");
+    }
+
+    #[test]
+    fn domain_list_suffix_policy_covers_c2_wildcards() {
+        // L14: the URLhaus domain list is one domain per line with no
+        // leading-dot marker, so through the hosts loader it produced
+        // rules_added:0 — and even parsed as exact rules it could never
+        // cover subdomain-wildcarding C2, the normal shape. The suffix
+        // policy (a property of the SOURCE) closes that.
+        let urlhaus_like = "# URLhaus-style domain list\n\
+                            evil-c2.example\n\
+                            malware-drop.example # active since 2024\n\
+                            \n\
+                            a..broken\n";
+        let mut engine = FilterEngine::new();
+        let stats = engine
+            .load_domain_list(
+                ListKind::Block,
+                io::BufReader::new(urlhaus_like.as_bytes()),
+                DomainListPolicy::Suffix,
+            )
+            .expect("load");
+        assert_eq!(stats.rules_added, 2);
+        assert_eq!(stats.hosts_rejected, 1, "the malformed line is reported");
+        assert_eq!(engine.decide("evil-c2.example"), Decision::Block);
+        assert_eq!(
+            engine.decide("anything.evil-c2.example"),
+            Decision::Block,
+            "wildcarded C2 subdomains are covered"
+        );
+        assert_eq!(engine.decide("notevil-c2.example"), Decision::Allow);
+        // Same data through the hosts loader adds nothing — the old
+        // measured behaviour, kept as a guard against format drift.
+        let mut hosts_engine = FilterEngine::new();
+        let hosts_stats = load(&mut hosts_engine, ListKind::Block, urlhaus_like);
+        assert_eq!(hosts_stats.rules_added, 0);
+    }
+
+    #[test]
+    fn domain_list_exact_policy_is_the_fp_safe_default() {
+        // Suffix-by-source is correct for C2 feeds but FP-prone for
+        // generic lists: Exact must leave subtrees alone.
+        let mut engine = FilterEngine::new();
+        let stats = engine
+            .load_domain_list(
+                ListKind::Block,
+                io::BufReader::new(b"evil.example\n".as_slice()),
+                DomainListPolicy::Exact,
+            )
+            .expect("load");
+        assert_eq!(stats.rules_added, 1);
+        assert_eq!(engine.decide("evil.example"), Decision::Block);
+        assert_eq!(engine.decide("sub.evil.example"), Decision::Allow, "exact policy");
+        // The explicit leading-dot marker overrides the policy default.
+        let mut marked = FilterEngine::new();
+        marked
+            .load_domain_list(
+                ListKind::Block,
+                io::BufReader::new(b".evil.example\n".as_slice()),
+                DomainListPolicy::Exact,
+            )
+            .expect("load");
+        assert_eq!(marked.decide("sub.evil.example"), Decision::Block, "marker wins");
+        // Interior whitespace is not a domain — never silently stored.
+        let mut spaced = FilterEngine::new();
+        let spaced_stats = spaced
+            .load_domain_list(
+                ListKind::Block,
+                io::BufReader::new(b"evil.example extra-token\n".as_slice()),
+                DomainListPolicy::Exact,
+            )
+            .expect("load");
+        assert_eq!(spaced_stats.rules_added, 0);
+        assert_eq!(spaced_stats.hosts_rejected, 1);
+    }
+
+    #[test]
+    fn config_rule_api_understands_the_leading_dot_marker() {
+        // L16: before this API the marker was understood only inside the
+        // private hosts parser; the public adders rejected `.evil.example`
+        // (empty label), so an allowlist read from TOML vanished silently.
+        let mut engine = FilterEngine::new();
+        assert!(engine.add_allow_rule(".evil.example"), "suffix marker accepted");
+        assert!(engine.add_allow_rule("plain.example"), "bare name = exact rule");
+        assert_eq!(engine.decide("deep.evil.example"), Decision::Allow, "suffix allow");
+        engine.add_block("other.example");
+        assert_eq!(engine.decide("other.example"), Decision::Block);
+        assert!(engine.add_block_rule(".c2.example"));
+        assert_eq!(engine.decide("x.c2.example"), Decision::Block, "suffix block");
+        assert_eq!(engine.decide("c2.example"), Decision::Block);
+        // Garbage returns false — tratable como config error ruidoso.
+        assert!(!engine.add_allow_rule("a..broken"));
+        assert!(!engine.add_block_rule("."));
+    }
+
+    #[test]
+    fn root_name_fails_open_but_counted() {
+        // L15: the root name is wire-legal (root NS priming), arrives as
+        // "", does not normalize, and decide fails OPEN — now counted, so
+        // a Block→Allow regression in this class is visible, not silent.
+        // Revert-check: delete the fetch_add in `decide` and the counter
+        // stays 0, failing the assertion.
+        let engine = FilterEngine::new();
+        assert_eq!(engine.decide(""), Decision::Allow, "root name fails open");
+        assert_eq!(engine.decide("."), Decision::Allow, "rooted root fails open");
+        assert_eq!(
+            engine.unnormalizable_query_count(),
+            2,
+            "the fail-open branch is counted, not silent"
+        );
+        // Normal traffic does not move the counter.
+        assert_eq!(engine.decide("example.com"), Decision::Allow);
+        assert_eq!(engine.unnormalizable_query_count(), 2);
+    }
+
+    #[test]
+    fn malformed_hosts_on_a_multi_host_line_are_counted() {
+        // L18a: the measured line — one of three hosts dropped while the
+        // line reported full success (rules_added:2, lines_skipped:0).
+        // hosts_rejected makes the partial failure visible.
+        // Revert-check: stop accumulating `rejected` in parse_hosts_line
+        // and hosts_rejected stays 0, failing the assertion.
+        let mut engine = FilterEngine::new();
+        let stats = load(
+            &mut engine,
+            ListKind::Block,
+            "0.0.0.0 good.example a..bad .suffix.example\n",
+        );
+        assert_eq!(stats.rules_added, 2);
+        assert_eq!(stats.lines_skipped, 0, "the line produced rules");
+        assert_eq!(stats.hosts_rejected, 1, "the dropped host is reported");
+        assert_eq!(engine.decide("good.example"), Decision::Block);
+        assert_eq!(engine.decide("x.suffix.example"), Decision::Block);
     }
 }

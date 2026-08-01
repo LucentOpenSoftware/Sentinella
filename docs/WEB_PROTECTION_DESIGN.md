@@ -152,6 +152,21 @@ NOT the kernel system logger.
   - User local rules via IPC/GUI; enterprise import later.
   - Update path: the existing `sources.*` update pipeline (HTTPS,
     pinned SHA-256 where the source offers it, staleness tracking).
+- **No shipped source emits the leading-dot marker** — so without a
+  dedicated loader, every source is 100% exact-host, and the URLhaus
+  domain list (one domain per line, no leading IP token) fed through
+  the hosts loader adds NOTHING at all (`rules_added: 0`, Ok). Stated
+  plainly: an exact-only load of a C2 feed leaves subdomain-wildcarding
+  C2 — the normal shape — unblocked. The domain-list loader
+  (`FilterEngine::load_domain_list`) therefore takes a per-source
+  `exact|suffix` policy, declared in the source's config entry, never
+  inferred from the data: `suffix` for dedicated malware/C2 domain
+  feeds (the security-correct choice against wildcarding), `exact`
+  (the default) for anything generic — suffix-by-source on a generic
+  list is FALSE-POSITIVE-PRONE: one stale or hostile entry blackholes
+  its whole subtree. The Pi-hole precedent above covers hosts files;
+  Pi-hole ships regex/wildcard lists alongside them, and the suffix
+  policy is our equivalent — explicit, per source, and off by default.
 
 ## 5. Threat model & failure modes
 
@@ -185,13 +200,35 @@ NOT the kernel system logger.
      exits. The daemon (re)installs the rule only after its own
      self-test passes. The reconciler is also the uninstall path —
      but the ORDER matters: uninstalling Sentinella must remove the
-     RULE first (and rule removal must succeed or the uninstall aborts
-     loudly), THEN the task, then the binaries. The reverse order
+     RULE first, THEN the task, then the binaries. The reverse order
      destroys the only out-of-process remover first; any interruption
      between steps would strand a catch-all rule with no listener, no
      reconciler, and no product to clean it up. (The MSI has no
      CustomAction for this today — wiring it is installer work for the
      integration round.)
+     Rule removal is a LADDER, never a single attempt — "must succeed"
+     specifies an outcome, and the ladder specifies what happens when an
+     attempt fails, because a dead end here is one users route around
+     destructively (delete the install folder → live catch-all rule with
+     no reconciler and no product):
+     (1) `Remove-DnsClientNrptRule -GUID <our-guid>`;
+     (2) on failure (cmdlet unavailable — Server Core / Nano without the
+     DnsClient module, PowerShell ConstrainedLanguage, access denied),
+     delete OUR GUID subkey directly under
+     `HKLM\SYSTEM\CurrentControlSet\Services\DnsCache\Parameters\DnsPolicyConfig`
+     (the exact registry location from §3, written directly just as the
+     add path may be) and `Clear-DnsClientCache`;
+     (3) if BOTH fail, LEAVE the reconciler task and the binaries in
+     place, mark the uninstall BLOCKED with a loud, actionable error,
+     and let the boot reconciler retry the removal on next boot. The
+     abort must never destroy the remover: "aborts loudly" means the
+     uninstall refuses to proceed PAST rule removal, not that it tears
+     down the rest of the product around the failure.
+     When a GPO NRPT policy is present, local rules are ignored entirely
+     (§3) — ours included: the rule is ineffective but still ours, so
+     removal is still attempted by GUID (a GPO rule is never touched),
+     and a foreign GPO rule never blocks the uninstall; only failure to
+     remove our own rule does.
   4. **Runtime watchdog (in-daemon, layered under 1–3, never instead
      of):** the 3-step self-test every N s, probed against the PUBLIC
      socket `127.0.0.1:53` — NOT `proxy.local_addr()`: a health check
@@ -281,7 +318,8 @@ upstream = "system"             # or ["1.1.1.1", "9.9.9.9"]
 on_proxy_failure = "fallback"   # or "remove_rule"
 block_response = "nxdomain"     # or "zero_ip"
 allowlist = []                  # exact hosts; leading "." = suffix rule
-extra_blocklists = []           # file paths / source ids (hosts format = exact rules)
+extra_blocklists = []           # file paths / source ids (hosts format = exact rules;
+                                # domain lists take a per-source exact|suffix policy — §4)
 log_queries = false             # full query log off by default (privacy)
 ```
 
