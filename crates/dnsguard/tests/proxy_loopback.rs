@@ -2194,3 +2194,107 @@ async fn self_test_red_when_tcp_pool_is_saturated() {
         task.abort();
     }
 }
+
+/// REGRESSION (round-3 closure review, HIGH). Step (iii)(c) accepted any
+/// NOERROR-with-a-TTL answer, and a ZeroIp BLOCK answer is exactly that
+/// (NOERROR, ancount 1, A 0.0.0.0, TTL 60). So under the supported
+/// `block_response = "zero_ip"`, a filter that blocks `health_check_name`
+/// read as "resolves positively" and the whole report came back green with
+/// an EMPTY detail — while a single bad suffix rule blackholed the machine.
+///
+/// The two round-3 tests miss this by construction: one blocks the health
+/// name under the DEFAULT nxdomain policy, the other uses ZeroIp with a
+/// clean engine. Neither crosses them. This is that cell.
+#[tokio::test]
+async fn self_test_is_red_when_zero_ip_policy_blocks_the_health_check_name() {
+    let (upstream, _calls) = spawn_udp_upstream(|q| Some(canned_a_response(q, 60, false))).await;
+    let mut engine = FilterEngine::new();
+    // A single suffix rule that happens to cover the health-check name —
+    // the machine-wide blackhole shape, not a contrived exact rule.
+    assert!(engine.add_block("com"));
+    let proxy = Proxy::bind(
+        ProxyConfig {
+            block_response: BlockResponse::ZeroIp,
+            ..config_for(vec![upstream])
+        },
+        engine,
+        Arc::new(NoopDecisionHook),
+    )
+    .await
+    .expect("bind");
+
+    let report = proxy.self_test().await;
+    assert!(
+        !report.filter_ok,
+        "a blocked health_check_name under zero_ip must NOT read as a resolution: {report:?}"
+    );
+    assert!(!report.ok(), "{report:?}");
+    assert!(
+        report.detail.contains("BLOCKED by the filter"),
+        "the detail must name the real cause: {report:?}"
+    );
+}
+
+/// REGRESSION (round-3 closure review, HIGH). The queue permit was held for
+/// the whole connection, so queue occupancy equalled pool occupancy. At the
+/// SHIPPED default relation (`tcp_max_queued == tcp_max_connections`) the
+/// queue was full exactly when the pool was, `try_acquire_owned` always
+/// failed, and the client got a bare RST — `serve_overflow_servfail` was
+/// unreachable in production.
+///
+/// Every round-3 test that certified "pool-full => SERVFAIL, never RST"
+/// shrank `tcp_max_connections` to 1 or 8 while leaving `tcp_max_queued` at
+/// 128 — a 16x-128x ratio, the only regime where the SERVFAIL path runs.
+/// This test pins the DEFAULT relation instead: queued == connections.
+#[tokio::test]
+async fn pool_full_answers_servfail_at_the_shipped_queue_to_pool_ratio() {
+    let (upstream, _calls) = spawn_udp_upstream(|q| Some(canned_a_response(q, 60, false))).await;
+    let proxy = start_proxy(
+        FilterEngine::new(),
+        ProxyConfig {
+            tcp_max_connections: 2,
+            // THE POINT: identical, exactly as ProxyConfig::default ships it.
+            tcp_max_queued: 2,
+            tcp_queue_timeout: Duration::from_millis(300),
+            tcp_max_lifetime: Duration::from_secs(30),
+            tcp_idle_timeout: Duration::from_secs(30),
+            ..config_for(vec![upstream])
+        },
+    )
+    .await;
+
+    // Fill the pool: two connections that open and never speak, so each
+    // holds a pool permit for the whole test.
+    let mut hogs = Vec::new();
+    for _ in 0..2 {
+        hogs.push(TcpStream::connect(proxy.addr).await.expect("hog connect"));
+    }
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // A third client asks a real question. It must get an ANSWER — SERVFAIL
+    // is fine, a reset is not: truncation is what routes clients onto TCP,
+    // so a reset here is an unresolvable name with no retry signal.
+    let mut client = TcpStream::connect(proxy.addr).await.expect("client connect");
+    let query = wire::build_query(0x4242, "example.com", TYPE_A, CLASS_IN).expect("build");
+    let framed = (query.len() as u16).to_be_bytes();
+    client.write_all(&framed).await.expect("write len");
+    client.write_all(&query).await.expect("write body");
+
+    let mut len_buf = [0u8; 2];
+    let read = tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut len_buf)).await;
+    assert!(
+        matches!(read, Ok(Ok(_))),
+        "pool-full client got a reset instead of an answer: {read:?}"
+    );
+    let n = u16::from_be_bytes(len_buf) as usize;
+    let mut resp = vec![0u8; n];
+    tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut resp))
+        .await
+        .expect("no response body")
+        .expect("read body");
+    assert_eq!(rcode_of(&resp), RCODE_SERVFAIL, "expected the fail-safe answer");
+    assert_eq!(id_of(&resp), 0x4242, "the fail-safe must echo the client's ID");
+
+    drop(hogs);
+    proxy.stop().await;
+}

@@ -138,8 +138,12 @@ pub struct ProxyConfig {
     /// cache, and the filter — it validates upstream reachability ONLY and
     /// says nothing about whether the listener can resolve anything. Step
     /// (iii) resolves it again THROUGH the listener (parse → decide →
-    /// cache/forward → respond), so a name the filter blocks fails step
-    /// (iii): pick a name you never intend to block.
+    /// cache/forward → respond) AND requires the engine to decide it
+    /// `Allow`, so a name the filter blocks fails step (iii) under BOTH
+    /// block policies: pick a name you never intend to block. The engine
+    /// check is what makes that true — the answer's shape alone cannot
+    /// carry it, because a ZeroIp block answer is NOERROR with an A record
+    /// and is therefore indistinguishable from a resolution.
     ///
     /// Validated at [`Proxy::bind`]: empty, root-only, unencodable, and
     /// backslash-bearing names are rejected. The backslash rejection is
@@ -589,10 +593,13 @@ impl Proxy {
     ///    reaches either); (b) `counters.canary_probes` moved by EXACTLY 1
     ///    across the probe while the user-facing `queries`/`blocked` did
     ///    not move — a counter delta no upstream can fake, and proof the
-    ///    probe did not pollute user statistics; (c) `health_check_name`
-    ///    resolves POSITIVELY (NOERROR with at least one answer) through
-    ///    the LISTENER — a proxy that answers the canary but SERVFAILs
-    ///    everything else fails here.
+    ///    probe did not pollute user statistics; (c) the engine decides
+    ///    `health_check_name` as `Allow` AND it resolves POSITIVELY
+    ///    (NOERROR with at least one answer) through the LISTENER — a proxy
+    ///    that answers the canary but SERVFAILs everything else fails here,
+    ///    and so does one whose filter blocks the health-check name, which
+    ///    under `zero_ip` would otherwise be indistinguishable from a
+    ///    resolution.
     /// 4. `tcp_ok` — the canary returns the LOCAL signature through the
     ///    actual TCP listener (round 3, A2): truncation routes oversized
     ///    answers onto DNS-over-TCP, so a health surface that probes only
@@ -718,7 +725,35 @@ impl Proxy {
         // (c) POSITIVE resolution of the health-check name through the
         // LISTENER (not the direct forward of step (ii)): proves the
         // serving path resolves real names end to end.
-        let resolves_ok = match (&sock, wire::build_query(
+        //
+        // The ENGINE PRECONDITION below is load-bearing, not a nicety.
+        // `answered_positively` accepts NOERROR-with-a-TTL, and a ZeroIp
+        // BLOCK answer is exactly that (NOERROR, ancount 1, A 0.0.0.0,
+        // TTL 60). So under the supported `block_response = "zero_ip"`, a
+        // filter that blocks `health_check_name` used to read as "resolves
+        // positively": one bad suffix rule turned EVERY name on the machine
+        // into 0.0.0.0 with all four steps green and an empty detail, and
+        // because nothing SERVFAILs, no client fails over to the NRPT
+        // secondary either.
+        //
+        // WHY the decision and not the answer's shape: locally synthesized
+        // block answers do carry AA=1, but an upstream that is authoritative
+        // for the operator's chosen name legitimately sets AA=1 too, so an
+        // `AA == 0` test would red a healthy proxy — the same
+        // gate-rejects-healthy-proxy shape this step exists to avoid. If the
+        // engine ALLOWS the name, the block branch provably did not produce
+        // the answer, so a NOERROR really is a resolution.
+        let health_allowed =
+            self.state.decide(&self.state.config.health_check_name) == Decision::Allow;
+        if !health_allowed {
+            let _ = write!(
+                report.detail,
+                "health_check_name {:?} is BLOCKED by the filter, so step (iii) cannot \
+                 tell a block answer from a resolution — pick a name you never block; ",
+                self.state.config.health_check_name
+            );
+        }
+        let answered_positively = match (&sock, wire::build_query(
             self.state.txids.next(),
             &self.state.config.health_check_name,
             wire::TYPE_A,
@@ -736,12 +771,13 @@ impl Proxy {
             }
             _ => false,
         };
-        if !resolves_ok {
+        if !answered_positively {
             let _ = write!(
                 report.detail,
                 "health_check_name did not resolve positively through the listener; "
             );
         }
+        let resolves_ok = health_allowed && answered_positively;
 
         // (iv) the CANARY through the TCP listener (round 3, A2). WHY the
         // canary and not health_check_name: the signature is synthesized
@@ -841,9 +877,12 @@ pub struct SelfTestReport {
     /// signature (0.0.0.0 A, AA=1 — impossible to satisfy from an upstream
     /// or the cache, under either `block_response` policy), the
     /// `canary_probes` counter moved by exactly 1 while the user-facing
-    /// counters did not move, and `health_check_name` resolves POSITIVELY
-    /// through the listener. False when the serving path is broken OR when
-    /// real names do not resolve through it (e.g. every upstream dead).
+    /// counters did not move, and `health_check_name` is decided `Allow`
+    /// AND resolves POSITIVELY through the listener. False when the serving
+    /// path is broken, when real names do not resolve through it (e.g.
+    /// every upstream dead), or when the filter blocks the health-check
+    /// name — the last case reads as a resolution under `zero_ip` unless
+    /// the engine decision is checked separately.
     pub filter_ok: bool,
     /// The canary returns the LOCAL signature (0.0.0.0 A, AA=1) through
     /// the TCP listener (round 3, A2): truncation routes oversized answers
@@ -1133,12 +1172,24 @@ async fn tcp_loop(listener: Arc<TcpListener>, state: Arc<State>, mut shutdown: w
                 };
                 let state = Arc::clone(&state);
                 tokio::spawn(async move {
-                    let _waiter = waiter; // queue slot released on exit
                     let acquired = timeout(
                         state.config.tcp_queue_timeout,
                         state.tcp_semaphore.clone().acquire_owned(),
                     )
                     .await;
+                    // The queue slot bounds how many connections may WAIT for
+                    // a pool permit — NOT how many may be served. Holding it
+                    // for the whole connection made queue occupancy identical
+                    // to pool occupancy, so at the shipped default
+                    // (`tcp_max_queued == tcp_max_connections`) the queue was
+                    // full exactly when the pool was: `try_acquire_owned`
+                    // above always failed, the `drop(stream)` branch ran, and
+                    // the client got the bare RST this design exists to
+                    // prevent — `serve_overflow_servfail` was unreachable in
+                    // production. Released here, before either outcome, the
+                    // two bounds are independent as intended and total tasks
+                    // stay bounded by queued + connections.
+                    drop(waiter);
                     match acquired {
                         Ok(Ok(permit)) => tcp_conn(stream, peer, state, permit, synthetic).await,
                         Ok(Err(_closed)) => drop(stream), // semaphore closed: shutting down
