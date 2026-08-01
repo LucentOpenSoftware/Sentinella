@@ -484,3 +484,97 @@ step (iv) does not probe TCP-upstream reachability (visible via
 `unnormalizable_queries` to the health surface.
 
 ## Verdict: **Round 3 — completamente cerrado.**
+
+> **SUPERSEDED — see the AMENDMENT below.** This verdict was written
+> before the closure commits were themselves adversarially reviewed. Two
+> of the rows above were reopened by that review and are now fixed in
+> later commits; five other confirmed defects remain open. Do not cite
+> this line or the table above without reading the amendment.
+
+---
+
+# AMENDMENT — post-closure review (2026-08-01)
+
+Commits `660306f`..`6bffb6f` were reviewed adversarially the same way the
+work they closed was: 20 agents over 5 surfaces, every finding attacked
+by a second agent instructed to refute it. Result: **12 confirmed
+findings covering 10 distinct defects** (two were found independently by
+two surfaces), 3 refuted, 15 unverified.
+
+Five of the ten are now fixed, in `4f4e31a` and `80a7607`. Five remain
+open. This section is the correction of record; the table above is left
+as written, because what it claimed at the time is part of the history.
+
+## Rows that were wrong
+
+| Row | Claimed | Actually |
+|---|---|---|
+| **A3** `zero_ip → self_test red` — "Class closed? Yes" | step (iii) asserts a policy-agnostic canary signature | Half true. `660306f` fixed the (a) half and **reintroduced the same root cause in the (c) half it added in the same commit**: `resolves_ok` accepted any NOERROR-with-a-TTL, and a ZeroIp block answer is exactly that. With `block_response = "zero_ip"` and one suffix rule `com`, all four steps went green with an EMPTY detail while every name on the machine answered `0.0.0.0`. Fixed in `4f4e31a` by requiring the engine to decide `health_check_name` as `Allow`. |
+| **A1 / A2** FIFO+SERVFAIL — "Class closed? Yes" | pool-full clients get a bounded FIFO wait then SERVFAIL, never a reset | The queue permit was held for the whole connection, so queue occupancy equalled pool occupancy. At the **shipped** default (`tcp_max_queued == tcp_max_connections`) the queue was full exactly when the pool was, and `serve_overflow_servfail` was **unreachable in production** — clients got a bare RST. Fixed in `4f4e31a`. |
+| **L12** acceptance canary — "Class closed? Yes" | zero-IP signature + positive-resolution requirement | The positive-resolution requirement named here as the fix is precisely what reopened A3. Closed only after `4f4e31a`. |
+| **L05/L09** health_check_name comment — "Class closed? Yes" | truthful comment, bind-time validation | The comment was made truthful about escapes but became false again about step (iii): it promised that a blocked name fails the step, which was untrue under `zero_ip`. Corrected in `4f4e31a`. |
+| Verification claim | "every behavioral fix revert-verified" | True as far as it went, and it did not go far enough. The three tests certifying the SERVFAIL path all set `tcp_max_connections` to 1 or 8 while leaving `tcp_max_queued` at 128 — a 16×–128× ratio, **the only regime in which that code runs at all**. An implementation that deleted `serve_overflow_servfail` would fail them; the shipped one, which merely makes it unreachable, passed. Failure shape #2 for the third consecutive round, in a new variant: the code was right and the DEFAULT was wrong. |
+| Test count | 107 (59 lib + 48 integration) | 109 at `4f4e31a` (59 + 50). |
+| Doc scope | §5.3 removal ladder + §4 + §7 updated | §1, §5.1, §5.4 and the §6 IPC contract were left byte-identical and still specified the **pre-round-3** three-step self-test and "canary → NXDOMAIN". §6 is the contract the wiring implements `webprotection.test` from; written as specified it would have accepted NXDOMAIN as green — which every stock resolver returns for a `.invalid` name — putting the vacuity L12 removed from the code straight back at the IPC layer. Fixed in `80a7607`. |
+
+## Still open (5)
+
+Confirmed by the review, not fixed. Severities are the skeptic's
+corrected values.
+
+1. **SERVFAIL is in the OPT-strip retry trigger set** (MEDIUM). SERVFAIL
+   is the ordinary soft-failure rcode of the whole DNS, not an
+   EDNS-unsupported signal. Every EDNS query against a SERVFAILing
+   upstream costs two round trips, each with a fresh `upstream_timeout`,
+   with the in-flight permit held across both — measured **8.83 s for one
+   query**, 20% shed at 40 queries.
+2. **The SERVFAIL-triggered OPT strip caches a signature-less answer in
+   the DO=1 slot** (MEDIUM) — the exact invariant the `(DO,CD)` cache
+   fork was introduced to guarantee, and which the `CacheKey` doc comment
+   states as an invariant. One transient upstream SERVFAIL silently
+   downgrades DNSSEC for every DO=1 client for up to `max_ttl`.
+3. **The FORMERR/EDNS fallback does not exist on the TCP path** (LOW).
+   The retry is nested inside `if !via_tcp`. Sink fixed, sibling left —
+   and reachable in normal operation, because truncation is what routes
+   clients onto TCP in the first place.
+4. **`set_upstreams` is structurally unreachable** (MEDIUM). `run` takes
+   `self` by value and nothing exposes the upstreams `RwLock`, unlike
+   `engine_handle()`. The natural wiring does not compile
+   (`error[E0382]: borrow of moved value`). L08's row says "Class closed?
+   Yes"; the mutator the wiring needs cannot be called.
+5. **The byte budget is charged after the line is materialized**
+   (MEDIUM). `reader.lines()` allocates the whole line before the budget
+   comparison runs: a one-long-line source pulled **64 MiB under a
+   1024-byte budget** and reported `bytes_read: 0`.
+
+Plus **15 unverified** lower-severity findings from the same review
+(EDNS-capability not in the cache key, the `(DO,CD)` fork against a
+fixed capacity with no eviction, `canary_probes` exact-equality races,
+step (iv) cannot tell "TCP dead" from "TCP busy", `hosts_rejected`
+double-counting, two implementations of the leading-dot marker, and
+others). They were never adversarially checked — treat them as
+hypotheses and refute the wrong ones.
+
+## The pattern worth carrying forward
+
+Round 1 broke DNS with a bad blocklist rule. Round 2 shipped a false
+"hard cap" comment. Round 3's closure shipped code that was **correct**
+and defaults, docs and tests that were **not** — which is harder to see,
+because everything compiles, 107 tests pass, and clippy is silent.
+
+Two concrete lessons:
+
+- **A test that pins a non-shipped configuration certifies nothing.**
+  Ask of every new test not only "would a broken implementation fail
+  it?" but "does it run the configuration we ship?"
+- **A disposition table is not evidence.** Four rows here said "Class
+  closed? Yes" about classes that were open. The only thing that
+  established closure was reverting the fix and watching a named test
+  turn red — and where that was done, it held.
+
+One more, from writing the `80a7607` correction: a first draft of the
+corrected §5/§6 text was itself checked against the code, and **16 of its
+claims were wrong** — including three I had asserted confidently in
+review. Prose describing code decays the same way comments do, and the
+only defense that worked was reading the implementation line by line
+with the specific intent to falsify each sentence.
