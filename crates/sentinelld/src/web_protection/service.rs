@@ -37,11 +37,25 @@ use super::config::{self, WebProtectionConfig};
 use super::status::{ProxyState, WebProtectionStatus};
 use super::upstreams;
 
-/// A running (or refused) web-protection subsystem.
+/// The READ-ONLY half of the subsystem, shareable with the IPC layer.
 ///
-/// Holding this holds the proxy alive: dropping `shutdown` signals the
-/// serving loops to stop.
-pub struct WebProtection {
+/// WHY THIS IS SEPARATE. The IPC handler needs the status, and `AppState`
+/// is `Arc`-shared by the server, its per-connection tasks and the Ctrl+C
+/// task — it outlives process exit, which is why `plm/mod.rs:910-922`
+/// documents that `Drop` is unreachable for anything it owns. Putting the
+/// subsystem itself in `AppState` would therefore make `stop()` unable to
+/// take `&mut`, and `stop()` MUST be a rendezvous (commit C removes the
+/// NRPT rule during shutdown; removing it while the sockets are still
+/// bound leaves the machine's DNS pointed at a listener that is going
+/// away). So the owner keeps the shutdown side and shares this.
+///
+/// Everything here is either fixed at start or read through an `Arc` the
+/// serving loops also hold, so it is always live without a lock of ours.
+pub struct WebProtectionHandle {
+    /// `enabled` AS OF START. A config edit since then is deliberately not
+    /// reflected: it has not taken effect either, and reporting the edited
+    /// value would claim a state the daemon is not in.
+    enabled: bool,
     state: ProxyState,
     detail: String,
     listen: Option<SocketAddr>,
@@ -49,10 +63,44 @@ pub struct WebProtection {
     upstreams_healthy: usize,
     upstreams_total: usize,
     rules_loaded: u64,
-
-    // Captured BEFORE `run` consumed the proxy — see the module docs.
     counters: Option<Arc<Counters>>,
     engine: Option<Arc<RwLock<FilterEngine>>>,
+}
+
+impl WebProtectionHandle {
+    /// A point-in-time status, reading live counters when serving.
+    pub fn status(&self) -> WebProtectionStatus {
+        let snap = self.counters.as_ref().map(|c| c.snapshot());
+        WebProtectionStatus {
+            enabled: self.enabled,
+            // Still genuinely unknown: no NRPT code exists in this commit,
+            // and `Some(false)` would be an assertion we cannot support.
+            nrpt_installed: None,
+            state: self.state,
+            listen: self.listen.map(|a| a.to_string()),
+            upstreams: self.resolved_upstreams.iter().map(|a| a.to_string()).collect(),
+            upstreams_healthy: self.upstreams_healthy,
+            upstreams_total: self.upstreams_total,
+            rules_loaded: self
+                .engine
+                .as_ref()
+                .map(|e| e.read().unwrap_or_else(|p| p.into_inner()).rule_count() as u64)
+                .unwrap_or(self.rules_loaded),
+            detail: self.detail.clone(),
+            queries: snap.as_ref().map(|s| s.queries).unwrap_or(0),
+            blocked: snap.as_ref().map(|s| s.blocked).unwrap_or(0),
+            cache_hits: snap.as_ref().map(|s| s.cache_hits).unwrap_or(0),
+            upstream_errors: snap.as_ref().map(|s| s.upstream_errors).unwrap_or(0),
+        }
+    }
+}
+
+/// A running (or refused) web-protection subsystem.
+///
+/// Holding this holds the proxy alive: dropping `shutdown` signals the
+/// serving loops to stop.
+pub struct WebProtection {
+    handle: Arc<WebProtectionHandle>,
     #[allow(dead_code)] // consumed by the network-change re-read in commit C
     upstreams_handle: Option<UpstreamsHandle>,
 
@@ -67,27 +115,45 @@ pub struct WebProtection {
 impl WebProtection {
     /// Not enabled, nothing running. Cheap and infallible.
     pub fn disabled() -> Self {
+        Self::inert(false, ProxyState::Disabled, String::new(), None)
+    }
+
+    /// Enabled but refused, with the reason. `enabled` stays TRUE: the user
+    /// did ask for this, and a status that reported `enabled: false` here
+    /// would hide the refusal behind what looks like an untouched setting.
+    fn refused(state: ProxyState, detail: impl Into<String>) -> Self {
+        Self::inert(true, state, detail.into(), None)
+    }
+
+    fn inert(
+        enabled: bool,
+        state: ProxyState,
+        detail: String,
+        listen: Option<SocketAddr>,
+    ) -> Self {
         Self {
-            state: ProxyState::Disabled,
-            detail: String::new(),
-            listen: None,
-            resolved_upstreams: Vec::new(),
-            upstreams_healthy: 0,
-            upstreams_total: 0,
-            rules_loaded: 0,
-            counters: None,
-            engine: None,
+            handle: Arc::new(WebProtectionHandle {
+                enabled,
+                state,
+                detail,
+                listen,
+                resolved_upstreams: Vec::new(),
+                upstreams_healthy: 0,
+                upstreams_total: 0,
+                rules_loaded: 0,
+                counters: None,
+                engine: None,
+            }),
             upstreams_handle: None,
             shutdown: None,
             task: None,
         }
     }
 
-    fn refused(state: ProxyState, detail: impl Into<String>) -> Self {
-        let mut s = Self::disabled();
-        s.state = state;
-        s.detail = detail.into();
-        s
+    /// Share the read-only half with the IPC layer. See
+    /// [`WebProtectionHandle`] for why this is not just `&self`.
+    pub fn handle(&self) -> Arc<WebProtectionHandle> {
+        Arc::clone(&self.handle)
     }
 
     /// Bring web protection up, or explain precisely why not.
@@ -177,13 +243,26 @@ impl WebProtection {
                 tcp_ok = report.tcp_ok,
                 "web protection: self-test failed — NOT serving"
             );
-            let mut s = Self::refused(ProxyState::SelfTestFailed, report.detail.clone());
-            s.listen = Some(bound);
-            s.resolved_upstreams = resolved;
-            s.upstreams_healthy = report.upstreams_healthy;
-            s.upstreams_total = report.upstreams_total;
-            s.rules_loaded = rules_loaded;
-            return s;
+            return Self {
+                handle: Arc::new(WebProtectionHandle {
+                    enabled: true,
+                    state: ProxyState::SelfTestFailed,
+                    detail: report.detail.clone(),
+                    listen: Some(bound),
+                    resolved_upstreams: resolved,
+                    upstreams_healthy: report.upstreams_healthy,
+                    upstreams_total: report.upstreams_total,
+                    rules_loaded,
+                    // The engine handle survives so status can still report
+                    // how many rules loaded — useful for telling "the list
+                    // did not load" apart from "the upstream is dead".
+                    counters: None,
+                    engine: Some(engine_handle),
+                }),
+                upstreams_handle: None,
+                shutdown: None,
+                task: None,
+            };
         }
 
         let (tx, rx) = watch::channel(false);
@@ -196,53 +275,21 @@ impl WebProtection {
         );
 
         Self {
-            state: ProxyState::Serving,
-            detail: String::new(),
-            listen: Some(bound),
-            resolved_upstreams: resolved,
-            upstreams_healthy: report.upstreams_healthy,
-            upstreams_total: report.upstreams_total,
-            rules_loaded,
-            counters: Some(counters),
-            engine: Some(engine_handle),
+            handle: Arc::new(WebProtectionHandle {
+                enabled: true,
+                state: ProxyState::Serving,
+                detail: String::new(),
+                listen: Some(bound),
+                resolved_upstreams: resolved,
+                upstreams_healthy: report.upstreams_healthy,
+                upstreams_total: report.upstreams_total,
+                rules_loaded,
+                counters: Some(counters),
+                engine: Some(engine_handle),
+            }),
             upstreams_handle: Some(upstreams_handle),
             shutdown: Some(tx),
             task: Some(task),
-        }
-    }
-
-    /// A point-in-time status, reading live counters when serving.
-    pub fn status(&self, enabled: bool) -> WebProtectionStatus {
-        let snap = self.counters.as_ref().map(|c| c.snapshot());
-        WebProtectionStatus {
-            enabled,
-            // Still genuinely unknown: no NRPT code exists in this commit,
-            // and reporting `Some(false)` would be an assertion we cannot
-            // support.
-            nrpt_installed: None,
-            state: self.state,
-            listen: self.listen.map(|a| a.to_string()),
-            upstreams: self
-                .resolved_upstreams
-                .iter()
-                .map(|a| a.to_string())
-                .collect(),
-            upstreams_healthy: self.upstreams_healthy,
-            upstreams_total: self.upstreams_total,
-            rules_loaded: self
-                .engine
-                .as_ref()
-                .map(|e| {
-                    e.read()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .rule_count() as u64
-                })
-                .unwrap_or(self.rules_loaded),
-            detail: self.detail.clone(),
-            queries: snap.as_ref().map(|s| s.queries).unwrap_or(0),
-            blocked: snap.as_ref().map(|s| s.blocked).unwrap_or(0),
-            cache_hits: snap.as_ref().map(|s| s.cache_hits).unwrap_or(0),
-            upstream_errors: snap.as_ref().map(|s| s.upstream_errors).unwrap_or(0),
         }
     }
 
@@ -267,7 +314,6 @@ impl WebProtection {
                 Err(_) => warn!("web protection: serving task did not stop within 5s"),
             }
         }
-        self.state = ProxyState::Disabled;
     }
 }
 

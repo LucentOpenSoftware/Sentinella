@@ -86,6 +86,39 @@ impl WebProtectionStatus {
 mod tests {
     use super::*;
 
+    /// The status must survive the IPC round trip: it is returned as JSON
+    /// and the GUI reads the two states separately. A rename here without
+    /// a GUI change shows up as a silently missing field, so the shape is
+    /// pinned.
+    #[test]
+    fn status_serializes_with_both_states_distinguishable() {
+        let s = WebProtectionStatus::disabled();
+        let v = serde_json::to_value(&s).expect("status must serialize");
+        assert_eq!(v["enabled"], serde_json::json!(false));
+        // null, NOT false — "we do not know" is a third value and the UI
+        // must be able to tell it from "not installed".
+        assert!(
+            v["nrpt_installed"].is_null(),
+            "unknown NRPT state must serialize as null, got {}",
+            v["nrpt_installed"]
+        );
+        assert_eq!(v["state"], serde_json::json!("disabled"));
+        for k in [
+            "listen",
+            "upstreams",
+            "upstreams_healthy",
+            "upstreams_total",
+            "rules_loaded",
+            "detail",
+            "queries",
+            "blocked",
+            "cache_hits",
+            "upstream_errors",
+        ] {
+            assert!(v.get(k).is_some(), "status is missing field {k}");
+        }
+    }
+
     #[test]
     fn disabled_status_does_not_claim_to_know_about_nrpt() {
         let s = WebProtectionStatus::disabled();

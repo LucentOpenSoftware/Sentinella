@@ -401,6 +401,13 @@ pub struct AppState {
     /// Developer-mode state (gates local perf telemetry). Mutable at runtime via
     /// `load_developer_config` when the mode is toggled.
     developer_config: std::sync::Mutex<crate::config::DeveloperConfig>,
+    /// Web-protection read handle, published by `run_daemon` once the
+    /// subsystem has started (or refused). `None` until then, and `None`
+    /// forever when the feature is off. RwLock because reads (status
+    /// polls) massively outnumber the single write.
+    web_protection: std::sync::RwLock<
+        Option<std::sync::Arc<crate::web_protection::WebProtectionHandle>>,
+    >,
     /// v0.1.9 Phase 2 (audit MED-6): serialises every config load→mutate→save
     /// sequence so two concurrent IPC handlers (e.g. settings.set_full racing
     /// dev.set_developer_mode) can't clobber each other's changes via
@@ -1052,6 +1059,7 @@ impl AppState {
             config_write_lock: std::sync::Mutex::new(()),
             gui_fullscreen_active: AtomicBool::new(false),
             gui_fullscreen_ts: AtomicI64::new(0),
+            web_protection: std::sync::RwLock::new(None),
             developer_config: std::sync::Mutex::new(
                 crate::config::Config::load(None)
                     .map(|c| c.developer)
@@ -1753,6 +1761,31 @@ impl AppState {
     /// at runtime so telemetry gating reflects the new state immediately).
     /// Wired by the forthcoming `dev.set_developer_mode` IPC (B2).
     #[allow(dead_code)]
+    /// Publish the web-protection read handle for the IPC layer.
+    ///
+    /// A slot rather than a constructor argument because the subsystem
+    /// starts AFTER `AppState` exists, and an `RwLock` rather than a plain
+    /// field because `AppState::fish_config` is the cautionary tale: it is
+    /// a plain field set once at construction and never updated, so
+    /// `fish_diagnostics()` reports defaults forever.
+    pub fn set_web_protection(&self, handle: std::sync::Arc<crate::web_protection::WebProtectionHandle>) {
+        *self
+            .web_protection
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(handle);
+    }
+
+    /// Current web-protection status, or the disabled shape when the
+    /// subsystem never started.
+    pub fn web_protection_status(&self) -> crate::web_protection::WebProtectionStatus {
+        self.web_protection
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|h| h.status())
+            .unwrap_or_else(crate::web_protection::WebProtectionStatus::disabled)
+    }
+
     pub fn load_developer_config(&self, dev: crate::config::DeveloperConfig) {
         *self
             .developer_config

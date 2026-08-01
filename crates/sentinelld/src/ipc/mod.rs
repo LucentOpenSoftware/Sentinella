@@ -1369,6 +1369,25 @@ fn dispatch_sync(
             }
         }
 
+        "webprotection.status" => {
+            // Authenticated for the same reason as watcher.status: the
+            // response discloses the machine's configured DNS servers and
+            // how many block rules are loaded.
+            let auth = req
+                .params
+                .get("auth")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !state.validate_ipc_auth(auth) {
+                return serde_json::to_vec(&RpcErrorResponse::err(
+                    req.id,
+                    error_codes::INVALID_PARAMS,
+                    "authenticated IPC required for web protection status".to_string(),
+                ))
+                .unwrap_or_default();
+            }
+            ok_json(serde_json::to_value(state.web_protection_status()).unwrap_or_default())
+        }
         "watcher.status" => {
             // Scanner-B Finding 2: response includes the full list of
             // watched roots — gives an unauth local caller an oracle for

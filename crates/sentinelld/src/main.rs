@@ -498,6 +498,10 @@ async fn run_daemon(
     // NOTHING is pointed at this listener: no NRPT rule is installed by
     // this build. Reach it directly to test — `nslookup name 127.0.0.1`.
     let mut web_protection = web_protection::WebProtection::start(&config.web_protection).await;
+    // Publish the read-only half so `webprotection.status` can answer.
+    // The subsystem itself stays owned here, because stop() needs &mut and
+    // AppState outlives process exit.
+    server.state().set_web_protection(web_protection.handle());
 
     // Load detection exclusions from config.
     if !config.excluded_detections.is_empty() {
