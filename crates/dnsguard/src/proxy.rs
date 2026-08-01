@@ -1124,7 +1124,14 @@ async fn tcp_probe_exchange(probe: &[u8], listener: SocketAddr, wait: Duration) 
 /// is the final 4 bytes. No stock upstream satisfies this for an `.invalid`
 /// name (they NXDOMAIN), and the short-circuit guarantees it never comes
 /// from cache either.
-fn is_canary_signature(resp: &[u8], probe_id: u16) -> bool {
+///
+/// PUBLIC because the out-of-process reconciler must ask the same question
+/// of `127.0.0.1:53` that the self-test asks internally, and two
+/// implementations of a security predicate drift. Build the probe with
+/// [`crate::wire::build_query`], which emits NO EDNS0 OPT — the trailing-4-
+/// bytes test is only valid for a response that carries none, and
+/// `handle_query` appends one whenever the requester sent one.
+pub fn is_canary_signature(resp: &[u8], probe_id: u16) -> bool {
     if resp.len() < wire::HEADER_LEN + 4 {
         return false;
     }

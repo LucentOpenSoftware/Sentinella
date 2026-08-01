@@ -14,6 +14,7 @@ members = [
     "crates/sentinella-dev-console",
     "crates/dnsguard",
     "crates/nrpt",
+    "crates/sentinella-dnsreconcile",
 ]
 exclude = ["gui/src-tauri", "third_party", "fuzz"]
 

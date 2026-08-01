@@ -151,6 +151,21 @@ pub fn list_rules() -> Result<Vec<String>, Error> {
     }
 }
 
+/// Where the rule GUID is recorded, by convention shared with the daemon.
+///
+/// Deliberately NOT derived from the daemon's `paths` module: the
+/// reconciler must run without loading the daemon's config, and a shared
+/// constant that both sides compute the same way is the whole point. If
+/// this ever disagrees with the daemon, the reconciler stops being able to
+/// name our rule — see the identity note in the crate docs.
+pub fn default_state_file() -> std::path::PathBuf {
+    let root = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into());
+    std::path::Path::new(&root)
+        .join("Sentinella")
+        .join("state")
+        .join("nrpt-rule.guid")
+}
+
 /// Read the GUID this installation recorded, if any.
 ///
 /// Anything unreadable, absent or malformed reads as `None` — "no rule was
