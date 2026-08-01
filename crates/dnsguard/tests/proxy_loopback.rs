@@ -2298,3 +2298,70 @@ async fn pool_full_answers_servfail_at_the_shipped_queue_to_pool_ratio() {
     drop(hogs);
     proxy.stop().await;
 }
+
+/// REGRESSION (round-3-closure review). `set_upstreams` was `&self` and
+/// `run` takes `self` by value, so the mutator the design requires — the
+/// daemon re-reading adapter DNS on network-change events — was
+/// STRUCTURALLY unreachable: the natural wiring failed to compile with
+/// `error[E0382]: borrow of moved value`. Nothing exposed the upstreams
+/// lock either, unlike `engine_handle()`.
+///
+/// This test IS the wiring pattern: capture the handle, spawn `run`, then
+/// swap upstreams from outside and prove the swap reaches the serving
+/// path. It cannot be written at all against the pre-fix API.
+#[tokio::test]
+async fn upstreams_can_be_replaced_while_the_proxy_is_serving() {
+    let (first, first_calls) = spawn_udp_upstream(|q| Some(canned_a_response(q, 60, false))).await;
+    let (second, second_calls) = spawn_udp_upstream(|q| Some(canned_a_response(q, 60, false))).await;
+
+    let proxy = Proxy::bind(
+        config_for(vec![first]),
+        FilterEngine::new(),
+        Arc::new(NoopDecisionHook),
+    )
+    .await
+    .expect("bind");
+    let addr = proxy.local_addr();
+    // THE POINT: captured BEFORE `run` consumes the proxy.
+    let upstreams = proxy.upstreams_handle();
+    let (tx, rx) = watch::channel(false);
+    let task = tokio::spawn(proxy.run(rx));
+
+    let q1 = wire::build_query(1, "one.example", TYPE_A, CLASS_IN).expect("build");
+    let _ = udp_query(addr, &q1, Duration::from_secs(2)).await;
+    assert_eq!(first_calls.load(Ordering::Relaxed), 1, "first upstream unused");
+    assert_eq!(second_calls.load(Ordering::Relaxed), 0);
+
+    // The network-change event the design calls for.
+    upstreams.set(vec![second]).expect("swap must be accepted");
+    assert_eq!(upstreams.get(), vec![second]);
+
+    // A DIFFERENT name, so this cannot be served from cache.
+    let q2 = wire::build_query(2, "two.example", TYPE_A, CLASS_IN).expect("build");
+    let _ = udp_query(addr, &q2, Duration::from_secs(2)).await;
+    assert_eq!(
+        second_calls.load(Ordering::Relaxed),
+        1,
+        "the swap did not reach the serving path"
+    );
+    assert_eq!(
+        first_calls.load(Ordering::Relaxed),
+        1,
+        "the old upstream was still queried after the swap"
+    );
+
+    // The handle carries the validation — it is not a raw lock.
+    assert!(upstreams.set(vec![]).is_err(), "empty list must be refused");
+    assert!(
+        upstreams.set(vec![addr]).is_err(),
+        "self-referential upstream must be refused"
+    );
+    assert_eq!(
+        upstreams.get(),
+        vec![second],
+        "a refused swap must keep the previous list"
+    );
+
+    let _ = tx.send(true);
+    let _ = task.await;
+}

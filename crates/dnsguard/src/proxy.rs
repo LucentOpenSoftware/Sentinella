@@ -554,23 +554,43 @@ impl Proxy {
         Arc::clone(&self.state.engine)
     }
 
-    /// Replace the upstream list at runtime (design: the daemon re-reads
-    /// adapter DNS on network-change events). Takes effect on the next
-    /// forwarded query; no rebind, no restart.
+    /// Handle for replacing the upstream list, valid BEFORE **and AFTER**
+    /// `run`.
+    ///
+    /// WHY THIS EXISTS AND `set_upstreams` IS NOT ENOUGH: `run` takes
+    /// `self` by value, so every `&self` method — including
+    /// [`Proxy::set_upstreams`] — becomes uncallable the moment the daemon
+    /// spawns the serving future. The design requires re-reading adapter
+    /// DNS on network-change events, which happens only while serving, so
+    /// a `&self` setter could never satisfy it: the natural wiring failed
+    /// to compile with `error[E0382]: borrow of moved value`. Same shape,
+    /// and same remedy, as [`Proxy::counters`] and
+    /// [`Proxy::engine_handle`] — capture it BEFORE `run`:
+    ///
+    /// ```ignore
+    /// let upstreams = proxy.upstreams_handle();
+    /// let counters  = proxy.counters();
+    /// tokio::spawn(proxy.run(rx));
+    /// // ... on a network-change event, from anywhere:
+    /// upstreams.set(adapter_dns_servers)?;
+    /// ```
+    pub fn upstreams_handle(&self) -> UpstreamsHandle {
+        UpstreamsHandle {
+            state: Arc::clone(&self.state),
+            listen: self.local_addr,
+        }
+    }
+
+    /// Replace the upstream list before `run` consumes the proxy. Prefer
+    /// [`Proxy::upstreams_handle`]: this method is unreachable once the
+    /// daemon is serving, which is the only time network-change re-reads
+    /// actually happen.
     ///
     /// Validated EXACTLY like [`Proxy::bind`]: non-empty, and no
     /// self-referential address (checked against the address we are
     /// actually bound on). On error the previous list is kept.
     pub fn set_upstreams(&self, upstreams: Vec<SocketAddr>) -> io::Result<()> {
-        validate_upstreams(&upstreams, self.local_addr)?;
-        let mut live = self
-            .state
-            .upstreams
-            .write()
-            .unwrap_or_else(|p| p.into_inner());
-        info!(old = live.len(), new = upstreams.len(), "dnsguard upstreams replaced");
-        *live = upstreams;
-        Ok(())
+        self.upstreams_handle().set(upstreams)
     }
 
     /// Four-step health check (design §5 self-test layer). Call BEFORE
@@ -869,6 +889,53 @@ impl Proxy {
         udp_task.abort();
         tcp_task.abort();
         Ok(())
+    }
+}
+
+/// Live handle to the proxy's upstream list, obtained from
+/// [`Proxy::upstreams_handle`] and valid for the life of the proxy —
+/// including after `run` has consumed it.
+///
+/// Holds the validation itself rather than exposing the lock, so a caller
+/// cannot install a list `bind` would have refused. Cheap to clone; every
+/// clone writes the same live list.
+#[derive(Clone)]
+pub struct UpstreamsHandle {
+    state: Arc<State>,
+    /// The address we are actually bound on — the reference point for the
+    /// self-referential check. Not `config.listen`: with a port-0 listen
+    /// those differ, and the bound address is the one that matters.
+    listen: SocketAddr,
+}
+
+impl UpstreamsHandle {
+    /// Replace the upstream list. Takes effect on the next forwarded
+    /// query; no rebind, no restart, no dropped in-flight query (each one
+    /// already picked its upstream before the swap).
+    ///
+    /// Validated EXACTLY like [`Proxy::bind`]: non-empty, and no
+    /// self-referential address. On error the previous list is kept, which
+    /// is the safe direction — a network-change event that hands us a
+    /// garbage list must not leave the machine with no resolver.
+    pub fn set(&self, upstreams: Vec<SocketAddr>) -> io::Result<()> {
+        validate_upstreams(&upstreams, self.listen)?;
+        let mut live = self
+            .state
+            .upstreams
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        info!(
+            old = live.len(),
+            new = upstreams.len(),
+            "dnsguard upstreams replaced"
+        );
+        *live = upstreams;
+        Ok(())
+    }
+
+    /// The upstream list currently in force.
+    pub fn get(&self) -> Vec<SocketAddr> {
+        self.state.upstreams()
     }
 }
 

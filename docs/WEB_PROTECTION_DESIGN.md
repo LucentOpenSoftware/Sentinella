@@ -313,10 +313,18 @@ NOT the kernel system logger.
      methods, so the watchdog is given the returned
      `Arc<Counters>`/`Arc<RwLock<FilterEngine>>`, never a `&Proxy`:
      ```rust
-     let engine = proxy.engine_handle();
-     let counters = proxy.counters();
+     let engine    = proxy.engine_handle();
+     let counters  = proxy.counters();
+     let upstreams = proxy.upstreams_handle();   // network-change re-reads
      tokio::spawn(proxy.run(rx));
      ```
+     `upstreams_handle()` is what makes §3's "re-read adapter DNS on
+     network-change events" expressible at all: `Proxy::set_upstreams` is
+     `&self` and therefore dies with the move, and re-reads happen only
+     while serving. The handle carries the same validation as `bind`
+     (non-empty, no self-referential address), so a network-change event
+     that hands us a garbage list is refused and the previous list is
+     kept — the machine is never left with no resolver.
      What the external watchdog can then reproduce is DIFFERENT from the
      four steps, not strictly stronger — better in one way, blind in two:
      - Stronger: it probes the PUBLIC socket the DNS Client actually uses,
