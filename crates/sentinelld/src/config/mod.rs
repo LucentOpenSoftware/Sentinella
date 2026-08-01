@@ -79,6 +79,9 @@ pub struct Config {
     pub sandbox: SandboxConfig,
     // ── Developer mode (v0.1.6 only — local perf telemetry) ──
     pub developer: DeveloperConfig,
+    /// DNS-layer web protection. Default-OFF; see the module docs for why
+    /// this section's validation forces a disable instead of clamping.
+    pub web_protection: crate::web_protection::WebProtectionConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -265,6 +268,7 @@ impl Default for Config {
             fish: crate::fish::FishConfig::default(),
             sandbox: SandboxConfig::default(),
             developer: DeveloperConfig::default(),
+            web_protection: crate::web_protection::WebProtectionConfig::default(),
         }
     }
 }
@@ -620,6 +624,10 @@ impl Config {
         // process-kill primitive (`active_response="terminate"`) with thresholds
         // that trip on the first event. Delegated to FishConfig::validate.
         self.fish.validate();
+        // Own validate() next to the type (FISH pattern), because this
+        // section forces enabled=false rather than clamping — see
+        // crate::web_protection::config.
+        self.web_protection.validate();
         // C2 fix: validate excluded_paths — reject dangerously broad entries.
         self.excluded_paths.retain(|p| {
             let trimmed = p.trim();

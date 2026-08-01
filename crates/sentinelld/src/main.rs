@@ -36,6 +36,7 @@ mod targeting;
 pub mod trust_graph;
 mod updater;
 mod watcher;
+mod web_protection;
 mod win_process;
 
 use clap::Parser;

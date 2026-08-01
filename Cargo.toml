@@ -41,3 +41,4 @@ clap = { version = "4", features = ["derive"] }
 sentinella-ipc-proto = { path = "crates/sentinella-ipc-proto" }
 sentinella-common = { path = "crates/sentinella-common" }
 argus = { path = "crates/argus" }
+dnsguard = { path = "crates/dnsguard" }
