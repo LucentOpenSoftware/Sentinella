@@ -109,10 +109,18 @@ pub struct ProxyConfig {
     pub block_response: BlockResponse,
     /// Inter-read idle timeout on client TCP connections.
     pub tcp_idle_timeout: Duration,
-    /// HARD total-lifetime cap on a client TCP connection (design §5): a
-    /// connection is closed once it is this old, no matter how active it
-    /// is — an idle timeout alone lets dribbling connections hold a permit
-    /// forever. EVERY socket operation on the connection — both reads and
+    /// HARD cap on a client TCP connection's SERVICE time (design §5). The
+    /// clock starts when the connection WINS ITS POOL PERMIT, not at
+    /// accept: a connection's total accept-to-close age is therefore
+    /// bounded by `tcp_queue_timeout + tcp_max_lifetime`, not by this value
+    /// alone (round-3 closure review, U08 — measured 2.28x when the two
+    /// were confused). Starting the clock at accept would be worse, not
+    /// better: a client that waited out most of the queue window would then
+    /// be served for the remainder and killed mid-answer, which is exactly
+    /// the bare-reset failure the FIFO+SERVFAIL fail-safe exists to avoid.
+    /// Once serving, the connection is closed when it is this old no matter
+    /// how active it is — an idle timeout alone lets dribbling connections
+    /// hold a permit forever. EVERY socket operation on the connection — both reads and
     /// the response WRITES — is bounded by the time remaining until this
     /// deadline, so a pipelining client that never reads (kernel send
     /// buffer full, `write_all` parked) cannot hold its permit past the
@@ -841,16 +849,28 @@ impl Proxy {
         // (b) counter deltas across the probes: each canary probe that was
         // actually SERVED (UDP in step (iii); TCP in step (iv) — a starved
         // TCP pool SERVFAILs before `handle_query`, so there the probe is
-        // never counted) must be counted EXACTLY once in the canary's OWN
-        // counter, and the user-facing counters must not have moved
-        // (synthetic traffic is invisible to them).
+        // never counted) must be reflected in the canary's OWN counter — as
+        // a LOWER bound, since other local processes may query the canary
+        // concurrently — and the user-facing counters must not have moved
+        // at all (synthetic traffic is invisible to them).
         let after = self.state.counters.snapshot();
         let expected_delta = u64::from(canary_ok) + u64::from(report.tcp_ok);
         let actual_delta = after.canary_probes.wrapping_sub(before.canary_probes);
-        if actual_delta != expected_delta {
+        // LOWER BOUND, not equality (round-3 closure review, U01). The
+        // canary bump is not gated on `synthetic`, so a canary query from
+        // ANY other local process inside the window inflates the counter —
+        // and the design's own operator acceptance test is defined to send
+        // exactly that query. Exact equality therefore reds a healthy proxy
+        // on concurrent traffic.
+        //
+        // Inflation cannot disprove what this check is for: an impostor
+        // owning port 53 can forge the signature but leaves OUR counter at
+        // 0, and `0 >= 2` is false, so it still reds. A probe served but
+        // lost in flight still reds via `canary_ok`/`tcp_ok`.
+        if actual_delta < expected_delta {
             let _ = write!(
                 report.detail,
-                "canary_probes delta {actual_delta} != {expected_delta} served probes; "
+                "canary_probes moved {actual_delta}, fewer than the {expected_delta} probes we served; "
             );
         }
         if after.queries != before.queries || after.blocked != before.blocked {
@@ -861,7 +881,7 @@ impl Proxy {
         }
         report.filter_ok = canary_ok
             && resolves_ok
-            && actual_delta == expected_delta
+            && actual_delta >= expected_delta
             && after.queries == before.queries
             && after.blocked == before.blocked;
 
@@ -1405,7 +1425,46 @@ async fn tcp_conn(
 /// loop): synthetic queries skip the user-facing counters and the decision
 /// hook so probe traffic never lands in the GUI/IPC statistics or the
 /// query log.
+/// Core pipeline plus the ONE egress point where EDNS0 OPT presence is
+/// normalized.
+///
+/// WHY a wrapper (round-3 closure review, U06): OPT is a per-hop transport
+/// negotiation, and the cache used to store whatever OPT the upstream sent,
+/// so the FIRST client to populate an entry decided what every later client
+/// received — a classic stub that sent no OPT was handed one it never asked
+/// for, and an EDNS client could be served an answer with none. The obvious
+/// fix, adding a "client sent an OPT" bit to the cache key, fixes one sink
+/// and leaves five (block NXDOMAIN, block zero-IP, canary, error/NOTIMP and
+/// the TC response), and doubles the cache fan-out. So the DATA is fixed
+/// once, here: every response we emit has inherited OPTs removed and then
+/// exactly one OPT appended iff THIS requester sent one.
+///
+/// Ordering note: this runs BEFORE the caller's size check, so the OPT's 11
+/// bytes are counted against the client's advertised limit rather than
+/// pushing the datagram over it.
 async fn handle_query(
+    state: &Arc<State>,
+    bytes: &[u8],
+    client: SocketAddr,
+    via_tcp: bool,
+    synthetic: bool,
+) -> Option<(Vec<u8>, usize)> {
+    let (resp, udp_limit) = handle_query_inner(state, bytes, client, via_tcp, synthetic).await?;
+    Some((normalize_client_edns(bytes, resp), udp_limit))
+}
+
+/// Strip inherited OPTs, then re-add one iff the requester sent one.
+fn normalize_client_edns(request: &[u8], resp: Vec<u8>) -> Vec<u8> {
+    let mut out = wire::strip_opt_records(&resp);
+    if let Ok(q) = wire::parse_query(request)
+        && let Some(size) = q.edns_udp_size
+    {
+        wire::append_client_opt(&mut out, wire::clamp_edns_udp_size(size) as u16, q.dnssec_ok);
+    }
+    out
+}
+
+async fn handle_query_inner(
     state: &Arc<State>,
     bytes: &[u8],
     client: SocketAddr,
@@ -1559,7 +1618,11 @@ async fn handle_query(
             } else {
                 cache_key.clone()
             };
-            state.cache_store(&store_key, &resp);
+            // RFC 6891 §6.1.1: OPT MUST NOT be cached. Storing it is what
+            // let the first requester's EDNS posture leak to every later
+            // one; the egress normalization in `handle_query` re-adds the
+            // right OPT for whoever is actually asking.
+            state.cache_store(&store_key, &wire::strip_opt_records(&resp));
             if !synthetic {
                 state.emit(client, &query, QueryOutcome::Forwarded);
             }

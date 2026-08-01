@@ -46,20 +46,44 @@ pub const CANARY_DOMAIN: &str = "webguard-test.sentinella.invalid";
 pub const MAX_PLAIN_PRESENTATION_LEN: usize = 253;
 
 /// Hard cap on hosts-file lines ingested in one load. WHY: blocklists are
-/// attacker-influenceable downloads; bounding BOTH the line count and the
-/// total byte volume ([`MAX_HOSTS_BYTES`]) keeps memory and load time
-/// predictable regardless of what a source serves. A line cap alone does
-/// not bound memory: one escaped name costs up to ~4 presentation chars
-/// per stored wire octet, so 2M maximal lines would be gigabytes.
+/// attacker-influenceable downloads. This is ONE of three budgets —
+/// lines, input bytes ([`MAX_HOSTS_BYTES`]) and rules
+/// ([`MAX_HOSTS_RULES`]) — and it is the weakest of them: a single hosts
+/// line may carry dozens of hostnames, so a line cap alone bounds neither
+/// memory nor load time. Measured: 684k lines produced 43.8M rules, 2.36
+/// GB resident, and 144.6 s of blocking single-threaded load. The rule cap
+/// is what makes those two quantities predictable.
 pub const MAX_HOSTS_LINES: u64 = 2_000_000;
 
-/// Hard cap on input bytes ingested in one load (line bytes including the
-/// newline). The stored rule strings are substrings of the input, so this
-/// also bounds the rules' memory to well under this figure plus HashSet
-/// overhead. 256 MiB comfortably fits the largest legitimate lists
-/// (2M lines × ~40 average bytes ≈ 80 MiB) while capping the worst case
-/// a hostile or broken source can make us allocate.
+/// Hard cap on INPUT bytes ingested in one load (line bytes including the
+/// newline). 256 MiB comfortably fits the largest legitimate lists
+/// (2M lines × ~40 average bytes ≈ 80 MiB).
+///
+/// This bounds the INPUT and nothing else. It does NOT bound the rules'
+/// memory: `normalize_name` returns an owned lowercased `String` per rule
+/// (not a borrowed substring of the input), which costs a 24-byte header
+/// inside the hashbrown table plus its own heap block plus load-factor
+/// slack. MEASURED at this budget with the worst LEGAL shape — many short
+/// hostnames per hosts line, which the loader explicitly supports — 256
+/// MiB of input produced 43.8M rules and **2.36 GB resident / 2.91 GB
+/// peak**, i.e. 9.2x/11.4x the byte budget. An earlier revision of this
+/// comment claimed the opposite ("substrings of the input, so this also
+/// bounds the rules' memory"); it was wrong by an order of magnitude.
+/// [`MAX_HOSTS_RULES`] is the cap that actually binds memory.
 pub const MAX_HOSTS_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Hard cap on RULES ingested in one load — the budget that actually
+/// bounds memory, because memory is proportional to rules, not to input
+/// bytes.
+///
+/// WHY a third cap: the line cap is defeated by multi-host lines (one
+/// hosts line may carry dozens of hostnames, each becoming a rule), and
+/// the byte cap prices input, not storage. Measured worst legal shape:
+/// 684k lines / 256 MiB of input yielded 43.8M rules — 22x more rules
+/// than lines and 44x the design's own stated ceiling for a blocklist
+/// (10^4–10^6 domains, design §4). 4M is comfortably above every real
+/// list and caps the hostile case at roughly 250 MB of rule storage.
+pub const MAX_HOSTS_RULES: u64 = 4_000_000;
 
 /// Which list a rule belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +107,23 @@ pub enum ListKind {
 pub enum DomainListPolicy {
     Exact,
     Suffix,
+}
+
+/// What an UNMARKED token means for a given caller. The leading-dot
+/// marker always overrides it; this is only the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuleKind {
+    Exact,
+    Suffix,
+}
+
+impl From<DomainListPolicy> for RuleKind {
+    fn from(p: DomainListPolicy) -> Self {
+        match p {
+            DomainListPolicy::Exact => RuleKind::Exact,
+            DomainListPolicy::Suffix => RuleKind::Suffix,
+        }
+    }
 }
 
 /// Filter decision for a query name.
@@ -317,17 +358,20 @@ impl FilterEngine {
     /// Returns `false` when the name failed normalization. `false` from
     /// config input is a LOUD CONFIG ERROR (the operator's rule vanished)
     /// — the daemon must surface it as such, never log-and-continue.
-    fn add_rule(&mut self, kind: ListKind, token: &str) -> bool {
-        if let Some(suffix) = token.strip_prefix('.') {
-            match kind {
-                ListKind::Allow => self.add_allow(suffix),
-                ListKind::Block => self.add_block(suffix),
-            }
-        } else {
-            match kind {
-                ListKind::Allow => self.add_allow_exact(token),
-                ListKind::Block => self.add_block_exact(token),
-            }
+    fn add_rule(&mut self, kind: ListKind, token: &str, default: RuleKind) -> bool {
+        // An explicit leading dot ALWAYS requests a suffix rule; without
+        // one the source's policy decides. Folding the per-source default
+        // in here is what lets the domain-list loader share this function
+        // instead of reimplementing the marker — see the doc above.
+        let (name, suffix) = match token.strip_prefix('.') {
+            Some(rest) => (rest, true),
+            None => (token, default == RuleKind::Suffix),
+        };
+        match (kind, suffix) {
+            (ListKind::Allow, true) => self.add_allow(name),
+            (ListKind::Allow, false) => self.add_allow_exact(name),
+            (ListKind::Block, true) => self.add_block(name),
+            (ListKind::Block, false) => self.add_block_exact(name),
         }
     }
 
@@ -337,13 +381,13 @@ impl FilterEngine {
     /// marker as an empty label and the rule would silently vanish.
     /// `false` = malformed config value; treat as a loud config error.
     pub fn add_allow_rule(&mut self, token: &str) -> bool {
-        self.add_rule(ListKind::Allow, token)
+        self.add_rule(ListKind::Allow, token, RuleKind::Exact)
     }
 
     /// Add one blocklist rule in config syntax — see
     /// [`add_allow_rule`](Self::add_allow_rule).
     pub fn add_block_rule(&mut self, token: &str) -> bool {
-        self.add_rule(ListKind::Block, token)
+        self.add_rule(ListKind::Block, token, RuleKind::Exact)
     }
 
     /// Load a hosts-format file into the given list with the default line
@@ -360,28 +404,33 @@ impl FilterEngine {
     /// written with a leading dot (`.evil.example`) becomes a suffix rule
     /// matching the host and all subdomains.
     ///
-    /// Runs in O(lines): one pass, hash inserts only — no per-line rescans,
-    /// so a 10⁶-line list loads in seconds. Bounded by BOTH
-    /// [`MAX_HOSTS_LINES`] and [`MAX_HOSTS_BYTES`]: a line cap alone does
-    /// not bound memory, because escaping inflates one stored wire octet
-    /// to up to 4 presentation chars.
+    /// Runs in O(RULES), not O(lines) — one hash insert per hostname, and
+    /// a hosts line may carry many. Measured: 684k lines carrying 43.8M
+    /// rules took 144.6 s of blocking single-threaded load, so "a 10⁶-line
+    /// list loads in seconds" (an earlier revision of this sentence) holds
+    /// only for one-host-per-line input. Bounded by ALL THREE of
+    /// [`MAX_HOSTS_LINES`], [`MAX_HOSTS_BYTES`] and [`MAX_HOSTS_RULES`];
+    /// the rule cap is the one that bounds memory and load time.
     pub fn load_hosts<R: BufRead>(&mut self, kind: ListKind, reader: R) -> io::Result<HostsLoadStats> {
-        self.load_hosts_with_limit(kind, reader, MAX_HOSTS_LINES, MAX_HOSTS_BYTES)
+        self.load_hosts_with_limit(kind, reader, MAX_HOSTS_LINES, MAX_HOSTS_BYTES, MAX_HOSTS_RULES)
     }
 
     /// Like [`load_hosts`](Self::load_hosts) with explicit caps (exposed
     /// so tests can exercise truncation without a 2M-line fixture). The
-    /// byte budget counts input bytes (including newlines); the stored
-    /// rules are substrings of the input, so this bounds their memory too.
+    /// byte budget counts INPUT bytes (including newlines) and bounds only
+    /// those; rules are owned lowercased `String`s, not substrings of the
+    /// input, so rule memory is bounded by the rule cap instead — see
+    /// [`MAX_HOSTS_BYTES`] for the measured factor.
     pub fn load_hosts_with_limit<R: BufRead>(
         &mut self,
         kind: ListKind,
         reader: R,
         max_lines: u64,
         max_bytes: u64,
+        max_rules: u64,
     ) -> io::Result<HostsLoadStats> {
-        self.ingest_lines(reader, max_lines, max_bytes, |engine, line| {
-            engine.parse_hosts_line(kind, line)
+        self.ingest_lines(reader, max_lines, max_bytes, max_rules, |engine, line, room| {
+            engine.parse_hosts_line(kind, line, room)
         })
     }
 
@@ -399,7 +448,14 @@ impl FilterEngine {
         reader: R,
         policy: DomainListPolicy,
     ) -> io::Result<HostsLoadStats> {
-        self.load_domain_list_with_limit(kind, reader, policy, MAX_HOSTS_LINES, MAX_HOSTS_BYTES)
+        self.load_domain_list_with_limit(
+            kind,
+            reader,
+            policy,
+            MAX_HOSTS_LINES,
+            MAX_HOSTS_BYTES,
+            MAX_HOSTS_RULES,
+        )
     }
 
     /// Like [`load_domain_list`](Self::load_domain_list) with explicit
@@ -411,8 +467,9 @@ impl FilterEngine {
         policy: DomainListPolicy,
         max_lines: u64,
         max_bytes: u64,
+        max_rules: u64,
     ) -> io::Result<HostsLoadStats> {
-        self.ingest_lines(reader, max_lines, max_bytes, |engine, line| {
+        self.ingest_lines(reader, max_lines, max_bytes, max_rules, |engine, line, _room| {
             engine.parse_domain_list_line(kind, line, policy)
         })
     }
@@ -427,7 +484,8 @@ impl FilterEngine {
         reader: R,
         max_lines: u64,
         max_bytes: u64,
-        mut parse: impl FnMut(&mut Self, &str) -> (u64, u64),
+        max_rules: u64,
+        mut parse: impl FnMut(&mut Self, &str, u64) -> (u64, u64),
     ) -> io::Result<HostsLoadStats> {
         let mut stats = HostsLoadStats::default();
         // BOUND THE SOURCE, not just the accounting (round-3 closure
@@ -453,8 +511,21 @@ impl FilterEngine {
             }
             stats.lines_read += 1;
             stats.bytes_read += line_bytes;
-            let (added, rejected) = parse(self, &line);
+            let (added, rejected) = parse(self, &line, max_rules.saturating_sub(stats.rules_added));
             stats.rules_added += added;
+            // RULE budget (round-3 closure review, U09). Memory is
+            // proportional to RULES, not to input bytes or lines: one hosts
+            // line may carry dozens of hostnames, so neither of the other
+            // two caps binds. Checked AFTER the line so a line is never
+            // half-ingested, and reported through the same `truncated` flag.
+            if stats.rules_added >= max_rules {
+                stats.truncated = true;
+                stats.hosts_rejected += rejected;
+                if added == 0 {
+                    stats.lines_skipped += 1;
+                }
+                break;
+            }
             stats.hosts_rejected += rejected;
             if added == 0 {
                 stats.lines_skipped += 1;
@@ -489,7 +560,7 @@ impl FilterEngine {
     }
 
     /// Parse one hosts line; returns `(rules added, hosts rejected)`.
-    fn parse_hosts_line(&mut self, kind: ListKind, line: &str) -> (u64, u64) {
+    fn parse_hosts_line(&mut self, kind: ListKind, line: &str, room: u64) -> (u64, u64) {
         // Strip inline comments first: everything from '#' onward is dead.
         let body = match line.find('#') {
             Some(i) => &line[..i],
@@ -507,9 +578,17 @@ impl FilterEngine {
         let mut added = 0u64;
         let mut rejected = 0u64;
         for host in tokens {
+            // The rule budget binds WITHIN the line, not just between
+            // lines: one hosts line may carry millions of hostnames (line
+            // length is bounded only by the byte budget), so a
+            // between-lines check alone would let a single line blow past
+            // the cap by an unbounded amount.
+            if added >= room {
+                break;
+            }
             // Hosts entries are EXACT rules (Pi-hole semantics); only the
             // explicit leading-dot marker requests a suffix rule.
-            if self.add_rule(kind, host) {
+            if self.add_rule(kind, host, RuleKind::Exact) {
                 added += 1;
             } else {
                 rejected += 1;
@@ -539,18 +618,11 @@ impl FilterEngine {
             // the whole line would silently store garbage).
             return (0, 1);
         }
-        let ok = if token.starts_with('.') || policy == DomainListPolicy::Suffix {
-            let name = token.strip_prefix('.').unwrap_or(token);
-            match kind {
-                ListKind::Allow => self.add_allow(name),
-                ListKind::Block => self.add_block(name),
-            }
-        } else {
-            match kind {
-                ListKind::Allow => self.add_allow_exact(token),
-                ListKind::Block => self.add_block_exact(token),
-            }
-        };
+        // ONE implementation of the marker (round-3 closure review, U11):
+        // this used to be a 12-line inline copy that could drift from
+        // `add_rule`, while the doc on `add_rule` claimed every caller
+        // went through it.
+        let ok = self.add_rule(kind, token, RuleKind::from(policy));
         if ok { (1, 0) } else { (0, 1) }
     }
 }
@@ -589,10 +661,15 @@ pub struct HostsLoadStats {
     pub bytes_read: u64,
     pub rules_added: u64,
     pub lines_skipped: u64,
-    /// Individual host entries dropped as malformed while their line
-    /// still produced at least one rule (so the line is NOT in
-    /// `lines_skipped`). Non-zero means part of a list silently did not
-    /// become protection — the loader warns when this moves.
+    /// Individual host ENTRIES rejected as malformed, whether or not
+    /// their line produced any rule. This and `lines_skipped` are counted
+    /// independently and DO overlap: `lines_skipped` counts LINES that
+    /// yielded no rule (including blank and comment lines), so a line on
+    /// which every entry is malformed is counted in both — and for
+    /// one-domain-per-line input that is always the case. An earlier
+    /// revision of this comment claimed the line is NOT in
+    /// `lines_skipped`; it is. Non-zero means part of a list silently did
+    /// not become protection — the loader warns when this moves.
     pub hosts_rejected: u64,
     /// True when the input exceeded a budget (line cap or byte budget)
     /// and was cut short.
@@ -602,6 +679,104 @@ pub struct HostsLoadStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REGRESSION (U09). Memory is proportional to RULES, and neither the
+    /// line cap nor the byte cap binds them: ONE hosts line may carry
+    /// dozens of hostnames. Measured at the real budget, 256 MiB of input
+    /// produced 43.8M rules and 2.36 GB resident under a comment claiming
+    /// the byte budget bounded rule memory "to well under this figure".
+    ///
+    /// Asserts the PROPERTY, so a byte-or-line-only implementation fails:
+    /// the rule cap binds while the other two are wide open.
+    #[test]
+    fn rule_budget_binds_what_line_and_byte_caps_cannot() {
+        const RULES: u64 = 50;
+        // 20 lines x 64 hosts = 1280 candidate rules from only 20 lines.
+        let mut input = String::new();
+        for line in 0..20u32 {
+            input.push_str("0.0.0.0");
+            for host in 0..64u32 {
+                input.push_str(&format!(" h{line}x{host}.example"));
+            }
+            input.push('\n');
+        }
+        let mut engine = FilterEngine::new();
+        let stats = engine
+            .load_hosts_with_limit(
+                ListKind::Block,
+                io::BufReader::new(input.as_bytes()),
+                u64::MAX, // line cap wide open
+                u64::MAX, // byte cap wide open
+                RULES,
+            )
+            .expect("load");
+        assert!(
+            stats.rules_added <= RULES,
+            "rule cap did not bind: {stats:?}"
+        );
+        assert!(stats.truncated, "hitting the rule cap must be reported: {stats:?}");
+        assert!(
+            stats.lines_read < 20,
+            "the cap must stop mid-list, not after it: {stats:?}"
+        );
+    }
+
+    /// REGRESSION (U11). `add_rule`'s doc claimed to be THE shared
+    /// implementation of the leading-dot marker while the domain-list
+    /// loader carried its own 12-line copy that could drift. The three
+    /// entry points must agree on what the marker means.
+    #[test]
+    fn leading_dot_marker_means_the_same_thing_on_every_entry_point() {
+        // (a) config/IPC surface
+        let mut cfg = FilterEngine::new();
+        assert!(cfg.add_block_rule(".evil.example"));
+        assert_eq!(cfg.decide("sub.evil.example"), Decision::Block, "config: suffix");
+        let mut cfg_exact = FilterEngine::new();
+        assert!(cfg_exact.add_block_rule("evil.example"));
+        assert_eq!(
+            cfg_exact.decide("sub.evil.example"),
+            Decision::Allow,
+            "config: bare token is EXACT"
+        );
+
+        // (b) hosts loader
+        let mut hosts = FilterEngine::new();
+        hosts
+            .load_hosts(ListKind::Block, io::BufReader::new("0.0.0.0 .evil.example
+".as_bytes()))
+            .expect("load");
+        assert_eq!(hosts.decide("sub.evil.example"), Decision::Block, "hosts: suffix");
+
+        // (c) domain list, Exact policy — the marker still overrides it
+        let mut dl = FilterEngine::new();
+        dl.load_domain_list(
+            ListKind::Block,
+            io::BufReader::new(".evil.example
+".as_bytes()),
+            DomainListPolicy::Exact,
+        )
+        .expect("load");
+        assert_eq!(
+            dl.decide("sub.evil.example"),
+            Decision::Block,
+            "domain list: an explicit marker beats an Exact source policy"
+        );
+
+        // (d) domain list, Suffix policy — an UNMARKED token follows it
+        let mut dl2 = FilterEngine::new();
+        dl2.load_domain_list(
+            ListKind::Block,
+            io::BufReader::new("evil.example
+".as_bytes()),
+            DomainListPolicy::Suffix,
+        )
+        .expect("load");
+        assert_eq!(
+            dl2.decide("sub.evil.example"),
+            Decision::Block,
+            "domain list: an unmarked token follows the source policy"
+        );
+    }
 
     /// A `BufRead` that records how many bytes were actually taken from the
     /// SOURCE, so a memory-budget claim can be measured rather than
@@ -652,7 +827,7 @@ mod tests {
 
         let mut engine = FilterEngine::new();
         let stats = engine
-            .load_hosts_with_limit(ListKind::Block, reader, u64::MAX, BUDGET)
+            .load_hosts_with_limit(ListKind::Block, reader, u64::MAX, BUDGET, u64::MAX)
             .expect("load must not error");
 
         let pulled = consumed.load(Ordering::SeqCst);
@@ -916,7 +1091,7 @@ mod tests {
         let mut engine = FilterEngine::new();
         let input = "0.0.0.0 a.example\n0.0.0.0 b.example\n0.0.0.0 c.example\n";
         let stats = engine
-            .load_hosts_with_limit(ListKind::Block, io::BufReader::new(input.as_bytes()), 2, u64::MAX)
+            .load_hosts_with_limit(ListKind::Block, io::BufReader::new(input.as_bytes()), 2, u64::MAX, u64::MAX)
             .expect("load");
         assert!(stats.truncated);
         assert_eq!(stats.lines_read, 2);
@@ -982,6 +1157,7 @@ mod tests {
                 io::BufReader::new(input.as_bytes()),
                 u64::MAX,
                 input_bytes - 20,
+                u64::MAX,
             )
             .expect("load");
         assert!(stats.truncated, "byte budget cut the input short");
@@ -1011,6 +1187,7 @@ mod tests {
                 io::BufReader::new(input.as_bytes()),
                 u64::MAX, // line cap out of the way: bytes are the binder
                 1024 * 1024,
+                u64::MAX,
             )
             .expect("load");
         assert!(stats.truncated);

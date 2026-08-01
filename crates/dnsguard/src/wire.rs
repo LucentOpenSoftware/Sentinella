@@ -22,6 +22,9 @@ pub const MAX_LABEL_LEN: usize = 63;
 
 pub const TYPE_A: u16 = 1;
 pub const TYPE_AAAA: u16 = 28;
+/// EDNS0 pseudo-record (RFC 6891 §6.1.1). Per-hop transport negotiation,
+/// never cacheable data.
+pub const TYPE_OPT: u16 = 41;
 pub const CLASS_IN: u16 = 1;
 
 pub const RCODE_NOERROR: u8 = 0;
@@ -687,6 +690,114 @@ pub fn build_zero_ip_response(request: &[u8], ttl: u32) -> Option<Vec<u8>> {
     out.extend_from_slice(rdata);
     Some(out)
 }
+
+
+/// Remove every OPT pseudo-record from a response's additional section and
+/// fix ARCOUNT, returning the OPT-free bytes.
+///
+/// WHY, and why on the CACHE path specifically: OPT is a per-hop
+/// transport negotiation between two peers, not data about the name. RFC
+/// 6891 §6.1.1 is explicit — "OPT RRs MUST NOT be cached, forwarded, or
+/// stored in or loaded from master files". Storing the upstream's OPT let
+/// whichever client populated an entry decide what every LATER client
+/// received: a classic stub that sent no OPT was handed one it never
+/// asked for, and an EDNS client could be served an answer with none.
+///
+/// Conservative by construction: anything that does not parse as a clean
+/// additional section is returned unchanged rather than mangled.
+pub fn strip_opt_records(resp: &[u8]) -> Vec<u8> {
+    let Some(info) = additional_section_start(resp) else {
+        return resp.to_vec();
+    };
+    let (ar_start, arcount) = info;
+    if arcount == 0 {
+        return resp.to_vec();
+    }
+    let mut out = resp[..ar_start].to_vec();
+    let mut offset = ar_start;
+    let mut kept = 0u16;
+    for _ in 0..arcount {
+        let Some(rr) = additional_record_span(resp, offset) else {
+            // Unparseable tail: keep the original bytes untouched.
+            return resp.to_vec();
+        };
+        let (end, is_opt) = rr;
+        if !is_opt {
+            out.extend_from_slice(&resp[offset..end]);
+            kept += 1;
+        }
+        offset = end;
+    }
+    // Trailing bytes past the additional section (there should be none)
+    // are preserved so this can never truncate an answer.
+    out.extend_from_slice(&resp[offset..]);
+    out[10..12].copy_from_slice(&kept.to_be_bytes());
+    out
+}
+
+/// Offset at which the additional section begins, plus its record count.
+fn additional_section_start(resp: &[u8]) -> Option<(usize, u16)> {
+    if resp.len() < HEADER_LEN {
+        return None;
+    }
+    let qdcount = read_u16(resp, 4)?;
+    let ancount = read_u16(resp, 6)?;
+    let nscount = read_u16(resp, 8)?;
+    let arcount = read_u16(resp, 10)?;
+    let mut offset = HEADER_LEN;
+    for _ in 0..qdcount {
+        offset = skip_name(resp, offset)?;
+        offset = offset.checked_add(4)?;
+        if offset > resp.len() {
+            return None;
+        }
+    }
+    for _ in 0..(usize::from(ancount) + usize::from(nscount)) {
+        let (end, _) = additional_record_span(resp, offset)?;
+        offset = end;
+    }
+    Some((offset, arcount))
+}
+
+/// End offset of one resource record starting at `offset`, and whether it
+/// is an OPT (type 41).
+fn additional_record_span(resp: &[u8], offset: usize) -> Option<(usize, bool)> {
+    let after_name = skip_name(resp, offset)?;
+    let rtype = read_u16(resp, after_name)?;
+    let rdlen = read_u16(resp, after_name.checked_add(8)?)?;
+    let end = after_name.checked_add(10)?.checked_add(usize::from(rdlen))?;
+    if end > resp.len() {
+        return None;
+    }
+    Some((end, rtype == TYPE_OPT))
+}
+
+/// Append one minimal EDNS0 OPT to a response and bump ARCOUNT: root
+/// name, type 41, class = the requester's clamped UDP size, DO reflected
+/// in the extended-flags half of the TTL field, empty rdata.
+///
+/// Applied on EGRESS to every response we emit, so OPT presence is decided
+/// by THE REQUESTER rather than by whoever populated the cache. Callers
+/// must have stripped any inherited OPT first (see
+/// [`strip_opt_records`]); this never removes one.
+pub fn append_client_opt(resp: &mut Vec<u8>, udp_size: u16, dnssec_ok: bool) {
+    if resp.len() < HEADER_LEN {
+        return;
+    }
+    let Some(arcount) = read_u16(resp, 10) else {
+        return;
+    };
+    let Some(next) = arcount.checked_add(1) else {
+        return;
+    };
+    resp.extend_from_slice(&[0x00]); // root name
+    resp.extend_from_slice(&TYPE_OPT.to_be_bytes());
+    resp.extend_from_slice(&udp_size.to_be_bytes()); // class = payload size
+    resp.extend_from_slice(&[0, 0, if dnssec_ok { 0x80 } else { 0 }, 0]); // ttl
+    resp.extend_from_slice(&[0, 0]); // rdlength
+    resp[10..12].copy_from_slice(&next.to_be_bytes());
+}
+
 
 #[cfg(test)]
 mod tests {

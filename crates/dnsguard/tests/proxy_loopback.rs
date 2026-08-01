@@ -2527,3 +2527,112 @@ async fn formerr_over_tcp_is_also_retried_without_opt() {
     );
     proxy.stop().await;
 }
+
+/// REGRESSION (round-3 closure review, U06). OPT is a per-hop transport
+/// negotiation, and the cache stored whatever OPT the upstream sent — so
+/// the FIRST client to populate an entry decided what every later client
+/// received. Both directions are asserted, because fixing only one is how
+/// this class survives.
+#[tokio::test]
+async fn opt_presence_is_decided_by_the_requester_not_by_the_cache() {
+    // A compliant upstream: mirrors OPT presence, as real resolvers do.
+    let (upstream, _calls) = spawn_udp_upstream(|q: &[u8]| {
+        let mut resp = canned_a_response(q, 300, false);
+        if u16::from_be_bytes([q[10], q[11]]) > 0 {
+            resp[11] = 1; // arcount = 1
+            resp.extend_from_slice(&[0x00, 0x00, 0x29, 0x10, 0x00, 0, 0, 0, 0, 0, 0]);
+        }
+        Some(resp)
+    })
+    .await;
+    let proxy = start_proxy(FilterEngine::new(), config_for(vec![upstream])).await;
+    let arcount = |r: &[u8]| u16::from_be_bytes([r[10], r[11]]);
+
+    // (a) an EDNS client populates the entry; a classic stub must NOT then
+    //     receive an OPT it never asked for.
+    let a1 = edns_query(0x9001, "opt-a.example", TYPE_A, 4096, false, false);
+    let r1 = udp_query(proxy.addr, &a1, Duration::from_secs(2)).await;
+    assert_eq!(arcount(&r1), 1, "an EDNS client must get an OPT back");
+    let a2 = wire::build_query(0x9002, "opt-a.example", TYPE_A, CLASS_IN).expect("build");
+    let r2 = udp_query(proxy.addr, &a2, Duration::from_secs(2)).await;
+    assert_eq!(
+        arcount(&r2),
+        0,
+        "a stub that sent no OPT must not be handed one from the cache"
+    );
+
+    // (b) the other direction: a classic stub populates, an EDNS client
+    //     must still get its OPT.
+    let b1 = wire::build_query(0x9003, "opt-b.example", TYPE_A, CLASS_IN).expect("build");
+    let s1 = udp_query(proxy.addr, &b1, Duration::from_secs(2)).await;
+    assert_eq!(arcount(&s1), 0);
+    let b2 = edns_query(0x9004, "opt-b.example", TYPE_A, 4096, false, false);
+    let s2 = udp_query(proxy.addr, &b2, Duration::from_secs(2)).await;
+    assert_eq!(
+        arcount(&s2),
+        1,
+        "an EDNS client must get an OPT even when a no-OPT client populated the entry"
+    );
+
+    // The block path is a sibling sink, not the cache — check it too.
+    let c = edns_query(0x9005, CANARY_DOMAIN, TYPE_A, 4096, false, false);
+    let rc = udp_query(proxy.addr, &c, Duration::from_secs(2)).await;
+    assert_eq!(
+        arcount(&rc),
+        1,
+        "the locally synthesized canary answer must also carry the client's OPT"
+    );
+    proxy.stop().await;
+}
+
+/// REGRESSION (round-3 closure review, U01). The canary counter delta was
+/// asserted with EXACT equality, and the bump is not gated on `synthetic`,
+/// so a canary query from any other local process inside the window reds a
+/// healthy proxy — and the design's own operator acceptance test is
+/// defined to send exactly that query. The check is a LOWER bound now:
+/// inflation cannot disprove that we served our own probes.
+#[tokio::test]
+async fn concurrent_canary_traffic_does_not_red_a_healthy_self_test() {
+    let (upstream, _calls) = spawn_udp_upstream(|q| Some(canned_a_response(q, 60, false))).await;
+    let proxy = Proxy::bind(
+        config_for(vec![upstream]),
+        FilterEngine::new(),
+        Arc::new(NoopDecisionHook),
+    )
+    .await
+    .expect("bind");
+    let addr = proxy.local_addr();
+    let counters = proxy.counters();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_task = Arc::clone(&stop);
+    let flood = tokio::spawn(async move {
+        let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind flood");
+        let q = wire::build_query(0xBEEF, CANARY_DOMAIN, TYPE_A, CLASS_IN).expect("build");
+        while !stop_task.load(Ordering::SeqCst) {
+            let _ = sock.send_to(&q, addr).await;
+            // Deliberately gentle: the property needs SOME probe inside
+            // the window, not volume. A tight loop here starves the shared
+            // test runtime and destabilizes unrelated tests.
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    });
+
+    let before = counters.snapshot().canary_probes;
+    let report = proxy.self_test().await;
+    let moved = counters.snapshot().canary_probes - before;
+    stop.store(true, Ordering::SeqCst);
+    let _ = flood.await;
+
+    // Non-vacuity guard: if the flood never landed inside the window there
+    // was nothing to be robust against, and this test proved nothing.
+    assert!(
+        moved > 2,
+        "flood did not reach the self-test window (moved {moved}); test is inconclusive"
+    );
+    assert!(
+        report.filter_ok,
+        "concurrent canary traffic must not red a healthy proxy: {report:?}"
+    );
+    assert!(report.ok(), "{report:?}");
+}

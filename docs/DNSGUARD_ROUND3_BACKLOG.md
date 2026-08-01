@@ -554,13 +554,50 @@ green). In commit order:
 What is NOT closed is the unverified tail below. It is the honest
 remainder of this round.
 
-Plus **15 unverified** lower-severity findings from the same review
-(EDNS-capability not in the cache key, the `(DO,CD)` fork against a
-fixed capacity with no eviction, `canary_probes` exact-equality races,
-step (iv) cannot tell "TCP dead" from "TCP busy", `hosts_rejected`
-double-counting, two implementations of the leading-dot marker, and
-others). They were never adversarially checked — treat them as
-hypotheses and refute the wrong ones.
+## The 15 unverified: now settled
+
+All fifteen went through the same adversarial verification: one skeptic
+each, instructed to refute, told the findings were six commits stale and
+that "already fixed at HEAD" counts as a refutation.
+
+**7 confirmed, 8 refuted.** Four refutations were "already fixed" by the
+commits between `6bffb6f` and `70f9f79` (U02, U05, U12, U14). Four were
+wrong on the merits: U03 (the canary escape hatch), U04 (step (iv)
+red-on-busy is the intended fail-closed behaviour), U07 (cache-fork
+eviction leverage, materially milder than claimed) and U13 (a NODATA
+`health_check_name` — mechanism real, severity LOW, no fix warranted).
+
+The seven confirmed are fixed:
+
+- **U09 (MEDIUM)** — `MAX_HOSTS_BYTES` claimed to bound rule memory; it
+  bounds INPUT. Rules are owned lowercased `String`s, not substrings.
+  Measured at the real budget: 256 MiB of input produced 43.8M rules,
+  **2.36 GB resident / 2.91 GB peak** (9.2x/11.4x) and 144.6 s of
+  blocking load. Neither existing cap binds rules, because one hosts line
+  may carry dozens of hostnames. Added `MAX_HOSTS_RULES` (4M), enforced
+  WITHIN a line as well as between lines. Corrected the memory claim and
+  the "O(lines) ... loads in seconds" claim, the same unit error.
+- **U01 (LOW)** — the canary delta used EXACT equality and the bump is not
+  gated on `synthetic`, so any concurrent canary query reds a healthy
+  proxy, including the one the design's own acceptance test sends. Now a
+  lower bound; an impostor still reds, because it leaves our counter at 0.
+- **U06 (LOW)** — the cache stored the upstream's OPT, so whichever client
+  populated an entry decided what every later one received. Fixed as DATA:
+  OPTs stripped before storing (RFC 6891 6.1.1) and exactly one re-added
+  on egress iff THIS requester sent one, covering all six response paths.
+  An EDNS bit in the cache key would have fixed one sink of six.
+- **U11 (LOW)** — `add_rule` claimed to be THE shared implementation of the
+  leading-dot marker while the domain-list loader kept its own copy. Made
+  the claim true rather than softening it.
+- **U08, U10, U15 (LOW)** — documentation. The lifetime clock starts at
+  permit acquisition, so accept-to-close age is queue timeout + lifetime;
+  moving the clock would kill queued clients mid-answer. `hosts_rejected`
+  does overlap `lines_skipped`, always, for one-domain-per-line input.
+
+U01, U06 and U09 are revert-verified. **U11's test is a characterization
+test, not a regression test** — the two implementations happened to agree,
+so it pins the shared semantics against future drift rather than proving a
+fixed bug. U08, U10 and U15 are prose and have no test.
 
 ## The pattern worth carrying forward
 
