@@ -183,14 +183,38 @@ pub fn spawn_watchdog(
             }
             tick += 1;
 
-            let before = counters.snapshot().canary_probes;
+            let before = counters.snapshot();
             let answered = probe_canary(listen).await;
-            let moved = counters.snapshot().canary_probes > before;
+            let after = counters.snapshot();
+            let moved = after.canary_probes > before.canary_probes;
             // The signature alone can be forged by whatever owns the port;
             // the counter delta proves OUR process served it. See the note
             // on WATCHDOG_STRIKES for why these two fail together rather
             // than independently.
-            let serving = answered && moved;
+            let mut serving = answered && moved;
+
+            // BUSY IS NOT DEAD. If the probe failed but the process is
+            // visibly still doing work, it is shedding, not gone — and a
+            // shed probe is byte-identical to a dead one from out here.
+            //
+            // This is not hypothetical: an unprivileged local process can
+            // saturate the UDP in-flight pool at will, which knocks out
+            // BOTH halves of the check above at once (the shed path answers
+            // SERVFAIL without ever reaching handle_query, so no signature
+            // and no counter bump). Without this clause, any local process
+            // could hold that for a minute and make the watchdog remove the
+            // rule — permanently disabling web protection until a restart.
+            //
+            // Deliberately asymmetric: this can only ever RESCUE a strike,
+            // never cause one. A genuinely dead serving task moves no
+            // counters at all, so it still strikes normally.
+            if !serving && (after.queries > before.queries || after.shed > before.shed) {
+                warn!(
+                    shed_delta = after.shed - before.shed,
+                    "web protection: canary probe failed but the proxy is still serving traffic                      — treating as overload, not death"
+                );
+                serving = true;
+            }
 
             let resolving = if tick.is_multiple_of(RESOLVE_EVERY) {
                 if health_name_is_allowed(&engine, &health_check_name) {

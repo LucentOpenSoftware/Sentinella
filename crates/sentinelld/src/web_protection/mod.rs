@@ -27,19 +27,22 @@
 //! rollback. Every surface that reports on web protection reports BOTH,
 //! and nothing derives one from the other.
 //!
-//! # What is here, and what is deliberately not
+//! # What is here
 //!
-//! This commit is the daemon side ONLY. It contains no NRPT code, creates
-//! no scheduled task, and writes no registry keys — so nothing it can do,
-//! including failing completely, can cost the machine its DNS. Enabling it
-//! starts a proxy on `127.0.0.1:53` that nothing points at; you reach it by
-//! asking it directly (`nslookup name 127.0.0.1`).
+//! The whole daemon side, including rule installation. `enabled = false`
+//! by default; when enabled and healthy this DOES point the machine's DNS
+//! at the local proxy.
 //!
-//! The rule itself cannot land until its remover exists. The sequence is:
-//! (A) this commit; (B) the installer registers the reconciler task and
-//! ships the reconciler binary; (C) the daemon installs and removes rules,
-//! with the task's existence as a hard precondition. No intermediate state
-//! of that sequence can leave a live rule with no remover.
+//! Two hard preconditions gate that, and both are in `rule.rs`: the
+//! four-step self-test must pass, and the boot reconciler's scheduled task
+//! must exist and be enabled. The second is why a development build
+//! installs nothing — `cargo run` has no MSI, so no task, so no rule.
+//!
+//! Three mechanisms can take the rule away, and they cover different
+//! failures: `stop()` on orderly shutdown, the watchdog while the daemon
+//! runs but the proxy stops working, and the out-of-process boot
+//! reconciler for everything else — crash, kill, disabled service,
+//! quarantined binary, power loss.
 
 pub mod config;
 pub mod rule;

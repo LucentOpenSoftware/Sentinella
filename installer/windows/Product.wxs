@@ -3,8 +3,8 @@
   Sentinella Antivirus — Windows Installer (WiX 4)
 
   Build requires:
-  - WiX Toolset v4 (dotnet tool install --global wix)
-  - Release binaries: cargo build --workspace --release
+  - WiX Toolset v4 (dotnet tool install -g wix)
+  - Release binaries: cargo build (workspace, release profile)
   - ClamAV DLLs in target/release/ or build/clamav/
   - YARA rules in runtime/argus/rules/yara/
 
@@ -246,20 +246,40 @@
          binaries first would delete the thing that knows how to remove the
          rule. Both actions are therefore sequenced BEFORE RemoveFiles,
          while the executable still exists. -->
+    <!-- Return="check", NOT "ignore". A failure here ABORTS the uninstall,
+         on purpose, and that is what gives the ladder a rung.
+
+         The previous version used Return="ignore" with a comment claiming
+         "the task survives and the next boot retries". It does not: with
+         ignore, the MSI continues into RemoveFiles, which deletes
+         sentinella-dnsreconcile.exe - so the surviving task points at a
+         binary that no longer exists, and nothing can ever remove the rule.
+         That is the exact stranded state this whole design prevents,
+         reached through the uninstall path.
+
+         With check, the sequence stops BEFORE RemoveFiles. Binaries and
+         task both remain, the rule is still named, the next boot reconciles
+         it away, and a retried uninstall then succeeds because the
+         removal action is idempotent. Aborting is the unfriendly-but-recoverable outcome;
+         continuing is the unrecoverable one. -->
     <CustomAction Id="RemoveNrptRule"
                   FileRef="DnsReconcilerExeFile"
                   ExeCommand="--remove"
                   Execute="deferred"
                   Impersonate="no"
-                  Return="ignore" />
+                  Return="check" />
 
-    <!-- Return="ignore" above is NOT a decision to proceed regardless: the
-         binary itself refuses to unregister the task while a rule is still
-         installed, and exits non-zero. That check lives in the binary
-         rather than in this sequencing precisely because sequencing is
-         what a future edit gets wrong. If rule removal failed, this action
-         fails too, the task survives, and the next boot retries - which is
-         the intended ladder. -->
+    <!-- Return="ignore" HERE is correct, and for a different reason than
+         above: by this point the rule is gone (the previous action would
+         have aborted otherwise), so a task that fails to unregister is
+         litter, not a hazard - an orphaned task whose binary is about to be
+         deleted simply exits non-zero at each boot. Blocking an uninstall
+         over litter would be the wrong trade.
+
+         The binary ALSO refuses to unregister itself while a rule is still
+         installed. That check lives in the binary rather than in this
+         sequencing precisely because sequencing is what a future edit gets
+         wrong, and it holds for a hand-run command too. -->
     <CustomAction Id="RemoveDnsReconcileTask"
                   FileRef="DnsReconcilerExeFile"
                   ExeCommand="--remove-task"

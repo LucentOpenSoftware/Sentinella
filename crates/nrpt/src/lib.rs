@@ -203,28 +203,68 @@ pub fn install_rule(guid: &str, namespace: &str, servers: &[std::net::IpAddr]) -
     )
 }
 
-/// Is the boot reconciler's scheduled task registered?
+/// Is the boot reconciler's scheduled task registered AND able to run?
 ///
-/// Checked by looking for the task's definition file rather than by
-/// spawning `schtasks /Query`: this is called on the daemon's startup path,
-/// and this product's own ARGUS treats schtasks invocation as a persistence
-/// signal — there is no reason to make our own detection noisier to answer
-/// a question the filesystem already answers.
+/// Checked by reading the task's definition file rather than spawning
+/// `schtasks /Query`: this is on the daemon's startup path, and this
+/// product's own ARGUS treats schtasks invocation as a persistence signal —
+/// there is no reason to make our own detection noisier to answer a
+/// question the filesystem already answers.
 ///
-/// A wrong answer here is asymmetric, which is why the simple check is the
-/// right one: a false "missing" costs FILTERING (we refuse to install a
-/// rule), while a false "present" would cost DNS. The cheap check fails in
-/// the safe direction.
+/// EXISTENCE IS NOT ENOUGH, and an earlier version of this function got
+/// that wrong. Disabling a scheduled task does NOT remove its definition
+/// file; it rewrites the file with `<Enabled>false</Enabled>`. So a
+/// presence check returned true for a task that will never fire, and the
+/// precondition it guards — "nothing could remove the rule if the service
+/// stopped" — did not hold. Verified on a live machine: five disabled
+/// system tasks, all five with their definition file still present.
+///
+/// The parse is deliberately crude and deliberately conservative: ANY
+/// `<Enabled>false</Enabled>` in the document means "do not rely on this
+/// task". A trigger-level disable is as fatal to us as a task-level one,
+/// and being wrong in this direction costs FILTERING (we refuse to install
+/// a rule), never DNS.
 pub fn reconciler_task_installed() -> bool {
     let Ok(root) = std::env::var("SystemRoot") else {
         return false;
     };
-    std::path::Path::new(&root)
+    let path = std::path::Path::new(&root)
         .join("System32")
         .join("Tasks")
         .join("Sentinella")
-        .join("DnsReconcile")
-        .exists()
+        .join("DnsReconcile");
+    let Ok(bytes) = std::fs::read(&path) else {
+        return false;
+    };
+    task_definition_is_enabled(&bytes)
+}
+
+/// Does this task definition describe a task that will actually run?
+///
+/// Split out so it can be tested without a registered task. Task Scheduler
+/// writes these files as UTF-16LE with a BOM, but tolerates UTF-8, so both
+/// are decoded.
+fn task_definition_is_enabled(bytes: &[u8]) -> bool {
+    let text = decode_task_xml(bytes);
+    if text.is_empty() {
+        // Unreadable is not "enabled". Refusing costs filtering only.
+        return false;
+    }
+    // Whitespace between the tags is legal XML, so normalise before
+    // looking. A crude contains() would miss `<Enabled> false </Enabled>`.
+    let squashed: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    !squashed.contains("<Enabled>false</Enabled>")
+}
+
+fn decode_task_xml(bytes: &[u8]) -> String {
+    if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
+        let units: Vec<u16> = bytes[2..]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        return String::from_utf16_lossy(&units);
+    }
+    String::from_utf8_lossy(bytes).into_owned()
 }
 
 /// Every rule GUID currently present — ours and other people's.
@@ -410,6 +450,49 @@ mod tests {
             install_rule(r"..\..\evil", NAMESPACE_ALL, &["1.1.1.1".parse().unwrap()]),
             Err(Error::MalformedGuid(_))
         ));
+    }
+
+    /// REGRESSION. Disabling a scheduled task does not remove its
+    /// definition file - it rewrites it with an Enabled-false setting. The
+    /// old presence check therefore returned true for a task that would
+    /// never fire, and the precondition it guards did not hold.
+    #[test]
+    fn a_disabled_task_definition_is_not_usable() {
+        let enabled = b"<Task><Settings><Enabled>true</Enabled></Settings></Task>";
+        let disabled = b"<Task><Settings><Enabled>false</Enabled></Settings></Task>";
+        assert!(task_definition_is_enabled(enabled));
+        assert!(!task_definition_is_enabled(disabled));
+    }
+
+    /// Whitespace between tags is legal XML; a naive contains() would miss
+    /// it and call a disabled task usable.
+    #[test]
+    fn whitespace_cannot_hide_a_disable() {
+        let spaced = b"<Task><Settings>
+  <Enabled> false </Enabled>
+</Settings></Task>";
+        assert!(!task_definition_is_enabled(spaced));
+    }
+
+    /// Task Scheduler writes UTF-16LE with a BOM. Failing to decode it
+    /// would make a disabled task read as enabled.
+    #[test]
+    fn utf16_definitions_are_decoded() {
+        let mut utf16: Vec<u8> = vec![0xFF, 0xFE];
+        for u in "<Task><Settings><Enabled>false</Enabled></Settings></Task>".encode_utf16() {
+            utf16.extend_from_slice(&u.to_le_bytes());
+        }
+        assert!(
+            !task_definition_is_enabled(&utf16),
+            "a UTF-16 disabled task must not read as enabled"
+        );
+    }
+
+    /// Unreadable is not enabled: refusing costs filtering, never DNS.
+    #[test]
+    fn garbage_is_not_enabled() {
+        assert!(!task_definition_is_enabled(&[]));
+        assert!(!task_definition_is_enabled(&[0xFF, 0xFE]));
     }
 
     /// The precondition check must be cheap and must never panic, whatever

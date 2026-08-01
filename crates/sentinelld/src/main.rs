@@ -495,8 +495,10 @@ async fn run_daemon(
     // and the log, because a daemon that will not start because its DNS
     // filter could not is worse than one that starts with filtering off.
     //
-    // NOTHING is pointed at this listener: no NRPT rule is installed by
-    // this build. Reach it directly to test — `nslookup name 127.0.0.1`.
+    // When this succeeds AND the boot reconciler's task is registered, an
+    // NRPT rule is installed and the machine's DNS goes through the proxy.
+    // Without that task — any development build — it serves but installs
+    // nothing, and you reach it directly: `nslookup name 127.0.0.1`.
     let mut web_protection = web_protection::WebProtection::start(&config.web_protection).await;
     // Publish the read-only half so `webprotection.status` can answer.
     // The subsystem itself stays owned here, because stop() needs &mut and
