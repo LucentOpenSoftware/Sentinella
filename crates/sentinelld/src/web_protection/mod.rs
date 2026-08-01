@@ -41,8 +41,15 @@
 //! with the task's existence as a hard precondition. No intermediate state
 //! of that sequence can leave a live rule with no remover.
 
+// PART 2 OF 3. `upstreams` and `status` are complete and tested but have
+// no caller yet — the proxy lifecycle that consumes them is part 3 of this
+// commit series. The allow is scoped to this module and MUST come out when
+// that lands; if it is still here afterwards, something did not get wired.
+#![allow(dead_code)]
+
 pub mod config;
 pub mod status;
+pub mod upstreams;
 
 pub use config::WebProtectionConfig;
 #[allow(unused_imports)] // consumed by the IPC status surface later in this commit

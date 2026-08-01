@@ -76,6 +76,16 @@ windows = { version = "0.58", features = [
     # was tripping the old detector).
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Gdi",
+    # v0.1.13: web protection needs the machine's real DNS servers to
+    # forward to. GetAdaptersAddresses is the only supported way to read
+    # them; there is no registry location that is correct across DHCP,
+    # VPN tunnels and per-interface overrides. Additive feature on the
+    # `windows` crate already in use — no new dependency.
+    "Win32_NetworkManagement_IpHelper",
+    # IP_ADAPTER_ADDRESSES_LH carries IF_OPER_STATUS/IFTYPE fields from Ndis,
+    # so the whole struct is gated on this feature too.
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
 ] }
 
 [dev-dependencies]

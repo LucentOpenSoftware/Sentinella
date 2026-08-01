@@ -243,7 +243,8 @@ mod tests {
     /// proxy that a later commit would install an NRPT rule for.
     #[test]
     fn malformed_input_disables_rather_than_substituting() {
-        let cases: &[(&str, fn(&mut WebProtectionConfig))] = &[
+        type Mutate = fn(&mut WebProtectionConfig);
+        let cases: &[(&str, Mutate)] = &[
             ("garbage listen", |c| c.listen = "not-an-address".into()),
             ("non-loopback listen", |c| c.listen = "0.0.0.0:53".into()),
             ("port 0", |c| c.listen = "127.0.0.1:0".into()),
