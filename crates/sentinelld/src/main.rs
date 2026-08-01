@@ -490,6 +490,15 @@ async fn run_daemon(
     // Load FISH config from config file.
     server.state().load_fish_config(config.fish.clone());
 
+    // Web protection (DNS-layer filtering). Default-OFF; `start` never
+    // fails the daemon — a refusal is reported through the status surface
+    // and the log, because a daemon that will not start because its DNS
+    // filter could not is worse than one that starts with filtering off.
+    //
+    // NOTHING is pointed at this listener: no NRPT rule is installed by
+    // this build. Reach it directly to test — `nslookup name 127.0.0.1`.
+    let mut web_protection = web_protection::WebProtection::start(&config.web_protection).await;
+
     // Load detection exclusions from config.
     if !config.excluded_detections.is_empty() {
         info!(
@@ -610,6 +619,16 @@ async fn run_daemon(
     };
 
     // Cleanup ALWAYS runs now (both error and stop paths).
+    //
+    // Web protection stops FIRST and is JOINED, unlike the flag-store
+    // stop() of the other subsystems. It matters from commit C onward:
+    // the NRPT rule is removed during shutdown, and removing it while the
+    // sockets are still bound would leave a window where the machine's DNS
+    // points at a listener that is going away. Establishing the rendezvous
+    // now means that commit does not have to change this ordering under
+    // pressure. Bounded at 5s against the SCM's 30s total stop budget.
+    web_protection.stop().await;
+
     if let Some(s) = scheduler {
         s.stop();
     }
