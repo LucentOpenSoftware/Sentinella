@@ -182,6 +182,12 @@ async fn blocked_domain_responds_nxdomain_with_matching_id_and_question() {
 
     assert_eq!(id_of(&resp), 0x1234, "response ID must match request");
     assert_eq!(rcode_of(&resp), RCODE_NXDOMAIN);
+    let flags = u16::from_be_bytes([resp[2], resp[3]]);
+    assert_ne!(
+        flags & wire::FLAG_AA,
+        0,
+        "locally synthesized block answer carries AA=1 (L07 self-identification)"
+    );
     let parsed = wire::parse_query(&query).expect("parse");
     assert_eq!(
         &resp[wire::HEADER_LEN..],
@@ -227,14 +233,59 @@ async fn allowed_domain_is_forwarded_byte_equivalent() {
 
 #[tokio::test]
 async fn canary_is_blocked_even_with_empty_blocklist() {
+    // UPDATED (round 3, A3/L07/L12): the canary is now SHORT-CIRCUITED by
+    // the serving path before cache/filter/forward and answered with the
+    // self-identifying zero-IP signature (NOERROR, AA=1, ancount=1,
+    // 0.0.0.0) under EITHER block policy. The old assertion (NXDOMAIN)
+    // codified the bug: a hard-coded NXDOMAIN expectation is what made the
+    // self-test permanently red under `block_response = "zero_ip"`.
     let (upstream, calls) = spawn_udp_upstream(|q| Some(canned_a_response(q, 60, false))).await;
     let proxy = start_proxy(FilterEngine::new(), config_for(vec![upstream])).await;
 
     let query = wire::build_query(7, CANARY_DOMAIN, TYPE_A, CLASS_IN).expect("build");
     let resp = udp_query(proxy.addr, &query, Duration::from_secs(2)).await;
-    assert_eq!(rcode_of(&resp), RCODE_NXDOMAIN);
     assert_eq!(id_of(&resp), 7);
+    assert_eq!(rcode_of(&resp), RCODE_NOERROR, "canary gets the zero-IP signature");
+    let flags = u16::from_be_bytes([resp[2], resp[3]]);
+    assert_ne!(flags & wire::FLAG_AA, 0, "locally synthesized answer is authoritative");
+    assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 1, "one answer");
+    assert_eq!(&resp[resp.len() - 4..], &[0, 0, 0, 0], "A rdata 0.0.0.0");
     assert_eq!(calls.load(Ordering::SeqCst), 0, "canary never reaches upstream");
+
+    // The signature is independent of the configured block policy.
+    let snap = proxy.counters.snapshot();
+    assert_eq!(snap.canary_probes, 1, "counted in the canary's OWN counter");
+    assert_eq!(snap.blocked, 0, "never a user-facing block");
+    proxy.stop().await;
+}
+
+#[tokio::test]
+async fn canary_never_touches_cache_even_when_engine_lost_the_rule() {
+    // L07: with an engine that lost its canary rule (FilterEngine::default,
+    // zero rules — models a blocklist load that failed), the OLD code
+    // forwarded the canary upstream and cached the upstream's NXDOMAIN for
+    // 60 s. The short-circuit must answer from the signature regardless:
+    // upstream untouched, no cache entry, identical signature twice.
+    let (upstream, calls) = spawn_udp_upstream(|q| {
+        let mut resp = canned_a_response(q, 60, false);
+        resp[3] = 0x83; // NXDOMAIN, like any resolver for .invalid
+        resp[7] = 0; // ancount = 0
+        resp.truncate(resp.len() - 16);
+        Some(resp)
+    })
+    .await;
+    let proxy = start_proxy(FilterEngine::default(), config_for(vec![upstream])).await;
+
+    for id in [1u16, 2] {
+        let query = wire::build_query(id, CANARY_DOMAIN, TYPE_A, CLASS_IN).expect("build");
+        let resp = udp_query(proxy.addr, &query, Duration::from_secs(2)).await;
+        assert_eq!(rcode_of(&resp), RCODE_NOERROR, "signature even without the engine rule");
+        assert_eq!(&resp[resp.len() - 4..], &[0, 0, 0, 0]);
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "canary never leaks upstream");
+    let snap = proxy.counters.snapshot();
+    assert_eq!(snap.canary_probes, 2);
+    assert_eq!(snap.cache_hits, 0, "canary answers are never served from cache");
     proxy.stop().await;
 }
 
@@ -1229,10 +1280,17 @@ async fn self_test_is_green_against_a_healthy_fake_upstream() {
 }
 
 #[tokio::test]
-async fn self_test_reports_dead_upstream_but_healthy_filter() {
-    // The discard port never answers: upstream_ok must be false while the
-    // engine and listener (filter) steps stay green — the report
-    // distinguishes "plumbing works" from "upstream dead".
+async fn self_test_reports_dead_upstream() {
+    // The discard port never answers: upstream_ok must be false. The
+    // engine step stays green — it is purely in-process.
+    //
+    // UPDATED (round 3, A3/L12): this test used to assert filter_ok=true
+    // ("plumbing works even though the upstream is dead"). Step (iii) now
+    // ALSO requires a POSITIVE resolution of health_check_name THROUGH the
+    // listener — a proxy that answers the canary but SERVFAILs everything
+    // else must fail — so with a dead upstream filter_ok is false too.
+    // The granularity the old test relied on ("plumbing vs upstream") is
+    // preserved in `detail`, which names the failing sub-checks.
     let proxy = Proxy::bind(
         config_for(vec![dead_upstream()]),
         FilterEngine::new(),
@@ -1243,7 +1301,10 @@ async fn self_test_reports_dead_upstream_but_healthy_filter() {
     let report = proxy.self_test().await;
     assert!(report.engine_ok, "{report:?}");
     assert!(!report.upstream_ok, "dead upstream must be reported: {report:?}");
-    assert!(report.filter_ok, "{report:?}");
+    assert!(
+        !report.filter_ok,
+        "nothing resolves through the listener with a dead upstream: {report:?}"
+    );
     assert!(!report.ok());
     assert!(!report.detail.is_empty());
 }
@@ -1330,4 +1391,265 @@ async fn self_test_is_red_when_only_one_of_two_upstreams_answers() {
         report.detail.contains(&dead_upstream().to_string()),
         "the detail must name WHICH upstream is dead: {report:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Round 3: A3 + L07 + L12 (unified canary/self-test fix), L10, L05/L09, L08
+// ---------------------------------------------------------------------------
+
+/// REGRESSION (round-3 A3). Step (iii) used to hard-code
+/// `rcode == NXDOMAIN`, so the supported `block_response = "zero_ip"` knob
+/// made the self-test permanently red on a 100%-healthy proxy — and the
+/// design's runtime watchdog would have fired `remove_rule`/`fallback` on
+/// it. The canary is now answered with the zero-IP signature under BOTH
+/// policies, and step (iii) asserts the signature.
+///
+/// Revert-checked: with the old step (iii) assertion this test fails with
+/// `filter_ok: false, detail: "canary through listener did not return
+/// NXDOMAIN"`.
+#[tokio::test]
+async fn self_test_is_green_with_zero_ip_policy() {
+    let (upstream, _calls) = spawn_udp_upstream(|q| Some(canned_a_response(q, 60, false))).await;
+    let mut config = config_for(vec![upstream]);
+    config.block_response = BlockResponse::ZeroIp;
+    let proxy = Proxy::bind(config, FilterEngine::new(), Arc::new(NoopDecisionHook))
+        .await
+        .expect("bind");
+    let report = proxy.self_test().await;
+    assert!(report.engine_ok, "{report:?}");
+    assert!(report.upstream_ok, "{report:?}");
+    assert!(report.filter_ok, "zero_ip policy must not break the self-test: {report:?}");
+    assert!(report.ok(), "{report:?}");
+    assert!(report.detail.is_empty(), "{report:?}");
+}
+
+/// REGRESSION (round-3 L07). With an engine that lost its canary rule
+/// (`FilterEngine::default`, zero rules — a blocklist load that failed)
+/// and an upstream that NXDOMAINs like any real resolver, the OLD step
+/// (iii) accepted the upstream's NXDOMAIN as "our block fired"
+/// (filter_ok=TRUE), leaked the canary upstream, and cached the negative
+/// answer for 60 s. Now: filter_ok must be FALSE (nothing resolves
+/// positively through the listener) and the upstream must NEVER see the
+/// canary name.
+///
+/// Revert-checked: against the old step (iii) this fails — filter_ok was
+/// true and the upstream recorded the canary query.
+#[tokio::test]
+async fn self_test_red_when_engine_empty_and_upstream_nxdomains() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_task = Arc::clone(&seen);
+    let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind upstream");
+    let upstream = sock.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
+            if let Ok(q) = wire::parse_query(&buf[..n]) {
+                seen_task.lock().expect("mutex").push(q.qname);
+            }
+            let mut resp = canned_a_response(&buf[..n], 60, false);
+            resp[3] = 0x83; // NXDOMAIN
+            resp[7] = 0; // ancount = 0
+            resp.truncate(resp.len() - 16);
+            let _ = sock.send_to(&resp, peer).await;
+        }
+    });
+    let proxy = Proxy::bind(
+        config_for(vec![upstream]),
+        FilterEngine::default(), // zero rules: no canary rule at all
+        Arc::new(NoopDecisionHook),
+    )
+    .await
+    .expect("bind");
+    let report = proxy.self_test().await;
+    assert!(!report.engine_ok, "empty engine has no canary rule: {report:?}");
+    assert!(!report.upstream_ok, "NXDOMAIN is not NOERROR: {report:?}");
+    assert!(
+        !report.filter_ok,
+        "an upstream NXDOMAIN must never read as 'our filter works': {report:?}"
+    );
+    assert!(!report.ok(), "{report:?}");
+    let seen = seen.lock().expect("mutex");
+    assert!(
+        !seen.iter().any(|n| n.eq_ignore_ascii_case(CANARY_DOMAIN)),
+        "the canary must never leak upstream: {seen:?}"
+    );
+}
+
+/// REGRESSION (round-3 L12, positive-resolution half). Step (ii) forwards
+/// health_check_name DIRECTLY to the upstreams — it never traverses the
+/// filter — so an operator who blocks their own health-check name still
+/// gets upstream_ok=true. Step (iii) resolves the same name THROUGH the
+/// listener, where the filter applies, so the misconfiguration surfaces as
+/// filter_ok=false. This is what makes the (rewritten) health_check_name
+/// doc comment true.
+#[tokio::test]
+async fn self_test_red_when_filter_blocks_health_check_name() {
+    let (upstream, _calls) = spawn_udp_upstream(|q| Some(canned_a_response(q, 60, false))).await;
+    let mut engine = FilterEngine::new();
+    engine.add_block("example.com"); // the default health_check_name
+    let proxy = Proxy::bind(
+        config_for(vec![upstream]),
+        engine,
+        Arc::new(NoopDecisionHook),
+    )
+    .await
+    .expect("bind");
+    let report = proxy.self_test().await;
+    assert!(report.engine_ok, "{report:?}");
+    assert!(
+        report.upstream_ok,
+        "step (ii) forwards directly, bypassing the filter: {report:?}"
+    );
+    assert!(
+        !report.filter_ok,
+        "step (iii) resolves through the listener, where the name IS blocked: {report:?}"
+    );
+    assert!(!report.ok(), "{report:?}");
+}
+
+/// REGRESSION (round-3 L10). The self-test's probes are SYNTHETIC: they
+/// must not move the user-facing counters (queries/blocked/forwarded/...)
+/// and must not emit DecisionHook events for queries no client issued.
+/// Only the canary's own counter moves, by exactly one.
+///
+/// Revert-checked: against the old code the counters show
+/// `{queries:1, blocked:1}` after self_test and the hook records a Blocked
+/// event for the canary.
+#[tokio::test]
+async fn self_test_does_not_pollute_user_counters_or_hook() {
+    let (upstream, _calls) = spawn_udp_upstream(|q| Some(canned_a_response(q, 60, false))).await;
+    let events = Arc::new(AtomicUsize::new(0));
+    let events_hook = Arc::clone(&events);
+    let hook: Arc<dyn dnsguard::proxy::DecisionHook> =
+        Arc::new(move |_e: &dnsguard::proxy::DecisionEvent| {
+            events_hook.fetch_add(1, Ordering::SeqCst);
+        });
+    let proxy = Proxy::bind(config_for(vec![upstream]), FilterEngine::new(), hook)
+        .await
+        .expect("bind");
+    let report = proxy.self_test().await;
+    assert!(report.ok(), "{report:?}");
+    let snap = proxy.counters().snapshot();
+    assert_eq!(snap.queries, 0, "probes are not user queries: {snap:?}");
+    assert_eq!(snap.blocked, 0, "the canary is not a user-facing block: {snap:?}");
+    assert_eq!(snap.forwarded, 0, "{snap:?}");
+    assert_eq!(snap.cache_hits, 0, "{snap:?}");
+    assert_eq!(snap.upstream_errors, 0, "{snap:?}");
+    assert_eq!(snap.shed, 0, "{snap:?}");
+    assert_eq!(snap.canary_probes, 1, "exactly one canary probe: {snap:?}");
+    assert_eq!(
+        events.load(Ordering::SeqCst),
+        0,
+        "no DecisionHook events for queries no client issued"
+    );
+}
+
+/// REGRESSION (round-3 L05/L09). `health_check_name` is validated at bind:
+/// empty, root-only, unencodable, and backslash-bearing names are refused.
+/// The backslash case is the load-bearing one: `wire::build_query` is
+/// escape-unaware, so `exam\.ple.com` would silently probe a DIFFERENT
+/// name than the operator configured.
+#[tokio::test]
+async fn bind_rejects_unusable_health_check_names() {
+    for bad in ["", ".", "a..b", "exam\\.ple.com", "trailing\\"] {
+        let mut config = config_for(vec![dead_upstream()]);
+        config.health_check_name = bad.to_string();
+        let result = Proxy::bind(config, FilterEngine::new(), Arc::new(NoopDecisionHook)).await;
+        assert!(
+            result.is_err(),
+            "health_check_name {bad:?} must be rejected at bind"
+        );
+    }
+    // A well-formed name (with and without the trailing root dot) binds.
+    for good in ["example.com", "example.com."] {
+        let mut config = config_for(vec![dead_upstream()]);
+        config.health_check_name = good.to_string();
+        Proxy::bind(config, FilterEngine::new(), Arc::new(NoopDecisionHook))
+            .await
+            .unwrap_or_else(|e| panic!("health_check_name {good:?} must be accepted: {e}"));
+    }
+}
+
+/// REGRESSION (round-3 L08). A self-referential upstream must be refused
+/// at bind: the old code accepted `listen == upstreams[0]`, and ONE client
+/// query then produced 65 internal queries + 1 shed at `max_in_flight=64`.
+#[tokio::test]
+async fn bind_refuses_self_referential_upstreams() {
+    // Exact identity: upstream == listen (port 0 on both sides — caught by
+    // the pre-bind identity check).
+    let result = Proxy::bind(
+        config_for(vec!["127.0.0.1:0".parse().expect("addr")]),
+        FilterEngine::new(),
+        Arc::new(NoopDecisionHook),
+    )
+    .await;
+    assert!(result.is_err(), "upstream == listen must be refused");
+
+    // Loopback on the listen port, even on a DIFFERENT loopback alias:
+    // grab a free port, then try to listen on it with 127.0.0.2:<port> as
+    // the upstream.
+    let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("probe bind");
+    let port = probe.local_addr().expect("addr").port();
+    drop(probe);
+    let mut config = config_for(vec![SocketAddr::from(([127, 0, 0, 2], port))]);
+    config.listen = SocketAddr::from(([127, 0, 0, 1], port));
+    let result = Proxy::bind(config, FilterEngine::new(), Arc::new(NoopDecisionHook)).await;
+    assert!(
+        result.is_err(),
+        "loopback upstream on the listen port must be refused"
+    );
+}
+
+/// REGRESSION (round-3 L08, second half). The wiring needs to re-read
+/// adapter DNS on network-change events: `set_upstreams` swaps the live
+/// list with the SAME validation as bind, keeping the old list on error.
+/// Loopback upstreams on OTHER ports — the test-suite fake upstreams —
+/// remain perfectly legal (and the whole suite runs on them).
+///
+/// The swap is observed through `self_test`: step (ii) reads the live
+/// list, and step (iii)(c) resolves through the LISTENER (full serving
+/// path → forward → the same live list), so a swap that did not take
+/// effect would keep filter_ok green.
+#[tokio::test]
+async fn set_upstreams_replaces_validates_and_keeps_old_on_error() {
+    // TTL=0 answers: never cached, so step (iii)(c) ALWAYS forwards live
+    // and the swap is observable through the listener, not masked by the
+    // cache.
+    let (live, _calls) = spawn_udp_upstream(|q| Some(canned_a_response(q, 0, false))).await;
+    let proxy = Proxy::bind(
+        config_for(vec![live]),
+        FilterEngine::new(),
+        Arc::new(NoopDecisionHook),
+    )
+    .await
+    .expect("bind");
+
+    // Refused: the proxy's own address, a loopback alias on the listen
+    // port, and the empty list.
+    let own = proxy.local_addr();
+    let alias = SocketAddr::from(([127, 0, 0, 2], own.port()));
+    for bad in [vec![own], vec![alias], vec![]] {
+        assert!(
+            proxy.set_upstreams(bad).is_err(),
+            "self-referential/empty upstream list must be refused"
+        );
+    }
+    // The old list survived every failed replacement.
+    let report = proxy.self_test().await;
+    assert!(report.ok(), "previous list kept after failed swaps: {report:?}");
+
+    // Swap to a dead upstream: BOTH the direct probes and the listener
+    // resolution fail — proof the serving path really uses the new list.
+    proxy
+        .set_upstreams(vec![dead_upstream()])
+        .expect("dead upstream is a valid (if useless) list");
+    let report = proxy.self_test().await;
+    assert!(report.engine_ok, "{report:?}");
+    assert!(!report.upstream_ok, "swapped list must be live: {report:?}");
+    assert!(!report.filter_ok, "listener resolution follows the swap: {report:?}");
+
+    // Swap back to the legit loopback upstream: green again.
+    proxy.set_upstreams(vec![live]).expect("swap back");
+    let report = proxy.self_test().await;
+    assert!(report.ok(), "{report:?}");
 }

@@ -31,6 +31,12 @@ pub const RCODE_NXDOMAIN: u8 = 3;
 
 const FLAG_QR: u16 = 0x8000;
 const FLAG_OPCODE_MASK: u16 = 0x7800;
+/// Authoritative-answer bit. Set ONLY on block answers we synthesize
+/// locally (NXDOMAIN / zero-IP / canary): it is the self-identifying mark
+/// that lets the health check tell "OUR filter answered" apart from "some
+/// upstream produced the same rcode". Never set on relayed or error
+/// (FORMERR/SERVFAIL) responses.
+pub const FLAG_AA: u16 = 0x0400;
 pub const FLAG_TC: u16 = 0x0200;
 const FLAG_RD: u16 = 0x0100;
 const FLAG_RA: u16 = 0x0080;
@@ -438,9 +444,15 @@ pub fn build_truncated_response(request: &[u8]) -> Option<Vec<u8>> {
 /// request's ID and — when the question parsed — the question section, with
 /// QR and RA set and RD/opcode preserved.
 ///
+/// `aa` sets the Authoritative-Answer bit ([`FLAG_AA`]): pass `true` ONLY
+/// for locally synthesized BLOCK answers (the NXDOMAIN a blocked query
+/// gets), where AA is the self-identifying mark the health check relies on
+/// to distinguish "our filter fired" from "an upstream happened to return
+/// the same rcode". FORMERR/SERVFAIL are not authoritative — pass `false`.
+///
 /// Returns `None` when the request is shorter than a header; there is no ID
 /// to answer with, so the only safe behavior is to drop it.
-pub fn build_error_response(request: &[u8], rcode: u8) -> Option<Vec<u8>> {
+pub fn build_error_response(request: &[u8], rcode: u8, aa: bool) -> Option<Vec<u8>> {
     if request.len() < HEADER_LEN {
         return None;
     }
@@ -449,6 +461,7 @@ pub fn build_error_response(request: &[u8], rcode: u8) -> Option<Vec<u8>> {
         | (flags_in & FLAG_OPCODE_MASK)
         | (flags_in & FLAG_RD)
         | FLAG_RA
+        | if aa { FLAG_AA } else { 0 }
         | u16::from(rcode & 0x0F);
     let question = parse_query(request)
         .ok()
@@ -468,15 +481,20 @@ pub fn build_error_response(request: &[u8], rcode: u8) -> Option<Vec<u8>> {
 /// `0.0.0.0` and AAAA queries at `::` (for clients that mishandle NXDOMAIN;
 /// design doc §3 policy option). Other qtypes get NXDOMAIN — there is no
 /// sensible null answer for them.
+///
+/// This is ONLY ever a locally synthesized block/canary answer, so the AA
+/// bit is set unconditionally: AA=1 + ancount=1 + rdata 0.0.0.0 is the
+/// self-identifying signature no stock upstream produces, which is what the
+/// health check's canary step asserts on.
 pub fn build_zero_ip_response(request: &[u8], ttl: u32) -> Option<Vec<u8>> {
     let query = parse_query(request).ok()?;
     let rdata: &[u8] = match query.qtype {
         TYPE_A => &[0, 0, 0, 0],
         TYPE_AAAA => &[0; 16],
-        _ => return build_error_response(request, RCODE_NXDOMAIN),
+        _ => return build_error_response(request, RCODE_NXDOMAIN, true),
     };
     let flags_in = u16::from_be_bytes([request[2], request[3]]);
-    let flags = FLAG_QR | (flags_in & FLAG_OPCODE_MASK) | (flags_in & FLAG_RD) | FLAG_RA;
+    let flags = FLAG_QR | (flags_in & FLAG_OPCODE_MASK) | (flags_in & FLAG_RD) | FLAG_RA | FLAG_AA;
     let question = &request[HEADER_LEN..query.question_end];
     let mut out = Vec::with_capacity(HEADER_LEN + question.len() + 16 + rdata.len());
     out.extend_from_slice(&request[0..2]);
@@ -567,7 +585,7 @@ mod tests {
                 "prefix of {len} bytes must not parse as a full query"
             );
             // Error-response builder must also be total on every prefix.
-            let _ = build_error_response(&bytes[..len], RCODE_FORMERR);
+            let _ = build_error_response(&bytes[..len], RCODE_FORMERR, false);
             let _ = response_info(&bytes[..len]);
         }
     }
@@ -607,11 +625,12 @@ mod tests {
     #[test]
     fn error_response_echoes_id_and_question() {
         let bytes = example_com_query();
-        let resp = build_error_response(&bytes, RCODE_NXDOMAIN).expect("response");
+        let resp = build_error_response(&bytes, RCODE_NXDOMAIN, true).expect("response");
         assert_eq!(&resp[0..2], &[0x12, 0x34], "same ID");
         let flags = u16::from_be_bytes([resp[2], resp[3]]);
         assert_ne!(flags & FLAG_QR, 0, "QR set");
         assert_ne!(flags & FLAG_RA, 0, "RA set");
+        assert_ne!(flags & FLAG_AA, 0, "AA set on a locally synthesized block answer");
         assert_eq!(flags & 0x000F, u16::from(RCODE_NXDOMAIN));
         assert_eq!(&resp[4..6], &[0x00, 0x01], "qdcount 1");
         assert_eq!(
@@ -622,13 +641,42 @@ mod tests {
     }
 
     #[test]
+    fn aa_bit_is_set_only_when_requested() {
+        let bytes = example_com_query();
+        // Errors (FORMERR/SERVFAIL) are NOT authoritative: AA stays clear.
+        for rcode in [RCODE_FORMERR, RCODE_SERVFAIL] {
+            let resp = build_error_response(&bytes, rcode, false).expect("response");
+            let flags = u16::from_be_bytes([resp[2], resp[3]]);
+            assert_eq!(flags & FLAG_AA, 0, "no AA on error responses");
+            assert_eq!(flags & 0x000F, u16::from(rcode));
+        }
+        // Block answers (NXDOMAIN or zero-IP) always carry AA — the
+        // self-identifying mark the health check asserts on.
+        let resp = build_error_response(&bytes, RCODE_NXDOMAIN, true).expect("response");
+        assert_ne!(u16::from_be_bytes([resp[2], resp[3]]) & FLAG_AA, 0);
+        let query = build_query(0xBEEF, "blocked.example", TYPE_A, CLASS_IN).expect("build");
+        let resp = build_zero_ip_response(&query, 60).expect("response");
+        assert_ne!(
+            u16::from_be_bytes([resp[2], resp[3]]) & FLAG_AA,
+            0,
+            "zero-IP block answer is authoritative"
+        );
+        // And the non-A/AAAA fallback inside the zero-IP builder keeps AA.
+        let query = build_query(0xBEEF, "blocked.example", 16, CLASS_IN).expect("build");
+        let resp = build_zero_ip_response(&query, 60).expect("response");
+        let flags = u16::from_be_bytes([resp[2], resp[3]]);
+        assert_ne!(flags & FLAG_AA, 0, "AA on the NXDOMAIN fallback too");
+        assert_eq!(flags & 0x000F, u16::from(RCODE_NXDOMAIN));
+    }
+
+    #[test]
     fn error_response_for_header_only_garbage_has_no_question() {
         let mut bytes = example_com_query();
         bytes.truncate(HEADER_LEN);
-        let resp = build_error_response(&bytes, RCODE_FORMERR).expect("response");
+        let resp = build_error_response(&bytes, RCODE_FORMERR, false).expect("response");
         assert_eq!(&resp[4..6], &[0x00, 0x00], "no question echoed");
         // Shorter than a header: nothing to answer with.
-        assert_eq!(build_error_response(&bytes[..5], RCODE_FORMERR), None);
+        assert_eq!(build_error_response(&bytes[..5], RCODE_FORMERR, false), None);
     }
 
     #[test]
@@ -875,7 +923,7 @@ mod tests {
                 Err(WireError::Truncated) => {}
                 Err(e) => panic!("impossible error past header validation: {e}"),
             }
-            let _ = build_error_response(&buf, RCODE_SERVFAIL);
+            let _ = build_error_response(&buf, RCODE_SERVFAIL, false);
             let _ = build_zero_ip_response(&buf, 60);
             let _ = response_info(&buf);
             let _ = is_truncated_response(&buf);
@@ -904,7 +952,7 @@ mod tests {
             }
             let q = parse_query(&buf).expect("trailing garbage must not break the question");
             assert_eq!(q.qname, *name);
-            let _ = build_error_response(&buf, RCODE_SERVFAIL);
+            let _ = build_error_response(&buf, RCODE_SERVFAIL, false);
             let _ = build_zero_ip_response(&buf, 60);
             let _ = response_info(&buf);
             let _ = validate_response(&buf, i as u16, &buf[HEADER_LEN..q.question_end]);

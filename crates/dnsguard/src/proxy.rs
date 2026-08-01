@@ -95,9 +95,24 @@ pub struct ProxyConfig {
     /// Deliberately much smaller than `max_in_flight` and never shared with
     /// it, so TCP clients cannot starve UDP query handling.
     pub tcp_max_connections: usize,
-    /// Name the [`Proxy::self_test`] upstream probe resolves
+    /// Name the [`Proxy::self_test`] health probes resolve
     /// (default `example.com` — IANA-reserved, stable, guaranteed to
-    /// exist). Must NOT be a name the filter could block.
+    /// exist).
+    ///
+    /// What the two probe steps actually prove with this name: step (ii)
+    /// forwards it DIRECTLY to each upstream, bypassing the listener, the
+    /// cache, and the filter — it validates upstream reachability ONLY and
+    /// says nothing about whether the listener can resolve anything. Step
+    /// (iii) resolves it again THROUGH the listener (parse → decide →
+    /// cache/forward → respond), so a name the filter blocks fails step
+    /// (iii): pick a name you never intend to block.
+    ///
+    /// Validated at [`Proxy::bind`]: empty, root-only, unencodable, and
+    /// backslash-bearing names are rejected. The backslash rejection is
+    /// load-bearing, not cosmetic — [`wire::build_query`] is
+    /// escape-unaware, so `exam\.ple.com` would be encoded with a literal
+    /// `\` byte and the probe would silently resolve a DIFFERENT name than
+    /// the operator configured.
     pub health_check_name: String,
 }
 
@@ -134,6 +149,14 @@ pub struct Counters {
     pub shed: AtomicU64,
     /// Client TCP connections force-closed by the hard lifetime cap.
     pub tcp_lifetime_kills: AtomicU64,
+    /// Health-check canary probes answered with the local signature. This
+    /// is deliberately SEPARATE from `queries`/`blocked`: canary answers
+    /// are synthesized unconditionally (never a filter decision, never
+    /// user traffic), so counting them as user-facing "blocked" would make
+    /// the GUI/IPC "domains blocked" figure include probes no client ever
+    /// issued. The self-test asserts a delta of EXACTLY 1 on this counter
+    /// across its canary probe — a signal no upstream can fake.
+    pub canary_probes: AtomicU64,
 }
 
 /// Point-in-time copy of [`Counters`].
@@ -146,6 +169,7 @@ pub struct CountersSnapshot {
     pub upstream_errors: u64,
     pub shed: u64,
     pub tcp_lifetime_kills: u64,
+    pub canary_probes: u64,
 }
 
 impl Counters {
@@ -158,6 +182,7 @@ impl Counters {
             upstream_errors: self.upstream_errors.load(Ordering::Relaxed),
             shed: self.shed.load(Ordering::Relaxed),
             tcp_lifetime_kills: self.tcp_lifetime_kills.load(Ordering::Relaxed),
+            canary_probes: self.canary_probes.load(Ordering::Relaxed),
         }
     }
 
@@ -260,6 +285,10 @@ struct CacheEntry {
 struct State {
     config: ProxyConfig,
     engine: Arc<RwLock<FilterEngine>>,
+    /// Live upstream list, mutable via [`Proxy::set_upstreams`] so the
+    /// daemon can re-read adapter DNS on network-change events without
+    /// rebinding. `config.upstreams` is only the constructor input.
+    upstreams: RwLock<Vec<SocketAddr>>,
     cache: Mutex<HashMap<CacheKey, CacheEntry>>,
     /// Permit pool bounding in-flight UDP queries.
     semaphore: Arc<Semaphore>,
@@ -279,8 +308,16 @@ impl State {
         engine.decide(qname)
     }
 
+    /// Current upstream list (poisoning-tolerant — see `decide`).
+    fn upstreams(&self) -> Vec<SocketAddr> {
+        self.upstreams
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
     fn pick_upstream(&self) -> Option<SocketAddr> {
-        let upstreams = &self.config.upstreams;
+        let upstreams = self.upstreams.read().unwrap_or_else(|p| p.into_inner());
         if upstreams.is_empty() {
             return None;
         }
@@ -370,21 +407,27 @@ impl Proxy {
     /// — it would pass bind and the filter self-test while SERVFAILing every
     /// real query, and the NRPT catch-all would then blackhole the machine's
     /// DNS behind a "healthy" status.
+    ///
+    /// Also refuses SELF-REFERENTIAL upstreams (see [`validate_upstreams`]):
+    /// forwarding to our own listener amplifies one client query into a
+    /// full in-flight pool of internal queries, and refuses an unusable
+    /// `health_check_name` (see the field docs).
     pub async fn bind(
         config: ProxyConfig,
         engine: FilterEngine,
         hook: Arc<dyn DecisionHook>,
     ) -> io::Result<Self> {
-        if config.upstreams.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "no upstream configured: a resolver with no upstream is a lie",
-            ));
-        }
+        validate_health_check_name(&config.health_check_name)?;
+        // Pre-bind check: with a fixed listen port this catches the
+        // self-referential cases without binding anything. With port 0 the
+        // listen port is not chosen yet; the post-bind check below covers
+        // the actual ephemeral port.
+        validate_upstreams(&config.upstreams, config.listen)?;
         let state = Arc::new(State {
             semaphore: Arc::new(Semaphore::new(config.max_in_flight)),
             tcp_semaphore: Arc::new(Semaphore::new(config.tcp_max_connections)),
             txids: UpstreamTxids::new(),
+            upstreams: RwLock::new(config.upstreams.clone()),
             config,
             engine: Arc::new(RwLock::new(engine)),
             cache: Mutex::new(HashMap::new()),
@@ -401,7 +444,12 @@ impl Proxy {
             match TcpListener::bind(tcp_addr).await {
                 Ok(tcp) => {
                     let local_addr = SocketAddr::new(state.config.listen.ip(), port);
-                    info!(%local_addr, upstreams = state.config.upstreams.len(), "dnsguard bound");
+                    // Post-bind check with the ACTUAL bound port: covers the
+                    // ephemeral-port case the pre-bind check could not see.
+                    // (A test upstream already bound on this exact port is
+                    // impossible — the OS would not have handed us the port.)
+                    validate_upstreams(&state.upstreams(), local_addr)?;
+                    info!(%local_addr, upstreams = state.upstreams().len(), "dnsguard bound");
                     return Ok(Self {
                         udp: Arc::new(udp),
                         tcp,
@@ -433,20 +481,55 @@ impl Proxy {
         Arc::clone(&self.state.engine)
     }
 
+    /// Replace the upstream list at runtime (design: the daemon re-reads
+    /// adapter DNS on network-change events). Takes effect on the next
+    /// forwarded query; no rebind, no restart.
+    ///
+    /// Validated EXACTLY like [`Proxy::bind`]: non-empty, and no
+    /// self-referential address (checked against the address we are
+    /// actually bound on). On error the previous list is kept.
+    pub fn set_upstreams(&self, upstreams: Vec<SocketAddr>) -> io::Result<()> {
+        validate_upstreams(&upstreams, self.local_addr)?;
+        let mut live = self
+            .state
+            .upstreams
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        info!(old = live.len(), new = upstreams.len(), "dnsguard upstreams replaced");
+        *live = upstreams;
+        Ok(())
+    }
+
     /// Three-step health check (design §5 self-test layer). Call BEFORE
     /// `run` (and before the NRPT rule is installed): it temporarily
-    /// serves the UDP socket itself for step (iii).
+    /// serves the UDP socket itself for step (iii), and that private
+    /// serving loop marks every query it answers as SYNTHETIC (skipped
+    /// from the user-facing counters and the decision hook). Running it
+    /// concurrently with `run` would race the real serving loop on the
+    /// same socket and could mislabel a real query as synthetic — don't.
     ///
     /// 1. `engine_ok` — the filter decides the always-blocked canary
-    ///    ([`crate::filter::CANARY_DOMAIN`]) as Block. The canary
-    ///    NXDOMAINs on ANY box (`.invalid` is reserved), so only a local
-    ///    engine decision proves the plumbing is actually ours.
+    ///    ([`crate::filter::CANARY_DOMAIN`]) as Block.
     /// 2. `upstream_ok` — a LIVE query for `config.health_check_name`
     ///    (default `example.com`) comes back NOERROR from EVERY configured
-    ///    upstream. `upstreams_healthy`/`upstreams_total` carry the detail.
-    /// 3. `filter_ok` — the canary queried through the actual UDP
-    ///    listener comes back NXDOMAIN (end-to-end through parse →
-    ///    decide → respond).
+    ///    upstream. This step forwards DIRECTLY to the upstreams: it
+    ///    validates upstream reachability only, never the listener.
+    ///    `upstreams_healthy`/`upstreams_total` carry the detail.
+    /// 3. `filter_ok` — the end-to-end step, through the actual UDP
+    ///    listener. ALL of: (a) the canary comes back with OUR
+    ///    self-identifying signature (NOERROR, AA=1, ancount=1, A rdata
+    ///    0.0.0.0) — the serving path short-circuits the canary before
+    ///    cache/filter/forward and synthesizes that signature
+    ///    unconditionally, under BOTH `block_response` policies, so it
+    ///    identifies this listener positively and can never be satisfied
+    ///    by an upstream answer or a cached entry (the canary never
+    ///    reaches either); (b) `counters.canary_probes` moved by EXACTLY 1
+    ///    across the probe while the user-facing `queries`/`blocked` did
+    ///    not move — a counter delta no upstream can fake, and proof the
+    ///    probe did not pollute user statistics; (c) `health_check_name`
+    ///    resolves POSITIVELY (NOERROR with at least one answer) through
+    ///    the LISTENER — a proxy that answers the canary but SERVFAILs
+    ///    everything else fails here.
     ///
     /// The daemon/reconciler must probe the PUBLIC socket
     /// (`127.0.0.1:53`), not [`Proxy::local_addr`] — a health check aimed
@@ -483,7 +566,7 @@ impl Proxy {
         // head-only probe stays green. `upstream_ok` therefore means ALL of
         // them answered; the counts let the daemon tell "all good" apart
         // from "one of two dead".
-        let upstreams = self.state.config.upstreams.clone();
+        let upstreams = self.state.upstreams();
         report.upstreams_total = upstreams.len();
         match upstream_probe {
             Some((bytes, query)) => {
@@ -518,46 +601,93 @@ impl Proxy {
             }
         }
 
-        // (iii) canary through the listener: serve the UDP socket on a
-        // private shutdown channel, query the canary, expect NXDOMAIN.
+        // (iii) end-to-end through the listener. The private serving loop
+        // marks every query it answers SYNTHETIC, so the probes below skip
+        // the user-facing counters and the decision hook entirely.
         let (tx, rx) = watch::channel(false);
         let loop_task = tokio::spawn(udp_loop(
             Arc::clone(&self.udp),
             Arc::clone(&self.state),
             rx,
+            true,
         ));
-        let probe = wire::build_query(
+        let sock = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).await;
+        let before = self.state.counters.snapshot();
+
+        // (a) canary signature: NOERROR + AA + ancount 1 + A 0.0.0.0.
+        let canary_ok = match (&sock, wire::build_query(
             self.state.txids.next(),
             crate::filter::CANARY_DOMAIN,
             wire::TYPE_A,
             wire::CLASS_IN,
-        );
-        if let Some(probe) = probe {
-            let sock = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).await;
-            let answered = match sock {
-                Ok(sock) => match sock.send_to(&probe, self.local_addr).await {
-                    Ok(_) => {
-                        let mut buf = [0u8; MAX_DATAGRAM];
-                        match timeout(self.state.config.upstream_timeout, sock.recv(&mut buf)).await
-                        {
-                            Ok(Ok(n)) => {
-                                let resp = &buf[..n];
-                                resp.len() >= wire::HEADER_LEN
-                                    && (u16::from_be_bytes([resp[2], resp[3]]) & 0x000F) as u8
-                                        == wire::RCODE_NXDOMAIN
-                            }
-                            _ => false,
-                        }
+        )) {
+            (Ok(sock), Some(probe)) => {
+                let id = u16::from_be_bytes([probe[0], probe[1]]);
+                match probe_exchange(sock, &probe, self.local_addr, self.state.config.upstream_timeout).await {
+                    Some(resp) => is_canary_signature(&resp, id),
+                    None => false,
+                }
+            }
+            _ => false,
+        };
+        if !canary_ok {
+            let _ = write!(
+                report.detail,
+                "canary through listener did not return the local signature (0.0.0.0 A, AA=1); "
+            );
+        }
+
+        // (c) POSITIVE resolution of the health-check name through the
+        // LISTENER (not the direct forward of step (ii)): proves the
+        // serving path resolves real names end to end.
+        let resolves_ok = match (&sock, wire::build_query(
+            self.state.txids.next(),
+            &self.state.config.health_check_name,
+            wire::TYPE_A,
+            wire::CLASS_IN,
+        )) {
+            (Ok(sock), Some(probe)) => {
+                match probe_exchange(sock, &probe, self.local_addr, self.state.config.upstream_timeout).await {
+                    Some(resp) => {
+                        wire::response_info(&resp).is_some_and(|info| {
+                            info.rcode == wire::RCODE_NOERROR && info.min_ttl.is_some()
+                        })
                     }
-                    Err(_) => false,
-                },
-                Err(_) => false,
-            };
-            report.filter_ok = answered;
+                    None => false,
+                }
+            }
+            _ => false,
+        };
+        if !resolves_ok {
+            let _ = write!(
+                report.detail,
+                "health_check_name did not resolve positively through the listener; "
+            );
         }
-        if !report.filter_ok {
-            let _ = write!(report.detail, "canary through listener did not return NXDOMAIN; ");
+
+        // (b) counter deltas across the probe: the canary must be counted
+        // EXACTLY once in its OWN counter, and the user-facing counters
+        // must not have moved (synthetic traffic is invisible to them).
+        let after = self.state.counters.snapshot();
+        if after.canary_probes != before.canary_probes + 1 {
+            let _ = write!(
+                report.detail,
+                "canary_probes delta {} != 1 across probe; ",
+                after.canary_probes.wrapping_sub(before.canary_probes)
+            );
         }
+        if after.queries != before.queries || after.blocked != before.blocked {
+            let _ = write!(
+                report.detail,
+                "self-test probes leaked into user-facing counters ({before:?} -> {after:?}); "
+            );
+        }
+        report.filter_ok = canary_ok
+            && resolves_ok
+            && after.canary_probes == before.canary_probes + 1
+            && after.queries == before.queries
+            && after.blocked == before.blocked;
+
         let _ = tx.send(true);
         loop_task.abort();
         report
@@ -572,6 +702,7 @@ impl Proxy {
             self.udp,
             Arc::clone(&self.state),
             shutdown.clone(),
+            false,
         ));
         let tcp_task = tokio::spawn(tcp_loop(self.tcp, self.state, shutdown.clone()));
         // changed() errors when the sender is dropped — treat as shutdown.
@@ -593,7 +724,13 @@ pub struct SelfTestReport {
     /// `forward` does not fail over, so a dead upstream is a real partial
     /// outage, not a redundancy the proxy can absorb.
     pub upstream_ok: bool,
-    /// The canary queried through the listener returns NXDOMAIN.
+    /// End-to-end through the listener: the canary returns the LOCAL
+    /// signature (0.0.0.0 A, AA=1 — impossible to satisfy from an upstream
+    /// or the cache, under either `block_response` policy), the
+    /// `canary_probes` counter moved by exactly 1 while the user-facing
+    /// counters did not move, and `health_check_name` resolves POSITIVELY
+    /// through the listener. False when the serving path is broken OR when
+    /// real names do not resolve through it (e.g. every upstream dead).
     pub filter_ok: bool,
     /// Configured upstreams that answered the health check with NOERROR.
     pub upstreams_healthy: usize,
@@ -611,7 +748,131 @@ impl SelfTestReport {
     }
 }
 
-async fn udp_loop(sock: Arc<UdpSocket>, state: Arc<State>, mut shutdown: watch::Receiver<bool>) {
+/// Reject upstreams that would route our own forwarded queries back into
+/// our listener — a self-referential upstream amplifies ONE client query
+/// into a full in-flight pool of internal queries (measured: 65 internal
+/// queries + 1 shed at `max_in_flight=64`) until the semaphore sheds.
+///
+/// Exact scope of the rule, and why:
+/// - `upstream == listen` (address AND port): always refused — that IS us.
+/// - ANY loopback upstream (all of 127.0.0.0/8 and ::1) on the LISTEN
+///   PORT, when we listen on loopback or wildcard: refused. Adapter DNS
+///   discovery legitimately returns 127.0.0.1 on any box that has run
+///   dnscrypt-proxy/Acrylic/Pi-hole-on-host/a prior Sentinella, and the
+///   whole 127/8 aliases the loopback interface, so bind-specificity
+///   (127.0.0.1 vs 127.0.0.2) is not a safety boundary we rely on — a
+///   second resolver on another loopback alias of the same port is either
+///   us-after-rebind or a sibling proxy, and both loop.
+/// - Loopback upstreams on OTHER ports are fine and heavily used: the
+///   test-suite fake upstreams live on 127.0.0.1 with ephemeral ports.
+///   The rule is about the LISTEN port, never about loopback in general.
+/// - With `listen` port 0 the port is not chosen yet, so only the exact
+///   `upstream == listen` case is caught here; `bind` re-runs this check
+///   against the ACTUAL bound address.
+///
+/// NOT covered (documented, dependency-free code cannot see it): an
+/// upstream on one of the machine's LAN interface addresses combined with
+/// a wildcard listen. That shape needs interface enumeration; the daemon
+/// is expected to refuse it when it discovers upstreams.
+fn validate_upstreams(upstreams: &[SocketAddr], listen: SocketAddr) -> io::Result<()> {
+    if upstreams.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "no upstream configured: a resolver with no upstream is a lie",
+        ));
+    }
+    for upstream in upstreams {
+        let self_referential = *upstream == listen
+            || (listen.port() != 0
+                && upstream.port() == listen.port()
+                && upstream.ip().is_loopback()
+                && (listen.ip().is_loopback() || listen.ip().is_unspecified()));
+        if self_referential {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "upstream {upstream} is self-referential (we listen on {listen}): \
+                     forwarding to our own listener amplifies every query"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate the configured `health_check_name` (see the field docs for the
+/// contract). Rejects empty/root names, names `wire::build_query` cannot
+/// encode, and any backslash — the query builder is escape-unaware, so a
+/// `\` would silently turn the probe into a query for a DIFFERENT name.
+fn validate_health_check_name(name: &str) -> io::Result<()> {
+    let invalid = |msg: &str| io::Error::new(io::ErrorKind::InvalidInput, msg.to_string());
+    if name.trim_end_matches('.').is_empty() {
+        return Err(invalid(
+            "health_check_name must not be empty or the root name: \
+             the self-test needs a real name to resolve",
+        ));
+    }
+    if name.contains('\\') {
+        return Err(invalid(
+            "health_check_name must not contain '\\': the query builder is \
+             escape-unaware and would silently probe a different name",
+        ));
+    }
+    if wire::build_query(0, name, wire::TYPE_A, wire::CLASS_IN).is_none() {
+        return Err(invalid(
+            "health_check_name cannot be encoded as a DNS wire name \
+             (empty label, label > 63 octets, or name > 255 wire bytes)",
+        ));
+    }
+    Ok(())
+}
+
+/// One UDP exchange against the listener during self-test step (iii):
+/// send `probe`, wait up to `wait` for the answer. `None` on any failure.
+async fn probe_exchange(
+    sock: &UdpSocket,
+    probe: &[u8],
+    listener: SocketAddr,
+    wait: Duration,
+) -> Option<Vec<u8>> {
+    sock.send_to(probe, listener).await.ok()?;
+    let mut buf = [0u8; MAX_DATAGRAM];
+    let n = timeout(wait, sock.recv(&mut buf)).await.ok()?.ok()?;
+    Some(buf[..n].to_vec())
+}
+
+/// The canary signature only THIS proxy can produce: NOERROR, AA=1,
+/// exactly one answer, A rdata 0.0.0.0, and the probe's own txid echoed.
+/// `build_zero_ip_response` lays the answer record out last, so the rdata
+/// is the final 4 bytes. No stock upstream satisfies this for an `.invalid`
+/// name (they NXDOMAIN), and the short-circuit guarantees it never comes
+/// from cache either.
+fn is_canary_signature(resp: &[u8], probe_id: u16) -> bool {
+    if resp.len() < wire::HEADER_LEN + 4 {
+        return false;
+    }
+    if u16::from_be_bytes([resp[0], resp[1]]) != probe_id {
+        return false;
+    }
+    let flags = u16::from_be_bytes([resp[2], resp[3]]);
+    flags & 0x000F == 0 // NOERROR
+        && flags & wire::FLAG_AA != 0
+        && u16::from_be_bytes([resp[6], resp[7]]) == 1 // ancount
+        && resp[resp.len() - 4..] == [0, 0, 0, 0]
+}
+
+/// Serve one UDP socket until shutdown. When `synthetic` is true (the
+/// self-test's private serving loop), every query answered here is a
+/// health-check probe: it skips the user-facing counters and the decision
+/// hook, so probes no client ever issued cannot leak into the GUI/IPC
+/// statistics or the query log. The canary's OWN counter
+/// (`canary_probes`) still moves — the self-test asserts on it.
+async fn udp_loop(
+    sock: Arc<UdpSocket>,
+    state: Arc<State>,
+    mut shutdown: watch::Receiver<bool>,
+    synthetic: bool,
+) {
     let mut buf = vec![0u8; MAX_DATAGRAM];
     loop {
         tokio::select! {
@@ -631,7 +892,7 @@ async fn udp_loop(sock: Arc<UdpSocket>, state: Arc<State>, mut shutdown: watch::
                         let sock = Arc::clone(&sock);
                         tokio::spawn(async move {
                             let _permit = permit; // released when the query completes
-                            if let Some(resp) = handle_query(&state, &bytes, peer, false).await {
+                            if let Some(resp) = handle_query(&state, &bytes, peer, false, synthetic).await {
                                 // UDP payload limit (v1: a flat 512 — we
                                 // strip EDNS0 from forwarded queries, so no
                                 // client UDP size is ever negotiated; see
@@ -668,7 +929,7 @@ async fn shed(state: &Arc<State>, bytes: &[u8], peer: SocketAddr, sock: &UdpSock
     if let Ok(query) = wire::parse_query(bytes) {
         state.emit(peer, &query, QueryOutcome::Shed);
     }
-    if let Some(resp) = wire::build_error_response(bytes, wire::RCODE_SERVFAIL) {
+    if let Some(resp) = wire::build_error_response(bytes, wire::RCODE_SERVFAIL, false) {
         let _ = sock.send_to(&resp, peer).await;
     }
     debug!(%peer, "query shed: in-flight limit reached");
@@ -757,7 +1018,7 @@ async fn tcp_conn(
         // (3) resolve. Without the deadline this await is bounded only by
         // `upstream_timeout`, which then chains onto the read waits above.
         let Some(budget) = left(deadline) else { break };
-        let Ok(Some(resp)) = timeout(budget, handle_query(&state, &buf, peer, true)).await else {
+        let Ok(Some(resp)) = timeout(budget, handle_query(&state, &buf, peer, true, false)).await else {
             break; // over budget, or not even a header to echo an ID for
         };
 
@@ -789,27 +1050,69 @@ async fn tcp_conn(
 
 /// Core pipeline, shared by UDP and TCP clients: parse → decide → answer.
 /// Returns `None` only when the input is too short to echo an ID for.
+///
+/// `synthetic` marks health-check probes (the self-test's private serving
+/// loop): synthetic queries skip the user-facing counters and the decision
+/// hook so probe traffic never lands in the GUI/IPC statistics or the
+/// query log.
 async fn handle_query(
     state: &Arc<State>,
     bytes: &[u8],
     client: SocketAddr,
     via_tcp: bool,
+    synthetic: bool,
 ) -> Option<Vec<u8>> {
-    state.counters.bump(&state.counters.queries);
     let query = match wire::parse_query(bytes) {
         Ok(q) => q,
         Err(e) => {
+            if !synthetic {
+                state.counters.bump(&state.counters.queries);
+            }
             debug!(error = %e, %client, "malformed DNS query");
-            return wire::build_error_response(bytes, wire::RCODE_FORMERR);
+            return wire::build_error_response(bytes, wire::RCODE_FORMERR, false);
         }
     };
 
+    // CANARY SHORT-CIRCUIT — by name identity, BEFORE decide/cache/forward
+    // and before any user-facing counter. The canary is answered with the
+    // zero-IP signature UNCONDITIONALLY (independent of `block_response`
+    // and of the engine's own canary rule), so:
+    //   - it can never leak upstream or be cached (L07: a forwarded canary
+    //     used to ride the negative cache for 60 s);
+    //   - "canary → 0.0.0.0 A with AA=1" positively identifies THIS
+    //     listener — no stock upstream produces it, and `.invalid`
+    //     NXDOMAINs everywhere else (L12);
+    //   - the answer is the same under both block policies, which is what
+    //     makes the health check policy-independent (A3).
+    // The wire decoder's escaped presentation is injective, and the canary
+    // is plain ASCII, so a case-insensitive compare matches exactly the
+    // canary's wire encodings — nothing else.
+    if query
+        .qname
+        .eq_ignore_ascii_case(crate::filter::CANARY_DOMAIN)
+    {
+        state.counters.bump(&state.counters.canary_probes);
+        debug!(%client, "canary probe answered with local signature");
+        return wire::build_zero_ip_response(bytes, ZERO_IP_TTL);
+    }
+
+    if !synthetic {
+        state.counters.bump(&state.counters.queries);
+    }
+
     if state.decide(&query.qname) == Decision::Block {
-        state.counters.bump(&state.counters.blocked);
-        state.emit(client, &query, QueryOutcome::Blocked);
+        if !synthetic {
+            state.counters.bump(&state.counters.blocked);
+            state.emit(client, &query, QueryOutcome::Blocked);
+        }
         debug!(qname = %query.qname, %client, "blocked");
+        // Locally synthesized block answers carry AA=1: the self-identifying
+        // mark that distinguishes "our filter fired" from "an upstream
+        // returned the same rcode" (L07).
         return match state.config.block_response {
-            BlockResponse::Nxdomain => wire::build_error_response(bytes, wire::RCODE_NXDOMAIN),
+            BlockResponse::Nxdomain => {
+                wire::build_error_response(bytes, wire::RCODE_NXDOMAIN, true)
+            }
             BlockResponse::ZeroIp => wire::build_zero_ip_response(bytes, ZERO_IP_TTL),
         };
     }
@@ -819,14 +1122,18 @@ async fn handle_query(
     // but keying on bytes is the safe direction (no aliasing, ever).
     let cache_key: CacheKey = (query.qname_wire.clone(), query.qtype, query.qclass);
     if let Some(resp) = state.cache_get(&cache_key, query.id) {
-        state.counters.bump(&state.counters.cache_hits);
-        state.emit(client, &query, QueryOutcome::CacheHit);
+        if !synthetic {
+            state.counters.bump(&state.counters.cache_hits);
+            state.emit(client, &query, QueryOutcome::CacheHit);
+        }
         return Some(resp);
     }
 
     match forward(state, bytes, &query, via_tcp).await {
         Ok(mut resp) => {
-            state.counters.bump(&state.counters.forwarded);
+            if !synthetic {
+                state.counters.bump(&state.counters.forwarded);
+            }
             // Restore the client's original txid: the wire bytes went
             // upstream with OUR generated ID (see forward).
             if resp.len() >= 2 {
@@ -836,14 +1143,18 @@ async fn handle_query(
             // anything failing txid/QR/question checks), so caching here
             // can never poison the cache with a forgery.
             state.cache_store(&cache_key, &resp);
-            state.emit(client, &query, QueryOutcome::Forwarded);
+            if !synthetic {
+                state.emit(client, &query, QueryOutcome::Forwarded);
+            }
             Some(resp)
         }
         Err(e) => {
-            state.counters.bump(&state.counters.upstream_errors);
-            state.emit(client, &query, QueryOutcome::UpstreamError);
+            if !synthetic {
+                state.counters.bump(&state.counters.upstream_errors);
+                state.emit(client, &query, QueryOutcome::UpstreamError);
+            }
             warn!(error = %e, qname = %query.qname, "upstream exchange failed");
-            wire::build_error_response(bytes, wire::RCODE_SERVFAIL)
+            wire::build_error_response(bytes, wire::RCODE_SERVFAIL, false)
         }
     }
 }
@@ -982,4 +1293,114 @@ async fn tcp_exchange(upstream: SocketAddr, query: &[u8], wait: Duration) -> io:
     })
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "upstream TCP timeout"))?
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(ip: [u8; 4], port: u16) -> SocketAddr {
+        SocketAddr::from((ip, port))
+    }
+
+    #[test]
+    fn validate_upstreams_rejects_empty() {
+        assert!(validate_upstreams(&[], addr([127, 0, 0, 1], 53)).is_err());
+        assert!(validate_upstreams(&[], addr([127, 0, 0, 1], 0)).is_err());
+    }
+
+    #[test]
+    fn validate_upstreams_rejects_listen_identity_and_loopback_on_listen_port() {
+        let listen = addr([127, 0, 0, 1], 53);
+        // Exact identity.
+        assert!(validate_upstreams(&[listen], listen).is_err());
+        // Another loopback alias on the listen port (127/8 is all loopback).
+        assert!(validate_upstreams(&[addr([127, 0, 0, 2], 53)], listen).is_err());
+        assert!(validate_upstreams(&[addr([127, 44, 0, 9], 53)], listen).is_err());
+        // IPv6 loopback on the listen port, with a wildcard listen.
+        let wildcard = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 53);
+        assert!(validate_upstreams(&[SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 53)], wildcard).is_err());
+        assert!(validate_upstreams(&[addr([127, 0, 0, 1], 53)], addr([0, 0, 0, 0], 53)).is_err());
+        // One bad apple in a longer list fails the whole list.
+        assert!(validate_upstreams(&[addr([9, 9, 9, 9], 53), listen], listen).is_err());
+    }
+
+    #[test]
+    fn validate_upstreams_accepts_legit_loopback_and_remote() {
+        let listen = addr([127, 0, 0, 1], 53);
+        // THE TEST-SUITE SHAPE: loopback upstream on a DIFFERENT port must
+        // stay legal — the rule is about the listen port, not loopback.
+        assert!(validate_upstreams(&[addr([127, 0, 0, 1], 5353)], listen).is_ok());
+        assert!(validate_upstreams(&[addr([127, 0, 0, 1], 9)], listen).is_ok());
+        // Remote upstreams.
+        assert!(validate_upstreams(&[addr([9, 9, 9, 9], 53), addr([1, 1, 1, 1], 53)], listen).is_ok());
+        // Non-loopback listen: a loopback upstream on the listen port is
+        // NOT us (a socket bound to 192.0.2.1 does not receive 127/8
+        // traffic) — accepted; the daemon owns the LAN-address case.
+        let lan_listen = addr([192, 0, 2, 1], 53);
+        assert!(validate_upstreams(&[addr([127, 0, 0, 1], 53)], lan_listen).is_ok());
+        assert!(validate_upstreams(&[lan_listen], lan_listen).is_err(), "identity still refused");
+    }
+
+    #[test]
+    fn validate_upstreams_with_ephemeral_listen_port_only_catches_identity() {
+        // Port 0: the port is not chosen yet, so port-based checks are
+        // skipped (the post-bind re-check covers the actual port).
+        let listen = addr([127, 0, 0, 1], 0);
+        assert!(validate_upstreams(&[listen], listen).is_err(), "identity still refused");
+        assert!(validate_upstreams(&[addr([127, 0, 0, 1], 53)], listen).is_ok());
+    }
+
+    #[test]
+    fn validate_health_check_name_rejects_empty_root_unencodable_backslash() {
+        assert!(validate_health_check_name("").is_err());
+        assert!(validate_health_check_name(".").is_err());
+        assert!(validate_health_check_name("a..b").is_err());
+        // Escape-unaware encoding would silently probe a different name.
+        assert!(validate_health_check_name("exam\\.ple.com").is_err());
+        assert!(validate_health_check_name("dangling\\").is_err());
+        // Overlong label / name.
+        assert!(validate_health_check_name(&"a".repeat(64)).is_err());
+        assert!(
+            validate_health_check_name(&format!(
+                "{}.{}.{}.{}",
+                "a".repeat(63),
+                "b".repeat(63),
+                "c".repeat(63),
+                "d".repeat(63)
+            ))
+            .is_err()
+        );
+        // Legit names, with and without the trailing root dot.
+        assert!(validate_health_check_name("example.com").is_ok());
+        assert!(validate_health_check_name("example.com.").is_ok());
+    }
+
+    #[test]
+    fn canary_signature_check_is_strict() {
+        let query = wire::build_query(0x1234, crate::filter::CANARY_DOMAIN, wire::TYPE_A, wire::CLASS_IN)
+            .expect("build");
+        let good = wire::build_zero_ip_response(&query, 60).expect("signature");
+        assert!(is_canary_signature(&good, 0x1234));
+
+        // Wrong txid.
+        assert!(!is_canary_signature(&good, 0x9999));
+        // Upstream-style NXDOMAIN for the same name: not the signature.
+        let nxdomain = wire::build_error_response(&query, wire::RCODE_NXDOMAIN, false).expect("nx");
+        assert!(!is_canary_signature(&nxdomain, 0x1234));
+        // Zero-IP WITHOUT AA (a hypothetical relayed/mocked answer): rejected.
+        let mut no_aa = good.clone();
+        no_aa[2] &= !(wire::FLAG_AA >> 8) as u8;
+        assert!(!is_canary_signature(&no_aa, 0x1234));
+        // Non-zero rdata.
+        let mut bad_rdata = good.clone();
+        let n = bad_rdata.len();
+        bad_rdata[n - 1] = 1;
+        assert!(!is_canary_signature(&bad_rdata, 0x1234));
+        // Total on short input.
+        for len in 0..wire::HEADER_LEN + 4 {
+            assert!(!is_canary_signature(&good[..len], 0x1234));
+        }
+    }
 }
