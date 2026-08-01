@@ -87,10 +87,16 @@
           DisplayName="Sentinella Protection Service"
           Description="Sentinella antivirus daemon — ClamAV signatures + ARGUS heuristic intelligence engine."
           Type="ownProcess"
-          Start="delayed"
+          Start="auto"
           Account="LocalSystem"
           ErrorControl="normal"
-          Arguments="--log-level info --runtime-root &quot;[DATADIRPARENT]&quot; --dll-dir &quot;[INSTALLFOLDER]&quot; --db-dir &quot;[SIGDIR]&quot; --state-db &quot;[STATEDIR]\sentinella.db&quot;" />
+          Arguments="--log-level info --runtime-root &quot;[DATADIRPARENT]&quot; --dll-dir &quot;[INSTALLFOLDER]&quot; --db-dir &quot;[SIGDIR]&quot; --state-db &quot;[STATEDIR]\sentinella.db&quot;">
+          <!-- Start="delayed" is NOT a legal WiX value (auto|demand|disabled)
+               and this file has therefore never built. Delayed-auto is
+               expressed as auto + this ServiceConfig, which is what was
+               intended. -->
+          <ServiceConfig DelayedAutoStart="yes" OnInstall="yes" OnReinstall="yes" />
+        </ServiceInstall>
         <ServiceControl
           Id="SentinelldControl"
           Name="SentinellaDaemon"
