@@ -105,11 +105,83 @@ fn is_transient(message: &str) -> bool {
     .any(|needle| m.contains(needle))
 }
 
+/// A `tmp.<hex>` staging directory younger than this may belong to a
+/// freshclam that is running RIGHT NOW, so it is never swept.
+///
+/// This guard is the whole safety argument. The daemon serialises its own
+/// updates behind `update_running`, but nothing stops an administrator
+/// running `freshclam.exe` by hand, and deleting a live download's staging
+/// directory would corrupt it. An hour is far longer than any run this
+/// updater permits (`CYCLE_BUDGET`), so anything older is provably dead.
+const ORPHAN_TEMP_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Delete `tmp.<hex>` staging directories left behind by killed freshclam runs.
+///
+/// freshclam stages every download into `<db_dir>/tmp.<hex>/` and moves the
+/// files out only on a clean finish. We kill it when it exceeds its budget,
+/// and on Windows that is a `TerminateProcess` — no cleanup handler runs, so
+/// the directory survives with a partial CVD inside it. `main.cvd` alone is
+/// ~170 MB, and nothing else in the daemon ever removed these, so a machine
+/// on a slow link accrued one per timed-out attempt until the disk noticed.
+///
+/// Is this directory entry one of freshclam's abandoned staging directories?
+///
+/// Split out from the walk so the decision is testable without backdating
+/// files on disk, which needs an OS-specific call to do to a DIRECTORY on
+/// Windows. `age` is `None` when the mtime could not be read.
+fn is_sweepable(name: &str, is_dir: bool, age: Option<std::time::Duration>) -> bool {
+    // Anchored: a directory merely CONTAINING "tmp." is not freshclam's.
+    if !name.starts_with("tmp.") || !is_dir {
+        return false;
+    }
+    match age {
+        Some(age) => age >= ORPHAN_TEMP_MIN_AGE,
+        // Unreadable or future-dated mtime. Treat as young and leave it: the
+        // cost of skipping is one stale directory, the cost of guessing wrong
+        // the other way is a corrupted live download.
+        None => false,
+    }
+}
+
+/// Best-effort throughout: this is housekeeping, and a failure to tidy up
+/// must never turn into a failed update. Errors are logged at debug.
+fn sweep_orphaned_temp_dirs(db_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(db_dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    let mut removed = 0u32;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let age = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|m| now.duration_since(m).ok());
+        let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+        if !is_sweepable(name, is_dir, age) {
+            continue;
+        }
+        match std::fs::remove_dir_all(entry.path()) {
+            Ok(()) => removed += 1,
+            Err(e) => tracing::debug!(path = %entry.path().display(), %e,
+                "could not remove an orphaned freshclam staging directory"),
+        }
+    }
+    if removed > 0 {
+        info!(
+            count = removed,
+            "removed orphaned freshclam staging directories left by killed update runs"
+        );
+    }
+}
+
 /// Run freshclam to update the signature database.
 /// Returns (success, output_message).
 #[allow(dead_code)]
-pub fn run_freshclam(freshclam_path: &Path, config_path: &Path, _db_dir: &Path) -> (bool, String) {
-    run_freshclam_with_retry(freshclam_path, config_path, _db_dir, |_| {})
+pub fn run_freshclam(freshclam_path: &Path, config_path: &Path, db_dir: &Path) -> (bool, String) {
+    run_freshclam_with_retry(freshclam_path, config_path, db_dir, |_| {})
 }
 
 /// One update CYCLE: run freshclam, retrying transient failures quietly.
@@ -128,6 +200,13 @@ pub fn run_freshclam_with_retry<F>(
 where
     F: FnMut(&str),
 {
+    // Sweep BEFORE the run, not after. After would only ever catch the
+    // directories this cycle just made, and those are younger than
+    // ORPHAN_TEMP_MIN_AGE by construction, so they would always be skipped
+    // and nothing would ever be collected. Sweeping first collects the ones
+    // previous cycles abandoned, which is the actual leak.
+    sweep_orphaned_temp_dirs(db_dir);
+
     let cycle_started = std::time::Instant::now();
     let mut last = (false, String::new());
     for attempt in 0..ATTEMPTS_PER_CYCLE {
@@ -561,6 +640,59 @@ mod tests {
     fn classification_is_case_insensitive() {
         assert!(is_transient("TIMED OUT"));
         assert!(is_transient("Connection Refused"));
+    }
+
+    #[test]
+    fn the_sweep_collects_dead_staging_dirs_and_spares_live_ones() {
+        use std::time::Duration;
+        let old = Some(ORPHAN_TEMP_MIN_AGE + Duration::from_secs(60));
+        let recent = Some(Duration::from_secs(30));
+
+        // The leak this closes: a killed freshclam's staging directory, with
+        // a partial CVD inside, that nothing ever removed.
+        assert!(is_sweepable("tmp.deadbeef01", true, old));
+
+        // The dangerous direction. `recent` stands for a freshclam running
+        // RIGHT NOW — ours, or one an admin started by hand. Dropping the age
+        // guard deletes a live download's staging directory mid-write.
+        assert!(!is_sweepable("tmp.cafebabe02", true, recent));
+
+        // An unreadable or future-dated mtime is not evidence of death.
+        assert!(!is_sweepable("tmp.deadbeef01", true, None));
+
+        // Only freshclam's own naming, and only directories.
+        assert!(!is_sweepable("quarantine-staging", true, old));
+        assert!(!is_sweepable("my-tmp.stuff", true, old));
+        assert!(!is_sweepable("tmp.notadirectory", false, old));
+        // Exactly at the threshold counts as dead — the boundary has to fall
+        // somewhere, and an hour is already far past any run we permit.
+        assert!(is_sweepable("tmp.x", true, Some(ORPHAN_TEMP_MIN_AGE)));
+    }
+
+    #[test]
+    fn the_sweep_walks_a_real_directory_and_removes_nothing_it_should_not() {
+        // The predicate above owns the decision; this owns the walk. Every
+        // entry here is RECENT, so a correct sweep removes none of them —
+        // which is also the regression guard for a sweep that ignored the
+        // predicate and deleted by name alone.
+        let root = std::env::temp_dir().join(format!("sentinella-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let live = root.join("tmp.cafebabe02");
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::write(live.join("daily.cvd.partial"), b"xx").unwrap();
+        let keep = root.join("enhanced");
+        std::fs::create_dir_all(&keep).unwrap();
+
+        sweep_orphaned_temp_dirs(&root);
+
+        assert!(live.exists(), "a live download must survive the sweep");
+        assert!(keep.exists(), "unrelated directories are not ours to touch");
+
+        // And it must not panic or complain on a directory that is not there.
+        sweep_orphaned_temp_dirs(&root.join("does-not-exist"));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
