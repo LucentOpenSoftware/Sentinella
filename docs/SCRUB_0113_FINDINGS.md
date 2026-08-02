@@ -40,11 +40,13 @@ that asserted something untrue of the code beside them.
 4. **217–228 UI keys missing from 7 locales.** Machine-translating
    security-critical settings labels would be worse than the English
    fallback that renders today.
-5. **freshclam exits 0 on a ClamAV CDN cool-down** without downloading, so
-   the daemon stamps `last_update_timestamp = now`. The signature-age signal
-   the 0.1.13 notification work rests on then reports fresh signatures that
-   were never fetched. Needs freshclam's output parsed for the cool-down
-   shape rather than trusting its exit code.
+This list was built from the raw findings rather than from the state after
+the fixes, so it originally also named the freshclam CDN cool-down. That one
+is CLOSED in `8cad296`: `freshclam_output_is_cooldown` splits the cool-down
+run out before anything stamps `last_update_timestamp`, matching
+"cool-down until after" rather than the bare word, because freshclam logs
+"Cool-down expired, ok to try again." immediately before a real fetch and
+matching that would suppress the freshness stamp on every recovery run.
 
 Findings below are listed most-severe first, each with file, line, failure
 scenario and the evidence it was verified against.
