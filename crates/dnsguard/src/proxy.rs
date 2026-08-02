@@ -78,6 +78,22 @@ pub const DEFAULT_MAX_TTL: Duration = Duration::from_secs(300);
 /// Negative (NXDOMAIN) cache lifetime (design: min(60s)).
 pub const DEFAULT_NEGATIVE_TTL: Duration = Duration::from_secs(60);
 pub const DEFAULT_CACHE_CAPACITY: usize = 10_000;
+/// SECOND cache bound, in BYTES of stored response — the entry cap alone
+/// does not bound memory.
+///
+/// WHY: a cached entry holds the response verbatim, and `tcp_exchange`
+/// accepts a full u16-framed answer, so ONE entry can be 65535 bytes. At
+/// the entry cap alone, 10_000 such entries are ~640 MB resident in a
+/// service running as SYSTEM, and any unprivileged local process can drive
+/// it there by resolving 10_000 distinct names under a zone that serves
+/// ~64 KB TXT RRsets — refreshable for as long as it keeps asking. This is
+/// the same entries-vs-bytes mistake `filter.rs` documents for
+/// `MAX_HOSTS_BYTES`: memory is proportional to BYTES, not to entries.
+///
+/// 8 MiB is chosen so the ENTRY cap is what binds in ordinary operation
+/// (a typical answer is a few hundred bytes, so 10_000 of them are ~3 MB)
+/// and this cap binds only on the abusive shape.
+pub const CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// Upper bound on UDP datagrams we read/write (DNS-over-UDP without EDNS is
 /// 512; with EDNS up to 4096 — anything larger is nonsense).
 const MAX_DATAGRAM: usize = 4096;
@@ -212,11 +228,17 @@ pub struct Counters {
     /// are synthesized unconditionally (never a filter decision, never
     /// user traffic), so counting them as user-facing "blocked" would make
     /// the GUI/IPC "domains blocked" figure include probes no client ever
-    /// issued. The self-test asserts a delta equal to the number of canary
-    /// probes it actually got SERVED — the UDP one in step (iii) plus the
-    /// TCP one in step (iv), so up to 2, and fewer when a probe failed
+    /// issued. The self-test asserts a delta of AT LEAST the number of its
+    /// own canary probes that SUCCEEDED — the UDP one in step (iii) plus
+    /// the TCP one in step (iv), so up to 2, and fewer when a probe failed
     /// (a starved TCP pool SERVFAILs before the query is ever counted).
-    /// A signal no upstream can fake.
+    /// A LOWER BOUND and not equality, deliberately (U01): this counter is
+    /// NOT gated on `synthetic`, so any other local process querying the
+    /// canary inside the self-test window inflates it — and the design's
+    /// own operator acceptance test sends exactly that query, so equality
+    /// would red a healthy proxy on concurrent traffic.
+    /// A signal no upstream can fake: an impostor owning port 53 can forge
+    /// the signature but leaves THIS counter at 0.
     pub canary_probes: AtomicU64,
 }
 
@@ -356,6 +378,55 @@ struct CacheEntry {
     expires_at: Instant,
 }
 
+/// The response cache and its running BYTE total.
+///
+/// The total is maintained incrementally on every insert/remove rather than
+/// summed on demand: `cache_store` runs on every cache miss, and walking
+/// 10_000 entries there would put an O(capacity) loop on the hot path.
+/// INVARIANT: `bytes == entries.values().map(|e| e.bytes.len()).sum()`. If
+/// it drifts low the cap stops binding (the bug this type exists to fix
+/// comes back); if it drifts high the cache stops accepting entries early.
+/// Every mutation of `entries` therefore goes through the methods below.
+#[derive(Default)]
+struct ResponseCache {
+    entries: HashMap<CacheKey, CacheEntry>,
+    bytes: usize,
+}
+
+impl ResponseCache {
+    fn get(&self, key: &CacheKey) -> Option<&CacheEntry> {
+        self.entries.get(key)
+    }
+
+    fn remove(&mut self, key: &CacheKey) {
+        if let Some(entry) = self.entries.remove(key) {
+            self.bytes -= entry.bytes.len();
+        }
+    }
+
+    /// Drop every entry that has expired by `now`.
+    fn purge_expired(&mut self, now: Instant) {
+        let mut freed = 0usize;
+        self.entries.retain(|_, entry| {
+            if entry.expires_at > now {
+                true
+            } else {
+                freed += entry.bytes.len();
+                false
+            }
+        });
+        self.bytes -= freed;
+    }
+
+    /// Insert, accounting for the bytes an entry under the same key frees.
+    fn insert(&mut self, key: CacheKey, entry: CacheEntry) {
+        self.bytes += entry.bytes.len();
+        if let Some(old) = self.entries.insert(key, entry) {
+            self.bytes -= old.bytes.len();
+        }
+    }
+}
+
 struct State {
     config: ProxyConfig,
     engine: Arc<RwLock<FilterEngine>>,
@@ -363,7 +434,7 @@ struct State {
     /// daemon can re-read adapter DNS on network-change events without
     /// rebinding. `config.upstreams` is only the constructor input.
     upstreams: RwLock<Vec<SocketAddr>>,
-    cache: Mutex<HashMap<CacheKey, CacheEntry>>,
+    cache: Mutex<ResponseCache>,
     /// Permit pool bounding in-flight UDP queries.
     semaphore: Arc<Semaphore>,
     /// SEPARATE pool bounding concurrent client TCP connections.
@@ -441,12 +512,26 @@ impl State {
             return; // SERVFAIL and friends are never cached
         };
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        if cache.len() >= self.config.cache_capacity {
-            let now = Instant::now();
-            cache.retain(|_, entry| entry.expires_at > now);
-            if cache.len() >= self.config.cache_capacity {
+        // BOTH bounds are checked, because neither implies the other: the
+        // entry cap bounds a flood of small answers, and the byte cap bounds
+        // a flood of maximal (up to 65535-byte, TCP-fetched) ones, which the
+        // entry cap alone would let reach ~640 MB resident. An insert that
+        // REPLACES an entry frees that entry's bytes, so it is charged the
+        // difference — otherwise a large name refreshing itself would be
+        // refused by a budget it does not actually grow.
+        let would_be = |cache: &ResponseCache| {
+            cache.bytes - cache.get(key).map_or(0, |e| e.bytes.len()) + response.len()
+        };
+        if cache.entries.len() >= self.config.cache_capacity || would_be(&cache) > CACHE_MAX_BYTES {
+            cache.purge_expired(Instant::now());
+            if cache.entries.len() >= self.config.cache_capacity
+                || would_be(&cache) > CACHE_MAX_BYTES
+            {
                 // WHY: bounded memory beats perfect caching — drop the
-                // insert rather than grow without limit.
+                // insert rather than grow without limit. Note this makes a
+                // FULL cache stop accepting new names until entries expire
+                // (there is no eviction policy); that is a hit-rate loss,
+                // never a correctness or memory problem.
                 return;
             }
         }
@@ -511,7 +596,7 @@ impl Proxy {
             upstreams: RwLock::new(config.upstreams.clone()),
             config,
             engine: Arc::new(RwLock::new(engine)),
-            cache: Mutex::new(HashMap::new()),
+            cache: Mutex::new(ResponseCache::default()),
             counters: Arc::new(Counters::default()),
             hook,
             upstream_rr: AtomicUsize::new(0),
@@ -625,11 +710,13 @@ impl Proxy {
     ///    unconditionally, under BOTH `block_response` policies, so it
     ///    identifies this listener positively and can never be satisfied
     ///    by an upstream answer or a cached entry (the canary never
-    ///    reaches either); (b) `counters.canary_probes` moved by exactly
-    ///    the number of canary probes SERVED (the UDP one here plus the
-    ///    TCP one of step (iv), so up to 2) while the user-facing
+    ///    reaches either); (b) `counters.canary_probes` moved by AT LEAST
+    ///    the number of canary probes that SUCCEEDED (the UDP one here plus
+    ///    the TCP one of step (iv), so up to 2) while the user-facing
     ///    `queries`/`blocked` did not move — a counter delta no upstream
-    ///    can fake, and proof the probe did not pollute user statistics;
+    ///    can fake, and proof the probe did not pollute user statistics.
+    ///    A lower bound, never equality: the canary counter is not gated on
+    ///    `synthetic`, so concurrent local canary traffic inflates it;
     ///    (c) the engine decides
     ///    `health_check_name` as `Allow` AND it resolves POSITIVELY
     ///    (NOERROR with at least one answer) through the LISTENER — a proxy
@@ -769,9 +856,13 @@ impl Proxy {
         // TTL 60). So under the supported `block_response = "zero_ip"`, a
         // filter that blocks `health_check_name` used to read as "resolves
         // positively": one bad suffix rule turned EVERY name on the machine
-        // into 0.0.0.0 with all four steps green and an empty detail, and
-        // because nothing SERVFAILs, no client fails over to the NRPT
-        // secondary either.
+        // into 0.0.0.0 with all four steps green and an empty detail — and
+        // nothing SERVFAILs, so not even a client that treats SERVFAIL as
+        // "try something else" gets a hint that the answers are ours. There
+        // is nothing else to try in any case: the NRPT rule this product
+        // installs carries exactly ONE server (see
+        // `sentinelld/web_protection/rule.rs`), and an NRPT rule overrides
+        // the adapter's DNS for every matching name.
         //
         // WHY the decision and not the answer's shape: locally synthesized
         // block answers do carry AA=1, but an upstream that is authoritative
@@ -972,8 +1063,10 @@ pub struct SelfTestReport {
     /// End-to-end through the listener: the canary returns the LOCAL
     /// signature (0.0.0.0 A, AA=1 — impossible to satisfy from an upstream
     /// or the cache, under either `block_response` policy), the
-    /// `canary_probes` counter moved by exactly the number of canary
-    /// probes served (up to 2: UDP here, TCP in step (iv)) while the
+    /// `canary_probes` counter moved by AT LEAST the number of canary
+    /// probes that succeeded (up to 2: UDP here, TCP in step (iv)) —
+    /// a lower bound, because concurrent local canary traffic inflates that
+    /// counter and equality would red a healthy proxy — while the
     /// user-facing counters did not move, and `health_check_name` is
     /// decided `Allow`
     /// AND resolves POSITIVELY through the listener. False when the serving
@@ -1149,8 +1242,10 @@ pub fn is_canary_signature(resp: &[u8], probe_id: u16) -> bool {
 /// self-test's private serving loop), every query answered here is a
 /// health-check probe: it skips the user-facing counters and the decision
 /// hook, so probes no client ever issued cannot leak into the GUI/IPC
-/// statistics or the query log. The canary's OWN counter
-/// (`canary_probes`) still moves — the self-test asserts on it.
+/// statistics or the query log — the overload (`shed`) path included, which
+/// is served here and not by `handle_query`. Two counters still move: the
+/// canary's own (`canary_probes`), which the self-test asserts on, and
+/// `shed`, which is a liveness signal rather than a user-facing statistic.
 async fn udp_loop(
     sock: Arc<UdpSocket>,
     state: Arc<State>,
@@ -1190,20 +1285,9 @@ async fn udp_loop(
                                 // client retries over TCP, where the full
                                 // answer is served.
                                 let resp = if resp.len() > udp_limit {
-                                    let rcode = wire::response_info(&resp)
-                                        .map_or(wire::RCODE_NOERROR, |info| info.rcode);
-                                    match wire::build_truncated_response(&bytes, rcode) {
+                                    match truncate_for_client(&bytes, &resp) {
                                         Some(truncated) => truncated,
-                                        // L03: the fallback must NEVER be
-                                        // the oversized response itself
-                                        // (that is the thing truncation
-                                        // protects against). SERVFAIL, and
-                                        // if there is not even a header to
-                                        // answer, drop.
-                                        None => match wire::build_error_response(&bytes, wire::RCODE_SERVFAIL, false) {
-                                            Some(servfail) => servfail,
-                                            None => return,
-                                        },
+                                        None => return,
                                     }
                                 } else {
                                     resp
@@ -1212,24 +1296,70 @@ async fn udp_loop(
                             }
                         });
                     }
-                    Err(_) => shed(&state, &bytes, peer, &sock).await,
+                    Err(_) => shed(&state, &bytes, peer, &sock, synthetic).await,
                 }
             }
         }
     }
 }
 
+/// Rebuild an answer that does not fit the transport as a TC=1 response to
+/// `request`, so the client retries where the full answer does fit (UDP →
+/// TCP; on TCP itself, TC is RFC 2181 §9's "it does not fit at all").
+///
+/// `None` only when `request` is too short to echo an ID from — the caller
+/// must then drop, and must NEVER fall back to sending `oversized`, which is
+/// the thing this protects against (L03).
+///
+/// The rebuild goes through [`normalize_client_edns`] like every other
+/// egress: `build_truncated_response` emits ARCOUNT 0, so without it an
+/// EDNS/DO client would receive a TC answer carrying no OPT — which RFC
+/// 8906-style probers read as "this server does not implement EDNS" and
+/// cache per-server, downgrading later queries to the 512-byte limit and
+/// pushing far more traffic onto the bounded TCP pool. The result stays
+/// well inside any UDP limit: header + question + one OPT is at most
+/// 12 + 259 + 11 bytes, and the smallest limit is 512.
+fn truncate_for_client(request: &[u8], oversized: &[u8]) -> Option<Vec<u8>> {
+    let rcode = wire::response_info(oversized).map_or(wire::RCODE_NOERROR, |info| info.rcode);
+    let resp = match wire::build_truncated_response(request, rcode) {
+        Some(truncated) => truncated,
+        None => wire::build_error_response(request, wire::RCODE_SERVFAIL, false)?,
+    };
+    Some(normalize_client_edns(request, resp))
+}
+
 /// Overload path: answer immediately with SERVFAIL. WHY SERVFAIL and not a
 /// drop: a dropped query leaves the client's resolver retrying for seconds;
-/// SERVFAIL makes it move on (or fail over to the NRPT secondary) at once.
-async fn shed(state: &Arc<State>, bytes: &[u8], peer: SocketAddr, sock: &UdpSocket) {
+/// SERVFAIL makes it move on at once. It does NOT make it resolve the name
+/// elsewhere — the NRPT rule this product installs carries exactly one
+/// server (ours) and overrides the adapter's DNS for every matching name,
+/// so under shedding the machine degrades to NO DNS for the shed queries,
+/// not to unfiltered DNS. That is the whole reason the pool sizes and the
+/// watchdog's strike count are what they are.
+///
+/// `synthetic` has the same meaning as in [`udp_loop`]: a shed inside the
+/// self-test's private serving loop must not move the user-facing counters
+/// or fire the decision hook, because `self_test` asserts those did not
+/// move. Dropping the flag here made any concurrent local flood that
+/// saturated the in-flight pool during the self-test window fail the
+/// self-test — and web protection then refuses to serve for the whole
+/// daemon lifetime.
+async fn shed(state: &Arc<State>, bytes: &[u8], peer: SocketAddr, sock: &UdpSocket, synthetic: bool) {
+    // NOT gated on `synthetic`, like `canary_probes`: `shed` is the liveness
+    // signal the watchdog reads to tell "shedding" from "gone"
+    // (`rule.rs`: `after.shed > before.shed`), and the self-test does not
+    // assert on it.
     state.counters.bump(&state.counters.shed);
-    state.counters.bump(&state.counters.queries);
-    if let Ok(query) = wire::parse_query(bytes) {
-        state.emit(peer, &query, QueryOutcome::Shed);
+    if !synthetic {
+        state.counters.bump(&state.counters.queries);
+        if let Ok(query) = wire::parse_query(bytes) {
+            state.emit(peer, &query, QueryOutcome::Shed);
+        }
     }
     if let Some(resp) = wire::build_error_response(bytes, wire::RCODE_SERVFAIL, false) {
-        let _ = sock.send_to(&resp, peer).await;
+        // Same egress normalization as every other response we emit: this
+        // one is built here, after `handle_query`, so it does not inherit it.
+        let _ = sock.send_to(&normalize_client_edns(bytes, resp), peer).await;
     }
     debug!(%peer, "query shed: in-flight limit reached");
 }
@@ -1318,8 +1448,10 @@ async fn tcp_loop(listener: Arc<TcpListener>, state: Arc<State>, mut shutdown: w
 /// Fail-safe answer for a client that waited out the TCP queue (round 3,
 /// A1/A2): read ONE framed query (bounded — a client that sends nothing
 /// gets closed silently) and answer SERVFAIL, so a TC-honouring resolver
-/// can retry or fail over instead of hitting a connection reset on the
-/// path truncation sent it to. Holds no pool permit; fully bounded.
+/// can RETRY instead of hitting a connection reset on the path truncation
+/// sent it to. Retry is all it can do: the NRPT rule names exactly one
+/// server, so there is nowhere else for the name to resolve. Holds no pool
+/// permit; fully bounded.
 async fn serve_overflow_servfail(mut stream: TcpStream) {
     /// Total budget for the whole overflow exchange.
     const OVERFLOW_BUDGET: Duration = Duration::from_secs(2);
@@ -1330,6 +1462,11 @@ async fn serve_overflow_servfail(mut stream: TcpStream) {
         let mut buf = vec![0u8; n];
         stream.read_exact(&mut buf).await?;
         if let Some(resp) = wire::build_error_response(&buf, wire::RCODE_SERVFAIL, false) {
+            // Built here rather than by `handle_query`, so the egress EDNS
+            // normalization has to be applied explicitly — an EDNS client
+            // must not read our overload answer as "no EDNS support here".
+            let resp = normalize_client_edns(&buf, resp);
+            // Header + question + one OPT; `as u16` cannot wrap on it.
             let framed = (resp.len() as u16).to_be_bytes();
             stream.write_all(&framed).await?;
             stream.write_all(&resp).await?;
@@ -1398,7 +1535,32 @@ async fn tcp_conn(
         // (4) write back. An unbounded `write_all` lets a pipelining client
         // that never reads park the permit forever on a full send buffer.
         let Some(budget) = left(deadline) else { break };
-        let framed_len = (resp.len() as u16).to_be_bytes();
+        // A DNS-over-TCP message is framed by a 2-byte length, so anything
+        // past 65535 bytes HAS NO FRAME. `resp.len() as u16` would wrap
+        // silently (65541 -> 5) and we would announce 5 bytes and then write
+        // 65541: the client reads 5 bytes as a whole message and re-frames
+        // the rest of OUR answer as further messages — the stream is
+        // desynchronized for its whole lifetime and every pipelined query on
+        // it is answered from garbage. No hostile upstream needed:
+        // `tcp_exchange` accepts a 65535-byte answer, and the egress OPT
+        // `normalize_client_edns` appends for an EDNS requester adds 11 more.
+        let (resp, len) = match u16::try_from(resp.len()) {
+            Ok(len) => (resp, len),
+            Err(_) => {
+                debug!(%peer, len = resp.len(), "answer exceeds the DNS-over-TCP frame limit: truncating");
+                // TC=1 over TCP is RFC 2181 §9's "the answer does not fit",
+                // which is exactly true here — a truthful failure the client
+                // can act on, instead of a corrupted stream.
+                let Some(truncated) = truncate_for_client(&buf, &resp) else {
+                    break;
+                };
+                let Ok(len) = u16::try_from(truncated.len()) else {
+                    break; // unreachable: header + question + OPT
+                };
+                (truncated, len)
+            }
+        };
+        let framed_len = len.to_be_bytes();
         let written = timeout(budget, async {
             stream.write_all(&framed_len).await?;
             stream.write_all(&resp).await
@@ -1441,10 +1603,18 @@ async fn tcp_conn(
 /// received — a classic stub that sent no OPT was handed one it never asked
 /// for, and an EDNS client could be served an answer with none. The obvious
 /// fix, adding a "client sent an OPT" bit to the cache key, fixes one sink
-/// and leaves five (block NXDOMAIN, block zero-IP, canary, error/NOTIMP and
-/// the TC response), and doubles the cache fan-out. So the DATA is fixed
-/// once, here: every response we emit has inherited OPTs removed and then
+/// and leaves four (block NXDOMAIN, block zero-IP, canary, error/NOTIMP),
+/// and doubles the cache fan-out. So the DATA is fixed once, here: every
+/// response that leaves this function has inherited OPTs removed and then
 /// exactly one OPT appended iff THIS requester sent one.
+///
+/// THE RESPONSES BUILT AFTER IT RETURNS ARE NOT COVERED BY IT and call
+/// [`normalize_client_edns`] themselves — the TC rebuild and the overload
+/// SERVFAILs, which are constructed from the raw REQUEST by their callers
+/// ([`truncate_for_client`], [`shed`], [`serve_overflow_servfail`]) and
+/// never pass through here. An earlier revision of this comment claimed
+/// "the TC response" was one of the sinks fixed here; it was not, and an
+/// EDNS client's truncated answer went out with ARCOUNT 0.
 ///
 /// Ordering note: this runs BEFORE the caller's size check, so the OPT's 11
 /// bytes are counted against the client's advertised limit rather than
@@ -1881,6 +2051,354 @@ mod tests {
 
     fn addr(ip: [u8; 4], port: u16) -> SocketAddr {
         SocketAddr::from((ip, port))
+    }
+
+    /// A `State` built without binding anything: enough for the parts of the
+    /// pipeline that are driven directly (`udp_loop`, `tcp_conn`, the cache),
+    /// with no upstream reachable — every test below answers from the cache,
+    /// the shed path, or the truncation path.
+    fn test_state(config: ProxyConfig, hook: Arc<dyn DecisionHook>) -> Arc<State> {
+        Arc::new(State {
+            semaphore: Arc::new(Semaphore::new(config.max_in_flight)),
+            tcp_semaphore: Arc::new(Semaphore::new(config.tcp_max_connections)),
+            tcp_queue_semaphore: Arc::new(Semaphore::new(config.tcp_max_queued)),
+            txids: UpstreamTxids::new(),
+            upstreams: RwLock::new(config.upstreams.clone()),
+            config,
+            engine: Arc::new(RwLock::new(FilterEngine::new())),
+            cache: Mutex::new(ResponseCache::default()),
+            counters: Arc::new(Counters::default()),
+            hook,
+            upstream_rr: AtomicUsize::new(0),
+        })
+    }
+
+    /// A query carrying an EDNS0 OPT that advertises `udp_size` — what a
+    /// Windows stub actually sends. `build_query` deliberately emits none,
+    /// so the upstream builder is the one that can produce this shape.
+    fn edns_query(id: u16, name: &str, udp_size: u16) -> Vec<u8> {
+        let plain = wire::build_query(id, name, wire::TYPE_A, wire::CLASS_IN).expect("build query");
+        let q = wire::parse_query(&plain).expect("parse query");
+        wire::build_upstream_query(
+            id,
+            &plain[wire::HEADER_LEN..q.question_end],
+            false,
+            Some((udp_size, false)),
+        )
+    }
+
+    /// A cacheable NOERROR answer for `query`, padded out to `len` bytes.
+    /// The padding is trailing (past the single answer record), so it parses
+    /// exactly like the real TCP-fetched answers this crate already caches —
+    /// `response_info` reads its TTL, and `strip_opt_records` leaves it
+    /// alone because ARCOUNT is 0.
+    fn padded_answer(query: &[u8], len: usize) -> Vec<u8> {
+        let mut resp = wire::build_zero_ip_response(query, 60).expect("answer");
+        assert!(resp.len() <= len, "padding target must exceed the answer");
+        resp.resize(len, 0);
+        assert!(
+            wire::response_info(&resp).and_then(|info| info.min_ttl).is_some(),
+            "the padded answer must still parse as a cacheable NOERROR"
+        );
+        resp
+    }
+
+    /// Put `bytes` in the cache under the key `handle_query` computes for
+    /// `query`, so the serving path returns it without any upstream.
+    fn seed_cache(state: &State, query: &[u8], bytes: Vec<u8>) {
+        let q = wire::parse_query(query).expect("parse query");
+        let key: CacheKey = (
+            q.qname_wire.clone(),
+            q.qtype,
+            q.qclass,
+            u8::from(q.dnssec_ok) | u8::from(q.checking_disabled) << 1,
+        );
+        state.cache.lock().expect("cache").insert(
+            key,
+            CacheEntry {
+                bytes,
+                expires_at: Instant::now() + Duration::from_secs(60),
+            },
+        );
+    }
+
+    /// REGRESSION. DNS-over-TCP frames each message with a 2-byte length,
+    /// and the frame length used to be `resp.len() as u16` — which WRAPS.
+    /// An upstream answer may be 65535 bytes (that is the framing limit on
+    /// the way in too) and the egress OPT adds 11, so a 65530-byte answer
+    /// went out announced as 5 bytes: the client read 5 bytes as a whole
+    /// message and then re-framed the remaining 65536 bytes of our answer as
+    /// further messages, desynchronizing the connection for its lifetime.
+    ///
+    /// The property asserted is the one that matters to the client: the
+    /// frame length describes the whole message, and nothing follows it.
+    #[tokio::test]
+    async fn an_answer_too_large_to_frame_never_desynchronizes_the_tcp_stream() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let listen_addr = listener.local_addr().expect("addr");
+        let state = test_state(
+            ProxyConfig {
+                tcp_idle_timeout: Duration::from_millis(200),
+                tcp_max_lifetime: Duration::from_secs(5),
+                ..ProxyConfig::default()
+            },
+            Arc::new(NoopDecisionHook),
+        );
+
+        // The maximal answer a `tcp_exchange` can hand us. With the client's
+        // OPT appended on egress this is 65546 bytes — unframeable.
+        let query = edns_query(0x4242, "big.example", 4096);
+        seed_cache(&state, &query, padded_answer(&query, 65_535));
+
+        let served = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.expect("accept");
+            let permit = Arc::clone(&served.tcp_semaphore)
+                .try_acquire_owned()
+                .expect("permit");
+            tcp_conn(stream, peer, served, permit, false).await;
+        });
+
+        let mut client = TcpStream::connect(listen_addr).await.expect("connect");
+        client
+            .write_all(&(query.len() as u16).to_be_bytes())
+            .await
+            .expect("write length");
+        client.write_all(&query).await.expect("write query");
+
+        let mut len_buf = [0u8; 2];
+        client.read_exact(&mut len_buf).await.expect("frame length");
+        let framed = usize::from(u16::from_be_bytes(len_buf));
+        let mut message = vec![0u8; framed];
+        client.read_exact(&mut message).await.expect("framed message");
+
+        // THE ASSERTION: the frame was the whole message. Anything left on
+        // the wire is answer bytes the client will re-frame as garbage.
+        let mut trailing = Vec::new();
+        timeout(Duration::from_secs(3), client.read_to_end(&mut trailing))
+            .await
+            .expect("connection must close on the idle timeout")
+            .expect("read to end");
+        assert!(
+            trailing.is_empty(),
+            "framed {framed} bytes but {} more followed: the client's next \
+             length prefix is our answer's payload",
+            trailing.len()
+        );
+        assert_eq!(
+            u16::from_be_bytes([message[0], message[1]]),
+            0x4242,
+            "the framed message must be the answer to our query"
+        );
+        assert!(
+            wire::is_truncated_response(&message),
+            "TC=1 is how the client learns the answer did not fit (RFC 2181 §9)"
+        );
+        server.await.expect("server task");
+    }
+
+    /// REGRESSION. The UDP truncation path rebuilds the response from the
+    /// raw REQUEST after `handle_query` has returned, so it bypassed the
+    /// egress EDNS normalization: an EDNS/DO client got TC=1 with ARCOUNT 0,
+    /// which RFC 8906-style probers read as "this server does not implement
+    /// EDNS" and cache per-server — downgrading later queries to the classic
+    /// 512-byte limit and pushing far more traffic onto the bounded TCP pool.
+    #[tokio::test]
+    async fn a_truncated_udp_answer_still_carries_the_requesters_opt() {
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
+        let listen_addr = sock.local_addr().expect("addr");
+        let state = test_state(ProxyConfig::default(), Arc::new(NoopDecisionHook));
+
+        // Advertise 1232 (the common stub value) and cache a 2000-byte
+        // answer, so the size check trips.
+        let query = edns_query(0x1234, "big.example", 1232);
+        seed_cache(&state, &query, padded_answer(&query, 2000));
+
+        let (tx, rx) = watch::channel(false);
+        let loop_task = tokio::spawn(udp_loop(Arc::clone(&sock), Arc::clone(&state), rx, false));
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("client");
+        client.send_to(&query, listen_addr).await.expect("send");
+        let mut buf = [0u8; MAX_DATAGRAM];
+        let n = timeout(Duration::from_secs(3), client.recv(&mut buf))
+            .await
+            .expect("proxy must answer")
+            .expect("recv");
+        let resp = &buf[..n];
+
+        assert!(wire::is_truncated_response(resp), "the answer must be truncated");
+        assert!(n <= 1232, "the truncated answer must fit the advertised size");
+        assert_eq!(
+            u16::from_be_bytes([resp[10], resp[11]]),
+            1,
+            "ARCOUNT: the TC answer must carry exactly one OPT for this requester"
+        );
+        // Root name + type 41 opens the OPT record, which is the last 11
+        // bytes `append_client_opt` wrote.
+        assert_eq!(
+            &resp[n - 11..n - 8],
+            &[0x00, 0x00, 0x29],
+            "the additional record must actually be an OPT"
+        );
+
+        let _ = tx.send(true);
+        loop_task.abort();
+    }
+
+    /// Drive one query into a proxy whose in-flight pool is exhausted, and
+    /// report what the shed left behind: the counters and how many decision
+    /// events the hook saw.
+    async fn shed_one_query(synthetic: bool) -> (CountersSnapshot, usize) {
+        let events = Arc::new(Mutex::new(Vec::<QueryOutcome>::new()));
+        let sink = Arc::clone(&events);
+        let hook: Arc<dyn DecisionHook> =
+            Arc::new(move |event: &DecisionEvent| sink.lock().expect("events").push(event.outcome));
+        // Zero permits: `try_acquire_owned` always fails, so every query
+        // takes the overload path.
+        let state = test_state(
+            ProxyConfig {
+                max_in_flight: 0,
+                ..ProxyConfig::default()
+            },
+            hook,
+        );
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
+        let listen_addr = sock.local_addr().expect("addr");
+        let (tx, rx) = watch::channel(false);
+        let loop_task = tokio::spawn(udp_loop(
+            Arc::clone(&sock),
+            Arc::clone(&state),
+            rx,
+            synthetic,
+        ));
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("client");
+        let query =
+            wire::build_query(0x77, "example.com", wire::TYPE_A, wire::CLASS_IN).expect("query");
+        client.send_to(&query, listen_addr).await.expect("send");
+        let mut buf = [0u8; MAX_DATAGRAM];
+        let n = timeout(Duration::from_secs(3), client.recv(&mut buf))
+            .await
+            .expect("a shed query must be ANSWERED, never dropped")
+            .expect("recv");
+        assert_eq!(
+            wire::response_info(&buf[..n]).expect("response").rcode,
+            wire::RCODE_SERVFAIL,
+            "the overload answer is SERVFAIL"
+        );
+
+        let _ = tx.send(true);
+        loop_task.abort();
+        let seen = events.lock().expect("events").len();
+        (state.counters.snapshot(), seen)
+    }
+
+    /// REGRESSION. `shed` never received `synthetic`, so a query shed inside
+    /// the self-test's private serving loop bumped the user-facing `queries`
+    /// counter and fired the decision hook — and `self_test` requires those
+    /// NOT to move. Any concurrent local traffic that saturated the 256-permit
+    /// pool during the self-test window therefore reded a healthy proxy, and
+    /// `WebProtection::start` refuses to serve for the whole daemon lifetime
+    /// on that verdict: sustained flood, no web protection, ever.
+    #[tokio::test]
+    async fn a_synthetic_shed_stays_out_of_the_user_facing_counters() {
+        let (counters, events) = shed_one_query(true).await;
+        assert_eq!(
+            counters.queries, 0,
+            "self_test asserts queries did not move across its probes"
+        );
+        assert_eq!(counters.blocked, 0);
+        assert_eq!(events, 0, "probe traffic must not reach the query log");
+        assert_eq!(
+            counters.shed, 1,
+            "shed is a liveness signal the watchdog reads: it must still move"
+        );
+    }
+
+    /// The other half: a REAL client's shed is user traffic and must be
+    /// counted and logged, or the overload becomes invisible.
+    #[tokio::test]
+    async fn a_real_shed_is_counted_and_logged() {
+        let (counters, events) = shed_one_query(false).await;
+        assert_eq!(counters.queries, 1);
+        assert_eq!(counters.shed, 1);
+        assert_eq!(events, 1);
+    }
+
+    /// REGRESSION. The cache was bounded in ENTRIES only. One entry holds a
+    /// whole response, and a TCP-fetched answer can be 65535 bytes, so the
+    /// 10_000-entry cap allowed ~640 MB resident in a service running as
+    /// SYSTEM — reachable by any local process resolving distinct names
+    /// under a zone that serves large RRsets. Measured before the fix, with
+    /// this test's 400 x 60 KiB answers: 24.6 MB stored under an 8 MiB
+    /// budget, and nothing to stop it scaling to the entry cap.
+    #[test]
+    fn the_cache_is_bounded_in_bytes_not_only_in_entries() {
+        let state = test_state(ProxyConfig::default(), Arc::new(NoopDecisionHook));
+        let query =
+            wire::build_query(1, "big.example", wire::TYPE_A, wire::CLASS_IN).expect("query");
+        let big = padded_answer(&query, 60 * 1024);
+
+        for i in 0..400u32 {
+            // Distinct names, one entry each — the shape a hostile zone
+            // drives. 400 x 60 KiB is 24 MB, three times the byte budget.
+            let key: CacheKey = (i.to_be_bytes().to_vec(), wire::TYPE_A, wire::CLASS_IN, 0);
+            state.cache_store(&key, &big);
+        }
+
+        let cache = state.cache.lock().expect("cache");
+        assert_eq!(
+            cache.bytes,
+            cache.entries.values().map(|e| e.bytes.len()).sum::<usize>(),
+            "the running byte total must equal the contents, or the cap stops binding"
+        );
+        assert!(
+            cache.bytes <= CACHE_MAX_BYTES,
+            "cache holds {} bytes, over the {CACHE_MAX_BYTES}-byte budget",
+            cache.bytes
+        );
+        assert!(
+            !cache.entries.is_empty() && cache.entries.len() < 400,
+            "the byte cap must bind before the entry cap does: {} entries",
+            cache.entries.len()
+        );
+    }
+
+    /// The byte total must survive the operations that REMOVE entries, or it
+    /// drifts up and the cache silently stops accepting anything.
+    #[test]
+    fn cache_byte_accounting_survives_expiry_and_replacement() {
+        let state = test_state(ProxyConfig::default(), Arc::new(NoopDecisionHook));
+        let query =
+            wire::build_query(1, "big.example", wire::TYPE_A, wire::CLASS_IN).expect("query");
+        let answer = padded_answer(&query, 4096);
+        let key: CacheKey = (vec![1, 2, 3], wire::TYPE_A, wire::CLASS_IN, 0);
+
+        state.cache_store(&key, &answer);
+        state.cache_store(&key, &answer); // same key: replaces, does not add
+        {
+            let cache = state.cache.lock().expect("cache");
+            assert_eq!(cache.entries.len(), 1);
+            assert_eq!(cache.bytes, answer.len());
+        }
+
+        // Expire it by hand and purge: the total must come back to zero.
+        {
+            let mut cache = state.cache.lock().expect("cache");
+            let entry = cache.entries.get_mut(&key).expect("entry");
+            entry.expires_at = Instant::now() - Duration::from_secs(1);
+            cache.purge_expired(Instant::now());
+            assert!(cache.entries.is_empty());
+            assert_eq!(cache.bytes, 0, "freed bytes must be credited back");
+        }
+
+        // And through the read path's expiry removal.
+        state.cache_store(&key, &answer);
+        {
+            let mut cache = state.cache.lock().expect("cache");
+            cache.remove(&key);
+            assert_eq!(cache.bytes, 0);
+        }
     }
 
     #[test]

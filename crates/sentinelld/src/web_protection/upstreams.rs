@@ -22,6 +22,12 @@
 //! inventing one — the design forbids a hardcoded public resolver, and a
 //! resolver silently pointed somewhere the operator did not choose is
 //! worse than a resolver that refuses to start.
+//!
+//! Dropped ENTRY BY ENTRY, by the same test `dnsguard` applies at bind
+//! (see `is_self_referential`). The two halves of one safety rule have to
+//! agree: dnsguard rejects the whole list on one bad address, so anything
+//! this filter lets through and dnsguard then refuses costs us every good
+//! upstream that was in the list alongside it.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -143,21 +149,43 @@ fn filter_usable(raw: Vec<IpAddr>, listen: SocketAddr) -> Vec<SocketAddr> {
             debug!(%ip, "dropping unusable DNS server address");
             continue;
         }
+        let addr = SocketAddr::new(ip, DNS_PORT);
         // THE LOOP GUARD. A loopback DNS server on our own port is us, and
         // even a loopback server on a DIFFERENT port is a local resolver
         // that may itself be configured to point back here. We keep the
         // latter — it is a legitimate chained-resolver setup and refusing
         // it would break dnscrypt users — but never the former.
-        if ip.is_loopback() && SocketAddr::new(ip, DNS_PORT) == listen {
+        if is_self_referential(addr, listen) {
             warn!(%ip, %listen, "dropping DNS server that is this proxy itself");
             continue;
         }
-        let addr = SocketAddr::new(ip, DNS_PORT);
         if !out.contains(&addr) {
             out.push(addr);
         }
     }
     out
+}
+
+/// Would `dnsguard` refuse this upstream as self-referential?
+///
+/// THIS MUST MATCH `dnsguard::proxy::validate_upstreams` EXACTLY, because
+/// the two run in sequence and the narrower one runs FIRST. `filter_usable`
+/// used to drop only the exact `ip:53 == listen` match, so `[::1]` or
+/// `127.0.0.2` survived discovery on a machine that had once run
+/// dnscrypt-proxy / AdGuard Home / a host Pi-hole (they configure both
+/// families, and 127/8 is all loopback). `Proxy::bind` then rejected the
+/// WHOLE list on that one entry and web protection refused to start —
+/// throwing away the perfectly usable LAN resolver that was sitting next to
+/// it. Dropping the entry keeps the list; rejecting it loses the list.
+///
+/// The rule is about the LISTEN PORT, not about loopback: a local resolver
+/// on some other port is a legitimate chained setup and must survive.
+fn is_self_referential(upstream: SocketAddr, listen: SocketAddr) -> bool {
+    upstream == listen
+        || (listen.port() != 0
+            && upstream.port() == listen.port()
+            && upstream.ip().is_loopback()
+            && (listen.ip().is_loopback() || listen.ip().is_unspecified()))
 }
 
 fn is_ipv6_placeholder(ip: &IpAddr) -> bool {
@@ -330,6 +358,59 @@ mod tests {
         ];
         let kept = filter_usable(raw, listen53());
         assert_eq!(kept, vec!["192.168.1.1:53".parse::<SocketAddr>().unwrap()]);
+    }
+
+    /// REGRESSION. The filter used to compare against `listen` for exact
+    /// equality, so a leftover `::1` or `127.0.0.2` adapter entry survived
+    /// discovery — and `Proxy::bind` then rejected the ENTIRE list on it,
+    /// taking the usable LAN resolver down with it. Web protection reported
+    /// BindFailed on a machine whose DNS was perfectly serviceable.
+    ///
+    /// Both shapes are ordinary leftovers: removing dnscrypt-proxy /
+    /// AdGuard Home / a host Pi-hole leaves loopback DNS configured on both
+    /// families, and every address in 127/8 is loopback.
+    #[test]
+    fn any_loopback_alias_on_our_port_is_dropped_not_the_whole_list() {
+        for leftover in ["::1", "127.0.0.2", "127.44.0.9"] {
+            let raw = vec![
+                leftover.parse().unwrap(),
+                "192.168.1.1".parse().unwrap(),
+            ];
+            let kept = filter_usable(raw, listen53());
+            assert_eq!(
+                kept,
+                vec!["192.168.1.1:53".parse::<SocketAddr>().unwrap()],
+                "{leftover}: dnsguard would refuse the whole list over this entry"
+            );
+        }
+    }
+
+    /// The filter and `dnsguard::proxy::validate_upstreams` are one rule in
+    /// two places, and the narrower one runs first. Anything this predicate
+    /// calls safe must still be safe there.
+    #[test]
+    fn the_self_reference_test_matches_dnsguards() {
+        let listen: SocketAddr = "127.0.0.1:53".parse().unwrap();
+        for refused in ["127.0.0.1:53", "127.0.0.2:53", "[::1]:53"] {
+            assert!(
+                is_self_referential(refused.parse().unwrap(), listen),
+                "{refused} is refused by dnsguard at bind"
+            );
+        }
+        for allowed in ["127.0.0.1:5353", "192.168.1.1:53", "[2001:db8::1]:53"] {
+            assert!(
+                !is_self_referential(allowed.parse().unwrap(), listen),
+                "{allowed} is accepted by dnsguard and must not be dropped here"
+            );
+        }
+        // A wildcard listener receives loopback traffic, so dnsguard treats
+        // loopback-on-the-listen-port as self-referential there too.
+        let wildcard: SocketAddr = "0.0.0.0:53".parse().unwrap();
+        assert!(is_self_referential("127.0.0.1:53".parse().unwrap(), wildcard));
+        // Port 0 means the port is not chosen yet: only identity counts.
+        let ephemeral: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        assert!(is_self_referential(ephemeral, ephemeral));
+        assert!(!is_self_referential("127.0.0.1:53".parse().unwrap(), ephemeral));
     }
 
     /// A loopback resolver on a DIFFERENT port is a legitimate chained

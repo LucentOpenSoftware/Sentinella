@@ -124,20 +124,36 @@ fn install_task() {
 ///
 /// REFUSES while a rule is still live. The uninstall ladder is meant to
 /// remove the RULE first (`--remove`) and the task second, but that
-/// ordering lives in MSI sequencing — which a future edit, a partial
-/// uninstall, or someone running this by hand can all get wrong. Deleting
+/// ordering lives in the NSIS uninstall hook (`gui/src-tauri/nsis-hooks.nsh`,
+/// NSIS_HOOK_PREUNINSTALL — the WiX/MSI packaging this comment used to name
+/// was never what shipped) — which a future edit, a partial uninstall, or
+/// someone running this by hand can all get wrong. Deleting
 /// the remover while a rule is still installed is precisely the state this
 /// design exists to prevent, so the refusal belongs HERE, where it holds
 /// regardless of who is calling and in what order.
+/// The refusal message, as a function so the ASCII test can assert on the
+/// string the binary actually emits rather than on a copy of it.
+fn refuse_because_rule_is_live(guid: &str) -> String {
+    format!(
+        "refusing to unregister {}: NRPT rule {guid} is still installed.                      Remove the rule first (--remove); deleting the task now would                      leave this machine's DNS pointed at a proxy with nothing able                      to undo it.",
+        task::TASK_NAME
+    )
+}
+
+/// Same, for the case where the registry could not be read at all.
+fn refuse_because_rule_state_is_unknown(e: &nrpt::Error) -> String {
+    format!(
+        "refusing to unregister {}: cannot confirm the rule is gone ({e})",
+        task::TASK_NAME
+    )
+}
+
 fn remove_task() {
     let state_file = nrpt::default_state_file();
     if let Some(guid) = nrpt::recorded_guid(&state_file) {
         match nrpt::rule_exists(&guid) {
             Ok(true) => {
-                let msg = format!(
-                    "refusing to unregister {}: NRPT rule {guid} is still installed.                      Remove the rule first (--remove); deleting the task now would                      leave this machine's DNS pointed at a proxy with nothing able                      to undo it.",
-                    task::TASK_NAME
-                );
+                let msg = refuse_because_rule_is_live(&guid);
                 log(&state_file, &msg);
                 eprintln!("sentinella-dnsreconcile: {msg}");
                 std::process::exit(1);
@@ -145,7 +161,7 @@ fn remove_task() {
             // Unreadable registry is not "confirmed absent". Same reasoning
             // as the reconcile path: refuse rather than act on a guess.
             Err(e) => {
-                let msg = format!("refusing to unregister {}: cannot confirm the rule is gone ({e})", task::TASK_NAME);
+                let msg = refuse_because_rule_state_is_unknown(&e);
                 log(&state_file, &msg);
                 eprintln!("sentinella-dnsreconcile: {msg}");
                 std::process::exit(1);
@@ -320,6 +336,13 @@ fn probe_once(addr: SocketAddr) -> bool {
 /// no working DNS; a UTF-8 em-dash renders as mojibake in a legacy-codepage
 /// console, and the one artifact that has to be readable in an emergency
 /// should not depend on the reader's encoding.
+///
+/// ENFORCED HERE, not left to whoever writes the next message. It used to
+/// be a convention backed by a test that asserted on hand-copied duplicates
+/// of the messages: editing one to use an em-dash — which the doc comments
+/// all around it are full of, so it is the natural thing to type — shipped
+/// mojibake with the test still green. Every caller now funnels through
+/// [`ascii_only`], so the invariant holds for messages nobody thought about.
 fn log(state_file: &Path, msg: &str) {
     let Some(dir) = state_file.parent().and_then(Path::parent) else {
         return;
@@ -333,8 +356,19 @@ fn log(state_file: &Path, msg: &str) {
         let _ = std::fs::write(&path, b"");
     }
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(f, "{msg}");
+        let _ = writeln!(f, "{}", ascii_only(msg));
     }
+}
+
+/// Replace every non-ASCII character with `?`.
+///
+/// A `?` is ugly. A mojibake byte in the one file somebody reads to find out
+/// why their machine has no DNS is worse, and unlike the `?` it is not
+/// obviously a substitution.
+fn ascii_only(msg: &str) -> String {
+    msg.chars()
+        .map(|c| if c.is_ascii() { c } else { '?' })
+        .collect()
 }
 
 #[cfg(test)]
@@ -381,25 +415,58 @@ mod tests {
         );
     }
 
-    /// The forensic log and the usage text are read on a machine with no
-    /// DNS, by whoever is trying to find out why. A non-ASCII byte renders
-    /// as mojibake in a legacy-codepage console, so every string this
-    /// binary can emit is pinned to ASCII.
+    /// REGRESSION, and a test about a test. The old version of this
+    /// asserted on hand-copied duplicates of six log messages, so it stayed
+    /// green no matter what the code actually wrote — swap any `-` for an
+    /// em-dash (the doc comments around them are full of em-dashes) and the
+    /// binary shipped mojibake in the one file that has to be readable on a
+    /// machine with no DNS. It also did not cover `remove_task`'s two
+    /// messages at all, one of which is exactly what the uninstaller's
+    /// abort dialog tells the user to go and read.
+    ///
+    /// So the rule is enforced at the choke point instead, and this checks
+    /// the enforcement: whatever a caller hands `log`, the file stays ASCII.
     #[test]
-    fn everything_this_binary_prints_is_ascii() {
+    fn the_log_file_stays_ascii_whatever_a_caller_hands_it() {
+        let root = std::env::temp_dir().join("dnsreconcile-ascii-test");
+        let _ = std::fs::remove_dir_all(&root);
+        let state_file = root.join("state").join("nrpt-rule.guid");
+        let log_path = root.join("logs").join("dnsreconcile.log");
+
+        // The exact edit that used to slip through: an em-dash where the
+        // ASCII hyphen was. Plus a non-Latin script, for good measure.
+        log(&state_file, "no recorded rule \u{2014} nothing to reconcile");
+        log(&state_file, "REMOVED {guid} \u{2014} DNS restored \u{4e2d}\u{6587}");
+
+        let written = std::fs::read(&log_path).expect("log file");
+        assert!(
+            written.is_ascii(),
+            "the log has non-ASCII bytes: {:?}",
+            String::from_utf8_lossy(&written)
+        );
+        // And it must still be legible, not blanked.
+        let text = String::from_utf8(written).expect("ascii is utf8");
+        assert!(text.contains("no recorded rule ? nothing to reconcile"));
+        assert!(text.contains("DNS restored ??"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The strings that go to the console rather than the log. These are
+    /// referenced, not copied — an edit to any of them is an edit to what
+    /// this test sees.
+    #[test]
+    fn the_strings_printed_to_the_console_are_ascii() {
+        assert!(USAGE.is_ascii(), "usage text: {USAGE}");
+        // The uninstall refusals: the abort dialog points the user at these.
         let guid = "{0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0}";
-        let why = "rule is live but 127.0.0.1:53 did not answer with our signature";
-        for m in [
-            "no recorded rule - nothing to reconcile".to_string(),
-            format!("recorded rule {guid} is absent - clearing stale record"),
-            format!("rule {guid} is live and the proxy answers - leaving it"),
-            format!("REMOVED {guid} ({why}) - DNS restored to system defaults"),
-            format!("FAILED to remove {guid}: access denied"),
-            format!("DRY RUN: would remove {guid} ({why})"),
-            USAGE.to_string(),
-        ] {
-            assert!(m.is_ascii(), "not ASCII, will render as mojibake: {m}");
-        }
+        let live = refuse_because_rule_is_live(guid);
+        assert!(live.is_ascii(), "not ASCII: {live}");
+        let unknown = refuse_because_rule_state_is_unknown(&nrpt::Error::AccessDenied(
+            "SYSTEM required".into(),
+        ));
+        assert!(unknown.is_ascii(), "not ASCII: {unknown}");
+        // Both must name the escape hatch, or the refusal is a dead end.
+        assert!(live.contains("--remove"));
     }
 
     /// THE POSITIVE CASE, and the most important test here. If the probe

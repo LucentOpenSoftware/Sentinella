@@ -426,7 +426,14 @@ export function ListEditor({
           }
         }
         if (next.length >= cap) {
-          errs.push(i18n.t("settings.list_full") || "list full");
+          // tf(), not `t(...) || "…"`: t() returns the KEY on a miss and a key
+          // is truthy, so that idiom rendered the literal "settings.list_full"
+          // under the field. The key is still absent from all 9 locale files.
+          errs.push(
+            i18n
+              .tf("settings.list_full", "List is full ({max} maximum)")
+              .replace("{max}", String(cap)),
+          );
           break;
         }
         next.push(v);
@@ -465,7 +472,7 @@ export function ListEditor({
                 <button
                   onClick={() => onChange(items.filter((_, j) => j !== i))}
                   className="text-[rgb(var(--muted))] hover:text-red-400"
-                  aria-label="Remove"
+                  aria-label={i18n.t("settings.remove")}
                 >
                   <X className="w-3 h-3" />
                 </button>

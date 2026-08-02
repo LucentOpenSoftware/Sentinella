@@ -85,6 +85,19 @@ pub const MAX_HOSTS_BYTES: u64 = 256 * 1024 * 1024;
 /// list and caps the hostile case at roughly 250 MB of rule storage.
 pub const MAX_HOSTS_RULES: u64 = 4_000_000;
 
+/// Consecutive undecodable lines a load tolerates before giving up.
+///
+/// Skipping a line that is not valid UTF-8 is safe because `lines()` has
+/// CONSUMED that line's bytes: the load makes progress, and a list with
+/// non-UTF-8 bytes scattered through it never comes near this bound. A
+/// reader that fails WITHOUT consuming — a transport returning InvalidData
+/// on every read — makes no progress at all, and skipping forever would spin
+/// the load inside a SYSTEM service. This is what bounds that. It is
+/// reported as a partial load like any other cut ONLY if at least one rule
+/// made it in; trip it before that and the load is an honest `Err`, because
+/// "partially loaded" would be a lie about an engine holding nothing.
+const MAX_CONSECUTIVE_UNDECODABLE: u64 = 64;
+
 /// Which list a rule belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListKind {
@@ -475,10 +488,17 @@ impl FilterEngine {
     }
 
     /// Shared ingest loop for both list formats: enforces the line and
-    /// byte budgets and reports honestly — `truncated` when a budget cut
-    /// the input short, `hosts_rejected` when individual entries were
-    /// malformed. Silently truncating or silently dropping entries would
-    /// hide protection gaps.
+    /// byte budgets and reports honestly — `truncated` when a budget or a
+    /// failed read cut the input short, `hosts_rejected` when individual
+    /// entries were malformed (a line that is not valid UTF-8 counts as
+    /// one). Silently truncating or silently dropping entries would hide
+    /// protection gaps.
+    ///
+    /// `Err` is reserved for a read failure that added NO RULE, so a caller
+    /// may describe it as skipped. A failure with rules already added comes
+    /// back `Ok` and `truncated` — they are live in the engine, and
+    /// reporting them as "not loaded" is the failure mode this contract
+    /// exists to prevent.
     fn ingest_lines<R: BufRead>(
         &mut self,
         reader: R,
@@ -501,8 +521,69 @@ impl FilterEngine {
         // "the input ended at the budget" from "there was more" without
         // reading the more.
         let mut limited = reader.take(max_bytes.saturating_add(1));
+        let mut undecodable_run = 0u64;
         for line in limited.by_ref().lines() {
-            let line = line?;
+            // A LINE FAILURE MUST NOT DISCARD THE LOAD, because the rules
+            // read before it are ALREADY in the engine: `line?` reported
+            // "the list failed" for a list that was in fact partially
+            // applied, and the daemon then logged it as SKIPPED while
+            // serving with it. Measured: a 5004-entry hosts file with one
+            // 0xE9 byte on line 3 left 2 rules live and 5001 missing, with
+            // `WebProtectionStatus` reporting Serving and no gap anywhere in
+            // the status surface.
+            let line = match line {
+                Ok(line) => line,
+                // Not valid UTF-8 — a list saved in the system ANSI codepage
+                // with an accented character in a comment is the common
+                // shape. `lines()` has already consumed the offending line's
+                // bytes, so this skips exactly it: a malformed ENTRY, which
+                // is what `hosts_rejected` is for, and which both this loader
+                // and the daemon warn on. The bytes it consumed are charged
+                // against the budget PHYSICALLY by `take` even though
+                // `bytes_read` cannot count what it never decoded. The run
+                // guard is what keeps skipping from becoming spinning when a
+                // reader errors without consuming anything — see
+                // [`MAX_CONSECUTIVE_UNDECODABLE`].
+                Err(e)
+                    if e.kind() == io::ErrorKind::InvalidData
+                        && undecodable_run < MAX_CONSECUTIVE_UNDECODABLE =>
+                {
+                    if stats.lines_read >= max_lines {
+                        stats.truncated = true;
+                        break;
+                    }
+                    undecodable_run += 1;
+                    stats.lines_read += 1;
+                    stats.lines_skipped += 1;
+                    stats.hosts_rejected += 1;
+                    continue;
+                }
+                // A real read failure (a network path going away mid-file),
+                // or a reader stuck on undecodable input. Retrying either
+                // would spin — every later `next()` returns the same error —
+                // so the load stops here. It stops HONESTLY: with rules
+                // already applied it is a PARTIAL load, which is what
+                // `truncated` means to the caller, and only a load that
+                // applied nothing is reported as a failure the caller may
+                // describe as skipped.
+                Err(e) => {
+                    // No rule from this list reached the engine, so there is
+                    // nothing live to misreport: `Err` is both accurate and
+                    // more informative than empty stats.
+                    if stats.rules_added == 0 {
+                        return Err(e);
+                    }
+                    tracing::warn!(
+                        error = %e,
+                        lines_read = stats.lines_read,
+                        rules_added = stats.rules_added,
+                        "blocklist read failed mid-file; the rules already ingested stay loaded"
+                    );
+                    stats.truncated = true;
+                    break;
+                }
+            };
+            undecodable_run = 0; // a decoded line: the reader is making progress
             // +1 for the newline the line iterator stripped.
             let line_bytes = line.len() as u64 + 1;
             if stats.lines_read >= max_lines || stats.bytes_read + line_bytes > max_bytes {
@@ -546,7 +627,7 @@ impl FilterEngine {
                 lines_read = stats.lines_read,
                 bytes_read = stats.bytes_read,
                 rules_added = stats.rules_added,
-                "blocklist exceeded a load budget; remaining input ignored"
+                "blocklist load was cut short; remaining input ignored"
             );
         }
         if stats.hosts_rejected != 0 {
@@ -671,8 +752,10 @@ pub struct HostsLoadStats {
     /// `lines_skipped`; it is. Non-zero means part of a list silently did
     /// not become protection — the loader warns when this moves.
     pub hosts_rejected: u64,
-    /// True when the input exceeded a budget (line cap or byte budget)
-    /// and was cut short.
+    /// True when the load did not consume the whole input: it exceeded a
+    /// budget (line, byte or rule cap), or a read failed part-way through.
+    /// Either way the list is PARTIALLY applied — the rules ingested before
+    /// the cut are live in the engine.
     pub truncated: bool,
 }
 
@@ -840,6 +923,155 @@ mod tests {
             "hitting the budget must be reported, not silent: {stats:?}"
         );
         assert_eq!(stats.rules_added, 0, "no rule can come from a cut fragment");
+    }
+
+    /// A `BufRead` that serves `head` and then fails forever with `kind` —
+    /// a network path going away part-way through a list.
+    struct FailAfter {
+        head: io::Cursor<Vec<u8>>,
+        kind: io::ErrorKind,
+    }
+
+    impl FailAfter {
+        fn new(head: &[u8], kind: io::ErrorKind) -> Self {
+            Self {
+                head: io::Cursor::new(head.to_vec()),
+                kind,
+            }
+        }
+
+        fn spent(&self) -> bool {
+            self.head.position() as usize >= self.head.get_ref().len()
+        }
+    }
+
+    impl Read for FailAfter {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.spent() {
+                return Err(io::Error::new(self.kind, "read failed mid-file"));
+            }
+            self.head.read(buf)
+        }
+    }
+
+    impl BufRead for FailAfter {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            if self.spent() {
+                return Err(io::Error::new(self.kind, "read failed mid-file"));
+            }
+            self.head.fill_buf()
+        }
+        fn consume(&mut self, amt: usize) {
+            self.head.consume(amt);
+        }
+    }
+
+    /// REGRESSION. One undecodable byte anywhere in a list used to abort
+    /// the whole load via `line?` — while the rules read BEFORE it stayed
+    /// in the engine. The daemon logged "blocklist read failed — SKIPPED"
+    /// and then served with the fragment: measured, a 5004-entry file with
+    /// one 0xE9 byte on line 3 left 2 rules live, 5001 missing, and
+    /// `WebProtectionStatus` reporting Serving with nothing anywhere saying
+    /// the list was 0.04% loaded.
+    ///
+    /// The shape is ordinary, not adversarial: a hosts list saved by
+    /// Notepad in the system ANSI codepage with an accent in a comment.
+    #[test]
+    fn one_undecodable_line_does_not_discard_the_rest_of_the_list() {
+        let mut input: Vec<u8> = Vec::new();
+        input.extend_from_slice(b"0.0.0.0 first.example\n");
+        input.extend_from_slice(b"0.0.0.0 second.example\n");
+        input.extend_from_slice(b"# actualis\xE9 2026\n"); // cp1252 'e-acute'
+        input.extend_from_slice(b"0.0.0.0 third.example\n");
+        input.extend_from_slice(b"0.0.0.0 fourth.example\n");
+
+        let mut engine = FilterEngine::new();
+        let stats = engine
+            .load_hosts(ListKind::Block, io::BufReader::new(&input[..]))
+            .expect("an undecodable line is a bad ENTRY, not a failed load");
+
+        assert_eq!(
+            engine.decide("fourth.example"),
+            Decision::Block,
+            "every rule after the bad line must be live: {stats:?}"
+        );
+        assert_eq!(stats.rules_added, 4, "only the bad line is lost: {stats:?}");
+        assert_eq!(
+            stats.hosts_rejected, 1,
+            "the dropped line must be REPORTED — a silent drop is a hidden \
+             protection gap: {stats:?}"
+        );
+        assert!(
+            !stats.truncated,
+            "the load was not cut short, it skipped one entry: {stats:?}"
+        );
+    }
+
+    /// REGRESSION. A read that fails PART-WAY leaves its rules in the
+    /// engine, so reporting it as a plain error made the caller describe a
+    /// live partial list as skipped. It comes back `Ok` and `truncated` —
+    /// "partially applied" — which is what the caller warns about.
+    #[test]
+    fn a_mid_file_read_failure_reports_a_partial_load_not_a_skipped_one() {
+        let head = b"0.0.0.0 first.example\n0.0.0.0 second.example\n";
+        let mut engine = FilterEngine::new();
+        let stats = engine
+            .load_hosts(
+                ListKind::Block,
+                FailAfter::new(head, io::ErrorKind::ConnectionReset),
+            )
+            .expect("rules that are already live must not be reported as unloaded");
+
+        assert_eq!(stats.rules_added, 2, "{stats:?}");
+        assert!(stats.truncated, "a partial load must say so: {stats:?}");
+        assert_eq!(engine.decide("first.example"), Decision::Block);
+        assert_eq!(engine.decide("second.example"), Decision::Block);
+    }
+
+    /// A reader that reports undecodable input WITHOUT ever consuming it
+    /// must not be skipped forever. Skipping is only safe because it makes
+    /// progress; this reader makes none, so the load has to end — with the
+    /// budgets wide open, nothing else would stop it.
+    ///
+    /// The test fails by HANGING if the run guard is removed, so it is kept
+    /// small and cheap deliberately.
+    #[test]
+    fn a_reader_stuck_on_undecodable_input_ends_the_load_instead_of_spinning() {
+        /// Never consumes, always InvalidData — a broken transport.
+        struct Stuck;
+        impl Read for Stuck {
+            fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::InvalidData, "stuck"))
+            }
+        }
+        impl BufRead for Stuck {
+            fn fill_buf(&mut self) -> io::Result<&[u8]> {
+                Err(io::Error::new(io::ErrorKind::InvalidData, "stuck"))
+            }
+            fn consume(&mut self, _amt: usize) {}
+        }
+
+        let mut engine = FilterEngine::new();
+        // Every budget wide open: only the run guard can end this.
+        let err = engine
+            .load_hosts_with_limit(ListKind::Block, Stuck, u64::MAX, u64::MAX, u64::MAX)
+            .expect_err("nothing was applied, so this is a failed load");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// The other half of the contract: a load that applied NOTHING is still
+    /// an error, because "skipped" is then the truth.
+    #[test]
+    fn a_read_that_fails_before_any_rule_is_still_an_error() {
+        let mut engine = FilterEngine::new();
+        let err = engine
+            .load_hosts(
+                ListKind::Block,
+                FailAfter::new(b"", io::ErrorKind::PermissionDenied),
+            )
+            .expect_err("nothing was applied: the caller may say SKIPPED");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(engine.decide("first.example"), Decision::Allow);
     }
 
     fn engine_with_block(rules: &[&str]) -> FilterEngine {

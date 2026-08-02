@@ -29,6 +29,17 @@ pub struct Config {
     /// fact here they can act on. Default 14 days.
     #[serde(default = "default_signature_stale_notify_days")]
     pub signature_stale_notify_days: u32,
+    /// ClamAV mirror hostname.
+    ///
+    /// CURRENTLY INERT — validated, persisted, and rendered as an editable
+    /// field in Settings > Updates, but nothing reads it. The updater shells
+    /// out to freshclam, which takes its `DatabaseMirror` from
+    /// freshclam.conf, and no code templates this value into that file
+    /// (`grep -rn update_mirror crates/` finds only this struct, its
+    /// validation, the FullConfig mirror, and i18n strings). Pointing this at
+    /// an internal mirror therefore does NOT redirect signature updates.
+    /// Wiring it means writing `DatabaseMirror` into freshclam.conf before
+    /// the updater invokes freshclam.
     pub update_mirror: String,
     pub quarantine_retention_days: u32,
     pub auto_quarantine: bool,
@@ -652,29 +663,38 @@ impl Config {
         // C2 fix: validate excluded_paths — reject dangerously broad entries.
         self.excluded_paths.retain(|p| {
             let trimmed = p.trim();
-            // Reject entries shorter than 3 characters (prevents "\" or "C:" matching everything).
-            if trimmed.len() < 3 {
-                warn!(entry = trimmed, "excluded_paths entry too short — removed");
-                return false;
-            }
-            // Reject entries that are just directory separators.
-            if trimmed.chars().all(|c| c == '\\' || c == '/') {
+            // Reject entries that are just directory separators (or empty).
+            if trimmed.is_empty() || trimmed.chars().all(|c| c == '\\' || c == '/') {
                 warn!(
                     entry = trimmed,
                     "excluded_paths entry is only separators — removed"
                 );
                 return false;
             }
+            // Every check below runs on the form the MATCHER sees, not on the
+            // raw entry. `scan::is_excluded` lowercases and then pops EVERY
+            // trailing separator before prefix-matching, so validating the raw
+            // string let a doubled separator walk straight past the drive-root
+            // guard: "C://" is 4 bytes, so it was neither "too short" nor a
+            // drive root here, yet it reached the matcher as "c:" and excluded
+            // the whole drive from realtime, idle, quick and full scans alike.
+            // Forward slashes are folded too — "C:/Windows" and "C:\Windows"
+            // name the same directory, so the system-root list below must not
+            // be sidestepped by picking the other separator.
+            let normalized = {
+                let mut n = trimmed.to_ascii_lowercase().replace('/', "\\");
+                while n.ends_with('\\') {
+                    n.pop();
+                }
+                n
+            };
             // R4-C16: reject bare drive-letter roots (e.g. "C:\", "D:/") and
             // raw drive specs ("C:") which would exclude the entire drive
-            // from realtime scanning when used as a path prefix.
-            let lower = trimmed.to_ascii_lowercase();
-            let bytes = lower.as_bytes();
-            let is_drive_root = bytes.len() <= 3
-                && bytes.len() >= 2
-                && bytes[0].is_ascii_alphabetic()
-                && bytes[1] == b':'
-                && (bytes.len() == 2 || bytes[2] == b'\\' || bytes[2] == b'/');
+            // from realtime scanning when used as a path prefix. Trailing
+            // separators are already gone, so a drive root is exactly 2 bytes.
+            let bytes = normalized.as_bytes();
+            let is_drive_root =
+                bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
             if is_drive_root {
                 warn!(
                     entry = trimmed,
@@ -682,15 +702,22 @@ impl Config {
                 );
                 return false;
             }
+            // Reject prefixes shorter than 3 characters (prevents "\" or a
+            // 2-char stem matching a huge slice of the tree).
+            if normalized.len() < 3 {
+                warn!(entry = trimmed, "excluded_paths entry too short — removed");
+                return false;
+            }
             // Refuse system roots that would gut protection of the OS.
+            // Compared against `normalized`, so trailing-separator and
+            // forward-slash spellings of the same root are all caught.
             for forbidden in [
                 "c:\\windows",
-                "c:\\windows\\",
                 "c:\\program files",
                 "c:\\program files (x86)",
                 "c:\\users",
             ] {
-                if lower == forbidden || lower == format!("{forbidden}\\") {
+                if normalized == forbidden {
                     warn!(
                         entry = trimmed,
                         "excluded_paths entry would disable protection on a critical system root — refused"
@@ -788,8 +815,16 @@ impl Config {
         self.trusted_hashes.retain(|h| {
             let trimmed = h.trim();
             if trimmed.len() != 64 || !trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+                // Truncate by CHARS, not bytes. `&s[..16]` panics when byte 16
+                // lands inside a multi-byte character, and this arm runs on
+                // exactly the input that is malformed enough to reach it — a
+                // smart quote or accented letter pasted into the whitelist.
+                // validate() runs on every Config::load, including the one in
+                // main() before IPC binds, so the panic took the whole daemon
+                // down: no realtime protection, no scanning, no service.
+                let preview: String = trimmed.chars().take(16).collect();
                 warn!(
-                    entry = &trimmed[..trimmed.len().min(16)],
+                    entry = preview.as_str(),
                     "trusted_hashes: invalid SHA-256 format — removed"
                 );
                 return false;
@@ -1193,8 +1228,15 @@ fn merge_table_into(target: &mut toml_edit::Table, fresh: &toml_edit::Table) {
 // `sentinella_ipc_proto::full_config::FullConfig` is the wire-format
 // mirror of `Config`. These conversions are the single seam between
 // the two — every field of Config has to appear here or it won't make
-// it to the GUI. The compile-time field-coverage test below catches
-// drift after a Config struct add.
+// it to the GUI. Nothing in the compiler notices when one doesn't:
+// `impl From<&Config> for FullConfig` is exhaustive over FullConfig,
+// not over Config, so an unbridged Config field builds clean and is
+// simply never read. `every_config_field_is_accounted_for_by_the_bridge`
+// below is the guard — it destructures Config with no `..`, so adding a
+// field there stops that test COMPILING until someone decides where the
+// field belongs. (It was added after [web_protection] reached Config
+// without reaching any part of the bridge — see the test for why that
+// section is still deliberately unbridged.)
 //
 // `apply_non_critical` is the inverse used by `settings.set_full`: it
 // applies every NON-critical field from a FullConfig into a Config,
@@ -1604,15 +1646,110 @@ mod full_config_bridge_tests {
         hostile.argus_worker_path = "attacker".into();
         hostile.scan.argus_worker_enabled = !baseline.scan.argus_worker_enabled;
         hostile.scan.argus_worker_path = "attacker".into();
+        // v0.1.9 additions — these five were never exercised, so deleting
+        // their checks from critical_diff broke nothing.
+        hostile.fish.enabled = !baseline.fish.enabled;
+        hostile.fish.observe_only = !baseline.fish.observe_only;
+        hostile.fish.active_response = "terminate".into();
+        hostile.sandbox.enabled = !baseline.sandbox.enabled;
+        hostile.clamav_isolation = "subprocess".into();
+        // Guard the mutations that are only "different" relative to a
+        // default — if a default ever changes to match, the field would
+        // stop being tested and the assert below would go quiet.
+        assert_ne!(baseline.fish.active_response, hostile.fish.active_response);
+        assert_ne!(baseline.clamav_isolation, hostile.clamav_isolation);
 
         let diffs = baseline.critical_diff(&hostile);
-        // All 15 critical fields should be flagged (15 entries because
-        // both top-level + scan.* argus pairs count).
-        assert!(diffs.len() >= 13, "critical_diff missed fields: {diffs:?}");
-        assert!(diffs.contains(&"realtime_enabled"));
-        assert!(diffs.contains(&"excluded_paths"));
-        assert!(diffs.contains(&"trusted_hashes"));
-        assert!(diffs.contains(&"argus_worker_path"));
+
+        // SET equality against CRITICAL_FIELDS, not a `>=` count. The old
+        // `diffs.len() >= 13` assert stayed green after deleting two of the
+        // branches below it — which is exactly the second-layer kill-vector
+        // defence this test exists to protect. Equality also catches the
+        // other direction the debug_assert in critical_diff cannot: a field
+        // added to CRITICAL_FIELDS with no branch here would be advertised
+        // as protected while set_full happily let it through.
+        let mut got = diffs.clone();
+        got.sort_unstable();
+        let mut want = CRITICAL_FIELDS.to_vec();
+        want.sort_unstable();
+        assert_eq!(
+            got, want,
+            "critical_diff and CRITICAL_FIELDS have drifted apart"
+        );
+    }
+
+    /// Compile-time field coverage for the `Config` → `FullConfig` bridge.
+    ///
+    /// The destructure below has no `..` rest pattern, so adding a field to
+    /// `Config` makes THIS test fail to compile (E0027) — and nothing else
+    /// in the workspace notices, because the `From` impl is exhaustive over
+    /// `FullConfig`, not over `Config`. When it stops compiling, decide
+    /// where the new field goes (`From<&Config>`, `apply_non_critical`,
+    /// `RestartRequirementMap::build`, maybe `CRITICAL_FIELDS`) and then add
+    /// it here.
+    #[test]
+    fn every_config_field_is_accounted_for_by_the_bridge() {
+        let Config {
+            realtime_enabled: _,
+            realtime_roots: _,
+            max_file_size_mb: _,
+            scan_archives: _,
+            heuristic_alerts: _,
+            auto_update: _,
+            update_interval_hours: _,
+            signature_stale_days: _,
+            signature_stale_notify_days: _,
+            update_mirror: _,
+            quarantine_retention_days: _,
+            auto_quarantine: _,
+            excluded_paths: _,
+            excluded_extensions: _,
+            excluded_detections: _,
+            trusted_hashes: _,
+            enhanced_signature_provider: _,
+            log_level: _,
+            scheduled_scan_enabled: _,
+            scheduled_scan_hour: _,
+            scheduled_scan_type: _,
+            startup_critical_scan: _,
+            powershell_bridge_enabled: _,
+            powershell_poll_seconds: _,
+            idle_scan_enabled: _,
+            idle_scan_start_delay_secs: _,
+            idle_scan_on_battery: _,
+            idle_scan_cpu_pause_threshold: _,
+            idle_scan_max_file_size_mb: _,
+            idle_scan_fullscreen_pause: _,
+            idle_scan_disk_latency_pause_ms: _,
+            idle_scan_max_files_per_session: _,
+            idle_scan_slow_delay_min_ms: _,
+            idle_scan_slow_delay_max_ms: _,
+            idle_scan_normal_delay_min_ms: _,
+            idle_scan_normal_delay_max_ms: _,
+            idle_scan_fast_delay_min_ms: _,
+            idle_scan_fast_delay_max_ms: _,
+            scan: _,
+            argus_worker_enabled: _,
+            argus_worker_path: _,
+            argus_worker_timeout_sec: _,
+            clamav_isolation: _,
+            clamav_worker_timeout_sec: _,
+            performance: _,
+            fish: _,
+            sandbox: _,
+            // developer is bridged as DeveloperConfigPublic — password_sha256
+            // is deliberately dropped on the way out.
+            developer: _,
+            // NOT bridged, deliberately. [web_protection] has no FullConfig
+            // counterpart, so settings.get_full/set_full cannot see it and the
+            // section is TOML-only for now. Adding the mirror without the GUI
+            // half would be worse than the gap: FullConfig is
+            // #[serde(default)], so a save from a GUI that does not round-trip
+            // the section would deserialize a default WebProtectionConfig and
+            // apply_non_critical would wipe the user's blocklists, allowlist
+            // and upstreams on every unrelated settings save.
+            web_protection: _,
+        } = Config::default();
     }
 
     #[test]
@@ -1913,6 +2050,109 @@ mod tests {
                 .iter()
                 .any(|e| e.eq_ignore_ascii_case("txt")),
             "benign 'txt' was wrongly removed"
+        );
+    }
+
+    /// The drive-root guard used to inspect the RAW entry while
+    /// `scan::is_excluded` pops every trailing separator before
+    /// prefix-matching. "C://" is 4 bytes — too long for the old
+    /// `bytes.len() <= 3` drive-root test and too long for the "< 3" length
+    /// test — so it survived validation and then collapsed to "c:" at match
+    /// time, excluding the entire drive from every scan profile.
+    ///
+    /// Asserted through `scan::is_excluded` rather than by inspecting the
+    /// surviving list, so the test states the property that matters: nothing
+    /// validate() keeps may exclude an arbitrary file on C:.
+    #[test]
+    fn no_surviving_exclusion_can_swallow_the_whole_drive() {
+        let victim = Path::new(r"C:\Users\alice\Downloads\ransom.exe");
+        let attempts = [
+            "C://",
+            r"C:\\",
+            "C:\\/",
+            "C:/",
+            r"C:\",
+            "C:",
+            "c://",
+            "D://",
+            // The system-root list must survive the same normalization.
+            "C:/Windows",
+            r"C:\Windows\\",
+            r"C:\Users\",
+            "C:/Users//",
+        ];
+        for entry in attempts {
+            let mut config = Config {
+                excluded_paths: vec![entry.into()],
+                ..Config::default()
+            };
+            config.validate();
+            assert!(
+                config.excluded_paths.is_empty(),
+                "excluded_paths={entry:?} survived validation as {:?}",
+                config.excluded_paths
+            );
+            assert!(
+                !crate::scan::is_excluded(victim, &config.excluded_paths, &[]),
+                "excluded_paths={entry:?} survived validation and excludes {}",
+                victim.display()
+            );
+        }
+
+        // ...and a legitimate exclusion still works, in both spellings of the
+        // trailing separator. (Forward-slash spellings are refused above only
+        // when they name a system root; a normal folder keeps working.)
+        for good in [r"C:\Users\alice\build", r"C:\Users\alice\build\"] {
+            let mut config = Config {
+                excluded_paths: vec![good.into()],
+                ..Config::default()
+            };
+            config.validate();
+            assert_eq!(config.excluded_paths.len(), 1, "{good} was wrongly dropped");
+            assert!(
+                crate::scan::is_excluded(
+                    Path::new(r"C:\Users\alice\build\out.exe"),
+                    &config.excluded_paths,
+                    &[]
+                ),
+                "{good} no longer excludes its own subtree"
+            );
+        }
+    }
+
+    /// validate() sliced the invalid-entry log preview at byte 16. A
+    /// non-ASCII character straddling that offset panicked, and validate()
+    /// runs inside `Config::load` — including main()'s startup load, so a
+    /// smart quote in the whitelist took the daemon down before IPC bound.
+    #[test]
+    fn non_ascii_trusted_hash_is_dropped_not_panicked_on() {
+        let mut config = Config {
+            trusted_hashes: vec![
+                // 14 ASCII bytes + a 3-byte CJK char → byte 16 is mid-char.
+                "aaaaaaaaaaaaaa\u{65e5}x".into(),
+                // Multi-byte character at the very front, too.
+                "\u{1f480}not-a-hash".into(),
+                "a".repeat(64),
+            ],
+            ..Config::default()
+        };
+
+        // The subscriber is load-bearing, not decoration. `warn!` evaluates
+        // its field expressions ONLY when something is listening, so the
+        // offending slice is unreachable in a bare `cargo test` — and very
+        // much reachable in the daemon, which installs a WARN-level
+        // subscriber before it ever loads the config. Without this the test
+        // passes against the broken code.
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_test_writer()
+            .finish();
+        tracing::subscriber::with_default(subscriber, || config.validate());
+
+        assert_eq!(
+            config.trusted_hashes,
+            vec!["a".repeat(64)],
+            "only the valid SHA-256 should survive"
         );
     }
 

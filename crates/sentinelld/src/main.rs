@@ -540,7 +540,23 @@ async fn run_daemon(
 
     // Start real-time watcher (if engine is available).
     // Watcher runs even in audit mode (minimal protection).
-    server.state().start_watcher();
+    //
+    // ...but NOT when the master switch is off. `realtime_enabled` was
+    // written by `protection.set_critical` (a UAC-gated, challenge-token
+    // path) and persisted, yet startup called start_watcher()
+    // unconditionally and start_watcher() itself only reads
+    // `realtime_roots` — so every reboot silently turned protection back on
+    // while Settings still rendered the switch as off from the same saved
+    // config. `user_disabled_protection` did not cover it either: that is
+    // an in-memory AtomicBool reset to false by AppState::new.
+    if config.realtime_enabled {
+        server.state().start_watcher();
+    } else {
+        warn!(
+            "real-time protection is OFF in sentinelld.toml — watcher NOT started; only \
+             on-demand scans will run"
+        );
+    }
 
     // Heartbeat-driven auto-restart: if the watcher stops ticking for >60s
     // while protection is supposed to be on, respawn it. A targeted attacker

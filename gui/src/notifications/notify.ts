@@ -13,7 +13,7 @@ import { sendNotification, isPermissionGranted, requestPermission } from "@tauri
 import { loadNotificationSettings, meetsMinSeverity, type NotificationSeverity } from "./settings";
 import { dedupeCheck, stormControlled } from "./dedupe";
 import { recordNotification } from "./history";
-import { t } from "../i18n";
+import { t, tf } from "../i18n";
 
 // ── Permission ────────────────────────────────────────────────
 
@@ -118,9 +118,24 @@ export function notifyScanComplete(threats: number, filesScanned: number, scanTy
   const dedupeKey = `scan_complete:${scanType}:${threats}`;
   if (!dedupeCheck(dedupeKey, 60_000)) return; // 1-min cooldown for scan completion
 
-  const label = scanType === "quick" ? "Quick scan" : scanType === "full" ? "Full scan" : "Scan";
-  send(`${label} complete`, `${threats} threat${threats > 1 ? "s" : ""} found in ${filesScanned.toLocaleString()} files.`);
-  recordNotification("scan_complete", `${label} complete — ${threats} threats`);
+  // Every other toast here goes through the locale table; this one was built
+  // from English literals, so a Chinese user got an English toast in an
+  // otherwise Chinese app. The two keys below are not in the locale files yet
+  // — tf() keeps today's English text and picks up the translations the
+  // instant they land. `{threats}` carries its own plural form per locale, so
+  // no English "s" is appended.
+  // Callers pass "scan" when the daemon reported no type; "quick" → "Quick".
+  const label = scanType === "scan" || !scanType
+    ? ""
+    : scanType.charAt(0).toUpperCase() + scanType.slice(1);
+  const title = tf("notify.scan_complete", "{type} scan complete")
+    .replace("{type}", label)
+    .trim();
+  const body = tf("notify.body_scan_complete", "{threats} threat(s) found in {files} files.")
+    .replace("{threats}", String(threats))
+    .replace("{files}", filesScanned.toLocaleString());
+  send(title, body);
+  recordNotification("scan_complete", `${title} — ${body}`);
 }
 
 /**
@@ -174,7 +189,15 @@ export function notifyFirstRunUpdateComplete(sigCount: number): void {
   if (!loadNotificationSettings().enabled) return;
   if (!dedupeCheck("first_run_complete")) return;
 
-  send(t("notify.ready"), `${sigCount.toLocaleString()} signatures loaded.`);
+  // Title was translated, body was an English literal. notify.body_ready is
+  // not in the locale files yet — see notifyScanComplete for the same pattern.
+  send(
+    t("notify.ready"),
+    tf("notify.body_ready", "{count} signatures loaded.").replace(
+      "{count}",
+      sigCount.toLocaleString(),
+    ),
+  );
   recordNotification("first_run_complete", t("notify.ready"));
 }
 

@@ -106,9 +106,15 @@ impl WebProtectionHandle {
 pub struct WebProtection {
     handle: Arc<WebProtectionHandle>,
     watchdog: Option<tokio::task::JoinHandle<()>>,
-    #[allow(dead_code)] // consumed by the network-change re-read in commit C
-    upstreams_handle: Option<UpstreamsHandle>,
     /// Periodic upstream re-discovery. Aborted in `stop`, like the watchdog.
+    ///
+    /// The `UpstreamsHandle` lives INSIDE this task, not beside it. A copy
+    /// was kept here once, `#[allow(dead_code)]`, with a comment promising a
+    /// future consumer — which is how the stale-upstream outage stayed
+    /// invisible for a release: the field made the wiring look done. There
+    /// is nothing for an owner-side copy to do (the handle is `Clone` over
+    /// an `Arc` the proxy holds, so holding one keeps nothing alive), so the
+    /// only holder is the only caller.
     refresher: Option<tokio::task::JoinHandle<()>>,
 
     /// Dropping or sending on this stops the serving loops. This is the
@@ -274,7 +280,6 @@ impl WebProtection {
                 rule_guid: None,
             }),
             watchdog: None,
-            upstreams_handle: None,
             refresher: None,
             shutdown: None,
             task: None,
@@ -398,7 +403,6 @@ impl WebProtection {
                     rule_guid: None,
                 }),
                 watchdog: None,
-                upstreams_handle: None,
                 refresher: None,
                 shutdown: None,
                 task: None,
@@ -412,7 +416,7 @@ impl WebProtection {
         let refresher = spawn_upstream_refresh(
             cfg.upstreams.clone(),
             listen,
-            upstreams_handle.clone(),
+            upstreams_handle,
             tx.subscribe(),
         );
         let task = tokio::spawn(proxy.run(rx));
@@ -467,7 +471,6 @@ impl WebProtection {
                 rule_guid,
             }),
             watchdog,
-            upstreams_handle: Some(upstreams_handle),
             refresher: Some(refresher),
             shutdown: Some(tx),
             task: Some(task),

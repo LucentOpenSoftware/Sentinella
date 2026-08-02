@@ -44,7 +44,9 @@ pub enum RestartRequirement {
     /// (exclusions, signature-provider switch, trusted hashes)
     EngineReload,
     /// Requires `sc stop SentinellaDaemon && sc start SentinellaDaemon`.
-    /// (log_level, clamav_isolation, powershell bridge, scheduler enable)
+    /// (log_level, clamav_isolation, powershell bridge, scheduler enable,
+    /// plus every knob the daemon COPIES into `AppState` at startup — see
+    /// the second `DaemonRestart` arm in [`restart_requirement`])
     DaemonRestart,
 }
 
@@ -77,7 +79,41 @@ pub fn restart_requirement(field_path: &str) -> RestartRequirement {
         | "fish.enabled"
         | "sandbox.enabled" => DaemonRestart,
 
+        // ── DaemonRestart (value is COPIED at startup) ─
+        //
+        // These are saved to the TOML the moment the user hits save, but the
+        // running daemon keeps the copy it took at boot. `None` here would be
+        // a lie told next to a threshold the user just lowered *because* they
+        // wanted it to bite sooner — and unlike a missed hot-apply, the pill
+        // at least tells them what to do about it.
+        //
+        // - performance.*: `AppState::performance_config` is a plain field
+        //   with no interior mutability; the pressure evaluator borrows it
+        //   directly, so nothing can replace it on a live daemon.
+        // - clamav_worker_timeout_sec: reaches the scan path only through
+        //   `AppState::set_clamav_subprocess`, called once from `main()` and
+        //   only when isolation is already "subprocess".
+        //
+        // Neither is covered by `AppState::refresh_hot_config`. If you add
+        // one, move that entry back to the `None` bucket in the SAME commit:
+        // an over-reported restart pill is merely noisy, but a `None` that
+        // never applies is a setting that silently lies.
+        "performance.memory_profile"
+        | "performance.memory_warning_mb"
+        | "performance.memory_critical_mb"
+        | "performance.external_argus_under_pressure"
+        | "performance.max_resident_workers_on_pressure"
+        | "clamav_worker_timeout_sec" => DaemonRestart,
+
         // Everything else is hot-applied.
+        //
+        // For the ones the daemon caches rather than re-reads per use —
+        // signature-staleness thresholds, scan.orchestrator_* routing flags,
+        // and every fish.* threshold (owned by a `MutationWindow` built from
+        // the config) — "hot-applied" is true ONLY because
+        // `AppState::refresh_hot_config` runs after each successful config
+        // write. Drop that call and these silently become boot-only values
+        // while the GUI keeps promising the save was enough.
         _ => None,
     }
 }
@@ -548,15 +584,40 @@ mod tests {
             restart_requirement("idle_scan_cpu_pause_threshold"),
             RestartRequirement::None
         );
-        assert_eq!(
-            restart_requirement("fish.rename_threshold"),
-            RestartRequirement::None
-        );
         // Unknown field → safe default (no restart needed).
         assert_eq!(
             restart_requirement("not_a_real_field"),
             RestartRequirement::None
         );
+    }
+
+    /// Every field below is read out of a copy the daemon takes at startup
+    /// and has no refresher, so classifying any of them `None` puts a
+    /// "saved, applies immediately" pill next to a value the running daemon
+    /// is still ignoring. This list is a PIN, not a proof — the proof lives
+    /// in the daemon crate (`AppState::performance_config` is a plain field;
+    /// `AppState::set_clamav_subprocess` is reachable only from `main()`),
+    /// and neither is reached by `AppState::refresh_hot_config`. When one of
+    /// them does get a hot-apply, delete its line here in the same commit as
+    /// the move out of the `DaemonRestart` arm.
+    #[test]
+    fn boot_copied_fields_are_not_advertised_as_hot_applied() {
+        for field in [
+            "performance.memory_profile",
+            "performance.memory_warning_mb",
+            "performance.memory_critical_mb",
+            "performance.external_argus_under_pressure",
+            "performance.max_resident_workers_on_pressure",
+            "clamav_worker_timeout_sec",
+        ] {
+            assert_eq!(
+                restart_requirement(field),
+                RestartRequirement::DaemonRestart,
+                "{field} is copied at daemon start — a `None` pill tells the \
+                 user a threshold is live when the running daemon still has \
+                 its boot value"
+            );
+        }
     }
 
     #[test]

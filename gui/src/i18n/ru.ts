@@ -3,7 +3,6 @@ export const ru: Record<string, string> = {
   // ── Приложение / Глобальное ────────────────────────────
   "app.name": "Sentinella",
   "app.subtitle": "Антивирусный комплекс",
-  "app.version": "v0.1.13",
 
   // ── Боковая панель ─────────────────────────────────────
   "nav.dashboard": "Обзор",
@@ -26,7 +25,6 @@ export const ru: Record<string, string> = {
   "meta.notifications_sub": "История оповещений",
   "meta.update_sub": "База сигнатур",
   "meta.settings_sub": "Настройка Sentinella",
-  "meta.about_sub": "Sentinella v0.1.13",
 
   // ── Панель управления ──────────────────────────────────
   "dash.protected": "Ваша система защищена",

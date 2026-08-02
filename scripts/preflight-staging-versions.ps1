@@ -18,7 +18,13 @@
 # Run manually:
 #   pwsh scripts\preflight-staging-versions.ps1
 #
-# Wired into npm run tauri:build via gui/package.json prebuild hook.
+# WHAT ACTUALLY RUNS THIS. One command, and it is not the obvious one:
+#   cd gui && npm run release:build     -> preflight:staging && tauri build
+# There is no tauri:build script and no prebuild hook. `pnpm tauri build`,
+# `npm run tauri -- build` and a bare `tauri build` all invoke the Tauri CLI
+# directly and never reach this file, so packaging that way ships the
+# v0.1.7 stale-daemon class unguarded. Package with release:build, or run
+# this script yourself first.
 
 $ErrorActionPreference = "Stop"
 
@@ -119,7 +125,8 @@ if ($Errors.Count -gt 0) {
     Write-Host "If you're packaging a new release, the standard recipe is:" -ForegroundColor Yellow
     Write-Host "  cargo build --release -p sentinelld -p argusd -p sentinella-cli" -ForegroundColor Yellow
     Write-Host "  scripts\stage-windows-package.bat" -ForegroundColor Yellow
-    Write-Host "  cd gui && npm run tauri -- build" -ForegroundColor Yellow
+    Write-Host "  cd gui && npm run release:build" -ForegroundColor Yellow
+    Write-Host "(release:build, not 'tauri build' -- only release:build re-runs this check.)" -ForegroundColor Yellow
     exit 1
 }
 

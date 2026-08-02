@@ -45,6 +45,38 @@ const CYCLE_BUDGET: std::time::Duration = std::time::Duration::from_secs(10 * 60
 /// be killed mid-handshake and the kill costs another orphaned temp dir.
 const MIN_ATTEMPT_BUDGET: std::time::Duration = std::time::Duration::from_secs(45);
 
+/// What the retry loop does next, decided BEFORE any sleeping.
+struct Attempt {
+    /// Backoff to take before running. Zero on the first attempt.
+    pause: std::time::Duration,
+    /// How long freshclam may then run.
+    budget: std::time::Duration,
+}
+
+/// Plan attempt `attempt` of a cycle that has already spent `elapsed`.
+///
+/// `None` means the cycle is out of time and must stop **without sleeping**.
+/// That ordering is the whole point of this function. The backoff used to be
+/// taken first and the budget checked after, so the last attempt of a stuck
+/// cycle slept the full 120 s and only then discovered there was no time
+/// left to use it: a cycle documented as a 10-minute ceiling ran 12 minutes,
+/// two of them pure dead time. `update_running` is held for all of it, so
+/// every scheduled and user-pressed update in that window is rejected as
+/// "already in progress" and the Update page just spins.
+fn plan_attempt(attempt: usize, elapsed: std::time::Duration) -> Option<Attempt> {
+    let pause = if attempt == 0 {
+        std::time::Duration::ZERO
+    } else {
+        RETRY_BACKOFF[(attempt - 1).min(RETRY_BACKOFF.len() - 1)]
+    };
+    // The pause is charged to the budget HERE, before it is taken.
+    let budget = CYCLE_BUDGET.saturating_sub(elapsed.saturating_add(pause));
+    if budget < MIN_ATTEMPT_BUDGET {
+        return None;
+    }
+    Some(Attempt { pause, budget })
+}
+
 /// Is this failure worth retrying inside the same cycle?
 ///
 /// Transient means "the same command might succeed in two minutes":
@@ -99,21 +131,11 @@ where
     let cycle_started = std::time::Instant::now();
     let mut last = (false, String::new());
     for attempt in 0..ATTEMPTS_PER_CYCLE {
-        if attempt > 0 {
-            let pause = RETRY_BACKOFF[(attempt - 1).min(RETRY_BACKOFF.len() - 1)];
-            info!(
-                attempt = attempt + 1,
-                of = ATTEMPTS_PER_CYCLE,
-                backoff_secs = pause.as_secs(),
-                "retrying signature update after a transient failure"
-            );
-            std::thread::sleep(pause);
-        }
         // The backoff sleeps come out of the same budget as the downloads, so
         // the ceiling covers the whole cycle and not just the time freshclam
-        // was running.
-        let remaining = CYCLE_BUDGET.saturating_sub(cycle_started.elapsed());
-        if remaining < MIN_ATTEMPT_BUDGET {
+        // was running - and the sleep is only taken once we know there will
+        // be time left to use it.
+        let Some(plan) = plan_attempt(attempt, cycle_started.elapsed()) else {
             warn!(
                 attempt = attempt + 1,
                 budget_secs = CYCLE_BUDGET.as_secs(),
@@ -123,12 +145,21 @@ where
                 last.1 = "signature update cycle exceeded its time budget".into();
             }
             return last;
+        };
+        if !plan.pause.is_zero() {
+            info!(
+                attempt = attempt + 1,
+                of = ATTEMPTS_PER_CYCLE,
+                backoff_secs = plan.pause.as_secs(),
+                "retrying signature update after a transient failure"
+            );
+            std::thread::sleep(plan.pause);
         }
         last = run_freshclam_bounded(
             freshclam_path,
             config_path,
             db_dir,
-            remaining,
+            plan.budget,
             &mut on_line,
         );
         if last.0 {
@@ -561,5 +592,72 @@ mod tests {
         assert!(RETRY_BACKOFF.len() >= ATTEMPTS_PER_CYCLE - 1);
         // And the pauses must be ordered, or "backoff" is a lie.
         assert!(RETRY_BACKOFF.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    /// REGRESSION. The worst case walked through by hand, with the shipped
+    /// constants: attempt 0 fails fast, attempt 1 runs to its budget and
+    /// times out at t=10m00s, attempt 2 is refused. The old loop slept the
+    /// 120 s backoff BEFORE testing the budget, so the cycle ran 12 minutes
+    /// against a documented 10-minute ceiling with `update_running` held —
+    /// two minutes of sleeping toward an attempt it had already decided to
+    /// refuse.
+    #[test]
+    fn a_dead_cycle_is_not_padded_by_a_backoff_it_will_not_use() {
+        let spent = std::time::Duration::from_secs(10 * 60);
+        assert!(
+            plan_attempt(2, spent).is_none(),
+            "an exhausted cycle must stop instead of sleeping first"
+        );
+        // The same at the boundary: 120 s of backoff plus the 45 s floor
+        // does not fit in what is left, so there is nothing to sleep for.
+        let almost = CYCLE_BUDGET - std::time::Duration::from_secs(160);
+        assert!(plan_attempt(2, almost).is_none());
+    }
+
+    /// The ceiling is wall-clock, "sleeps included" — so NO sequence the
+    /// loop can walk may exceed it. Every combination of "failed fast" and
+    /// "burned its whole budget" is simulated through the same planner the
+    /// loop uses, summing sleeps and run time exactly as the loop spends
+    /// them. Charging the backoff to the budget only AFTER taking it (the
+    /// shape this replaced) pushes the fast-then-slow sequences over.
+    #[test]
+    fn no_cycle_sequence_can_exceed_the_wall_clock_ceiling() {
+        let fast = std::time::Duration::from_secs(1);
+        // Bit i of `pattern` = attempt i fails fast rather than timing out.
+        for pattern in 0..(1u32 << ATTEMPTS_PER_CYCLE) {
+            let mut elapsed = std::time::Duration::ZERO;
+            let mut ran = 0;
+            for attempt in 0..ATTEMPTS_PER_CYCLE {
+                let Some(plan) = plan_attempt(attempt, elapsed) else {
+                    break;
+                };
+                let ran_for = if pattern & (1 << attempt) != 0 {
+                    fast
+                } else {
+                    plan.budget
+                };
+                elapsed += plan.pause + ran_for;
+                ran += 1;
+            }
+            assert!(ran > 0, "the first attempt must always be allowed to run");
+            assert!(
+                elapsed <= CYCLE_BUDGET,
+                "pattern {pattern:b} occupies {elapsed:?}, past the {CYCLE_BUDGET:?} ceiling"
+            );
+        }
+    }
+
+    /// ...and the ceiling must not be bought by refusing to retry: a fast
+    /// first failure has to leave room for the later attempts.
+    #[test]
+    fn a_fast_first_failure_still_gets_every_attempt() {
+        let mut elapsed = std::time::Duration::from_secs(1);
+        for attempt in 1..ATTEMPTS_PER_CYCLE {
+            let plan = plan_attempt(attempt, elapsed)
+                .unwrap_or_else(|| panic!("attempt {attempt} refused after {elapsed:?}"));
+            assert!(plan.budget >= MIN_ATTEMPT_BUDGET);
+            // A quick transient failure, not a full-budget burn.
+            elapsed += plan.pause + std::time::Duration::from_secs(1);
+        }
     }
 }

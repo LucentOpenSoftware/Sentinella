@@ -224,6 +224,24 @@ pub fn install_rule(guid: &str, namespace: &str, servers: &[std::net::IpAddr]) -
 /// task". A trigger-level disable is as fatal to us as a task-level one,
 /// and being wrong in this direction costs FILTERING (we refuse to install
 /// a rule), never DNS.
+///
+/// NEITHER IS THE DEFINITION FILE ENOUGH, and that was the next version of
+/// the same mistake. Deleting the reconciler executable does not touch
+/// `%SystemRoot%\System32\Tasks\Sentinella\DnsReconcile` — not when this
+/// product's own quarantine takes it, not when a competing AV does, not
+/// when a partial uninstall skips `--remove-task` because the exe it would
+/// have invoked is already gone. The task then stays registered, fires at
+/// boot, fails with 0x80070002, and removes nothing — while the daemon,
+/// having passed this check, installed a catch-all rule. So the `<Command>`
+/// is resolved and its existence is confirmed.
+///
+/// What that proves and what it does not: it proves a file is at the path
+/// the task will launch. It does NOT prove the file is our reconciler or
+/// that it will succeed. Full identity would mean hashing, on the startup
+/// path, against a manifest this crate deliberately does not depend on —
+/// and existence closes the failure that actually happens (the binary is
+/// deleted), not a hypothetical substitution by someone who already has
+/// SYSTEM.
 pub fn reconciler_task_installed() -> bool {
     let Ok(root) = std::env::var("SystemRoot") else {
         return false;
@@ -236,7 +254,89 @@ pub fn reconciler_task_installed() -> bool {
     let Ok(bytes) = std::fs::read(&path) else {
         return false;
     };
-    task_definition_is_enabled(&bytes)
+    task_definition_is_usable(&bytes)
+}
+
+/// Both halves of the question, split out so it can be tested against a
+/// definition file we wrote rather than against a registered task.
+fn task_definition_is_usable(bytes: &[u8]) -> bool {
+    if !task_definition_is_enabled(bytes) {
+        return false;
+    }
+    match task_command(&decode_task_xml(bytes)) {
+        // A relative command would be resolved against the task's working
+        // directory, which we do not know; refuse rather than guess at a
+        // path and then "confirm" it.
+        Some(cmd) => Path::new(&cmd).is_absolute() && Path::new(&cmd).is_file(),
+        None => false,
+    }
+}
+
+/// The executable path from the task's `<Exec><Command>`, resolved.
+///
+/// Returns `None` when the document has no command — a task with no Exec
+/// action cannot run the reconciler, so that reads as "not installed".
+///
+/// Handles the three shapes a real definition file can carry: XML entity
+/// escapes (our own writer escapes all five, and a path CAN contain `&`),
+/// surrounding quotes (what the Task Scheduler UI writes when a path has
+/// spaces), and `%VAR%` environment references. An unset variable is left
+/// untouched, so the resulting path fails the existence check rather than
+/// collapsing into something shorter that might exist.
+fn task_command(xml: &str) -> Option<String> {
+    let open = xml.find("<Command>")? + "<Command>".len();
+    let rest = &xml[open..];
+    let close = rest.find("</Command>")?;
+    let raw = xml_unescape(rest[..close].trim());
+    let unquoted = raw.trim_matches('"').trim();
+    if unquoted.is_empty() {
+        return None;
+    }
+    Some(expand_env_vars(unquoted))
+}
+
+fn xml_unescape(s: &str) -> String {
+    // &amp; LAST: doing it first would turn "&amp;lt;" into "<".
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+/// Expand `%VAR%` references. An unpaired `%`, or a name that is not set,
+/// is passed through verbatim.
+fn expand_env_vars(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find('%') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        match after.find('%') {
+            Some(end) => {
+                let name = &after[..end];
+                match std::env::var(name) {
+                    Ok(v) => out.push_str(&v),
+                    // Unresolvable: keep the literal so the caller's
+                    // existence check fails instead of silently succeeding
+                    // against a truncated path.
+                    Err(_) => {
+                        out.push('%');
+                        out.push_str(name);
+                        out.push('%');
+                    }
+                }
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push('%');
+                rest = after;
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Does this task definition describe a task that will actually run?
@@ -500,6 +600,104 @@ mod tests {
     #[test]
     fn task_check_is_total() {
         let _ = reconciler_task_installed();
+    }
+
+    /// Build a definition file the way `sentinella-dnsreconcile` does.
+    fn definition_for(command: &str) -> Vec<u8> {
+        format!(
+            "<Task><Settings><Enabled>true</Enabled></Settings>\
+             <Actions Context=\"Author\"><Exec><Command>{command}</Command></Exec></Actions></Task>"
+        )
+        .into_bytes()
+    }
+
+    /// REGRESSION, and the second version of the same mistake: an enabled
+    /// definition file proves nothing about whether the task can run.
+    /// Deleting the reconciler executable — quarantine, a competing AV, a
+    /// partial uninstall that skipped `--remove-task` precisely BECAUSE the
+    /// exe was gone — leaves the definition untouched. The daemon then
+    /// passed this precondition and installed a catch-all rule that nothing
+    /// on the machine could remove.
+    #[test]
+    fn a_task_whose_executable_is_gone_is_not_usable() {
+        let present = scratch("reconciler-stand-in.exe");
+        std::fs::write(&present, b"not really an exe, but it is a file").unwrap();
+        assert!(
+            task_definition_is_usable(&definition_for(&present.display().to_string())),
+            "a task naming a file that exists must be usable"
+        );
+
+        std::fs::remove_file(&present).unwrap();
+        assert!(
+            !task_definition_is_usable(&definition_for(&present.display().to_string())),
+            "the definition survives the executable; the check must not"
+        );
+    }
+
+    /// A definition with no Exec action cannot launch the reconciler, and a
+    /// directory is not something Task Scheduler can start.
+    #[test]
+    fn a_definition_that_cannot_launch_anything_is_not_usable() {
+        assert!(!task_definition_is_usable(
+            b"<Task><Settings><Enabled>true</Enabled></Settings></Task>"
+        ));
+        assert!(!task_definition_is_usable(&definition_for("")));
+        assert!(!task_definition_is_usable(&definition_for("   ")));
+        // Relative: resolved against a working directory we do not know.
+        assert!(!task_definition_is_usable(&definition_for(
+            "sentinella-dnsreconcile.exe"
+        )));
+        // A directory exists but cannot be executed.
+        let dir = std::env::temp_dir().join("nrpt-tests");
+        assert!(!task_definition_is_usable(&definition_for(
+            &dir.display().to_string()
+        )));
+        // Disabled still loses, even with a command that resolves.
+        let f = scratch("disabled-but-present.exe");
+        std::fs::write(&f, b"x").unwrap();
+        let disabled = format!(
+            "<Task><Settings><Enabled>false</Enabled></Settings>\
+             <Actions><Exec><Command>{}</Command></Exec></Actions></Task>",
+            f.display()
+        );
+        assert!(!task_definition_is_usable(disabled.as_bytes()));
+        let _ = std::fs::remove_file(&f);
+    }
+
+    /// The path goes into XML text escaped, may be quoted by the Task
+    /// Scheduler UI, and may carry `%VAR%`. Failing to undo any of those
+    /// turns a healthy task into "missing" and silently costs filtering.
+    #[test]
+    fn the_command_is_read_back_the_way_it_was_written() {
+        assert_eq!(
+            task_command("<Command>C:\\a&amp;b\\d&apos;e\\f.exe</Command>").as_deref(),
+            Some("C:\\a&b\\d'e\\f.exe")
+        );
+        assert_eq!(
+            task_command("<Command>\"C:\\Program Files\\S\\r.exe\"</Command>").as_deref(),
+            Some("C:\\Program Files\\S\\r.exe")
+        );
+        assert_eq!(task_command("<Task/>"), None);
+
+        // %VAR% expansion, against a variable that certainly exists.
+        let var = if cfg!(windows) { "SystemRoot" } else { "PATH" };
+        if let Ok(v) = std::env::var(var) {
+            assert_eq!(
+                task_command(&format!("<Command>%{var}%\\marker.exe</Command>")).as_deref(),
+                Some(format!("{v}\\marker.exe").as_str())
+            );
+        }
+
+        // An unset variable must NOT collapse into a shorter path that
+        // might exist — it stays literal and then fails the file check.
+        let cmd = "<Command>%SENTINELLA_NO_SUCH_VAR%\\r.exe</Command>";
+        assert_eq!(
+            task_command(cmd).as_deref(),
+            Some("%SENTINELLA_NO_SUCH_VAR%\\r.exe")
+        );
+        assert!(!task_definition_is_usable(&definition_for(
+            "%SENTINELLA_NO_SUCH_VAR%\\r.exe"
+        )));
     }
 
     /// The ONLY test that exercises the write path against the real

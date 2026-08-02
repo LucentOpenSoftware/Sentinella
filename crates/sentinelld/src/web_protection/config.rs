@@ -75,10 +75,13 @@ pub struct WebProtectionConfig {
     /// from the system, never from this field.
     pub enabled: bool,
 
-    /// Address the proxy listens on. MUST be loopback on port 53 when
+    /// Address the proxy listens on. MUST be IPv4 loopback on port 53 when
     /// `enabled`: NRPT `NameServers` carries no port syntax, so the DNS
-    /// Client always queries 53, and the rule records only the IP. Any
-    /// other port forces `enabled = false` — see [`Self::validate`].
+    /// Client always queries 53, and the rule records only the IP; and
+    /// every health probe in the stack — self-test, watchdog, boot
+    /// reconciler — is AF_INET, so an IPv6 listener can never be proven
+    /// healthy. Anything else forces `enabled = false` — see
+    /// [`Self::validate`].
     pub listen: String,
 
     /// `"system"` to discover from active adapters, or explicit
@@ -168,6 +171,23 @@ impl WebProtectionConfig {
             // A non-loopback listener turns the AV into an open resolver
             // for the whole network.
             return Err(format!("listen {addr} is not a loopback address"));
+        }
+        // IPv4 LOOPBACK, EXACTLY. `[::1]:53` is loopback and on port 53, so
+        // it used to pass here — and then could never work, because every
+        // probe in the stack is AF_INET and cannot send to an AF_INET6
+        // address: dnsguard's self-test binds
+        // `UdpSocket::bind(Ipv4Addr::LOCALHOST:0)` before probing the
+        // listener, the watchdog binds `127.0.0.1:0`, and the boot
+        // reconciler has `127.0.0.1:53` compiled in (it must not read our
+        // config, or it could be pointed away from the thing it checks).
+        // The visible symptom was SelfTestFailed forever with nothing in
+        // the detail naming the address family. Refusing here says why.
+        if !addr.is_ipv4() {
+            return Err(format!(
+                "listen {addr} is IPv6 - the self-test, the watchdog and the boot reconciler all \
+                 probe over IPv4 loopback, so an IPv6 listener can never be proven healthy. \
+                 Use 127.0.0.1:{DNS_PORT}"
+            ));
         }
         // PORT 53, EXACTLY. NRPT `NameServers` carries no port syntax, so
         // the Windows DNS Client always queries 53 - and `install` writes
@@ -314,12 +334,39 @@ mod tests {
             c.validate();
             assert!(!c.enabled, "{bad}: NRPT cannot route to a non-53 port");
         }
-        // ...and loopback:53 in either family stays enabled.
-        for good in ["127.0.0.1:53", "[::1]:53"] {
+        // ...and IPv4 loopback:53 stays enabled. 127/8 is all loopback, so
+        // an alias is as serviceable as .1.
+        for good in ["127.0.0.1:53", "127.0.0.53:53"] {
             let mut c = enabled();
             c.listen = good.into();
             c.validate();
             assert!(c.enabled, "{good}: must remain usable");
         }
+    }
+
+    /// REGRESSION. `[::1]:53` used to validate — it is loopback and it is
+    /// port 53 — and could then never serve: dnsguard's self-test probes
+    /// the listener from an AF_INET socket, so `canary_ok` and `filter_ok`
+    /// are false whatever the proxy does, and `service.rs` refuses to serve
+    /// on a failed self-test. The old test asserted only that `enabled`
+    /// survived validation, which it did, all the way to a permanent
+    /// SelfTestFailed.
+    #[test]
+    fn an_ipv6_listener_cannot_be_enabled() {
+        // `::1` is refused as IPv6; the IPv4-mapped form is refused one
+        // check earlier, because `Ipv6Addr::is_loopback` is true only for
+        // `::1`. Both must end up disabled.
+        for v6 in ["[::1]:53", "[::ffff:127.0.0.1]:53"] {
+            let mut c = enabled();
+            c.listen = v6.into();
+            c.validate();
+            assert!(!c.enabled, "{v6}: must not be enabled");
+        }
+        // The refusal has to name the cause: "it stopped working" with no
+        // mention of the address family is the whole failure being fixed.
+        let mut c = enabled();
+        c.listen = "[::1]:53".into();
+        let why = c.check_enablable().expect_err("must refuse");
+        assert!(why.contains("IPv6"), "the reason must name the cause: {why}");
     }
 }

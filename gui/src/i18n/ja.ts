@@ -3,7 +3,6 @@ export const ja: Record<string, string> = {
   // ── アプリ / 全般 ────────────────────────────────────
   "app.name": "Sentinella",
   "app.subtitle": "アンチウイルススイート",
-  "app.version": "v0.1.13",
 
   // ── サイドバー ─────────────────────────────────────
   "nav.dashboard": "ダッシュボード",
@@ -26,7 +25,6 @@ export const ja: Record<string, string> = {
   "meta.notifications_sub": "アラート履歴",
   "meta.update_sub": "署名データベース",
   "meta.settings_sub": "Sentinella を設定",
-  "meta.about_sub": "Sentinella v0.1.13",
 
   // ── ダッシュボード ──────────────────────────────────
   "dash.protected": "システムは保護されています",
