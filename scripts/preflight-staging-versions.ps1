@@ -127,14 +127,21 @@ foreach ($name in $ShippedBinaries) {
 # get an installer that existing users cannot auto-update to. 0.1.13 was
 # built unsigned twice before anyone noticed.
 #
-# Nothing in this repo records where the key comes from: no doc, no script,
-# no CI workflow references the variable at all. It survives only as an
-# ad-hoc env var in whichever shell the release was cut from, which is
-# exactly why it "goes missing" between versions. Catching it here costs a
-# second; catching it after the bundle costs the whole build.
+# The key itself is NOT missing: keys\sentinella-update.key has been in
+# place since 2026-05-26 and is gitignored. What goes missing between
+# releases is the env var pointing at it, which lives only in whichever
+# shell the release was cut from. docs\WORKING_STATE_v0.1.0.md records the
+# procedure; nothing enforces it. Catching this here costs a second,
+# catching it after the bundle costs the whole build.
 #
-# This checks only that the variable is NON-EMPTY. It never reads, logs,
-# echoes or validates the key material.
+# BOTH variables count. Tauri accepts the key inline
+# (TAURI_SIGNING_PRIVATE_KEY) or as a path to a key file
+# (TAURI_SIGNING_PRIVATE_KEY_PATH), and the documented procedure uses the
+# PATH form. An earlier version of this check only knew the inline one,
+# which would have failed a correctly-configured build.
+#
+# This checks only that a variable is NON-EMPTY, and for the path form that
+# the file exists. It never reads, logs, echoes or validates key material.
 $TauriConf = Join-Path $RepoRoot "gui\src-tauri\tauri.conf.json"
 if (Test-Path $TauriConf) {
     $conf = Get-Content $TauriConf -Raw | ConvertFrom-Json
@@ -142,11 +149,28 @@ if (Test-Path $TauriConf) {
     if ($conf.bundle.createUpdaterArtifacts) {
         if ($conf.plugins.updater.pubkey) { $wantsSignature = $true }
     }
-    if ($wantsSignature -and [string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
-        $Errors += "  - TAURI_SIGNING_PRIVATE_KEY is not set, but tauri.conf.json configures"
-        $Errors += "    an updater pubkey. The bundle would be built UNSIGNED and the"
-        $Errors += "    bundler would still exit 0, so nothing downstream would notice."
-        $Errors += "    Existing installs could not auto-update to it."
+    $haveInline = -not [string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)
+    $keyPath = $env:TAURI_SIGNING_PRIVATE_KEY_PATH
+    $havePath = -not [string]::IsNullOrWhiteSpace($keyPath)
+    if ($wantsSignature -and -not $haveInline -and -not $havePath) {
+        $DefaultKey = Join-Path $RepoRoot "keys\sentinella-update.key"
+        $Errors += "  - No updater signing key is configured, but tauri.conf.json sets an"
+        $Errors += "    updater pubkey. The bundle would be built UNSIGNED and the bundler"
+        $Errors += "    would still exit 0, so nothing downstream would notice. Existing"
+        $Errors += "    installs could not auto-update to it."
+        if (Test-Path $DefaultKey) {
+            # The usual cause: the key is right there, the variable is not.
+            $Errors += "    The key IS on disk. From the repo root, before building:"
+            $Errors += "      `$env:TAURI_SIGNING_PRIVATE_KEY_PATH = `"$DefaultKey`""
+        } else {
+            $Errors += "    Set TAURI_SIGNING_PRIVATE_KEY_PATH (see docs\WORKING_STATE_v0.1.0.md)."
+        }
+    } elseif ($havePath -and -not (Test-Path -LiteralPath $keyPath)) {
+        # A path that does not resolve fails exactly like no key at all, and
+        # just as quietly, so it is the same error.
+        $Errors += "  - TAURI_SIGNING_PRIVATE_KEY_PATH points at a file that does not exist:"
+        $Errors += "      $keyPath"
+        $Errors += "    The bundle would be built UNSIGNED and still exit 0."
     }
 }
 
