@@ -123,13 +123,32 @@ export function notifyScanComplete(threats: number, filesScanned: number, scanTy
   recordNotification("scan_complete", `${label} complete — ${threats} threats`);
 }
 
-/** Signature update failed. */
-export function notifyUpdateFailed(reason: string): void {
+/**
+ * Signatures are old enough to be worth interrupting the user.
+ *
+ * This REPLACED a notification that fired whenever a freshclam run failed.
+ * That was the wrong event: a single failed fetch is transient (slow mirror,
+ * Wi-Fi drop, machine suspended mid-download), the updater now retries it,
+ * and the next scheduled cycle is hours away at most — so the user was being
+ * interrupted about something that had already fixed itself, with no action
+ * available to them. Signature AGE is the fact they can actually act on, and
+ * the daemon only sets `db_stale_notify` once it crosses
+ * `signature_stale_notify_days` (default 14). Failed attempts are still
+ * recorded in the activity log for diagnosis; they just no longer shout.
+ *
+ * Kept on the `onUpdateFailure` gate: it is the same user preference
+ * ("tell me about signature update problems"), now attached to the event
+ * that deserves it, so anyone who had already switched it off stays quiet.
+ */
+export function notifySignaturesStale(days: number): void {
   if (!shouldNotify("onUpdateFailure", "warning")) return;
-  if (!dedupeCheck("update_failed")) return;
+  // 24h cooldown: while the condition persists this could otherwise re-fire
+  // on the transition guard after any daemon reconnect.
+  if (!dedupeCheck("signatures_stale", 24 * 60 * 60 * 1000)) return;
 
-  send(t("notify.update_failed"), `${t("notify.update_failed")}: ${reason}`);
-  recordNotification("update_failed", t("notify.update_failed"));
+  const title = t("notify.signatures_stale");
+  send(title, t("notify.signatures_stale_body").replace("{n}", String(days)));
+  recordNotification("signatures_stale", title);
 }
 
 /** Protection state degraded or unavailable. */

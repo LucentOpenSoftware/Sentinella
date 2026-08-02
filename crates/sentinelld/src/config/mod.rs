@@ -18,6 +18,17 @@ pub struct Config {
     /// Freshness is measured from the newest signature file's mtime. Default 3.
     #[serde(default = "default_signature_stale_days")]
     pub signature_stale_days: u32,
+    /// Age (days) at which the user is actively NOTIFIED that signatures are
+    /// stale. Deliberately much larger than `signature_stale_days`: that one
+    /// tints a card in the UI for someone already looking, this one interrupts.
+    ///
+    /// A failed update fetch is NOT a notification-worthy event — with a
+    /// 4-hour update interval, transient failures self-heal long before the
+    /// signatures are meaningfully old, and the user can do nothing useful
+    /// with the news that one attempt timed out. Signature AGE is the only
+    /// fact here they can act on. Default 14 days.
+    #[serde(default = "default_signature_stale_notify_days")]
+    pub signature_stale_notify_days: u32,
     pub update_mirror: String,
     pub quarantine_retention_days: u32,
     pub auto_quarantine: bool,
@@ -228,6 +239,7 @@ impl Default for Config {
             auto_update: true,
             update_interval_hours: 4,
             signature_stale_days: 3,
+            signature_stale_notify_days: 14,
             update_mirror: "database.clamav.net".into(),
             quarantine_retention_days: 90,
             auto_quarantine: true,
@@ -398,6 +410,15 @@ impl Config {
         // Signature staleness warning age — clamp to a sane [1, 30] day range
         // (0 would warn constantly; >30 would hide a genuinely abandoned DB).
         self.signature_stale_days = self.signature_stale_days.clamp(1, 30);
+        // The NOTIFY threshold interrupts the user, so it gets a wider floor
+        // and ceiling: [3, 365]. It must also never be earlier than the UI
+        // staleness age — notifying about a condition the UI does not even
+        // consider stale yet would be incoherent, so a too-small value is
+        // raised to the UI threshold rather than accepted.
+        self.signature_stale_notify_days = self
+            .signature_stale_notify_days
+            .clamp(3, 365)
+            .max(self.signature_stale_days);
         // R4-C8: 0 days = instant cleanup on every scheduler tick — wipes
         // quarantine. Enforce a 1-day minimum so accidental UI input does
         // not destroy quarantined evidence.
@@ -832,6 +853,10 @@ fn default_idle_scan_start_delay() -> u64 {
 }
 fn default_signature_stale_days() -> u32 {
     3
+}
+
+fn default_signature_stale_notify_days() -> u32 {
+    14
 }
 
 fn expand_vec(values: &mut [String]) {

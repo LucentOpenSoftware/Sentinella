@@ -1446,7 +1446,7 @@ fn dispatch_sync(
                 ))
                 .unwrap_or_default();
             }
-            let r = AppState::start_update(state);
+            let r = AppState::start_update(state, /* manual */ true);
             Ok(r)
         }
         "activity.list" => {

@@ -432,6 +432,11 @@ pub struct AppState {
     gui_fullscreen_ts: AtomicI64,
     /// Signature-staleness warning threshold (hours), from config.signature_stale_days.
     signature_stale_hours: u64,
+    /// Threshold (hours) at which staleness becomes worth INTERRUPTING the
+    /// user, from config.signature_stale_notify_days. Much larger than
+    /// `signature_stale_hours` — see that config field for why a failed fetch
+    /// is not itself notification-worthy.
+    signature_stale_notify_hours: u64,
     // ── ClamAV isolation config (cached) ───────────────
     clamav_subprocess_enabled: AtomicBool,
     clamav_worker_timeout_sec: AtomicU64,
@@ -519,6 +524,15 @@ struct Inner {
     update_current_file: String,
     last_update_timestamp: Option<i64>,
     last_update_error: Option<String>,
+    /// Should `last_update_error` be surfaced as `UpdateState::Error`?
+    ///
+    /// Only for updates the USER started. They pressed a button and are
+    /// watching; silence would read as a hung UI. A SCHEDULED update that
+    /// fails is recorded (activity log + `last_update_error` for diagnostics)
+    /// but stays `Idle`, because the user is not watching and the next cycle
+    /// is at most `update_interval_hours` away. What eventually interrupts
+    /// them is `db_stale_notify` — signature age, not a failed fetch.
+    last_update_error_notifiable: bool,
 }
 
 /// Aggregate scan performance summary.
@@ -1070,6 +1084,11 @@ impl AppState {
                 .unwrap_or(3)
                 .clamp(1, 30) as u64
                 * 24,
+            signature_stale_notify_hours: crate::config::Config::load(None)
+                .map(|c| c.signature_stale_notify_days)
+                .unwrap_or(14)
+                .clamp(3, 365) as u64
+                * 24,
             clamav_subprocess_enabled: AtomicBool::new(false),
             clamav_worker_timeout_sec: AtomicU64::new(30),
             excluded_detections: std::sync::Mutex::new(Vec::new()),
@@ -1122,6 +1141,7 @@ impl AppState {
                 update_current_file: String::new(),
                 last_update_timestamp: None,
                 last_update_error: None,
+                last_update_error_notifiable: false,
             }),
         }
     }
@@ -4168,8 +4188,14 @@ impl AppState {
             }
         } else {
             match &inner.last_update_error {
-                Some(_) => (UpdateState::Error, None, String::new()),
-                None => (UpdateState::Idle, None, String::new()),
+                // A background failure is deliberately reported as Idle — see
+                // `last_update_error_notifiable`. `last_error` below is still
+                // populated either way, so the detail stays available for
+                // diagnostics without the UI treating it as an alert.
+                Some(_) if inner.last_update_error_notifiable => {
+                    (UpdateState::Error, None, String::new())
+                }
+                _ => (UpdateState::Idle, None, String::new()),
             }
         };
 
@@ -4189,7 +4215,10 @@ impl AppState {
 
     /// Start a signature update in the background.
     /// Returns immediately so the IPC handler is NOT blocked.
-    pub fn start_update(self: &Arc<Self>) -> serde_json::Value {
+    ///
+    /// `manual` = the user pressed Update. It controls only whether a FAILURE
+    /// is surfaced as `UpdateState::Error`; see `last_update_error_notifiable`.
+    pub fn start_update(self: &Arc<Self>, manual: bool) -> serde_json::Value {
         // Record update activity — blocks quiet re-trim.
         self.activity_tracker.record_update();
 
@@ -4201,6 +4230,7 @@ impl AppState {
             }
             inner.update_running = true;
             inner.last_update_error = None;
+            inner.last_update_error_notifiable = false;
         }
 
         self.log_activity(
@@ -4240,6 +4270,7 @@ impl AppState {
                 let mut inner = self.lock_inner();
                 inner.update_running = false;
                 inner.last_update_error = Some(msg.to_string());
+                inner.last_update_error_notifiable = manual;
                 self.log_activity("warning", "update", "Update failed", msg, None);
                 return serde_json::json!({"ok": false, "error": msg});
             }
@@ -4273,7 +4304,7 @@ impl AppState {
             }
 
             // Phase 2: Run freshclam with real-time output parsing.
-            let (success, message) = crate::updater::run_freshclam_with_progress(
+            let (success, message) = crate::updater::run_freshclam_with_retry(
                 &fc_path,
                 &config_path,
                 &db_dir,
@@ -4366,6 +4397,7 @@ impl AppState {
                 let detail = freshclam_error_detail(&message);
                 let mut inner = state.lock_inner();
                 inner.last_update_error = Some(detail.clone());
+                inner.last_update_error_notifiable = manual;
                 drop(inner);
                 tracing::warn!(detail = detail.as_str(), "signature update failed");
                 state.log_activity(
@@ -4467,6 +4499,14 @@ impl AppState {
         } else {
             db_stale_raw
         };
+        // The much older "worth interrupting the user" threshold. Same
+        // no-timestamp guard as above: absent a real timestamp we do NOT know
+        // the signatures are old, and a notification is exactly the wrong
+        // thing to fire on a guess. Computed against the same effective_ts so
+        // the two thresholds can never disagree about the DB's age.
+        let (db_stale_notify_raw, _) =
+            compute_db_stale(effective_ts, now_ts, self.signature_stale_notify_hours);
+        let db_stale_notify = effective_ts.is_some() && db_stale_notify_raw;
 
         // Watcher status.
         let watcher_active = self
@@ -4500,6 +4540,7 @@ impl AppState {
             signature_count: self.signature_count.load(Ordering::Relaxed),
             db_stale,
             db_stale_hours,
+            db_stale_notify,
             watcher_active,
             last_update_timestamp: inner.last_update_timestamp,
             total_files_scanned: inner.scan_history.iter().map(|s| s.files_scanned).sum(),
@@ -6475,6 +6516,11 @@ pub struct RuntimeStats {
     pub signature_count: u64,
     pub db_stale: bool,
     pub db_stale_hours: u64,
+    /// Signatures are old enough that it is worth interrupting the user
+    /// (config.signature_stale_notify_days, default 14). This — not a failed
+    /// update attempt — is what drives the user-facing update notification.
+    #[serde(default)]
+    pub db_stale_notify: bool,
     pub watcher_active: bool,
     pub last_update_timestamp: Option<i64>,
     pub total_files_scanned: u64,
@@ -6681,6 +6727,7 @@ mod tests {
             update_current_file: String::new(),
             last_update_timestamp: None,
             last_update_error: None,
+            last_update_error_notifiable: false,
         }
     }
 
@@ -6701,6 +6748,44 @@ mod tests {
             perf_summary: ScanPerformanceSummary::default(),
             live: None,
         }
+    }
+
+    #[test]
+    fn notify_threshold_is_far_later_than_the_ui_threshold() {
+        let now = 1_700_000_000_i64;
+        let day = 24 * 3600_i64;
+        let ui = 3 * 24_u64;      // signature_stale_days default
+        let notify = 14 * 24_u64; // signature_stale_notify_days default
+
+        // Four days old: the UI tints its card, but nothing interrupts the
+        // user. This is the whole point of the split — a few days behind is
+        // worth showing to someone already looking, not worth a toast.
+        let ts = Some(now - 4 * day);
+        assert!(compute_db_stale(ts, now, ui).0);
+        assert!(!compute_db_stale(ts, now, notify).0);
+
+        // Fifteen days: now it is worth saying out loud.
+        let ts = Some(now - 15 * day);
+        assert!(compute_db_stale(ts, now, notify).0);
+
+        // Exactly at the threshold is NOT past it (strict >), so the toast
+        // fires a day after the age is reached, never a day early.
+        let ts = Some(now - 14 * day);
+        assert!(!compute_db_stale(ts, now, notify).0);
+    }
+
+    #[test]
+    fn no_timestamp_never_fires_the_notification() {
+        // compute_db_stale reports (true, 0) with no timestamp — meaning
+        // "unknown", not "old". The UI banner has its own guard for this;
+        // build_stats guards the notify flag with effective_ts.is_some().
+        // Absent that guard, every daemon start with an unreadable
+        // signature mtime would toast "your signatures are 0 days old".
+        let (stale, hours) = compute_db_stale(None, 1_700_000_000, 14 * 24);
+        assert!(stale);
+        assert_eq!(hours, 0);
+        let effective_ts: Option<i64> = None;
+        assert!(!(effective_ts.is_some() && stale));
     }
 
     #[test]

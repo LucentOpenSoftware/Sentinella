@@ -375,7 +375,8 @@ export const en: Record<string, string> = {
   "notify.file_quarantined": "File quarantined",
   "notify.files_quarantined": "Files quarantined",
   "notify.quarantine_failed": "Quarantine failed",
-  "notify.update_failed": "Signature update failed",
+  "notify.signatures_stale": "Signatures are out of date",
+  "notify.signatures_stale_body": "Your virus signatures are {n} days old. Sentinella has not been able to update them.",
   "notify.protection_degraded": "Protection degraded",
   "notify.realtime_unavailable": "Real-time protection unavailable",
   "notify.ready": "Sentinella is ready",
@@ -942,6 +943,8 @@ export const en: Record<string, string> = {
   "settings.update_mirror_desc": "Hostname of the ClamAV mirror used by freshclam.",
   "settings.signature_stale_days": "Stale after",
   "settings.signature_stale_days_desc": "After this many days without a successful update, the engine status pill turns yellow.",
+  "settings.signature_stale_notify_days": "Notify after",
+  "settings.signature_stale_notify_days_desc": "Sentinella stays quiet about failed update attempts — they usually fix themselves. It only notifies you once the signatures are actually this old.",
 
   // ── Engine tab (Phase 2) ──────────────────────────
   "settings.section_clamav": "ClamAV isolation",

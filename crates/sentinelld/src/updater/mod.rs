@@ -9,11 +9,107 @@ use tracing::{error, info, warn};
 
 use crate::win_process::QuietCommand;
 
+/// Attempts per update cycle, and the pause between them.
+///
+/// WHY THIS EXISTS. Before this, a single freshclam failure ended the cycle
+/// and surfaced as a user-facing "signature update failed" toast. But the
+/// overwhelmingly common causes — a slow mirror, Wi-Fi that dropped, the
+/// machine suspending mid-download — are transient and fix themselves. The
+/// user could do nothing useful with that notification, and with a 4-hour
+/// update interval a single miss leaves signatures at most 4 hours old.
+///
+/// Three attempts covers the transient cases without turning a genuinely
+/// unreachable mirror into a long stall: worst case here is one timeout
+/// plus two short waits, and the cycle then ends quietly and waits for the
+/// next scheduled run.
+const ATTEMPTS_PER_CYCLE: usize = 3;
+const RETRY_BACKOFF: [std::time::Duration; 2] = [
+    std::time::Duration::from_secs(30),
+    std::time::Duration::from_secs(120),
+];
+
+/// Is this failure worth retrying inside the same cycle?
+///
+/// Transient means "the same command might succeed in two minutes":
+/// timeouts, connection failures, DNS resolution, a mirror returning 5xx.
+/// A 403, a bad config, or a missing binary will fail identically on every
+/// retry, so retrying just delays the inevitable — those end the cycle
+/// immediately and wait for the next scheduled run like everything else.
+fn is_transient(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    [
+        "timed out",
+        "timeout",
+        "connection",
+        "connect",
+        "network",
+        "temporarily",
+        "resolve",
+        "unreachable",
+        "reset",
+        "refused",
+        "503",
+        "502",
+        "504",
+    ]
+    .iter()
+    .any(|needle| m.contains(needle))
+}
+
 /// Run freshclam to update the signature database.
 /// Returns (success, output_message).
 #[allow(dead_code)]
 pub fn run_freshclam(freshclam_path: &Path, config_path: &Path, _db_dir: &Path) -> (bool, String) {
-    run_freshclam_with_progress(freshclam_path, config_path, _db_dir, |_| {})
+    run_freshclam_with_retry(freshclam_path, config_path, _db_dir, |_| {})
+}
+
+/// One update CYCLE: run freshclam, retrying transient failures quietly.
+///
+/// The returned message is the LAST attempt's, and the caller still records
+/// it for diagnostics. What changed is that a failure here is no longer an
+/// event worth interrupting the user for — see the module note on
+/// ATTEMPTS_PER_CYCLE. The user-facing signal is signature AGE, which is a
+/// fact they can act on, not a failed fetch, which is not.
+pub fn run_freshclam_with_retry<F>(
+    freshclam_path: &Path,
+    config_path: &Path,
+    db_dir: &Path,
+    mut on_line: F,
+) -> (bool, String)
+where
+    F: FnMut(&str),
+{
+    let mut last = (false, String::new());
+    for attempt in 0..ATTEMPTS_PER_CYCLE {
+        if attempt > 0 {
+            let pause = RETRY_BACKOFF[(attempt - 1).min(RETRY_BACKOFF.len() - 1)];
+            info!(
+                attempt = attempt + 1,
+                of = ATTEMPTS_PER_CYCLE,
+                backoff_secs = pause.as_secs(),
+                "retrying signature update after a transient failure"
+            );
+            std::thread::sleep(pause);
+        }
+        last = run_freshclam_with_progress(freshclam_path, config_path, db_dir, &mut on_line);
+        if last.0 {
+            return last;
+        }
+        if !is_transient(&last.1) {
+            // Retrying will produce the same answer; stop wasting the time.
+            warn!(
+                detail = last.1.as_str(),
+                "signature update failed for a non-transient reason - not retrying this cycle"
+            );
+            return last;
+        }
+    }
+    warn!(
+        attempts = ATTEMPTS_PER_CYCLE,
+        detail = last.1.as_str(),
+        "signature update did not succeed this cycle - will retry on the next scheduled run"
+    );
+    last
 }
 
 /// Run freshclam with a progress callback that receives each output line.
@@ -339,4 +435,63 @@ fn resolve_freshclam_config(config_path: &Path) -> Option<PathBuf> {
     std::fs::write(&tmp, &rewritten).ok()?;
     info!(path = %tmp.display(), "freshclam config resolved to absolute paths");
     Some(tmp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_failure_that_started_this_is_transient() {
+        // The literal message the user saw as a toast. If this ever stops
+        // classifying as transient, the silent-retry behaviour is gone.
+        assert!(is_transient("freshclam timed out"));
+    }
+
+    #[test]
+    fn network_shaped_failures_retry() {
+        for m in [
+            "freshclam timed out and was killed",
+            "ERROR: Can't connect to database.clamav.net",
+            "Connection refused",
+            "could not resolve host",
+            "Network is unreachable",
+            "connection reset by peer",
+            "HTTP 503 Service Unavailable",
+            "Temporarily unavailable",
+        ] {
+            assert!(is_transient(m), "should retry: {m}");
+        }
+    }
+
+    #[test]
+    fn permanent_failures_do_not_retry() {
+        // Retrying these wastes RETRY_BACKOFF seconds to reach the same
+        // answer; the cycle should end immediately and wait for the next.
+        for m in [
+            "freshclam binary not found",
+            "freshclam.conf not found",
+            "ERROR: 403 Forbidden",
+            "Can't create temporary directory",
+            "Permission denied",
+            "mirrors.dat is corrupt",
+        ] {
+            assert!(!is_transient(m), "should NOT retry: {m}");
+        }
+    }
+
+    #[test]
+    fn classification_is_case_insensitive() {
+        assert!(is_transient("TIMED OUT"));
+        assert!(is_transient("Connection Refused"));
+    }
+
+    #[test]
+    fn backoff_covers_every_retry() {
+        // Indexing RETRY_BACKOFF[attempt - 1] must stay in bounds for every
+        // attempt the loop can take.
+        assert!(RETRY_BACKOFF.len() >= ATTEMPTS_PER_CYCLE - 1);
+        // And the pauses must be ordered, or "backoff" is a lie.
+        assert!(RETRY_BACKOFF.windows(2).all(|w| w[0] < w[1]));
+    }
 }

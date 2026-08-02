@@ -3,7 +3,7 @@ export {
   notifyQuarantined,
   notifyQuarantineFailed,
   notifyScanComplete,
-  notifyUpdateFailed,
+  notifySignaturesStale,
   notifyProtectionDegraded,
   notifyRealtimeUnavailable,
   notifyFirstRunUpdateComplete,

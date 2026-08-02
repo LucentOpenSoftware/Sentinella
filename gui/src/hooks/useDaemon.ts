@@ -3,7 +3,7 @@ import type { DashboardData, ConnectionState } from "../api/sentinella";
 import { fetchDashboard, getConnectionState } from "../api/sentinella";
 import {
   notifyScanComplete,
-  notifyUpdateFailed,
+  notifySignaturesStale,
   notifyProtectionDegraded,
   notifyRealtimeUnavailable,
   notifyQuarantined,
@@ -68,6 +68,7 @@ export function useDaemon(): DaemonState {
     scanType: string;
     updateState: string;
     updateError: string | null;
+    dbStaleNotify: boolean;
     protectionState: string;
     watcherActive: boolean;
     quarantineCount: number;
@@ -140,9 +141,18 @@ export function useDaemon(): DaemonState {
           );
         }
 
-        // Update failed.
-        if (prev.updateState !== "error" && result.update.state === "error" && result.update.last_error) {
-          notifyUpdateFailed(result.update.last_error);
+        // Signatures went stale enough to be worth interrupting for.
+        //
+        // This used to fire on `update.state === "error"` — i.e. on any
+        // failed freshclam run. That interrupted the user about transient,
+        // self-healing failures they could do nothing about. The daemon now
+        // retries transient failures within the cycle, keeps scheduled
+        // failures at state=Idle, and raises `db_stale_notify` only once the
+        // signatures are genuinely old (default 14 days). `statsAreReal`
+        // guards against the disconnect fallback, whose db_stale defaults
+        // are not measurements.
+        if (statsAreReal && !prev.dbStaleNotify && result.stats.db_stale_notify) {
+          notifySignaturesStale(Math.floor((result.stats.db_stale_hours ?? 0) / 24));
         }
 
         // Protection degraded — only notify if we're actually connected.
@@ -150,7 +160,10 @@ export function useDaemon(): DaemonState {
         // is a false positive. Only fire if the daemon is genuinely reachable
         // and reports degraded state.
         const ps = result.stats.protection_state;
-        const statsAreReal = result.stats.uptime_secs > 0; // fallback has uptime=0
+        // `statsAreReal` (fallback has uptime=0) comes from the enclosing
+        // scope. It used to be re-declared here, which shadowed the outer
+        // binding and put every earlier line in this block inside its
+        // temporal dead zone — the staleness check above reads it.
         if (statsAreReal && prev.protectionState === "fully_protected" && ps !== "fully_protected") {
           notifyProtectionDegraded(result.stats.protection_detail || "");
         }
@@ -198,6 +211,7 @@ export function useDaemon(): DaemonState {
           scanType: result.scan.scan_type || "",
           updateState: result.update.state,
           updateError: result.update.last_error ?? null,
+          dbStaleNotify: result.stats.db_stale_notify ?? false,
           protectionState: result.stats.protection_state,
           watcherActive: result.stats.watcher_active,
           quarantineCount: qReliable
