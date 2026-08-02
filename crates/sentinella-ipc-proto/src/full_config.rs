@@ -149,6 +149,9 @@ pub struct FullConfig {
     pub auto_update: bool,
     pub update_interval_hours: u32,
     pub signature_stale_days: u32,
+    /// Age (days) at which staleness is worth INTERRUPTING the user.
+    /// Far larger than signature_stale_days, which only tints a card.
+    pub signature_stale_notify_days: u32,
     pub update_mirror: String,
 
     // ── Quarantine ───────────────────────────────────
@@ -225,6 +228,7 @@ impl Default for FullConfig {
             auto_update: true,
             update_interval_hours: 4,
             signature_stale_days: 3,
+            signature_stale_notify_days: 14,
             update_mirror: "database.clamav.net".into(),
 
             quarantine_retention_days: 90,
@@ -432,6 +436,7 @@ impl RestartRequirementMap {
             "auto_update",
             "update_interval_hours",
             "signature_stale_days",
+            "signature_stale_notify_days",
             "update_mirror",
             "quarantine_retention_days",
             "auto_quarantine",

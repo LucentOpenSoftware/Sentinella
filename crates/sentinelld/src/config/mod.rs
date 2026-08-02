@@ -1219,6 +1219,7 @@ impl From<&Config> for FullConfig {
             auto_update: c.auto_update,
             update_interval_hours: c.update_interval_hours,
             signature_stale_days: c.signature_stale_days,
+            signature_stale_notify_days: c.signature_stale_notify_days,
             update_mirror: c.update_mirror.clone(),
 
             quarantine_retention_days: c.quarantine_retention_days,
@@ -1327,6 +1328,7 @@ impl Config {
         self.auto_update = full.auto_update;
         self.update_interval_hours = full.update_interval_hours;
         self.signature_stale_days = full.signature_stale_days;
+        self.signature_stale_notify_days = full.signature_stale_notify_days;
         self.update_mirror = full.update_mirror.clone();
 
         self.quarantine_retention_days = full.quarantine_retention_days;

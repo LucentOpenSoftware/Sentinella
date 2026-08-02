@@ -431,12 +431,19 @@ pub struct AppState {
     gui_fullscreen_active: AtomicBool,
     gui_fullscreen_ts: AtomicI64,
     /// Signature-staleness warning threshold (hours), from config.signature_stale_days.
-    signature_stale_hours: u64,
+    ///
+    /// ATOMIC, not a plain field. `restart_requirement()` classifies both
+    /// staleness thresholds as hot-applied, so the GUI shows no restart pill
+    /// — but `settings.set_full` only writes the TOML, it pushes nothing back
+    /// into AppState. Cached at construction these kept their boot values
+    /// until the daemon restarted, making that "no restart needed" a promise
+    /// the daemon did not keep. `refresh_staleness_thresholds` makes it true.
+    signature_stale_hours: AtomicU64,
     /// Threshold (hours) at which staleness becomes worth INTERRUPTING the
     /// user, from config.signature_stale_notify_days. Much larger than
     /// `signature_stale_hours` — see that config field for why a failed fetch
     /// is not itself notification-worthy.
-    signature_stale_notify_hours: u64,
+    signature_stale_notify_hours: AtomicU64,
     // ── ClamAV isolation config (cached) ───────────────
     clamav_subprocess_enabled: AtomicBool,
     clamav_worker_timeout_sec: AtomicU64,
@@ -687,6 +694,21 @@ fn compute_db_stale(effective_ts: Option<i64>, now_ts: i64, threshold_hours: u64
             (hours > threshold_hours, hours)
         }
         None => (true, 0),
+    }
+}
+
+/// Should the user be INTERRUPTED about signature age?
+///
+/// Split out of `runtime_stats` so the no-timestamp guard is reachable from a
+/// test. `compute_db_stale` answers `(true, 0)` when it has no timestamp,
+/// which means "unknown age", NOT "old" — firing a notification on that would
+/// shout at every user whose signature mtimes were briefly unreadable at boot.
+/// Uses the same `effective_ts` as the 3-day UI threshold, so the two can
+/// never disagree about how old the database is.
+fn compute_db_stale_notify(effective_ts: Option<i64>, now_ts: i64, threshold_hours: u64) -> bool {
+    match effective_ts {
+        Some(_) => compute_db_stale(effective_ts, now_ts, threshold_hours).0,
+        None => false,
     }
 }
 
@@ -1079,16 +1101,20 @@ impl AppState {
                     .map(|c| c.developer)
                     .unwrap_or_default(),
             ),
-            signature_stale_hours: crate::config::Config::load(None)
-                .map(|c| c.signature_stale_days)
-                .unwrap_or(3)
-                .clamp(1, 30) as u64
-                * 24,
-            signature_stale_notify_hours: crate::config::Config::load(None)
-                .map(|c| c.signature_stale_notify_days)
-                .unwrap_or(14)
-                .clamp(3, 365) as u64
-                * 24,
+            signature_stale_hours: AtomicU64::new(
+                crate::config::Config::load(None)
+                    .map(|c| c.signature_stale_days)
+                    .unwrap_or(3)
+                    .clamp(1, 30) as u64
+                    * 24,
+            ),
+            signature_stale_notify_hours: AtomicU64::new(
+                crate::config::Config::load(None)
+                    .map(|c| c.signature_stale_notify_days)
+                    .unwrap_or(14)
+                    .clamp(3, 365) as u64
+                    * 24,
+            ),
             clamav_subprocess_enabled: AtomicBool::new(false),
             clamav_worker_timeout_sec: AtomicU64::new(30),
             excluded_detections: std::sync::Mutex::new(Vec::new()),
@@ -4213,6 +4239,25 @@ impl AppState {
         }
     }
 
+    /// Re-read both staleness thresholds from a freshly-saved config.
+    ///
+    /// Call after every write that can change them. Both are classified as
+    /// hot-applied by `restart_requirement()`, so the GUI promises the change
+    /// takes effect immediately; without this the daemon kept its boot values
+    /// and the promise was false. Clamps mirror `Config::validate` so a config
+    /// written by something other than `settings.set_full` cannot install an
+    /// out-of-range threshold here.
+    pub fn refresh_staleness_thresholds(&self, cfg: &crate::config::Config) {
+        self.signature_stale_hours.store(
+            cfg.signature_stale_days.clamp(1, 30) as u64 * 24,
+            Ordering::Relaxed,
+        );
+        self.signature_stale_notify_hours.store(
+            cfg.signature_stale_notify_days.clamp(3, 365) as u64 * 24,
+            Ordering::Relaxed,
+        );
+    }
+
     /// Start a signature update in the background.
     /// Returns immediately so the IPC handler is NOT blocked.
     ///
@@ -4226,6 +4271,14 @@ impl AppState {
         {
             let mut inner = self.lock_inner();
             if inner.update_running {
+                // The user pressed Update while a SCHEDULED run was already in
+                // flight. They are now watching that run, so adopt their
+                // intent: if it fails they must see why, rather than having
+                // their press silently inherit the background run's silence.
+                // The window this covers is up to a full cycle wide.
+                if manual {
+                    inner.last_update_error_notifiable = true;
+                }
                 return serde_json::json!({"ok": false, "error": "Update already in progress"});
             }
             inner.update_running = true;
@@ -4270,7 +4323,10 @@ impl AppState {
                 let mut inner = self.lock_inner();
                 inner.update_running = false;
                 inner.last_update_error = Some(msg.to_string());
-                inner.last_update_error_notifiable = manual;
+                // |= not =: a manual press that arrived mid-run adopted this
+                // cycle by setting the flag true. Assigning would clobber that
+                // back to false and re-silence the failure they are watching.
+                inner.last_update_error_notifiable |= manual;
                 self.log_activity("warning", "update", "Update failed", msg, None);
                 return serde_json::json!({"ok": false, "error": msg});
             }
@@ -4397,7 +4453,10 @@ impl AppState {
                 let detail = freshclam_error_detail(&message);
                 let mut inner = state.lock_inner();
                 inner.last_update_error = Some(detail.clone());
-                inner.last_update_error_notifiable = manual;
+                // |= not =: a manual press that arrived mid-run adopted this
+                // cycle by setting the flag true. Assigning would clobber that
+                // back to false and re-silence the failure they are watching.
+                inner.last_update_error_notifiable |= manual;
                 drop(inner);
                 tracing::warn!(detail = detail.as_str(), "signature update failed");
                 state.log_activity(
@@ -4482,7 +4541,11 @@ impl AppState {
         .flatten()
         .max();
         let (db_stale_raw, db_stale_hours) =
-            compute_db_stale(effective_ts, now_ts, self.signature_stale_hours);
+            compute_db_stale(
+                effective_ts,
+                now_ts,
+                self.signature_stale_hours.load(Ordering::Relaxed),
+            );
         // v0.1.8 bug fix: compute_db_stale returns (true, 0) when
         // effective_ts is None — i.e. no in-RAM `last_update_timestamp`
         // AND no readable signature file mtime. This wrongly fired
@@ -4499,14 +4562,11 @@ impl AppState {
         } else {
             db_stale_raw
         };
-        // The much older "worth interrupting the user" threshold. Same
-        // no-timestamp guard as above: absent a real timestamp we do NOT know
-        // the signatures are old, and a notification is exactly the wrong
-        // thing to fire on a guess. Computed against the same effective_ts so
-        // the two thresholds can never disagree about the DB's age.
-        let (db_stale_notify_raw, _) =
-            compute_db_stale(effective_ts, now_ts, self.signature_stale_notify_hours);
-        let db_stale_notify = effective_ts.is_some() && db_stale_notify_raw;
+        let db_stale_notify = compute_db_stale_notify(
+            effective_ts,
+            now_ts,
+            self.signature_stale_notify_hours.load(Ordering::Relaxed),
+        );
 
         // Watcher status.
         let watcher_active = self
@@ -6776,16 +6836,23 @@ mod tests {
 
     #[test]
     fn no_timestamp_never_fires_the_notification() {
-        // compute_db_stale reports (true, 0) with no timestamp — meaning
-        // "unknown", not "old". The UI banner has its own guard for this;
-        // build_stats guards the notify flag with effective_ts.is_some().
-        // Absent that guard, every daemon start with an unreadable
-        // signature mtime would toast "your signatures are 0 days old".
-        let (stale, hours) = compute_db_stale(None, 1_700_000_000, 14 * 24);
-        assert!(stale);
-        assert_eq!(hours, 0);
-        let effective_ts: Option<i64> = None;
-        assert!(!(effective_ts.is_some() && stale));
+        let now = 1_700_000_000_i64;
+        let notify = 14 * 24_u64;
+
+        // The trap this guards: compute_db_stale reports (true, 0) with no
+        // timestamp, meaning "unknown age", not "old".
+        assert!(compute_db_stale(None, now, notify).0);
+        // ...but the notification decision must NOT inherit that true.
+        // Asserting through compute_db_stale_notify (the function
+        // runtime_stats actually calls) means deleting the guard fails this
+        // test. An earlier version re-implemented the guard with local
+        // literals and would have stayed green through exactly that deletion.
+        assert!(!compute_db_stale_notify(None, now, notify));
+
+        // And with a real timestamp it still answers the age question.
+        let day = 24 * 3600_i64;
+        assert!(!compute_db_stale_notify(Some(now - 4 * day), now, notify));
+        assert!(compute_db_stale_notify(Some(now - 15 * day), now, notify));
     }
 
     #[test]

@@ -2477,6 +2477,11 @@ fn dispatch_sync(
                     let path = crate::paths::paths().config_file();
                     match config.save(&path) {
                         Ok(()) => {
+                            // Push the hot-applied thresholds into AppState.
+                            // Saving the TOML alone left the daemon running on
+                            // its boot values, so the GUI's "no restart needed"
+                            // pill was lying about these two fields.
+                            state.refresh_staleness_thresholds(&config);
                             state.log_activity(
                                 "info",
                                 "settings",

@@ -19,14 +19,31 @@ use crate::win_process::QuietCommand;
 /// update interval a single miss leaves signatures at most 4 hours old.
 ///
 /// Three attempts covers the transient cases without turning a genuinely
-/// unreachable mirror into a long stall: worst case here is one timeout
-/// plus two short waits, and the cycle then ends quietly and waits for the
-/// next scheduled run.
+/// unreachable mirror into a long stall, because the attempts SHARE one
+/// deadline (`CYCLE_BUDGET`) rather than each starting a fresh clock. The
+/// cycle then ends quietly and waits for the next scheduled run.
+///
+/// The shared deadline is load-bearing, not tidiness. `update_running` is
+/// held for the whole cycle, so its duration is the window in which every
+/// other update — scheduled or user-pressed — is rejected as "already in
+/// progress", and it is how long a user watching the Update page waits.
+/// With a per-attempt timeout, three 10-minute timeouts plus the backoffs
+/// reached 32.5 minutes; freshclam's own ConnectTimeout/ReceiveTimeout do
+/// not bound this, because libfreshclam maps ReceiveTimeout to curl's
+/// LOW_SPEED_TIME, which a slow-but-progressing transfer never trips.
 const ATTEMPTS_PER_CYCLE: usize = 3;
 const RETRY_BACKOFF: [std::time::Duration; 2] = [
     std::time::Duration::from_secs(30),
     std::time::Duration::from_secs(120),
 ];
+/// Wall-clock ceiling for one cycle, sleeps included. Chosen so a stuck
+/// mirror costs roughly one old-style timeout in total instead of three:
+/// main.cvd is large, so a single attempt still needs most of it, and the
+/// point of the retries is a mirror that fails FAST and recovers.
+const CYCLE_BUDGET: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+/// Below this there is no point starting another attempt — freshclam would
+/// be killed mid-handshake and the kill costs another orphaned temp dir.
+const MIN_ATTEMPT_BUDGET: std::time::Duration = std::time::Duration::from_secs(45);
 
 /// Is this failure worth retrying inside the same cycle?
 ///
@@ -79,6 +96,7 @@ pub fn run_freshclam_with_retry<F>(
 where
     F: FnMut(&str),
 {
+    let cycle_started = std::time::Instant::now();
     let mut last = (false, String::new());
     for attempt in 0..ATTEMPTS_PER_CYCLE {
         if attempt > 0 {
@@ -91,7 +109,28 @@ where
             );
             std::thread::sleep(pause);
         }
-        last = run_freshclam_with_progress(freshclam_path, config_path, db_dir, &mut on_line);
+        // The backoff sleeps come out of the same budget as the downloads, so
+        // the ceiling covers the whole cycle and not just the time freshclam
+        // was running.
+        let remaining = CYCLE_BUDGET.saturating_sub(cycle_started.elapsed());
+        if remaining < MIN_ATTEMPT_BUDGET {
+            warn!(
+                attempt = attempt + 1,
+                budget_secs = CYCLE_BUDGET.as_secs(),
+                "signature update cycle is out of time - waiting for the next scheduled run"
+            );
+            if last.1.is_empty() {
+                last.1 = "signature update cycle exceeded its time budget".into();
+            }
+            return last;
+        }
+        last = run_freshclam_bounded(
+            freshclam_path,
+            config_path,
+            db_dir,
+            remaining,
+            &mut on_line,
+        );
         if last.0 {
             return last;
         }
@@ -112,13 +151,20 @@ where
     last
 }
 
-/// Run freshclam with a progress callback that receives each output line.
-/// The callback fires in real-time as freshclam produces output, enabling
-/// the daemon to track download phases and filenames.
-pub fn run_freshclam_with_progress<F>(
+/// One freshclam invocation, killed after `budget`.
+///
+/// The progress callback fires in real-time as freshclam produces output,
+/// letting the daemon track download phases and filenames.
+///
+/// The budget is a PARAMETER rather than a per-call constant because the
+/// retry loop divides one cycle budget across its attempts. When it was a
+/// local const, every attempt started a fresh 10-minute clock and three
+/// attempts could occupy the updater for 32.5 minutes.
+fn run_freshclam_bounded<F>(
     freshclam_path: &Path,
     config_path: &Path,
     _db_dir: &Path,
+    budget: std::time::Duration,
     mut on_line: F,
 ) -> (bool, String)
 where
@@ -128,7 +174,7 @@ where
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    const FRESHCLAM_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+    let freshclam_timeout = budget;
     const MAX_FRESHCLAM_OUTPUT_BYTES: usize = 256 * 1024;
 
     if !freshclam_path.exists() {
@@ -272,7 +318,7 @@ where
             }
         }
 
-        if started.elapsed() > FRESHCLAM_TIMEOUT {
+        if started.elapsed() > freshclam_timeout {
             let _ = child.kill();
             let _ = child.wait();
             warn!("freshclam timed out and was killed");
@@ -484,6 +530,28 @@ mod tests {
     fn classification_is_case_insensitive() {
         assert!(is_transient("TIMED OUT"));
         assert!(is_transient("Connection Refused"));
+    }
+
+    #[test]
+    fn the_cycle_ceiling_is_the_ceiling_not_a_per_attempt_one() {
+        // The defect this pins: ATTEMPTS_PER_CYCLE's doc comment describes
+        // the worst case as one timeout plus the backoffs. That is only true
+        // while the attempts SHARE a deadline. If someone reverts
+        // run_freshclam_bounded to a per-call constant, the real worst case
+        // becomes ATTEMPTS_PER_CYCLE * CYCLE_BUDGET and the comment silently
+        // becomes a lie again.
+        //
+        // Asserted as a property of the constants: the sleeps must fit inside
+        // the cycle budget with room for at least one real attempt, or the
+        // retry loop can only ever run the first attempt.
+        let backoff_total: std::time::Duration = RETRY_BACKOFF.iter().sum();
+        assert!(
+            backoff_total + MIN_ATTEMPT_BUDGET < CYCLE_BUDGET,
+            "backoffs ({backoff_total:?}) leave no room for a retry inside CYCLE_BUDGET ({CYCLE_BUDGET:?})"
+        );
+        // And the floor must be small enough that a retry is actually
+        // reachable after the first attempt has consumed most of the budget.
+        assert!(MIN_ATTEMPT_BUDGET < CYCLE_BUDGET / 2);
     }
 
     #[test]

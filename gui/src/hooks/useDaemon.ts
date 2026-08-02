@@ -131,6 +131,25 @@ export function useDaemon(): DaemonState {
 
       // ── Detect transitions → fire notifications ───────
       const prev = prevRef.current;
+
+      // Signatures stale enough to be worth interrupting for.
+      //
+      // NOT inside the `prev &&` block below, and deliberately so. Every
+      // other notification here is about an EVENT that happens while the app
+      // is watching (a scan finished, the watcher died), so "no previous
+      // state = nothing to compare = stay quiet" is right for them. This one
+      // is about a CONDITION that latches true and stays true for weeks. The
+      // dominant real case is a user opening Sentinella on a machine whose
+      // signatures are already months old — exactly the case they asked to be
+      // told about. Requiring a false→true edge with `prev` seeded from the
+      // first poll made that case unreachable: the condition was already true
+      // before we started looking. Treating a missing `prev` as "not stale"
+      // lets the first healthy poll fire; dedupeCheck's 24h window in
+      // notifySignaturesStale stops it repeating.
+      if (healthyThisPoll && statsAreReal && result.stats.db_stale_notify && !(prev?.dbStaleNotify ?? false)) {
+        notifySignaturesStale(Math.floor((result.stats.db_stale_hours ?? 0) / 24));
+      }
+
       if (prev && healthyThisPoll) {
         // Scan completed with threats.
         if (prev.scanRunning && !result.scan.running && result.scan.state === "completed") {
@@ -141,19 +160,8 @@ export function useDaemon(): DaemonState {
           );
         }
 
-        // Signatures went stale enough to be worth interrupting for.
-        //
-        // This used to fire on `update.state === "error"` — i.e. on any
-        // failed freshclam run. That interrupted the user about transient,
-        // self-healing failures they could do nothing about. The daemon now
-        // retries transient failures within the cycle, keeps scheduled
-        // failures at state=Idle, and raises `db_stale_notify` only once the
-        // signatures are genuinely old (default 14 days). `statsAreReal`
-        // guards against the disconnect fallback, whose db_stale defaults
-        // are not measurements.
-        if (statsAreReal && !prev.dbStaleNotify && result.stats.db_stale_notify) {
-          notifySignaturesStale(Math.floor((result.stats.db_stale_hours ?? 0) / 24));
-        }
+        // (The staleness notification lives above this block — it must fire
+        // on the first poll too. See the comment there.)
 
         // Protection degraded — only notify if we're actually connected.
         // Transient IPC failures produce fallback stats with "unprotected" which
