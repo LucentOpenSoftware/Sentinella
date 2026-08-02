@@ -22,6 +22,7 @@
 //! degrade-to-no-filtering direction.
 
 use std::net::SocketAddr;
+use std::time::Duration;
 use std::sync::Arc;
 use std::sync::RwLock;
 
@@ -107,6 +108,8 @@ pub struct WebProtection {
     watchdog: Option<tokio::task::JoinHandle<()>>,
     #[allow(dead_code)] // consumed by the network-change re-read in commit C
     upstreams_handle: Option<UpstreamsHandle>,
+    /// Periodic upstream re-discovery. Aborted in `stop`, like the watchdog.
+    refresher: Option<tokio::task::JoinHandle<()>>,
 
     /// Dropping or sending on this stops the serving loops. This is the
     /// daemon's FIRST `watch` channel — every other subsystem here polls an
@@ -116,9 +119,128 @@ pub struct WebProtection {
     task: Option<JoinHandle<std::io::Result<()>>>,
 }
 
+/// How often to re-discover the system resolvers.
+///
+/// The upstream list was resolved once at daemon start and never re-read.
+/// `UpstreamsHandle` exists precisely to fix that and was stored, unused —
+/// dead code that looked like the feature was implemented. Meanwhile the NRPT
+/// rule routes EVERY name on the machine at us, so once the list goes stale
+/// the machine cannot resolve anything: connect to a VPN, switch Wi-Fi, dock,
+/// or just renew a DHCP lease onto a different resolver, and the proxy keeps
+/// forwarding to addresses that no longer answer.
+///
+/// 30 s is a compromise. `GetAdaptersAddresses` is cheap, but this is a
+/// poll — a proper `NotifyIpInterfaceChange` subscription would react
+/// immediately and is the better long-term answer. Polling closes the
+/// indefinite outage now without adding an FFI callback surface.
+const UPSTREAM_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Re-discover upstreams periodically and push them at the proxy.
+///
+/// Deliberately quiet and deliberately conservative. `UpstreamsHandle::set`
+/// validates and KEEPS THE PREVIOUS LIST on error, so a transient discovery
+/// failure — every adapter down mid-roam — cannot leave the proxy with no
+/// resolver at all. That is the same "degrade to no filtering, never to no
+/// DNS" rule the rest of this module runs on: a stale-but-working list beats
+/// an empty one.
+fn spawn_upstream_refresh(
+    configured: Vec<String>,
+    listen: SocketAddr,
+    handle: UpstreamsHandle,
+    mut shutdown: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut current: Vec<SocketAddr> = Vec::new();
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => return,
+                _ = tokio::time::sleep(UPSTREAM_REFRESH_INTERVAL) => {}
+            }
+            let discovered = match upstreams::resolve(&configured, listen) {
+                Ok(u) => u,
+                Err(e) => {
+                    // Keep serving with what we have. An empty list here
+                    // would be worse than a stale one.
+                    warn!(%e, "web protection: upstream re-discovery failed — keeping the current list");
+                    continue;
+                }
+            };
+            if discovered == current {
+                continue;
+            }
+            match handle.set(discovered.clone()) {
+                Ok(()) => {
+                    info!(
+                        upstreams = ?discovered,
+                        "web protection: upstream list changed — proxy updated"
+                    );
+                    current = discovered;
+                }
+                Err(e) => warn!(
+                    %e,
+                    "web protection: rediscovered upstreams were rejected — keeping the current list"
+                ),
+            }
+        }
+    })
+}
+
+/// Remove a rule that some PREVIOUS run of this daemon installed, when this
+/// run is not going to serve.
+///
+/// THE HOLE THIS FILLS. `stop()` removes the rule on an orderly shutdown, and
+/// the boot reconciler removes it at the next boot. Nothing covered the gap
+/// between them: the daemon dying without running `stop()` and then being
+/// restarted IN THE SAME BOOT. That is not exotic — the SCM restarts the
+/// service on failure after 5 s, and the installer's PREINSTALL hook
+/// `taskkill /F`s the daemon on every upgrade. If the restarted process then
+/// refuses to serve for any reason (no adapters up yet on a laptop resuming,
+/// port taken, self-test fail), the old rule stayed live in the registry
+/// pointing every name on the machine at a port with nothing behind it, and
+/// the new process had `rule_guid: None` so `stop()` would not remove it
+/// either — the daemon was structurally incapable of ever taking it away.
+/// The machine had no DNS until a reboot, which is the one outcome this
+/// design says must never happen.
+///
+/// Best-effort by construction: a failure here leaves us exactly where we
+/// already were, so it logs and moves on rather than blocking startup.
+fn reconcile_orphan_rule(reason: &str) {
+    let state_file = nrpt::default_state_file();
+    let Some(guid) = nrpt::recorded_guid(&state_file) else {
+        return;
+    };
+    match nrpt::rule_exists(&guid) {
+        Ok(false) => {}
+        Ok(true) => {
+            warn!(
+                %guid, reason,
+                "web protection: a rule from a previous run is still live and this run is not \
+                 serving — removing it so the machine keeps working DNS"
+            );
+            match super::rule::remove(&guid) {
+                Ok(()) => info!(%guid, "web protection: orphaned rule removed"),
+                Err(e) => error!(
+                    %guid, %e,
+                    "web protection: COULD NOT remove the orphaned rule — DNS on this machine is \
+                     pointed at a port we are not serving; the boot reconciler is the backstop"
+                ),
+            }
+        }
+        Err(e) => warn!(
+            %guid, %e,
+            "web protection: could not tell whether a previous rule is still live"
+        ),
+    }
+}
+
 impl WebProtection {
     /// Not enabled, nothing running. Cheap and infallible.
+    ///
+    /// Still reconciles: `enabled = false` is one of the ways a live rule
+    /// from a previous run gets orphaned (the user turned it off, or
+    /// validation forced it off, while a rule was installed).
     pub fn disabled() -> Self {
+        reconcile_orphan_rule("web protection disabled");
         Self::inert(false, ProxyState::Disabled, String::new(), None)
     }
 
@@ -126,7 +248,9 @@ impl WebProtection {
     /// did ask for this, and a status that reported `enabled: false` here
     /// would hide the refusal behind what looks like an untouched setting.
     fn refused(state: ProxyState, detail: impl Into<String>) -> Self {
-        Self::inert(true, state, detail.into(), None)
+        let detail = detail.into();
+        reconcile_orphan_rule(&detail);
+        Self::inert(true, state, detail, None)
     }
 
     fn inert(
@@ -151,6 +275,7 @@ impl WebProtection {
             }),
             watchdog: None,
             upstreams_handle: None,
+            refresher: None,
             shutdown: None,
             task: None,
         }
@@ -249,6 +374,12 @@ impl WebProtection {
                 tcp_ok = report.tcp_ok,
                 "web protection: self-test failed — NOT serving"
             );
+            // This path builds its handle by hand rather than through
+            // `inert` (it keeps the engine handle so status can distinguish
+            // "rules did not load" from "upstream is dead"), so it needs the
+            // reconcile call explicitly. Bound socket or not, we are not
+            // serving, and a rule pointing here would black-hole DNS.
+            reconcile_orphan_rule("self-test failed");
             return Self {
                 handle: Arc::new(WebProtectionHandle {
                     enabled: true,
@@ -268,12 +399,22 @@ impl WebProtection {
                 }),
                 watchdog: None,
                 upstreams_handle: None,
+                refresher: None,
                 shutdown: None,
                 task: None,
             };
         }
 
         let (tx, rx) = watch::channel(false);
+        // Spawned BEFORE `proxy.run` consumes the proxy, and given its own
+        // shutdown receiver so it dies with the rest of the service rather
+        // than outliving it and pushing upstreams at a stopped proxy.
+        let refresher = spawn_upstream_refresh(
+            cfg.upstreams.clone(),
+            listen,
+            upstreams_handle.clone(),
+            tx.subscribe(),
+        );
         let task = tokio::spawn(proxy.run(rx));
 
         // ONLY NOW, with the self-test passed and the listener serving, may
@@ -327,6 +468,7 @@ impl WebProtection {
             }),
             watchdog,
             upstreams_handle: Some(upstreams_handle),
+            refresher: Some(refresher),
             shutdown: Some(tx),
             task: Some(task),
         }
@@ -360,6 +502,12 @@ impl WebProtection {
         let _ = tx.send(true);
         if let Some(wd) = self.watchdog.take() {
             wd.abort();
+        }
+        // Same treatment as the watchdog: it holds an UpstreamsHandle into a
+        // proxy that is going away, and its `watch` receiver would otherwise
+        // let it survive one more sleep and push a list at a stopped proxy.
+        if let Some(rf) = self.refresher.take() {
+            rf.abort();
         }
         if let Some(task) = self.task.take() {
             match tokio::time::timeout(std::time::Duration::from_secs(5), task).await {

@@ -174,7 +174,8 @@ pub fn spawn_watchdog(
     mut shutdown: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut strikes = 0u32;
+        let mut serve_strikes = 0u32;
+        let mut resolve_strikes = 0u32;
         let mut tick = 0u64;
         loop {
             tokio::select! {
@@ -216,7 +217,8 @@ pub fn spawn_watchdog(
                 serving = true;
             }
 
-            let resolving = if tick.is_multiple_of(RESOLVE_EVERY) {
+            let ran_resolve_probe = tick.is_multiple_of(RESOLVE_EVERY);
+            let resolving = if ran_resolve_probe {
                 if health_name_is_allowed(&engine, &health_check_name) {
                     probe_resolves(listen, &health_check_name).await
                 } else {
@@ -236,11 +238,37 @@ pub fn spawn_watchdog(
                 true
             };
 
+            // Two INDEPENDENT strike counters, and this is the whole point.
+            //
+            // They used to share one counter, which made the resolution half
+            // of this watchdog decorative. The serving probe runs every tick
+            // but the resolution probe only every RESOLVE_EVERY-th, and the
+            // skipped ticks reported `resolving = true` — so with a proxy
+            // that answers the canary while resolving nothing, the sequence
+            // was strike, reset, reset, strike, reset, reset. `strikes` could
+            // never exceed 1 against a threshold of WATCHDOG_STRIKES (3), so
+            // the exact failure this probe was added to catch could never
+            // remove the rule. The machine kept every name pointed at a proxy
+            // that answered nothing, indefinitely.
+            //
+            // A skipped resolution tick is NOT evidence of health, so it must
+            // leave `resolve_strikes` untouched rather than clear it.
+            if serving {
+                serve_strikes = 0;
+            } else {
+                serve_strikes += 1;
+            }
+            if ran_resolve_probe {
+                if resolving {
+                    resolve_strikes = 0;
+                } else {
+                    resolve_strikes += 1;
+                }
+            }
+            let strikes = serve_strikes.max(resolve_strikes);
             if serving && resolving {
-                strikes = 0;
                 continue;
             }
-            strikes += 1;
             warn!(
                 strikes,
                 answered,

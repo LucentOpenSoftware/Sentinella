@@ -4320,13 +4320,24 @@ impl AppState {
                 } else {
                     "freshclam.conf not found"
                 };
-                let mut inner = self.lock_inner();
-                inner.update_running = false;
-                inner.last_update_error = Some(msg.to_string());
-                // |= not =: a manual press that arrived mid-run adopted this
-                // cycle by setting the flag true. Assigning would clobber that
-                // back to false and re-silence the failure they are watching.
-                inner.last_update_error_notifiable |= manual;
+                {
+                    let mut inner = self.lock_inner();
+                    inner.update_running = false;
+                    inner.last_update_error = Some(msg.to_string());
+                    // |= not =: a manual press that arrived mid-run adopted
+                    // this cycle by setting the flag true. Assigning would
+                    // clobber that back to false and re-silence the failure
+                    // they are watching.
+                    inner.last_update_error_notifiable |= manual;
+                }
+                // SCOPE IS LOAD-BEARING. `inner` is a std::sync::Mutex guard
+                // and std mutexes are NOT reentrant; log_activity takes the
+                // same lock. Calling it inside the guard's scope self-
+                // deadlocked this thread with the daemon's central lock held
+                // forever — every later IPC request would block on it too.
+                // Reached whenever freshclam.exe is missing (another AV
+                // quarantined it, a partial install), so the daemon hung on
+                // the first update attempt rather than reporting the problem.
                 self.log_activity("warning", "update", "Update failed", msg, None);
                 return serde_json::json!({"ok": false, "error": msg});
             }

@@ -6,15 +6,47 @@
 ; PROGRAMDATA = C:\ProgramData\Sentinella (PathManager root in installed mode)
 
 !macro NSIS_HOOK_PREINSTALL
-  ; Stop the old daemon before Tauri writes files. Otherwise Windows keeps
-  ; sentinelld.exe locked and NSIS leaves the previous engine binary installed.
+  ; ORDER IS LOAD-BEARING, for the same reason it is in PREUNINSTALL.
+  ;
+  ; An UPGRADE does not run the old uninstaller: installer.nsi skips it in
+  ; update mode, and the non-uninstall radio choice skips it interactively.
+  ; So NSIS_HOOK_PREUNINSTALL — which holds the careful --remove ladder — is
+  ; NOT executed on the upgrade path. This hook is the only thing that runs.
+  ;
+  ; It used to `taskkill /F` sentinelld.exe first. That destroys the only
+  ; in-process path that removes the NRPT rule (WebProtection::stop), so
+  ; every upgrade left a catch-all rule routing all DNS at a port whose
+  ; listener had just been killed. For the length of the install the machine
+  ; had NO DNS, and if the install then aborted it stayed that way until the
+  ; next reboot, with the service already deleted.
+  ;
+  ; So: ask nicely first, and remove the rule explicitly before resorting to
+  ; force.
+
+  ; 1. Graceful stop. Lets the daemon run its own shutdown, which removes the
+  ;    rule and is the only path that also stops the proxy cleanly.
+  nsExec::ExecToLog 'sc stop SentinellaDaemon'
+  Sleep 3000
+
+  ; 2. Belt and braces: remove the rule out-of-process, whether or not the
+  ;    daemon was running or managed to do it itself. This is the OLD
+  ;    install's binary — PREINSTALL runs before Tauri overwrites files, so
+  ;    it is still on disk. Missing (fresh install, or an older version that
+  ;    predates the reconciler) is fine: there is no rule to remove.
+  IfFileExists "$INSTDIR\daemon\sentinella-dnsreconcile.exe" 0 +3
+    nsExec::ExecToLog '"$INSTDIR\daemon\sentinella-dnsreconcile.exe" --remove'
+    Goto senti_rule_done
+  IfFileExists "$INSTDIR\resources\daemon\sentinella-dnsreconcile.exe" 0 +2
+    nsExec::ExecToLog '"$INSTDIR\resources\daemon\sentinella-dnsreconcile.exe" --remove'
+  senti_rule_done:
+
+  ; 3. Only now force. Otherwise Windows keeps sentinelld.exe locked and NSIS
+  ;    leaves the previous engine binary installed.
   nsExec::ExecToLog 'taskkill /F /IM gui.exe'
   nsExec::ExecToLog 'taskkill /F /IM Sentinella.exe'
   nsExec::ExecToLog 'taskkill /F /IM sentinelld.exe'
   nsExec::ExecToLog 'taskkill /F /IM argusd.exe'
   nsExec::ExecToLog 'taskkill /F /IM freshclam.exe'
-  nsExec::ExecToLog 'sc stop SentinellaDaemon'
-  Sleep 3000
   nsExec::ExecToLog 'sc delete SentinellaDaemon'
   Sleep 3000
 !macroend
@@ -207,5 +239,26 @@
     ; Only now, with the rule provably gone, may the remover be removed.
     ; The binary refuses this itself if a rule is somehow still present.
     nsExec::ExecToLog '"$SENTI_UNINST_DAEMON\sentinella-dnsreconcile.exe" --remove-task'
+    Goto senti_uninst_rule_done
+
   no_reconciler:
+    ; The remover is gone but a rule may not be. This used to be a bare label:
+    ; the uninstall skipped both steps in silence and deleted everything
+    ; anyway, which is the one unrecoverable outcome — a live catch-all rule
+    ; with the product, its reconciler, and its scheduled task all removed,
+    ; and no reboot that fixes it because the thing the boot task ran is gone.
+    ;
+    ; We cannot query the registry for the rule without the binary, but the
+    ; GUID state file is written BEFORE the rule is ever created, so its
+    ; presence is a sound over-approximation of "a rule may exist". Its
+    ; absence proves none was.
+    Var /GLOBAL SENTI_UNINST_PD
+    ReadEnvStr $SENTI_UNINST_PD "ProgramData"
+    StrCmp $SENTI_UNINST_PD "" 0 +2
+      StrCpy $SENTI_UNINST_PD "C:\ProgramData"
+    IfFileExists "$SENTI_UNINST_PD\Sentinella\state\nrpt-rule.guid" 0 senti_uninst_rule_done
+      MessageBox MB_ICONSTOP|MB_YESNO|MB_DEFBUTTON2 "Sentinella cannot find sentinella-dnsreconcile.exe, which is the only tool that can remove its DNS policy rule.$\n$\nThis machine may currently route all DNS through Sentinella. Uninstalling now could leave it unable to resolve names, with nothing left to undo it.$\n$\nRepair or reinstall Sentinella first, then uninstall.$\n$\nContinue anyway?" IDYES senti_uninst_rule_done
+      Abort
+
+  senti_uninst_rule_done:
 !macroend
