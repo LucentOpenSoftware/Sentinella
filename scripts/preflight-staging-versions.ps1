@@ -117,6 +117,39 @@ foreach ($name in $ShippedBinaries) {
     }
 }
 
+# ── Updater signing key ───────────────────────────────────────────────
+#
+# WHY THIS IS HERE, BEFORE THE BUILD. tauri.conf.json sets
+# createUpdaterArtifacts + a minisign pubkey, so every release is SUPPOSED
+# to ship a .sig the auto-updater verifies. When TAURI_SIGNING_PRIVATE_KEY
+# is not set, the bundler prints "A public key has been found, but no
+# private key" -- and then EXITS 0. npm reports a successful build and you
+# get an installer that existing users cannot auto-update to. 0.1.13 was
+# built unsigned twice before anyone noticed.
+#
+# Nothing in this repo records where the key comes from: no doc, no script,
+# no CI workflow references the variable at all. It survives only as an
+# ad-hoc env var in whichever shell the release was cut from, which is
+# exactly why it "goes missing" between versions. Catching it here costs a
+# second; catching it after the bundle costs the whole build.
+#
+# This checks only that the variable is NON-EMPTY. It never reads, logs,
+# echoes or validates the key material.
+$TauriConf = Join-Path $RepoRoot "gui\src-tauri\tauri.conf.json"
+if (Test-Path $TauriConf) {
+    $conf = Get-Content $TauriConf -Raw | ConvertFrom-Json
+    $wantsSignature = $false
+    if ($conf.bundle.createUpdaterArtifacts) {
+        if ($conf.plugins.updater.pubkey) { $wantsSignature = $true }
+    }
+    if ($wantsSignature -and [string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
+        $Errors += "  - TAURI_SIGNING_PRIVATE_KEY is not set, but tauri.conf.json configures"
+        $Errors += "    an updater pubkey. The bundle would be built UNSIGNED and the"
+        $Errors += "    bundler would still exit 0, so nothing downstream would notice."
+        $Errors += "    Existing installs could not auto-update to it."
+    }
+}
+
 if ($Errors.Count -gt 0) {
     Write-Host ""
     Write-Host "[preflight] FAILED:" -ForegroundColor Red

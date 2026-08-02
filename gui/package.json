@@ -10,7 +10,8 @@
     "tauri": "tauri",
     "tauri:build": "npm run preflight:staging && tauri build",
     "preflight:staging": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File ../scripts/preflight-staging-versions.ps1",
-    "release:build": "npm run preflight:staging && tauri build"
+    "verify:signature": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File ../scripts/verify-updater-signature.ps1",
+    "release:build": "npm run preflight:staging && tauri build && npm run verify:signature"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.0",
