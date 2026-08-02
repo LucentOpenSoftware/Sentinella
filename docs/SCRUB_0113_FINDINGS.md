@@ -3,20 +3,51 @@
 20 independent review lenses across the whole shipping surface, up to 10
 findings each; 181 candidates, each attacked by a separate agent instructed
 to refute it and to default to refuted when uncertain. 90 were refuted.
-201 agents total.
+201 agents.
 
 Severity: 22 critical, 14 high, 23 medium, 32 low.
 62 of the 91 predate the 0.1.13 work.
 
-The 22 criticals deduplicate to six defects (several lenses found each one
-independently) and are CLOSED in commit 4b1e690. Everything below the
-criticals is open. Findings are listed most-severe first.
+## Status
 
-The single most alarming open item is the freshclam-exits-0 one: freshclam
-returns success when it is on a ClamAV CDN cool-down without downloading
-anything, so the daemon stamps last_update_timestamp = now. That makes the
-signature-age signal — which the 0.1.13 notification work rests on — report
-fresh signatures that were never fetched.
+| | |
+|---|---|
+| 22 critical (6 distinct defects, each found by several lenses) | CLOSED — `4b1e690` |
+| 54 of the remaining 69 | CLOSED — `8cad296` |
+| cross-group handoffs | CLOSED — `353e938` |
+| 2 findings | REJECTED: wrong on inspection |
+| 4 findings | DEFERRED: redesigns, listed below |
+
+Fixes were made by seven agents with exclusive, disjoint file ownership,
+each group then audited by a separate agent that could not edit anything.
+That audit caught five fixes that had only landed halfway and two comments
+that asserted something untrue of the code beside them.
+
+## Still open
+
+1. **`[web_protection]` has no IPC mutation path at all.** It is absent from
+   `FullConfig`, so `settings.set_full` cannot reach it and `critical_diff`
+   never guards it. Deferred because `FullConfig` is `#[serde(default)]`:
+   landing the daemon half alone would let an older GUI silently reset the
+   whole section to defaults, which is worse than the gap.
+2. **`update_mirror` is inert.** Validated, clamped, persisted and rendered
+   as an editable field that no code reads — freshclam gets a hardcoded
+   `DatabaseMirror`. Either template it into `freshclam.conf` or remove the
+   setting; today the UI claims it works.
+3. **The dnsguard response cache has no eviction policy.** Once full it stops
+   caching new names entirely until entries expire. The byte cap is closed;
+   choosing an eviction policy is a design decision, not a defect fix.
+4. **217–228 UI keys missing from 7 locales.** Machine-translating
+   security-critical settings labels would be worse than the English
+   fallback that renders today.
+5. **freshclam exits 0 on a ClamAV CDN cool-down** without downloading, so
+   the daemon stamps `last_update_timestamp = now`. The signature-age signal
+   the 0.1.13 notification work rests on then reports fresh signatures that
+   were never fetched. Needs freshclam's output parsed for the cool-down
+   shape rather than trusting its exit code.
+
+Findings below are listed most-severe first, each with file, line, failure
+scenario and the evidence it was verified against.
 
 ---
 
