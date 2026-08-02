@@ -68,7 +68,12 @@ $expectedVersion = $matches[1]
 Write-Host "Workspace version: $expectedVersion" -ForegroundColor Cyan
 
 # ── 2. Verify target/release binaries exist and have the right version ──
-$binaries = @('sentinelld.exe', 'argusd.exe')
+# sentinella-dnsreconcile.exe is the boot-time NRPT reconciler. It is the
+# ONLY thing that can remove the DNS policy rule when the daemon is not
+# running, and the daemon refuses to install a rule unless its scheduled
+# task exists - so a staging run that forgets it does not break DNS, it
+# silently disables web protection.
+$binaries = @('sentinelld.exe', 'argusd.exe', 'sentinella-dnsreconcile.exe')
 foreach ($bin in $binaries) {
     $path = Join-Path $targetDir $bin
     if (-not (Test-Path -LiteralPath $path)) {
@@ -86,7 +91,7 @@ foreach ($bin in $binaries) {
     $needle = [System.Text.Encoding]::ASCII.GetBytes($expectedVersion)
     $found = Find-AsciiSubstring -Bytes $bytes -Needle $needle
     if (-not $found) {
-        Write-Error "$bin does NOT contain version string '$expectedVersion'. Rebuild with 'cargo build --release -p sentinelld -p argusd'."
+        Write-Error "$bin does NOT contain version string '$expectedVersion'. Rebuild with 'cargo build --workspace --release'."
         exit 2
     }
     Write-Verbose "$bin contains expected version string"

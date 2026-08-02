@@ -99,7 +99,7 @@ pub fn install(listen: SocketAddr, existing: Option<String>) -> Result<String, S
     if !nrpt::reconciler_task_installed() {
         return Err(
             "the boot reconciler task is not registered, so nothing could remove this rule if \
-             the service stopped. Reinstall Sentinella with the MSI, which registers it. \
+             the service stopped. Reinstall Sentinella; the installer registers it. \
              (Running from a development build? That is expected — web protection installs no \
              rule without it.)"
                 .into(),

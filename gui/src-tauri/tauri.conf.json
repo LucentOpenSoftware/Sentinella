@@ -58,6 +58,7 @@
     "resources": {
       "../../release/staging/windows/sentinelld.exe": "daemon/sentinelld.exe",
       "../../release/staging/windows/argusd.exe": "daemon/argusd.exe",
+        "../../release/staging/windows/sentinella-dnsreconcile.exe": "daemon/sentinella-dnsreconcile.exe",
       "../../release/staging/windows/sentinella.exe": "daemon/sentinella-cli.exe",
       "../../release/staging/windows/freshclam.exe": "daemon/freshclam.exe",
       "../../release/staging/windows/libclamav.dll": "daemon/libclamav.dll",

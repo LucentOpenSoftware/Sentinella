@@ -68,6 +68,10 @@ fn main() {
         Some("--remove") => Mode::ForceRemove,
         Some("--install-task") => return install_task(),
         Some("--remove-task") => return remove_task(),
+        Some("--version" | "-V") => {
+            println!("sentinella-dnsreconcile {VERSION}");
+            return;
+        }
         Some("--help" | "-h") => {
             println!("{USAGE}");
             return;
@@ -80,6 +84,13 @@ fn main() {
     std::process::exit(run(mode));
 }
 
+/// Embedded so the binary carries its own version. The installer staging
+/// script greps every staged binary for the workspace version to catch a
+/// stale artifact being shipped — a check that exists because a stale
+/// daemon shipped twice — and a binary with no version string anywhere in
+/// it fails that check, correctly.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 const USAGE: &str = "\
 sentinella-dnsreconcile - removes Sentinella's NRPT rule unless the proxy is alive
 
@@ -91,6 +102,7 @@ sentinella-dnsreconcile - removes Sentinella's NRPT rule unless the proxy is ali
   --remove-task   unregister it (uninstaller only)
 
   --help      this text
+  --version   print the version
 
 Exit 0 = the system is in the intended state. Exit 1 = it is not and we
 could not fix it (almost always: not running as SYSTEM/Administrator).";

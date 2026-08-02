@@ -129,6 +129,31 @@
   ; === Start the service ===
   nsExec::ExecToLog 'sc start SentinellaDaemon'
 
+  ; === Register the boot-time NRPT reconciler task ===
+  ;
+  ; WHY THIS IS HERE AND NOT IN THE DAEMON. Web protection points the whole
+  ; machine's DNS at a local proxy using a Name Resolution Policy Table rule.
+  ; That rule lives in the registry and SURVIVES REBOOTS, while the service
+  ; above is delayed-auto. So the dangerous state is not "the proxy crashed"
+  ; - it is "the rule is installed and nothing is answering", which is a
+  ; machine with no name resolution at all, on every subsequent boot, for a
+  ; user who cannot search for the fix because search does not resolve.
+  ;
+  ; The reconciler runs at startup, before the daemon, and removes the rule
+  ; unless the proxy answers with a signature only it can produce. It is the
+  ; ONLY thing that removes rules when the daemon is not around. Registering
+  ; it at INSTALL time is what makes it exist before the first rule can: the
+  ; daemon refuses to install a rule while this task is missing or disabled.
+  ;
+  ; The binary registers its own task (the task XML must name its absolute
+  ; path, which only the running exe knows) and writes settings that the
+  ; schtasks command line cannot express - DisallowStartIfOnBatteries alone
+  ; would stop a laptop from ever reconciling.
+  ;
+  ; A failure here is SAFE: no task means the daemon refuses to install a
+  ; rule, so web protection stays off. Logged, not fatal.
+  nsExec::ExecToLog '"$SENTI_DAEMON\sentinella-dnsreconcile.exe" --install-task'
+
   ; === Register GUI autostart at login (per-machine, all users) ===
   ; HKLM Run key: launches Sentinella.exe at user login.
   ; --minimized so it starts in tray without showing main window.
@@ -145,8 +170,42 @@
   Sleep 500
 
   ; === Stop and remove service ===
+  ; Stopping first gives the daemon its own chance to remove the rule
+  ; cleanly, before we do it the blunt way below.
   nsExec::ExecToLog 'sc stop SentinellaDaemon'
   Sleep 3000
   nsExec::ExecToLog 'sc delete SentinellaDaemon'
   Sleep 1000
+
+  ; === Remove the NRPT rule, THEN its reconciler task ===
+  ;
+  ; ORDER IS LOAD-BEARING and this is the only place it can be enforced:
+  ; both must happen BEFORE the uninstaller deletes the files, because the
+  ; executable that knows how to do either is one of those files. Removing
+  ; the task first would delete the remover while a rule is still live;
+  ; letting the files go first would delete both.
+  Var /GLOBAL SENTI_UNINST_DAEMON
+  StrCpy $SENTI_UNINST_DAEMON "$INSTDIR\daemon"
+  IfFileExists "$SENTI_UNINST_DAEMON\sentinella-dnsreconcile.exe" +2 0
+    StrCpy $SENTI_UNINST_DAEMON "$INSTDIR\resources\daemon"
+
+  IfFileExists "$SENTI_UNINST_DAEMON\sentinella-dnsreconcile.exe" 0 no_reconciler
+    nsExec::ExecToLog '"$SENTI_UNINST_DAEMON\sentinella-dnsreconcile.exe" --remove'
+    Pop $0
+    StrCmp $0 "0" rule_gone 0
+      ; The rule could NOT be removed and this machine's DNS is currently
+      ; pointed at a proxy we are about to delete. Aborting is the
+      ; unfriendly-but-recoverable outcome; continuing is the unrecoverable
+      ; one - the reconciler task and its binary would both go, leaving a
+      ; rule nothing can ever undo.
+      ;
+      ; Everything stays in place, so the next boot's reconciler removes the
+      ; rule and a retried uninstall then succeeds.
+      MessageBox MB_ICONSTOP|MB_OK "Sentinella could not remove its DNS policy rule.$\n$\nUninstalling now would leave this machine unable to resolve names. Please reboot and run the uninstaller again - Sentinella removes the rule automatically at startup.$\n$\nDetails: %ProgramData%\Sentinella\logs\dnsreconcile.log"
+      Abort
+    rule_gone:
+    ; Only now, with the rule provably gone, may the remover be removed.
+    ; The binary refuses this itself if a rule is somehow still present.
+    nsExec::ExecToLog '"$SENTI_UNINST_DAEMON\sentinella-dnsreconcile.exe" --remove-task'
+  no_reconciler:
 !macroend
