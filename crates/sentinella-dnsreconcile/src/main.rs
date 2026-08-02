@@ -135,7 +135,10 @@ fn install_task() {
 /// string the binary actually emits rather than on a copy of it.
 fn refuse_because_rule_is_live(guid: &str) -> String {
     format!(
-        "refusing to unregister {}: NRPT rule {guid} is still installed.                      Remove the rule first (--remove); deleting the task now would                      leave this machine's DNS pointed at a proxy with nothing able                      to undo it.",
+        "refusing to unregister {}: NRPT rule {guid} is still installed. \
+             Remove the rule first (--remove); deleting the task now would \
+             leave this machine's DNS pointed at a proxy with nothing able \
+             to undo it.",
         task::TASK_NAME
     )
 }

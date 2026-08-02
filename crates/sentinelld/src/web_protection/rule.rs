@@ -96,6 +96,21 @@ pub fn install(listen: SocketAddr, existing: Option<String>) -> Result<String, S
             listen.port()
         ));
     }
+    // THIRD GATE, same shape as the port one and for the same reason: the
+    // rule records a bare IP, and the Windows DNS Client resolves through it
+    // over whichever transport the address implies. A proxy bound on an IPv6
+    // loopback would install a rule the client cannot use the way this design
+    // assumes, and the watchdog would still probe the address we bound and
+    // report healthy — a rule that looks installed and working while the
+    // machine cannot resolve. IPv4 is what the reconciler probes and what the
+    // canary signature is defined over, so anything else is refused rather
+    // than half-supported.
+    if !listen.is_ipv4() {
+        return Err(format!(
+            "refusing to install a rule for a proxy on {listen}: web protection is IPv4-only, \
+             and the reconciler probes 127.0.0.1"
+        ));
+    }
     if !nrpt::reconciler_task_installed() {
         return Err(
             "the boot reconciler task is not registered, so nothing could remove this rule if \
@@ -212,7 +227,8 @@ pub fn spawn_watchdog(
             if !serving && (after.queries > before.queries || after.shed > before.shed) {
                 warn!(
                     shed_delta = after.shed - before.shed,
-                    "web protection: canary probe failed but the proxy is still serving traffic                      — treating as overload, not death"
+                    "web protection: canary probe failed but the proxy is still serving traffic \
+                         — treating as overload, not death"
                 );
                 serving = true;
             }

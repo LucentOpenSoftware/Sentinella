@@ -497,7 +497,8 @@ impl WebProtection {
         if let Some(guid) = self.handle.rule_guid.clone()
             && let Err(e) = super::rule::remove(&guid)
         {
-            error!(%e, %guid, "web protection: could not remove the NRPT rule on shutdown —                    the boot reconciler will remove it at next startup");
+            error!(%e, %guid, "web protection: could not remove the NRPT rule on shutdown — \
+                 the boot reconciler will remove it at next startup");
         }
         let Some(tx) = self.shutdown.take() else {
             return;

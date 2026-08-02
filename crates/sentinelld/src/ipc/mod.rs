@@ -2634,14 +2634,36 @@ fn dispatch_sync(
             // excluding the world or feeding the watcher a path that
             // hangs the recursion.
             fn is_dangerous_path(p: &str) -> bool {
-                let lower = p.trim().to_lowercase();
-                let stripped = lower.trim_end_matches('\\');
-                matches!(
-                    stripped,
-                    "" | "c:" | "c:/" | "/" | "\\" | "c:\\windows"
-                        | "c:\\windows\\system32" | "c:\\program files"
-                        | "c:\\program files (x86)"
-                ) || stripped.contains("..")
+                // Normalized the same way `Config::validate` normalizes
+                // excluded_paths, and for the same reason: comparing a raw
+                // string against a fixed literal set is defeated by any
+                // spelling the set does not enumerate. `trim_end_matches('\\')`
+                // popped only backslashes and the set listed only some of the
+                // separator variants, so "C://", "C:\\\\", "C:/Windows/" and
+                // "c:\\program files\\" each walked straight past a guard that
+                // caught "C:\\". Fold case, fold forward slashes onto
+                // backslashes, then pop EVERY trailing separator — after which
+                // a drive spec is exactly 2 bytes and each system root has one
+                // spelling.
+                let normalized = {
+                    let mut n = p.trim().to_ascii_lowercase().replace('/', "\\");
+                    while n.ends_with('\\') {
+                        n.pop();
+                    }
+                    n
+                };
+                let b = normalized.as_bytes();
+                let is_drive_root = b.len() == 2 && b[0].is_ascii_alphabetic() && b[1] == b':';
+                normalized.is_empty()
+                    || is_drive_root
+                    || matches!(
+                        normalized.as_str(),
+                        "c:\\windows"
+                            | "c:\\windows\\system32"
+                            | "c:\\program files"
+                            | "c:\\program files (x86)"
+                    )
+                    || normalized.contains("..")
             }
             fn is_hex64_lower(s: &str) -> bool {
                 s.len() == 64

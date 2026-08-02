@@ -121,13 +121,28 @@ echo        YARA rules + IOC hashes + manifest OK
 :: Bootstrap ClamAV signatures
 echo  [5/9] Bootstrap signatures...
 set "SIG_SOURCE=%ROOT%\runtime\signatures"
-if not exist "%SIG_SOURCE%\main.cvd" set "SIG_SOURCE=C:\ProgramData\Sentinella\signatures"
-if exist "%SIG_SOURCE%\main.cvd" (
-    copy /Y "%SIG_SOURCE%\main.cvd" "%STAGE%\runtime\signatures_bootstrap\" >nul
-    if exist "%SIG_SOURCE%\daily.cvd" copy /Y "%SIG_SOURCE%\daily.cvd" "%STAGE%\runtime\signatures_bootstrap\" >nul
-    if exist "%SIG_SOURCE%\bytecode.cvd" copy /Y "%SIG_SOURCE%\bytecode.cvd" "%STAGE%\runtime\signatures_bootstrap\" >nul
+REM .cvd OR .cld. freshclam ships .cvd but applies incremental updates as
+REM .cld, so on any machine that has ever run an update, daily is daily.cld --
+REM and this only ever looked for .cvd. That is why the shipped bundle carries
+REM main.cvd and bytecode.cvd and NO daily at all: the one database that
+REM actually changes every day was silently skipped on every release.
+if not exist "%SIG_SOURCE%\main.cvd" if not exist "%SIG_SOURCE%\main.cld" set "SIG_SOURCE=C:\ProgramData\Sentinella\signatures"
+set "SIG_HAVE_MAIN="
+if exist "%SIG_SOURCE%\main.cvd" set "SIG_HAVE_MAIN=1"
+if exist "%SIG_SOURCE%\main.cld" set "SIG_HAVE_MAIN=1"
+if defined SIG_HAVE_MAIN (
+    for %%D in (main daily bytecode) do (
+        if exist "%SIG_SOURCE%\%%D.cvd" (
+            copy /Y "%SIG_SOURCE%\%%D.cvd" "%STAGE%\runtime\signatures_bootstrap\" >nul
+        ) else (
+            if exist "%SIG_SOURCE%\%%D.cld" copy /Y "%SIG_SOURCE%\%%D.cld" "%STAGE%\runtime\signatures_bootstrap\" >nul
+        )
+    )
     if exist "%SIG_SOURCE%\*.sign" copy /Y "%SIG_SOURCE%\*.sign" "%STAGE%\runtime\signatures_bootstrap\" >nul
-    if exist "%SIG_SOURCE%\freshclam.dat" copy /Y "%SIG_SOURCE%\freshclam.dat" "%STAGE%\runtime\signatures_bootstrap\" >nul
+    REM freshclam.dat is deliberately NOT staged: nsis-hooks.nsh already
+    REM refuses to install it (it is THIS build machine's mirror state, and
+    REM handing it to another machine misreports what that machine has), so
+    REM bundling it only inflated the installer.
     echo        main/daily/bytecode OK
 ) else (
     echo        [WARN] Bootstrap signatures not found

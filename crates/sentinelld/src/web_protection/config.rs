@@ -199,7 +199,8 @@ impl WebProtectionConfig {
         // refuses again as a second gate.
         if addr.port() != DNS_PORT {
             return Err(format!(
-                "listen port {} cannot be reached through NRPT - it carries no port syntax,                  so the DNS Client always queries {DNS_PORT}",
+                "listen port {} cannot be reached through NRPT - it carries no port syntax, \
+                     so the DNS Client always queries {DNS_PORT}",
                 addr.port()
             ));
         }

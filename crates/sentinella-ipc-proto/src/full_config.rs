@@ -59,14 +59,23 @@ pub fn restart_requirement(field_path: &str) -> RestartRequirement {
     use RestartRequirement::*;
     match field_path {
         // ── EngineReload (mpool rebuild required) ─────
+        // `excluded_detections` and `trusted_hashes` are NOT here any more:
+        // `protection.set_critical` pushes both into the running daemon
+        // (`load_detection_exclusions` / `load_trusted_hashes`) the moment it
+        // saves, so telling the user to reload the engine asks for work that
+        // has already happened — and, worse, implies the old value is still
+        // in force until they do, which is exactly backwards for a hash the
+        // admin just REMOVED from the allowlist.
         "excluded_paths"
         | "excluded_extensions"
-        | "excluded_detections"
-        | "trusted_hashes"
         | "enhanced_signature_provider"
         | "max_file_size_mb"
         | "scan_archives"
         | "heuristic_alerts" => EngineReload,
+
+        // Hot-applied by protection.set_critical, which mirrors them into
+        // AppState on save.
+        "excluded_detections" | "trusted_hashes" => None,
 
         // ── DaemonRestart (process-lifecycle state) ───
         "log_level"
