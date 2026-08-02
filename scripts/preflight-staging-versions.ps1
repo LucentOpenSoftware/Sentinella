@@ -63,7 +63,12 @@ if (-not (Test-Path $Staging)) {
 $ShippedBinaries = @(
     "sentinelld.exe",
     "argusd.exe",
-    "sentinella.exe"    # CLI, renamed to sentinella-cli.exe inside the bundle
+    "sentinella.exe",   # CLI, renamed to sentinella-cli.exe inside the bundle
+    # Added to tauri.conf.json during the 0.1.13 web-protection work but not
+    # here, so this guard would have passed a stale reconciler through. That
+    # is the worst one to miss: it is the only component that can remove the
+    # NRPT rule while the daemon is not running.
+    "sentinella-dnsreconcile.exe"
 )
 
 $WorkspaceTomlMtime = (Get-Item $WorkspaceTomlPath).LastWriteTime

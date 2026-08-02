@@ -73,7 +73,15 @@ Write-Host "Workspace version: $expectedVersion" -ForegroundColor Cyan
 # running, and the daemon refuses to install a rule unless its scheduled
 # task exists - so a staging run that forgets it does not break DNS, it
 # silently disables web protection.
-$binaries = @('sentinelld.exe', 'argusd.exe', 'sentinella-dnsreconcile.exe')
+# sentinella.exe is the CLI, bundled by tauri.conf.json as
+# daemon/sentinella-cli.exe. It was missing from this list until 0.1.13, so
+# every installer since the CLI was last hand-copied shipped whatever build
+# happened to be sitting in staging. preflight-staging-versions.ps1 caught it
+# on the 0.1.13 bundle (staged copy dated 2026-05-30) - which is precisely the
+# v0.1.7 stale-binary class this script exists to prevent, present in the
+# script itself. Anything listed under tauri.conf.json's resources and built
+# from this workspace belongs here.
+$binaries = @('sentinelld.exe', 'argusd.exe', 'sentinella-dnsreconcile.exe', 'sentinella.exe')
 foreach ($bin in $binaries) {
     $path = Join-Path $targetDir $bin
     if (-not (Test-Path -LiteralPath $path)) {
