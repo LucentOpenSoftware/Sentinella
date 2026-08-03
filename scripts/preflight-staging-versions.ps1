@@ -162,8 +162,13 @@ if (Test-Path $TauriConf) {
         $Errors += "    installs could not auto-update to it."
         if (-not [string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY_PATH)) {
             # The exact trap docs\WORKING_STATE_v0.1.0.md walks you into.
-            $Errors += "    NOTE: TAURI_SIGNING_PRIVATE_KEY_PATH *is* set, and `tauri build`"
-            $Errors += "    ignores it -- that variable is for `tauri signer sign`. Put the"
+            # Single quotes around the command names, NOT backticks: inside a
+            # double-quoted PowerShell string a backtick is the escape
+            # character, and the one before the closing quote swallowed it --
+            # the file stopped parsing and the guard took every release build
+            # down with it.
+            $Errors += "    NOTE: TAURI_SIGNING_PRIVATE_KEY_PATH *is* set, and 'tauri build'"
+            $Errors += "    ignores it -- that variable is for 'tauri signer sign'. Put the"
             $Errors += "    path in TAURI_SIGNING_PRIVATE_KEY instead; it accepts a path."
         }
         if (Test-Path $DefaultKey) {
