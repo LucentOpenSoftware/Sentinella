@@ -711,19 +711,27 @@ impl Config {
             // Refuse system roots that would gut protection of the OS.
             // Compared against `normalized`, so trailing-separator and
             // forward-slash spellings of the same root are all caught.
-            for forbidden in [
-                "c:\\windows",
-                "c:\\program files",
-                "c:\\program files (x86)",
-                "c:\\users",
-            ] {
-                if normalized == forbidden {
-                    warn!(
-                        entry = trimmed,
-                        "excluded_paths entry would disable protection on a critical system root — refused"
-                    );
-                    return false;
-                }
+            if is_forbidden_system_root(&normalized) {
+                warn!(
+                    entry = trimmed,
+                    "excluded_paths entry would disable protection on a critical system root — refused"
+                );
+                return false;
+            }
+            // Traversal. The IPC handlers have always refused this and
+            // `validate` never did — found by the test that pins the two
+            // together. It matters because the forbidden-root check above is
+            // a STRING comparison: "c:\\data\\..\\windows" is not equal to
+            // "c:\\windows", so it sails past, and any consumer that
+            // canonicalizes the path before matching gets the system root the
+            // check exists to refuse. Rejecting here costs nothing — a
+            // legitimate exclusion never needs "..".
+            if normalized.contains("..") {
+                warn!(
+                    entry = trimmed,
+                    "excluded_paths entry contains a traversal component — refused"
+                );
+                return false;
             }
             // Warn about very broad exclusions (single path component, no separator).
             if !trimmed.contains('\\') && !trimmed.contains('/') && !trimmed.contains(':') {
@@ -886,6 +894,56 @@ fn default_enhanced_provider() -> String {
 fn default_idle_scan_start_delay() -> u64 {
     300
 }
+/// Fold a user-supplied exclusion path to the form the MATCHER sees.
+///
+/// Lowercase, forward slashes folded onto backslashes, every trailing
+/// separator popped. `scan::is_excluded` does exactly this before
+/// prefix-matching, so validating any other form lets a different spelling
+/// of the same path walk past the guards below: "C://" is 4 bytes, so it was
+/// neither "too short" nor a drive root, yet it reached the matcher as "c:"
+/// and excluded a whole drive.
+pub fn normalize_excluded_path(entry: &str) -> String {
+    let mut n = entry.trim().to_ascii_lowercase().replace('/', "\\");
+    while n.ends_with('\\') {
+        n.pop();
+    }
+    n
+}
+
+/// Is this a system root whose exclusion would gut OS protection?
+///
+/// PUBLIC AND SHARED ON PURPOSE. `protection.set_critical` kept its own
+/// inline copy of this list, and the two DIVERGED: the IPC copy never
+/// gained `c:\users`. An administrator excluding `C:\Users` through the
+/// elevated Settings path was told the change succeeded — the handler
+/// reported `excluded_paths=[1]` — and then `Config::validate` silently
+/// dropped it on save. The setting appeared to apply and did not.
+///
+/// Takes an ALREADY-normalized path (see `normalize_excluded_path`); the
+/// caller-side normalization is what makes exact comparison sufficient.
+pub fn is_forbidden_system_root(normalized: &str) -> bool {
+    matches!(
+        normalized,
+        "c:\\windows" | "c:\\windows\\system32" | "c:\\program files" | "c:\\program files (x86)"
+    ) || normalized == "c:\\users"
+}
+
+/// The full "this exclusion is dangerous" predicate: empty, a bare drive
+/// root, a protected system root, or containing a traversal component.
+///
+/// `Config::validate` applies the length and drive-root checks separately
+/// (it has its own warnings for each); this is the composite used by the IPC
+/// handlers, which need one answer.
+pub fn is_dangerous_excluded_path(entry: &str) -> bool {
+    let normalized = normalize_excluded_path(entry);
+    let b = normalized.as_bytes();
+    let is_drive_root = b.len() == 2 && b[0].is_ascii_alphabetic() && b[1] == b':';
+    normalized.is_empty()
+        || is_drive_root
+        || is_forbidden_system_root(&normalized)
+        || normalized.contains("..")
+}
+
 fn default_signature_stale_days() -> u32 {
     3
 }
@@ -2154,6 +2212,40 @@ mod tests {
             vec!["a".repeat(64)],
             "only the valid SHA-256 should survive"
         );
+    }
+
+    #[test]
+    fn the_two_exclusion_guards_cannot_diverge_again() {
+        // The bug this pins: protection.set_critical carried its own inline
+        // copy of this list and never gained the users root. An admin
+        // excluding it through the elevated path was told the change applied
+        // (changes=["excluded_paths=[1]"]) and validate() then dropped it on
+        // save. Both callers now go through is_dangerous_excluded_path, so
+        // this asserts the composite agrees with what validate() actually
+        // does to a config - reverting either side fails it.
+        for entry in [r"C:\Users", r"c:/users/", r"C:\USERS\", r"C:\Windows", r"c:/windows", r"C:\Program Files", r"C:\Program Files (x86)", r"C:\", r"c:", r"C://", r"C:\data\..\Windows"] {
+            assert!(
+                is_dangerous_excluded_path(entry),
+                "{entry:?} must be refused by the shared predicate"
+            );
+            let mut cfg = Config::default();
+            cfg.excluded_paths = vec![entry.to_string()];
+            cfg.validate();
+            assert!(
+                cfg.excluded_paths.is_empty(),
+                "{entry:?} passed the predicate but validate() kept it - the two                  have diverged again, which is exactly the reported defect"
+            );
+        }
+
+        // The converse: an ordinary exclusion must survive BOTH, or the
+        // shared predicate has become uselessly strict.
+        for entry in [r"C:\Users\Nicolas\Downloads", r"D:\builds", r"c:\windows\temp"] {
+            assert!(!is_dangerous_excluded_path(entry), "{entry:?} must be allowed");
+            let mut cfg = Config::default();
+            cfg.excluded_paths = vec![entry.to_string()];
+            cfg.validate();
+            assert_eq!(cfg.excluded_paths.len(), 1, "{entry:?} must survive validate()");
+        }
     }
 
     #[test]
