@@ -1,12 +1,22 @@
 //! ETW behavioral monitor — real Windows kernel event tracing.
 //!
-//! Two backends:
-//! - **EtwKernelSession**: Real ETW kernel trace with EVENT_RECORD callback.
-//!   Captures process start/stop, image loads, network connects in real-time.
-//! - **PollingFallback**: Process snapshot polling + netstat. Always available.
+//! Two backends, and THEY DO NOT SEE THE SAME THINGS:
+//! - **EtwKernelSession**: real ETW kernel trace with an EVENT_RECORD
+//!   callback. Process start/stop, image loads, file I/O and TCP connects.
+//! - **PollingFallback**: process-snapshot polling ONLY. It emits exactly one
+//!   finding kind, `process_spawn` (see `poll_children_round`). It observes
+//!   no network, no image loads and no file I/O.
 //!
-//! `monitor_process()` tries ETW first, falls back to polling if unavailable.
-//! The contract (EtwFinding with confidence/source) is identical regardless of backend.
+//! `monitor_process()` tries ETW first and falls back to polling. The
+//! STRUCT is the same either way, the COVERAGE is not — and this header used
+//! to claim otherwise ("polling + netstat", "the contract is identical
+//! regardless of backend"). There is no netstat anywhere in this crate, and
+//! since the C-1 change any 5-second silent stretch engages the fallback, so
+//! `backend_used == "polling_fallback"` reports are routine rather than
+//! exotic. Read one of those with the old claim in mind and an empty
+//! `network_connections` looks like proof the sample stayed offline; it is
+//! only proof that nothing was watching. Treat every non-process finding as
+//! meaningful ONLY when `backend_used == "etw_kernel_session"`.
 //!
 //! Architecture (C-1 fix): the ETW session is a PRIVATE SYSTEM-LOGGER
 //! session — `EVENT_TRACE_SYSTEM_LOGGER_MODE | EVENT_TRACE_REAL_TIME_MODE`
@@ -646,14 +656,39 @@ unsafe fn etw_event_callback_inner(event: *mut EVENT_RECORD) {
                 )
             };
             let port = unsafe { u16::from_be_bytes([*data.add(12), *data.add(13)]) };
-            if ip != "127.0.0.1" && ip != "0.0.0.0" {
-                let severity = classify_port_severity(port);
+            // 0.0.0.0 is not a destination; drop it. Loopback is NOT
+            // dropped any more.
+            //
+            // The blanket `ip != "127.0.0.1"` predates web protection. Now
+            // that sentinelld can run dnsguard on 127.0.0.1:53, a detonated
+            // sample's name resolution is a LOOPBACK connection, and this
+            // filter deleted it before it could become evidence — the report
+            // then showed no sign the sample resolved anything. Loopback is
+            // also where a sample would reach a local proxy or a staging
+            // listener, which was equally invisible.
+            //
+            // Recorded at "info", which scores 0 (see main.rs's severity
+            // table): resolving a name is what normal software does, so this
+            // must inform a triager without inflating the verdict. Honest
+            // limit: this is the TCP detector, and DNS is overwhelmingly
+            // UDP — what shows up here is the DNS-over-TCP subset plus any
+            // other loopback service the sample talks to.
+            if ip != "0.0.0.0" {
+                let loopback = ip == "127.0.0.1";
+                let severity = if loopback { "info" } else { classify_port_severity(port) };
                 let mut r = ctx.report.lock().unwrap_or_else(|e| e.into_inner());
-                let detail = format!("TCP connect to {ip}:{port}");
+                let detail = if loopback && port == 53 {
+                    format!("DNS query to local resolver {ip}:{port}")
+                } else if loopback {
+                    format!("loopback connect to {ip}:{port}")
+                } else {
+                    format!("TCP connect to {ip}:{port}")
+                };
                 if !r.network_connections.contains(&detail) {
                     r.network_connections.push(detail.clone());
                     r.findings.push(EtwFinding {
-                        kind: "network_connection".into(),
+                        kind: if loopback { "loopback_connection" } else { "network_connection" }
+                            .into(),
                         severity: severity.into(),
                         detail,
                         confidence: "observed".into(),

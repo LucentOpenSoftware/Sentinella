@@ -189,6 +189,11 @@ fn main() {
             "high" => 15,
             "medium" => 10,
             "low" => 5,
+            // Observational evidence that must NOT move the verdict:
+            // loopback connections, which since web protection include the
+            // sample's own DNS resolution. Explicit rather than relying on
+            // the catch-all, so deleting this arm is a visible decision.
+            "info" => 0,
             _ => 0,
         })
         .sum();

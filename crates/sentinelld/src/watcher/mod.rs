@@ -258,9 +258,28 @@ fn watcher_loop(
                 fish_feed_event(&event, &state);
 
                 // Only care about file creation and modification for scanning.
+                //
+                // MATCH THE KINDS THE BACKEND ACTUALLY EMITS. notify 7's
+                // Windows backend (ReadDirectoryChangesW) emits exactly five:
+                //   FILE_ACTION_ADDED           -> Create(CreateKind::Any)
+                //   FILE_ACTION_REMOVED         -> Remove(RemoveKind::Any)
+                //   FILE_ACTION_MODIFIED        -> Modify(ModifyKind::Any)
+                //   FILE_ACTION_RENAMED_OLD_NAME-> Modify(Name(RenameMode::From))
+                //   FILE_ACTION_RENAMED_NEW_NAME-> Modify(Name(RenameMode::To))
+                // (verified in notify-7.0.0/src/windows.rs).
+                //
+                // `CreateKind::File`, `ModifyKind::Data(_)` and
+                // `RenameMode::Both` are inotify/FSEvents shapes and NEVER
+                // arrive here — so three of the five arms in this list were
+                // dead, and `Create(CreateKind::Any)`, the actual
+                // file-creation event on the only platform this ships to,
+                // was not matched at all. A file created and never touched
+                // again reached the scanner through no arm of this filter.
+                // The generic arms below keep the non-Windows shapes working
+                // and cost nothing.
                 let dominated = matches!(
                     event.kind,
-                    EventKind::Create(CreateKind::File)
+                    EventKind::Create(_)
                         | EventKind::Modify(ModifyKind::Data(_))
                         | EventKind::Modify(ModifyKind::Any)
                         | EventKind::Modify(ModifyKind::Name(RenameMode::Both))
@@ -273,7 +292,14 @@ fn watcher_loop(
                 // Fast-path: Create events for small files are scanned
                 // immediately without waiting for debounce. EICAR, scripts,
                 // and atomically-renamed downloads land here.
-                let is_create = matches!(event.kind, EventKind::Create(CreateKind::File));
+                //
+                // `Create(_)`, not `Create(CreateKind::File)`: see above.
+                // Pinned to `Create(CreateKind::File)` this was false for
+                // every event Windows produces, so the v0.1.4 fast path had
+                // never once run in production and every small file — the
+                // EICAR-in-Downloads case it was written for — sat through
+                // the full debounce instead.
+                let is_create = matches!(event.kind, EventKind::Create(_));
 
                 for path in event.paths {
                     if !path.is_file() {
@@ -1064,14 +1090,85 @@ fn is_fish_excluded_path(path: &std::path::Path) -> bool {
     )
 }
 
-/// Feed a notify event into the FISH MutationWindow (observe-only telemetry).
+/// How long a `RenameMode::From` waits for its matching `To`.
+///
+/// ReadDirectoryChangesW emits the pair back to back out of one buffer, so
+/// this only has to survive scheduling jitter. Short on purpose: a `From`
+/// whose `To` never arrives (moved out of a watched root, or the watcher
+/// restarted between them) must expire rather than pair with an unrelated
+/// rename minutes later and invent an extension mutation that never happened.
+const RENAME_PAIR_TTL: Duration = Duration::from_secs(2);
+
+/// Classify a completed rename: extension change, or plain rename.
+///
+/// Split out so it is testable without a notify backend - which matters,
+/// because the bug this replaced was invisible to every test that fed it
+/// synthetic `RenameMode::Both` events the real backend never produces.
+fn classify_rename(old: &std::path::Path, new: &std::path::Path) -> MutationKind {
+    let ext = |p: &std::path::Path| {
+        p.extension().unwrap_or_default().to_string_lossy().to_string()
+    };
+    let name = |p: &std::path::Path| {
+        p.file_name().unwrap_or_default().to_string_lossy().to_string()
+    };
+    let (old_ext, new_ext) = (ext(old), ext(new));
+    if old_ext != new_ext && !old_ext.is_empty() {
+        MutationKind::ExtensionMutation { old_ext, new_ext }
+    } else {
+        MutationKind::Rename { old_name: name(old), new_name: name(new) }
+    }
+}
+
+/// Feed a notify event into the FISH MutationWindow.
+///
+/// WINDOWS EMITS RENAMES AS TWO EVENTS. This used to key renames off
+/// `Modify(Name(RenameMode::Both))`, which notify's Windows backend never
+/// produces - it emits `RenameMode::From` then `RenameMode::To`
+/// (notify-7.0.0/src/windows.rs, FILE_ACTION_RENAMED_OLD_NAME / _NEW_NAME).
+/// So `MutationKind::Rename` and `ExtensionMutation` were unreachable in
+/// production, and the two canonical ransomware signals FISH exists to
+/// catch - mass rename, and mass mutation to .locked/.crypt - could never
+/// fire. `MutationWindow::evaluate` counted both as permanently zero, which
+/// left only RewriteBurst and SlowBurn live. The `From` is stashed here and
+/// paired with the `To` that follows.
 fn fish_feed_event(event: &Event, state: &Arc<crate::ipc::AppState>) {
+    use std::sync::Mutex as StdMutex;
+    use std::sync::OnceLock;
+    static PENDING_RENAME: OnceLock<StdMutex<Option<(PathBuf, Instant)>>> = OnceLock::new();
+    let pending = PENDING_RENAME.get_or_init(|| StdMutex::new(None));
+
     let now = Instant::now();
 
     let kind = match &event.kind {
-        EventKind::Create(CreateKind::File) => Some(MutationKind::Create),
+        EventKind::Create(_) => Some(MutationKind::Create),
         EventKind::Modify(ModifyKind::Data(_)) | EventKind::Modify(ModifyKind::Any) => {
             Some(MutationKind::Rewrite)
+        }
+        EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
+            // Stash and wait for the To. Nothing is recorded yet: a rename
+            // is one mutation, not two.
+            if let Some(p) = event.paths.first() {
+                let mut g = pending.lock().unwrap_or_else(|e| e.into_inner());
+                *g = Some((p.clone(), now));
+            }
+            None
+        }
+        EventKind::Modify(ModifyKind::Name(RenameMode::To)) => {
+            let prev = {
+                let mut g = pending.lock().unwrap_or_else(|e| e.into_inner());
+                match g.take() {
+                    Some((old, at)) if now.duration_since(at) <= RENAME_PAIR_TTL => Some(old),
+                    // Expired, or none: fall through to treating this as a
+                    // fresh arrival rather than pairing it with a stale From.
+                    _ => None,
+                }
+            };
+            match (prev, event.paths.first()) {
+                (Some(old), Some(new)) => Some(classify_rename(&old, new)),
+                // A To with no live From is a file appearing under a new
+                // name from the watcher's point of view.
+                _ => Some(MutationKind::Create),
+            }
         }
         EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => {
             // notify sends both old + new paths in event.paths[0..2].
@@ -1348,4 +1445,94 @@ fn collect_overflow_rescan_files(dir: &std::path::Path, out: &mut Vec<PathBuf>, 
     }
     let max_len = DEBOUNCE_CAP.saturating_add(cap);
     walk(dir, out, max_len, 0);
+}
+
+#[cfg(test)]
+mod windows_event_shape_tests {
+    use super::*;
+    use std::path::Path;
+
+    /// The five kinds notify 7's ReadDirectoryChangesW backend actually
+    /// emits, from notify-7.0.0/src/windows.rs. Every filter in this file
+    /// has to be written against THESE, not against the inotify shapes.
+    fn windows_kinds() -> Vec<EventKind> {
+        vec![
+            EventKind::Create(notify::event::CreateKind::Any),
+            EventKind::Remove(notify::event::RemoveKind::Any),
+            EventKind::Modify(ModifyKind::Any),
+            EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+            EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+        ]
+    }
+
+    fn dominated(kind: &EventKind) -> bool {
+        matches!(
+            kind,
+            EventKind::Create(_)
+                | EventKind::Modify(ModifyKind::Data(_))
+                | EventKind::Modify(ModifyKind::Any)
+                | EventKind::Modify(ModifyKind::Name(RenameMode::Both))
+                | EventKind::Modify(ModifyKind::Name(RenameMode::To))
+        )
+    }
+
+    #[test]
+    fn file_creation_on_windows_reaches_the_scanner() {
+        // The defect: the filter listed Create(CreateKind::File), an inotify
+        // shape the Windows backend never emits, and did NOT list
+        // Create(CreateKind::Any), which is what it does emit. A created
+        // file matched no arm at all. Pinning CreateKind::File again fails
+        // this.
+        let created = EventKind::Create(notify::event::CreateKind::Any);
+        assert!(dominated(&created), "FILE_ACTION_ADDED must reach the scanner");
+        assert!(
+            matches!(created, EventKind::Create(_)),
+            "the fast path keys off this and had never once run in production"
+        );
+    }
+
+    #[test]
+    fn every_windows_kind_is_classified_deliberately() {
+        // Not "all pass" - Remove SHOULD be filtered out for scanning. The
+        // point is that no Windows kind falls through by accident because
+        // the filter was written for another platform's taxonomy.
+        for k in windows_kinds() {
+            let expected = !matches!(k, EventKind::Remove(_))
+                && !matches!(k, EventKind::Modify(ModifyKind::Name(RenameMode::From)));
+            assert_eq!(
+                dominated(&k), expected,
+                "{k:?} is classified wrong for the Windows backend"
+            );
+        }
+    }
+
+    #[test]
+    fn an_extension_mutation_is_recognised_from_a_split_rename() {
+        // The ransomware signal: notes.docx -> notes.docx.locked, delivered
+        // by Windows as From then To. Keyed off RenameMode::Both (never
+        // emitted) this was unreachable, so FISH could not see the single
+        // most characteristic ransomware behaviour there is.
+        let k = classify_rename(Path::new(r"C:\docs
+otes.docx"), Path::new(r"C:\docs
+otes.locked"));
+        match k {
+            MutationKind::ExtensionMutation { old_ext, new_ext } => {
+                assert_eq!(old_ext, "docx");
+                assert_eq!(new_ext, "locked");
+            }
+            other => panic!("expected ExtensionMutation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_plain_rename_is_not_an_extension_mutation() {
+        // Or every ordinary "draft.docx -> final.docx" would feed the
+        // extension-mutation counter and FISH would alert on normal work.
+        let k = classify_rename(Path::new(r"C:\d\draft.docx"), Path::new(r"C:\dinal.docx"));
+        assert!(matches!(k, MutationKind::Rename { .. }), "got {k:?}");
+        // An extensionless original is a rename too - not a mutation FROM
+        // nothing, which would misfire on every file without a suffix.
+        let k = classify_rename(Path::new(r"C:\d\README"), Path::new(r"C:\d\README.txt"));
+        assert!(matches!(k, MutationKind::Rename { .. }), "got {k:?}");
+    }
 }
