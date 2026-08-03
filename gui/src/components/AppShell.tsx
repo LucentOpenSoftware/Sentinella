@@ -51,10 +51,11 @@ function subtitleFor(page: Page): string {
   return tf(subtitleKeys[page], subtitleFallbacks[page] ?? "");
 }
 
-export function AppShell({ currentPage, onNavigate, connected, onRefresh, notices, children }: {
+export function AppShell({ currentPage, onNavigate, connected, starting, onRefresh, notices, children }: {
   currentPage: Page;
   onNavigate: (p: Page) => void;
   connected: boolean;
+  starting?: boolean;
   onRefresh?: () => void;
   notices?: React.ReactNode[];
   children: React.ReactNode;
@@ -65,7 +66,7 @@ export function AppShell({ currentPage, onNavigate, connected, onRefresh, notice
     <div className="flex h-screen overflow-hidden bg-[rgb(var(--base))]">
       <Sidebar current={currentPage} onNavigate={onNavigate} />
       <div className="flex-1 flex flex-col min-w-0">
-        <TopBar title={title} subtitle={subtitle} connected={connected} onRefresh={onRefresh} onNotifications={() => onNavigate("notifications")} notices={notices} />
+        <TopBar title={title} subtitle={subtitle} connected={connected} starting={starting} onRefresh={onRefresh} onNotifications={() => onNavigate("notifications")} notices={notices} />
         <main className="flex-1 overflow-y-auto px-14 py-10 content-depth">
           <div className="app-shell-width">
             {children}

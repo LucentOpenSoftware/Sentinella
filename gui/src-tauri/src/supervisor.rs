@@ -26,6 +26,16 @@ pub enum ConnectionState {
     Disconnected,
     /// User intentionally disabled protection — no auto-respawn.
     UserDisabled,
+    /// The Windows service is alive but its pipe is not up yet: the daemon
+    /// is STARTING, not gone. First start compiles the whole signature
+    /// database (main.cvd 89 MB + daily.cld 87 MB as of 0.1.13) before the
+    /// IPC pipe exists, which takes minutes on an ordinary disk — and the
+    /// GUI spent all of them claiming "daemon disconnected" over a service
+    /// that was doing exactly what it should. Worse, each of those startup
+    /// ticks was recorded as a crash, so a slow enough first boot could
+    /// trip the crash-loop detector into audit mode without anything
+    /// having crashed.
+    ServiceStarting,
 }
 
 impl ConnectionState {
@@ -37,6 +47,7 @@ impl ConnectionState {
             Self::Degraded => 3,
             Self::Disconnected => 4,
             Self::UserDisabled => 5,
+            Self::ServiceStarting => 6,
         }
     }
 
@@ -48,6 +59,7 @@ impl ConnectionState {
             3 => Self::Degraded,
             4 => Self::Disconnected,
             5 => Self::UserDisabled,
+            6 => Self::ServiceStarting,
             _ => Self::Disconnected,
         }
     }
@@ -191,6 +203,7 @@ fn state_label(s: ConnectionState) -> &'static str {
         ConnectionState::Degraded => "degraded",
         ConnectionState::Disconnected => "disconnected",
         ConnectionState::UserDisabled => "user_disabled",
+        ConnectionState::ServiceStarting => "service_starting",
     }
 }
 
@@ -312,6 +325,49 @@ fn parse_service_state_code(stdout: &str) -> Option<u32> {
         }
     }
     None
+}
+
+/// How long a live-but-unreachable service is reported as STARTING before
+/// the normal severity ladder takes over.
+///
+/// The window has to cover a first boot compiling ~176 MB of signature
+/// databases on a slow disk, so it is generous. It must NOT be unbounded:
+/// a daemon that wedged while the SCM still shows RUNNING would otherwise
+/// wear "starting" forever, and the one thing this state must never do is
+/// hide a genuinely dead daemon behind a spinner.
+const SERVICE_START_GRACE: Duration = Duration::from_secs(10 * 60);
+
+/// What does a failed health check MEAN?
+///
+/// Split out of the supervisor loop so the answer is testable. The old loop
+/// answered by counting failures alone — 3 meant Degraded, 6 meant
+/// Disconnected — while the SCM, one query away, knew the service was
+/// RUNNING and simply still loading its signature DB. Every fresh install
+/// therefore greeted the user with "daemon disconnected", a dead hero card
+/// and an error toast for the several minutes the first engine compile
+/// takes. It looked like a broken product on the one screen a new user is
+/// guaranteed to see.
+///
+/// `service_alive` is the LIVE SCM answer (RUNNING / START_PENDING /
+/// CONTINUE_PENDING), not the boot-time snapshot; `outage_elapsed` is time
+/// since this outage's first failed check.
+fn classify_outage(
+    service_alive: bool,
+    outage_elapsed: Duration,
+    consecutive_failures: u64,
+) -> ConnectionState {
+    if service_alive && outage_elapsed < SERVICE_START_GRACE {
+        return ConnectionState::ServiceStarting;
+    }
+    // The pre-existing ladder, unchanged: it is right for a daemon that is
+    // actually gone, and right for one still unreachable past the grace.
+    if consecutive_failures <= 2 {
+        ConnectionState::Recovering
+    } else if consecutive_failures <= 5 {
+        ConnectionState::Degraded
+    } else {
+        ConnectionState::Disconnected
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -499,6 +555,9 @@ fn supervisor_loop(state: Arc<SupervisorState>) {
 
     let mut consecutive_failures = 0u64;
     let mut crash_timestamps: Vec<Instant> = Vec::new();
+    // First failed check of the CURRENT outage; None while healthy. This is
+    // what `classify_outage`'s grace window is measured from.
+    let mut outage_started: Option<Instant> = None;
 
     loop {
         // User disabled → do nothing.
@@ -524,6 +583,7 @@ fn supervisor_loop(state: Arc<SupervisorState>) {
                 state.set_state(ConnectionState::Connected);
                 consecutive_failures = 0;
             }
+            outage_started = None;
 
             // Track stability for audit mode auto-exit.
             if state.is_audit_mode() {
@@ -553,6 +613,29 @@ fn supervisor_loop(state: Arc<SupervisorState>) {
             *state.stable_since.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
 
+        let outage_began = *outage_started.get_or_insert_with(Instant::now);
+
+        // Ask the SCM before concluding anything. A service that is alive
+        // with no pipe is a daemon still LOADING its signature DB (or being
+        // restarted by the SCM after a crash) — and for the grace window
+        // that is reported as ServiceStarting rather than fed to the
+        // failure ladder. The early `continue` is load-bearing twice over:
+        // no consecutive_failures bump, so the ladder does not silently
+        // advance underneath the spinner, and no crash_timestamps entry, so
+        // a slow first boot cannot read as a crash loop and trip audit
+        // mode. `is_service_registered()` is queried LIVE, not the boot
+        // snapshot — the answer changes exactly when it matters.
+        let verdict = classify_outage(
+            is_service_registered(),
+            outage_began.elapsed(),
+            consecutive_failures + 1,
+        );
+        if verdict == ConnectionState::ServiceStarting {
+            state.set_state(ConnectionState::ServiceStarting);
+            std::thread::sleep(Duration::from_secs(3));
+            continue;
+        }
+
         consecutive_failures += 1;
 
         // Crash loop detection → escalate to audit mode.
@@ -574,14 +657,10 @@ fn supervisor_loop(state: Arc<SupervisorState>) {
         let backoff_sec = BACKOFF_SECS[idx];
         state.current_backoff_sec.store(backoff_sec, Ordering::Relaxed);
 
-        // Connection state reflects severity.
-        if consecutive_failures <= 2 {
-            state.set_state(ConnectionState::Recovering);
-        } else if consecutive_failures <= 5 {
-            state.set_state(ConnectionState::Degraded);
-        } else {
-            state.set_state(ConnectionState::Disconnected);
-        }
+        // Connection state reflects severity — the verdict already carries
+        // the ladder, computed by `classify_outage` from the same
+        // consecutive_failures this cycle uses. One decision, one place.
+        state.set_state(verdict);
 
         if backoff_sec > 0 {
             std::thread::sleep(Duration::from_secs(backoff_sec));
@@ -629,5 +708,59 @@ fn supervisor_loop(state: Arc<SupervisorState>) {
         }
 
         std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_live_service_within_grace_is_starting_not_dead() {
+        // The screenshot bug: fresh install, service RUNNING, engine
+        // compiling 176 MB of signatures, and the GUI called it
+        // "disconnected" after 6 ticks. Reverting the classify_outage call
+        // makes the ladder win again and this fails.
+        for failures in [1, 3, 6, 50] {
+            assert_eq!(
+                classify_outage(true, Duration::from_secs(120), failures),
+                ConnectionState::ServiceStarting,
+                "failures={failures}: a service the SCM reports alive, two minutes                  into its first boot, is starting - the failure count is noise"
+            );
+        }
+    }
+
+    #[test]
+    fn the_grace_window_is_a_window_not_a_blindfold() {
+        // A daemon wedged while the SCM still says RUNNING must not wear
+        // the spinner forever. Past the grace, the ladder resumes.
+        let past = SERVICE_START_GRACE + Duration::from_secs(1);
+        assert_eq!(classify_outage(true, past, 1), ConnectionState::Recovering);
+        assert_eq!(classify_outage(true, past, 6), ConnectionState::Disconnected);
+        // Exactly AT the boundary counts as expired (strict <): the state
+        // must flip, not hover.
+        assert_eq!(
+            classify_outage(true, SERVICE_START_GRACE, 6),
+            ConnectionState::Disconnected
+        );
+    }
+
+    #[test]
+    fn a_dead_service_gets_the_ladder_immediately() {
+        // No service (dev mode) or a STOPPED one: "starting" would be a
+        // lie, and the spawn/recovery path depends on the ladder running.
+        assert_eq!(classify_outage(false, Duration::ZERO, 1), ConnectionState::Recovering);
+        assert_eq!(classify_outage(false, Duration::ZERO, 3), ConnectionState::Degraded);
+        assert_eq!(classify_outage(false, Duration::ZERO, 6), ConnectionState::Disconnected);
+    }
+
+    #[test]
+    fn the_new_state_survives_the_u8_roundtrip() {
+        // ConnectionState crosses the Tauri command boundary as a u8 in an
+        // atomic. A variant missing from from_u8 silently becomes
+        // Disconnected - the exact state this variant exists to avoid.
+        let s = ConnectionState::ServiceStarting;
+        assert_eq!(ConnectionState::from_u8(s.as_u8()), s);
+        assert_eq!(state_label(s), "service_starting");
     }
 }

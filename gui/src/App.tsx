@@ -148,7 +148,14 @@ function App() {
     // Degraded → Disconnected on its own after sustained failure, which
     // is what we want for this notice anyway.
     const cs = daemon.connectionState;
-    if (cs === "recovering") {
+    if (cs === "service_starting") {
+      // The service is alive and loading its signature DB. An info line,
+      // not a warning: nothing is wrong, and the first boot spends minutes
+      // here compiling 176 MB of databases. This used to fall through to
+      // "daemon disconnected", which made every fresh install look broken
+      // on the first screen the user ever saw.
+      notices.push(<TopBarNotice key="service-starting" variant="info" message={t("notice.service_starting")} dismissKey="service-starting" />);
+    } else if (cs === "recovering") {
       notices.push(<TopBarNotice key="recovering" variant="info" message={t("notice.recovering")} dismissKey="recovering" />);
     } else if (cs === "degraded") {
       notices.push(<TopBarNotice key="degraded-recovery" variant="warning" message={t("notice.degraded_recovery")} dismissKey="degraded-recovery" />);
@@ -298,6 +305,7 @@ function App() {
           currentPage={page}
           onNavigate={setPage}
           connected={daemon.connected}
+          starting={daemon.connectionState === "service_starting"}
           onRefresh={daemon.refresh}
           notices={topNotices}
         >

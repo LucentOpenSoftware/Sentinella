@@ -24,7 +24,11 @@ import type { Page } from "../components/Sidebar";
 import type { RuntimeIntelligenceStatus, TrustGraphStatus } from "../types/sentinella";
 
 export function Dashboard({ onNavigate }: { onNavigate: (p: Page) => void }) {
-  const { data, connected, loading, error, lastRefresh, refresh } = useDaemonContext();
+  const { data, connected, connectionState, loading, error, lastRefresh, refresh } = useDaemonContext();
+  // Service alive, pipe not up: the daemon is loading its signature DB.
+  // The hero below must read "starting", never "broken" - a fresh install
+  // spends minutes here and this is the first screen the user ever sees.
+  const starting = connectionState === "service_starting";
 
   if (loading && !data) {
     return (
@@ -38,18 +42,18 @@ export function Dashboard({ onNavigate }: { onNavigate: (p: Page) => void }) {
   if (!connected && !data) {
     return (
       <div className="page-stack">
-        <Card className="border-[rgb(var(--amber))]/12">
+        <Card className={starting ? "border-[rgb(var(--accent))]/12" : "border-[rgb(var(--amber))]/12"}>
           <div className="grid gap-6 xl:grid-cols-[minmax(0,1.6fr)_320px] xl:items-start">
             <div className="flex items-start gap-5">
-              <div className="flex h-16 w-16 flex-shrink-0 items-center justify-center rounded bg-[rgb(var(--amber))]/8 text-[rgb(var(--amber))]">
-                <WifiOff size={28} />
+              <div className={`flex h-16 w-16 flex-shrink-0 items-center justify-center rounded ${starting ? "bg-[rgb(var(--accent))]/8 text-[rgb(var(--accent))]" : "bg-[rgb(var(--amber))]/8 text-[rgb(var(--amber))]"}`}>
+                {starting ? <Loader2 size={28} className="animate-spin" /> : <WifiOff size={28} />}
               </div>
               <div className="flex min-w-0 flex-col gap-3">
-                <h3 className="text-[24px] font-bold leading-tight">{t("dash.not_connected")}</h3>
+                <h3 className="text-[24px] font-bold leading-tight">{starting ? t("dash.starting") : t("dash.not_connected")}</h3>
                 <p className="max-w-xl text-[14px] leading-relaxed text-[rgb(var(--t2))]">
-                  {t("dash.not_connected_desc")}
+                  {starting ? t("dash.starting_desc") : t("dash.not_connected_desc")}
                 </p>
-                {error && (
+                {!starting && error && (
                   <div className="flex items-center gap-2 text-[12px] text-[rgb(var(--red))]">
                     <AlertCircle size={14} />
                     <span>{error}</span>
@@ -82,10 +86,10 @@ export function Dashboard({ onNavigate }: { onNavigate: (p: Page) => void }) {
           />
           <StatusTile
             label={t("tile.engine")}
-            value={t("tile.disconnected")}
-            sub={t("dash.daemon_unreachable")}
-            color="red"
-            icon={<ShieldOff size={18} />}
+            value={starting ? t("dash.starting_tile") : t("tile.disconnected")}
+            sub={starting ? t("dash.loading_signatures") : t("dash.daemon_unreachable")}
+            color={starting ? "accent" : "red"}
+            icon={starting ? <Loader2 size={18} className="animate-spin" /> : <ShieldOff size={18} />}
           />
           <StatusTile
             label={t("tile.signatures")}

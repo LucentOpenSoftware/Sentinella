@@ -317,7 +317,11 @@ export const scanProcessMemory = (pid: number) =>
 
 // ── Supervisor / Recovery ────────────────────────────────────
 
-export type ConnectionState = "connecting" | "connected" | "recovering" | "degraded" | "disconnected" | "user_disabled";
+// "service_starting": the Windows service is alive but the daemon has not
+// created its pipe yet - it is compiling the signature DB, which takes
+// minutes on first boot. Distinct from "connecting" (our first attempt) and
+// every failure state: the right UI is a spinner, not an error.
+export type ConnectionState = "connecting" | "connected" | "recovering" | "degraded" | "disconnected" | "user_disabled" | "service_starting";
 
 export interface RecoveryInfo {
   state: ConnectionState;
