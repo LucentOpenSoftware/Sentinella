@@ -13,7 +13,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use notify::event::{CreateKind, ModifyKind, RenameMode};
+use notify::event::{ModifyKind, RenameMode};
 use notify::{Event, EventKind, RecursiveMode, Watcher as NotifyWatcher};
 use tracing::{debug, error, info, warn};
 
@@ -206,7 +206,17 @@ fn watcher_loop(
     // Snapshot of watched roots for identity revalidation (TOCTOU).
     let watched_roots_vec: Vec<PathBuf> = roots.clone();
 
-    // FISH — observe-only ransomware detection via AppState's shared MutationWindow.
+    // FISH ransomware detection via AppState's shared MutationWindow.
+    //
+    // NOT observe-only, despite what this said until 0.1.13. A burst
+    // decision runs `fish_handle_burst` INLINE on this thread, and when
+    // `fish.observe_only` is false that enumerates every process on the box
+    // (`find_suspect_processes`) and then suspends or terminates the
+    // suspects. Two consequences a maintainer must know: the watcher thread
+    // is blocked for the duration, which is precisely when a ransomware
+    // burst is producing the most events; and active response is now
+    // genuinely reachable, because until the config-refresh fix the shield
+    // was pinned to its boot defaults and could never leave observe mode.
 
     // Watcher config snapshot, throttle-refreshed from disk.
     //
@@ -254,7 +264,9 @@ fn watcher_loop(
         // Wait for events with timeout.
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(event) => {
-                // ── FISH: feed all relevant events (observe-only) ──
+                // ── FISH: feed all relevant events ──
+                // May take ACTIVE response (suspend/terminate) inline; see
+                // the note at the top of this function.
                 fish_feed_event(&event, &state);
 
                 // Only care about file creation and modification for scanning.
@@ -1001,8 +1013,18 @@ fn sandbox_detonation_background(
                 );
 
                 // If sandbox pushes score into threat range, quarantine now.
-                // Threshold: same as unify_detection — ARGUS score >= 76 = auto-quarantine.
-                if final_score >= 76 && path.exists() {
+                //
+                // ARGUS_ONLY_QUARANTINE_SCORE, not a literal. This path is
+                // reached only under `!result.infected` (see the routing
+                // guard), so it is ALWAYS an ARGUS-only decision — exactly
+                // the case unify_detection_filtered raises the bar for. It
+                // used a hardcoded 76 while its comment claimed to match
+                // that function, so every detonation landing in 76-84
+                // quarantined a file the main path deliberately spares. With
+                // should_sandbox gating on 26-75 and the delta capped at
+                // +50, that band is not a corner case: it is the common
+                // outcome of a detonation that found something mild.
+                if final_score >= crate::ipc::ARGUS_ONLY_QUARANTINE_SCORE && path.exists() {
                     // Re-check trusted hash in case user whitelisted during detonation.
                     if state.is_hash_trusted(&sha256) {
                         debug!(file = %path.display(), "sandbox escalation skipped: hash trusted");

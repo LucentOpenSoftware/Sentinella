@@ -22,7 +22,9 @@ mod client_auth;
 mod fairness;
 mod policy;
 mod state;
-pub use state::{AppState, argus_analysis_error, unify_detection_filtered};
+pub use state::{
+    ARGUS_ONLY_QUARANTINE_SCORE, AppState, argus_analysis_error, unify_detection_filtered,
+};
 
 /// Min valid JSON-RPC frame: `{}`
 const MIN_FRAME_SIZE: usize = 2;
@@ -2726,13 +2728,18 @@ fn dispatch_sync(
                 .get("enhanced_signature_provider")
                 .and_then(|v| v.as_str())
             {
-                // Strict allowlist — anything else is an engine-swap kill vector.
-                if matches!(v, "none" | "enhanced" | "community") {
+                // Strict allowlist — anything else is an engine-swap kill
+                // vector. THE SAME predicate Config::validate uses: this had
+                // its own list (none|enhanced|community) that overlapped
+                // validate's only at "none", so real providers were rejected
+                // and the two accepted names were silently reset to "none"
+                // after being reported as a successful change.
+                if crate::config::is_known_signature_provider(v) {
                     config.enhanced_signature_provider = v.to_string();
                     changes.push(format!("enhanced_signature_provider={v}"));
                 } else {
                     errors.push(format!(
-                        "enhanced_signature_provider={v:?} not in allowlist (none|enhanced|community)"
+                        "enhanced_signature_provider={v:?} not in allowlist                          (none|securiteinfo|urlhaus|malwarepatrol)"
                     ));
                 }
             }

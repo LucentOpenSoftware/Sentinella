@@ -6860,6 +6860,19 @@ fn restore_suppress_key(path: &Path) -> PathBuf {
 ///
 /// Returns `(is_threat, unified_name)`.
 /// Unified detection with detection-name exclusion support.
+/// ARGUS score required to auto-quarantine with NO ClamAV agreement.
+///
+/// Deliberately above `Verdict::from_score`'s "Malicious" line (76): a
+/// structurally odd installer routinely lands in 76-84, and quarantining it
+/// on ARGUS alone is the false positive that makes people uninstall an
+/// antivirus. That band is recorded as a forensic verdict and left alone.
+///
+/// PUBLIC, and a constant rather than a literal, because it was a literal
+/// in two places that then disagreed: the watcher's post-sandbox escalation
+/// used 76 while claiming in a comment to match this function, so every
+/// detonation landing in 76-84 quarantined a file this rule exists to spare.
+pub const ARGUS_ONLY_QUARANTINE_SCORE: u32 = 85;
+
 pub fn unify_detection_filtered(
     clamav_infected: bool,
     clamav_name: Option<&str>,
@@ -6878,7 +6891,7 @@ pub fn unify_detection_filtered(
     let argus_threat = if clamav_infected {
         argus.is_threat() // When ClamAV agrees, normal threshold (76+)
     } else {
-        argus.score >= 85 // ARGUS-only needs higher confidence
+        argus.score >= ARGUS_ONLY_QUARANTINE_SCORE // higher confidence needed
     };
     let is_threat = clamav_infected || argus_threat;
 

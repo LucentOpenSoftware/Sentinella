@@ -547,10 +547,7 @@ impl Config {
             self.powershell_poll_seconds = 3600;
         }
         // R4-C14: enhanced_signature_provider allowlist.
-        if !matches!(
-            self.enhanced_signature_provider.as_str(),
-            "none" | "securiteinfo" | "urlhaus" | "malwarepatrol"
-        ) {
+        if !is_known_signature_provider(&self.enhanced_signature_provider) {
             warn!(
                 value = self.enhanced_signature_provider.as_str(),
                 "unknown enhanced_signature_provider — reset to none"
@@ -921,6 +918,23 @@ pub fn normalize_excluded_path(entry: &str) -> String {
 ///
 /// Takes an ALREADY-normalized path (see `normalize_excluded_path`); the
 /// caller-side normalization is what makes exact comparison sufficient.
+/// Is this a signature provider the engine can actually load?
+///
+/// SHARED, because it was duplicated and the copies did not merely drift -
+/// they became disjoint. `protection.set_critical` carried its own list,
+/// `none | enhanced | community`, which overlapped this one only at "none".
+/// The UAC-gated, challenge-token-gated path for changing the signature
+/// provider was therefore broken in both directions AND lied about it:
+/// "securiteinfo", a real provider this function accepts, was rejected as
+/// not-allowlisted, while "enhanced" and "community" were accepted, pushed
+/// into `changes`, reported as a success - and then silently reset to
+/// "none" by `validate` a few lines later, because they name nothing.
+///
+/// Keep in step with `engine::sources::SignatureSourceManager`.
+pub fn is_known_signature_provider(v: &str) -> bool {
+    matches!(v, "none" | "securiteinfo" | "urlhaus" | "malwarepatrol")
+}
+
 pub fn is_forbidden_system_root(normalized: &str) -> bool {
     matches!(
         normalized,
@@ -2257,5 +2271,43 @@ mod tests {
         config.validate();
         assert!(!config.excluded_extensions.iter().any(|e| e.contains('*')));
         assert!(!config.excluded_extensions.iter().any(|e| e.contains('?')));
+    }
+}
+
+#[cfg(test)]
+mod provider_allowlist_tests {
+    use super::*;
+
+    #[test]
+    fn validate_accepts_exactly_what_the_ipc_allowlist_accepts() {
+        // The defect: protection.set_critical had its own vocabulary
+        // (none|enhanced|community) disjoint from this one except for
+        // "none". Both now call is_known_signature_provider, so a value
+        // accepted by the elevated IPC path is a value validate keeps.
+        // Reintroducing a second literal list fails this.
+        for good in ["none", "securiteinfo", "urlhaus", "malwarepatrol"] {
+            assert!(is_known_signature_provider(good), "{good} must be accepted");
+            let mut c = Config::default();
+            c.enhanced_signature_provider = good.to_string();
+            c.validate();
+            assert_eq!(
+                c.enhanced_signature_provider, good,
+                "validate silently reset a provider the IPC path accepts"
+            );
+        }
+    }
+
+    #[test]
+    fn the_old_ipc_vocabulary_is_rejected_not_silently_reset() {
+        // "enhanced" and "community" name nothing the engine can load. They
+        // used to be ACCEPTED by set_critical, reported in `changes` as a
+        // successful change, and then reset to "none" by validate - so the
+        // caller was told a provider was set that never was.
+        for bogus in ["enhanced", "community", "securiteinfo2", ""] {
+            assert!(
+                !is_known_signature_provider(bogus),
+                "{bogus:?} must be refused at the door, not reset behind the caller's back"
+            );
+        }
     }
 }
