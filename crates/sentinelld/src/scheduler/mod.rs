@@ -84,7 +84,7 @@ fn scheduler_loop(state: Arc<crate::ipc::AppState>, running: Arc<AtomicBool>) {
             if should_update {
                 last_update_at = Some(std::time::Instant::now());
                 debug!("scheduler: auto-update triggered");
-                let result = state.start_update();
+                let result = state.start_update(/* manual */ false);
                 let ok = result.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
                 if ok {
                     info!("scheduler: auto-update started in background");

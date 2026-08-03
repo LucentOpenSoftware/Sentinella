@@ -1,7 +1,7 @@
 import { CheckCircle, AlertCircle, WifiOff, Shield, ShieldOff, Search, RefreshCw, XCircle, AlertTriangle, Loader2, Eye } from "lucide-react";
 
 export type StatusType =
-  | "connected" | "disconnected"
+  | "connected" | "disconnected" | "starting"
   | "protected" | "degraded" | "unprotected"
   | "scanning" | "cancelling" | "updating"
   | "clean" | "threat" | "warning"
@@ -10,6 +10,7 @@ export type StatusType =
 const CONFIG: Record<StatusType, { color: string; icon: React.ComponentType<{ size?: number }>; label: string }> = {
   connected:    { color: "green",  icon: CheckCircle,   label: "Connected" },
   disconnected: { color: "amber",  icon: WifiOff,       label: "Disconnected" },
+  starting:     { color: "accent", icon: Loader2,       label: "Starting" },
   protected:    { color: "green",  icon: Shield,        label: "Protected" },
   degraded:     { color: "amber",  icon: AlertCircle,   label: "Degraded" },
   unprotected:  { color: "red",    icon: ShieldOff,     label: "Unprotected" },
@@ -51,7 +52,7 @@ export function StatusBadge({ status, size = "md", showLabel = true, className =
       role="status"
       aria-label={cfg.label}
     >
-      {status === "cancelling" || status === "scanning" || status === "updating" ? (
+      {status === "cancelling" || status === "scanning" || status === "updating" || status === "starting" ? (
         <Loader2 size={sizes.icon} className="animate-spin" style={{ color: `rgb(${colorVar})` }} />
       ) : (
         <div

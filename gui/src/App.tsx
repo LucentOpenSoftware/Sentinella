@@ -20,6 +20,16 @@ import { FirstRunWizard, isFirstRunComplete } from "./pages/FirstRun";
 import { useDaemon } from "./hooks/useDaemon";
 import "./App.css";
 
+/**
+ * "quick" → "Quick". Fills the `{type}` slot in the notice.scan_* templates.
+ * Empty when the daemon reports no scan_type; the caller trims the result so
+ * the sentence still reads ("Scan in progress" rather than " scan in progress").
+ */
+function scanTypeLabel(type: string | null | undefined): string {
+  if (!type) return "";
+  return type.charAt(0).toUpperCase() + type.slice(1);
+}
+
 function App() {
   const [page, setPage] = useState<Page>("dashboard");
   const [droppedFile, setDroppedFile] = useState<string | null>(null);
@@ -103,7 +113,8 @@ function App() {
     // Detect scan completion transition.
     if (wasRunning && !isRunning && scan.state === "completed") {
       setScanDoneNotice({
-        type: scan.scan_type || "scan",
+        // "" when the daemon reports no type — scanTypeLabel/{type} handle it.
+        type: scan.scan_type ?? "",
         files: scan.files_scanned,
         threats: scan.threats_found,
       });
@@ -137,7 +148,14 @@ function App() {
     // Degraded → Disconnected on its own after sustained failure, which
     // is what we want for this notice anyway.
     const cs = daemon.connectionState;
-    if (cs === "recovering") {
+    if (cs === "service_starting") {
+      // The service is alive and loading its signature DB. An info line,
+      // not a warning: nothing is wrong, and the first boot spends minutes
+      // here compiling 176 MB of databases. This used to fall through to
+      // "daemon disconnected", which made every fresh install look broken
+      // on the first screen the user ever saw.
+      notices.push(<TopBarNotice key="service-starting" variant="info" message={t("notice.service_starting")} dismissKey="service-starting" />);
+    } else if (cs === "recovering") {
       notices.push(<TopBarNotice key="recovering" variant="info" message={t("notice.recovering")} dismissKey="recovering" />);
     } else if (cs === "degraded") {
       notices.push(<TopBarNotice key="degraded-recovery" variant="warning" message={t("notice.degraded_recovery")} dismissKey="degraded-recovery" />);
@@ -155,7 +173,9 @@ function App() {
       if (stats) {
         const ps = stats.protection_state;
         if (ps === "degraded" || ps === "minimal") {
-          notices.push(<TopBarNotice key="degraded" variant="warning" message={stats.protection_detail || "Protection degraded"} dismissKey="degraded" />);
+          // protection_detail is daemon-authored English; when it is empty we
+          // at least fall back to a translated headline rather than a literal.
+          notices.push(<TopBarNotice key="degraded" variant="warning" message={stats.protection_detail || t("notify.protection_degraded")} dismissKey="degraded" />);
         }
         // v0.1.8 bug fixes for the v0.1.7 banner pile-up:
         //   - "Signatures never updated" was a hardcoded English string
@@ -170,6 +190,15 @@ function App() {
         //     "never updated" case — the daemon DID load them from
         //     somewhere, so they can't be never-updated. Stale-by-time
         //     banners still fire normally.
+        //
+        // That guard only covers stats the daemon actually ANSWERED with. The
+        // other producer of {db_stale: true, hours: 0, signature_count: 0} is
+        // fetchDashboard's synthetic fallback for a timed-out stats.runtime,
+        // which is byte-identical to a genuinely empty database and would fire
+        // this banner on a machine holding a current signature DB. useDaemon
+        // no longer commits that snapshot (setData is gated on
+        // uptime_secs > 0), so every `stats` reaching here is a real daemon
+        // reply — drop that gate and this banner starts lying again.
         const sigCount = stats.signature_count ?? 0;
         const reallyNeverUpdated =
           stats.db_stale && stats.db_stale_hours === 0 && sigCount === 0;
@@ -206,20 +235,18 @@ function App() {
     // Priority 2: active scan progress.
     const scan = daemon.data?.scan;
     if (scan?.running && notices.length < 3) {
-      const label = scan.scan_type
-        ? scan.scan_type.charAt(0).toUpperCase() + scan.scan_type.slice(1)
-        : "Scan";
+      const label = scanTypeLabel(scan.scan_type);
       notices.push(
         <TopBarNotice
           key="scan-running"
           variant="info"
-          message={`${label} scan in progress`}
+          message={t("notice.scan_progress").replace("{type}", label).trim()}
           actions={
             <button
               onClick={() => setPage("scan")}
               className="text-[10px] font-semibold text-[rgb(var(--accent))] hover:underline cursor-pointer whitespace-nowrap"
             >
-              View progress
+              {t("notice.view_progress")}
             </button>
           }
         />
@@ -228,10 +255,17 @@ function App() {
 
     // Priority 3: scan completed (auto-dismissing).
     if (scanDoneNotice && !scan?.running && notices.length < 3) {
-      const label = scanDoneNotice.type.charAt(0).toUpperCase() + scanDoneNotice.type.slice(1);
-      const msg = scanDoneNotice.threats > 0
-        ? `${label} scan done — ${scanDoneNotice.threats} threat${scanDoneNotice.threats > 1 ? "s" : ""} found`
-        : `${label} scan complete — ${scanDoneNotice.files.toLocaleString()} files clean`;
+      // The {threats} templates carry their own plural form per locale
+      // ("threat(s)", "minaccia/minacce", …) — do NOT append an English "s".
+      const label = scanTypeLabel(scanDoneNotice.type);
+      const msg = (scanDoneNotice.threats > 0
+        ? t("notice.scan_done_threats")
+            .replace("{type}", label)
+            .replace("{threats}", String(scanDoneNotice.threats))
+        : t("notice.scan_done_clean")
+            .replace("{type}", label)
+            .replace("{files}", scanDoneNotice.files.toLocaleString())
+      ).trim();
       notices.push(
         <TopBarNotice
           key="scan-done"
@@ -244,7 +278,7 @@ function App() {
                 onClick={() => { setPage("quarantine"); dismissScanDone(); }}
                 className="text-[10px] font-semibold text-[rgb(var(--accent))] hover:underline cursor-pointer whitespace-nowrap"
               >
-                View quarantine
+                {t("notice.view_quarantine")}
               </button>
             ) : undefined
           }
@@ -271,6 +305,7 @@ function App() {
           currentPage={page}
           onNavigate={setPage}
           connected={daemon.connected}
+          starting={daemon.connectionState === "service_starting"}
           onRefresh={daemon.refresh}
           notices={topNotices}
         >

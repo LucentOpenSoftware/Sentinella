@@ -41,8 +41,20 @@ export function UpdatePage() {
         if (status.state === "error" && status.last_error) {
           setLastResult({ ok: false, message: status.last_error });
         } else if (status.state === "idle" && updating) {
-          // Went from running -> idle = success.
-          setLastResult({ ok: true, message: t("update.success") });
+          // "running -> idle" is NOT sufficient evidence of success. A
+          // SCHEDULED update that fails now ends at idle by design (the
+          // daemon no longer raises state=error for background runs, so it
+          // cannot fire a toast) while still reporting last_error. Mounting
+          // this page mid-run sets updating=true, so without the last_error
+          // check a failed background update painted a green "updated
+          // successfully". Here the user is watching a spinner they are
+          // waiting on — telling them it failed answers their question
+          // rather than interrupting them.
+          if (status.last_error) {
+            setLastResult({ ok: false, message: status.last_error });
+          } else {
+            setLastResult({ ok: true, message: t("update.success") });
+          }
         }
       }
     } catch {

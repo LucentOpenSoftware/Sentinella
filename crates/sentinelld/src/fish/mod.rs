@@ -208,6 +208,10 @@ pub struct FishDiagnostics {
 
 /// Sliding window mutation tracker.
 pub struct MutationWindow {
+    /// The shield's master switch, captured from the config this window was
+    /// built from. When false `record` does nothing at all — see there for
+    /// why the gate lives here rather than at the call site.
+    enabled: bool,
     events: VecDeque<FileMutationEvent>,
     window: Duration,
     rename_threshold: u32,
@@ -240,6 +244,7 @@ pub struct MutationWindow {
 impl MutationWindow {
     pub fn new(config: &FishConfig) -> Self {
         Self {
+            enabled: config.enabled,
             events: VecDeque::with_capacity(1024),
             window: Duration::from_secs(config.window_seconds),
             rename_threshold: config.rename_threshold,
@@ -289,7 +294,27 @@ impl MutationWindow {
     }
 
     /// Record a mutation event and check thresholds.
+    ///
+    /// THE MASTER SWITCH IS ENFORCED HERE, and nowhere else. `fish.enabled`
+    /// is a UAC-gated CRITICAL_FIELD that an admin turns off to stop FISH
+    /// false positives on a bulk-encryption or bulk-rename workload — but
+    /// it was validated, persisted, logged as a change, and then read by
+    /// nothing: `watcher::fish_feed_event` calls this unconditionally, so
+    /// every mutation was still recorded and "FISH: rewrite burst detected"
+    /// kept filling the activity log. The gate belongs at this end because
+    /// this is the one funnel every caller goes through; a check at the call
+    /// site would have to be repeated by the next caller and eventually
+    /// would not be.
+    ///
+    /// Disabled means disabled: no event stored, no counter moved, no
+    /// evaluation. `MutationWindow::new` is the only place `enabled` is
+    /// read, and `AppState::load_fish_config` rebuilds the window whenever
+    /// the config changes, so this cannot go stale without that path
+    /// breaking first.
     pub fn record(&mut self, event: FileMutationEvent) -> FishDecision {
+        if !self.enabled {
+            return FishDecision::Normal;
+        }
         self.total_events += 1;
         // Slow-burn tumbling window: reset the cumulative counter once the long
         // window elapses, then count this mutation. (Tumbling, not sliding —
@@ -763,5 +788,74 @@ mod tests {
         let diag = window.diagnostics(&cfg);
         assert!(!diag.top_mutated_directories.is_empty());
         assert!(diag.top_mutated_directories[0].contains("Documents"));
+    }
+
+    /// REGRESSION. `fish.enabled` is a UAC-gated CRITICAL_FIELD an admin
+    /// turns off to stop FISH firing on a legitimate bulk-encryption or
+    /// bulk-rename workload. Nothing read it: the window did not store it
+    /// and `record` did not check it, so the burst warnings kept coming
+    /// after the setting was accepted, persisted and logged as a change.
+    #[test]
+    fn a_disabled_shield_records_nothing_and_never_alerts() {
+        let mut cfg = make_config();
+        cfg.enabled = false;
+        let mut window = MutationWindow::new(&cfg);
+
+        // Ten times the rename threshold and ten times the rewrite
+        // threshold — a screaming burst under any configuration.
+        for i in 0..50 {
+            let decision = window.record(FileMutationEvent {
+                path: PathBuf::from(format!("C:\\Users\\test\\Documents\\file{i}.docx")),
+                kind: MutationKind::Rename {
+                    old_name: format!("file{i}.docx"),
+                    new_name: format!("file{i}.encrypted"),
+                },
+                timestamp: Instant::now(),
+            });
+            assert!(
+                matches!(decision, FishDecision::Normal),
+                "a disabled shield must not decide anything: {decision:?}"
+            );
+        }
+        for i in 0..50 {
+            window.record(FileMutationEvent {
+                path: PathBuf::from(format!("C:\\Users\\test\\Documents\\file{i}.docx")),
+                kind: MutationKind::Rewrite,
+                timestamp: Instant::now(),
+            });
+        }
+
+        // And it must not be silently accumulating either: an admin reading
+        // diagnostics on a disabled shield should see a shield that is
+        // doing nothing, not one that is watching and staying quiet.
+        let diag = window.diagnostics(&cfg);
+        assert_eq!(diag.total_events, 0, "events recorded while disabled");
+        assert_eq!(diag.recent_events, 0);
+        assert_eq!(diag.rename_bursts, 0);
+        assert_eq!(diag.rewrite_bursts, 0);
+        assert_eq!(diag.slow_burn_window_count, 0);
+        assert!(diag.last_decision.is_none());
+    }
+
+    /// The same events with the switch ON must alert — otherwise the test
+    /// above would pass on a `record` that is broken for everyone.
+    #[test]
+    fn an_enabled_shield_still_alerts_on_the_same_burst() {
+        let mut window = MutationWindow::new(&make_config());
+        let mut alerted = false;
+        for i in 0..50 {
+            let decision = window.record(FileMutationEvent {
+                path: PathBuf::from(format!("C:\\Users\\test\\Documents\\file{i}.docx")),
+                kind: MutationKind::Rename {
+                    old_name: format!("file{i}.docx"),
+                    new_name: format!("file{i}.encrypted"),
+                },
+                timestamp: Instant::now(),
+            });
+            if matches!(decision, FishDecision::RenameBurst { .. }) {
+                alerted = true;
+            }
+        }
+        assert!(alerted, "the enabled shield must still see this burst");
     }
 }

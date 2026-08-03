@@ -629,6 +629,126 @@ fn is_challengeable_method(method: &str) -> bool {
     )
 }
 
+/// Deep-merge `overlay` onto `base`, in place.
+///
+/// Objects merge key by key; every other JSON kind — arrays included — is
+/// replaced wholesale, because a list-valued config knob is a single value
+/// the caller either sets or doesn't, never something to append to. Merging
+/// arrays element-wise would make it impossible to shorten a list.
+fn json_merge_in_place(base: &mut serde_json::Value, overlay: &serde_json::Value) {
+    match (base, overlay) {
+        (serde_json::Value::Object(b), serde_json::Value::Object(o)) => {
+            for (k, v) in o {
+                json_merge_in_place(b.entry(k.clone()).or_insert(serde_json::Value::Null), v);
+            }
+        }
+        (b, o) => *b = o.clone(),
+    }
+}
+
+/// Build the `Config` that `settings.set` will persist, given the config
+/// currently on disk and the raw IPC params object.
+///
+/// Two properties hold here. The handler up to v0.1.13 held neither: it
+/// deserialized the params object on its own and pinned 15 of the 20
+/// `CRITICAL_FIELDS`.
+///
+/// 1. **Omission is not mutation.** `Config` carries `#[serde(default)]`, so
+///    `from_value::<Config>(params)` resurrects the *Default* for every key
+///    the caller left out. A request as small as `{max_file_size_mb: 1024}`
+///    therefore used to rewrite the entire file — silently flipping
+///    `clamav_isolation` back to `"in_process"`, `fish.active_response` back
+///    to `"observe"`, `sandbox.enabled` off and `web_protection` off with its
+///    blocklists emptied. Merging the params ONTO the on-disk config first
+///    means an absent key keeps its stored value.
+///
+/// 2. **Kill-vector fields are pinned even when sent explicitly.**
+///    `settings.set` is not the elevated path; `protection.set_critical` is.
+///    Every entry of `proto::full_config::CRITICAL_FIELDS` is restored from
+///    `current` below — the `settings_set_pins_every_critical_field` test
+///    walks that list and fails if a future addition is missed.
+///    `[web_protection]` is pinned too: it is absent from `FullConfig`, so it
+///    has no IPC mutation path at all by design, and letting `settings.set`
+///    write it would be the only way to disable DNS filtering over IPC.
+fn settings_set_merge(
+    current: &crate::config::Config,
+    params: &serde_json::Value,
+) -> Result<crate::config::Config, String> {
+    let mut merged = serde_json::to_value(current)
+        .map_err(|e| format!("cannot serialize current config: {e}"))?;
+    let mut overlay = params.clone();
+    if let Some(obj) = overlay.as_object_mut() {
+        // IPC envelope, not config schema (see the same strip in
+        // settings.set_full).
+        obj.remove("auth");
+        obj.remove("token");
+    }
+    json_merge_in_place(&mut merged, &overlay);
+    let mut config: crate::config::Config =
+        serde_json::from_value(merged).map_err(|e| format!("invalid config: {e}"))?;
+
+    // ── Security-critical fields restored from the on-disk config ──
+    // These can ONLY be changed via protection.set_critical (challenge token
+    // + UAC elevation on the GUI side).
+    //
+    // APT kill vector: attacker with the IPC secret calls settings.set to
+    // inject exclusions that suppress all detection. Pinning forces the
+    // attacker to have admin + challenge token.
+
+    // Protection state.
+    config.realtime_enabled = current.realtime_enabled;
+    config.auto_quarantine = current.auto_quarantine;
+
+    // Worker path (C2 fix).
+    config.argus_worker_path = current.argus_worker_path.clone();
+    config.argus_worker_enabled = current.argus_worker_enabled;
+    config.scan.argus_worker_path = current.scan.argus_worker_path.clone();
+    config.scan.argus_worker_enabled = current.scan.argus_worker_enabled;
+
+    // ☠️ KILL VECTOR FIX: protect all detection-affecting fields.
+    // An attacker setting excluded_detections=[""] kills ALL detection.
+    // An attacker setting excluded_paths=["C:\\Users"] blinds the scanner.
+    // An attacker adding to trusted_hashes whitelists specific malware.
+    // An attacker emptying realtime_roots disables watcher coverage.
+    config.excluded_paths = current.excluded_paths.clone();
+    config.excluded_extensions = current.excluded_extensions.clone();
+    config.excluded_detections = current.excluded_detections.clone();
+    config.trusted_hashes = current.trusted_hashes.clone();
+    config.realtime_roots = current.realtime_roots.clone();
+    config.heuristic_alerts = current.heuristic_alerts;
+    config.idle_scan_enabled = current.idle_scan_enabled;
+    config.scheduled_scan_enabled = current.scheduled_scan_enabled;
+    config.enhanced_signature_provider = current.enhanced_signature_provider.clone();
+
+    // ☠️ KILL VECTOR FIX (v0.1.9 CRITICAL_FIELDS additions): ransomware
+    // shield, behavioural sandbox and ClamAV isolation. Downgrading
+    // clamav_isolation to "in_process" re-exposes the daemon to the
+    // in-engine memory-corruption CVEs the subprocess mode exists to
+    // contain; forcing fish.active_response to "observe" turns the
+    // ransomware shield into a logger.
+    config.fish.enabled = current.fish.enabled;
+    config.fish.observe_only = current.fish.observe_only;
+    config.fish.active_response = current.fish.active_response.clone();
+    config.sandbox.enabled = current.sandbox.enabled;
+    config.clamav_isolation = current.clamav_isolation.clone();
+
+    // ☠️ No IPC mutation path exists for [web_protection] (FullConfig does
+    // not mirror it), so settings.set must not become one.
+    config.web_protection = current.web_protection.clone();
+
+    // ☠️ KILL VECTOR FIX: preserve developer-mode password hash.
+    // settings.get redacts password_sha256 to "" before returning, so a
+    // round-trip GUI settings.set would otherwise wipe the provisioned hash.
+    // Worse, an attacker with the IPC secret could inject a hash they know
+    // the plaintext of, then unlock developer mode without ever knowing the
+    // original password. The hash is provisioned out-of-band by editing the
+    // config file directly (documented dev-mode setup); IPC settings.set must
+    // never be a path to mutate it.
+    config.developer.password_sha256 = current.developer.password_sha256.clone();
+
+    Ok(config)
+}
+
 /// Synchronous dispatch — all handlers are sync (no async needed).
 ///
 /// `peer` is the per-connection caller identity resolved at accept time
@@ -1369,6 +1489,25 @@ fn dispatch_sync(
             }
         }
 
+        "webprotection.status" => {
+            // Authenticated for the same reason as watcher.status: the
+            // response discloses the machine's configured DNS servers and
+            // how many block rules are loaded.
+            let auth = req
+                .params
+                .get("auth")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !state.validate_ipc_auth(auth) {
+                return serde_json::to_vec(&RpcErrorResponse::err(
+                    req.id,
+                    error_codes::INVALID_PARAMS,
+                    "authenticated IPC required for web protection status".to_string(),
+                ))
+                .unwrap_or_default();
+            }
+            ok_json(serde_json::to_value(state.web_protection_status()).unwrap_or_default())
+        }
         "watcher.status" => {
             // Scanner-B Finding 2: response includes the full list of
             // watched roots — gives an unauth local caller an oracle for
@@ -1427,7 +1566,7 @@ fn dispatch_sync(
                 ))
                 .unwrap_or_default();
             }
-            let r = AppState::start_update(state);
+            let r = AppState::start_update(state, /* manual */ true);
             Ok(r)
         }
         "activity.list" => {
@@ -2176,59 +2315,19 @@ fn dispatch_sync(
                 ))
                 .unwrap_or_default();
             }
-            match serde_json::from_value::<crate::config::Config>(req.params.clone()) {
+            // v0.1.9 Phase 2: hold the config write lock for the entire
+            // load-current → merge → save window so a parallel
+            // settings.set_full / protection.set_critical can't clobber
+            // our save (or have us clobber theirs).
+            let _cfg_guard = state.lock_config_write();
+            let current = crate::config::Config::load(None).unwrap_or_default();
+
+            // settings_set_merge overlays the params onto `current` (so an
+            // omitted key is left alone rather than reset to its serde
+            // default) and then re-pins every kill-vector field. See its doc
+            // comment for what each property protects.
+            match settings_set_merge(&current, &req.params) {
                 Ok(mut config) => {
-                    // ── Security-critical fields preserved from current config ──
-                    // These can ONLY be changed via protection.set_critical (requires
-                    // challenge token + UAC elevation on GUI side).
-                    //
-                    // APT kill vector: attacker with IPC secret calls settings.set
-                    // to inject exclusions that suppress all detection. Protecting
-                    // these fields forces the attacker to have admin + challenge token.
-                    //
-                    // v0.1.9 Phase 2: hold the config write lock for the entire
-                    // load-current → merge → save window so a parallel
-                    // settings.set_full / protection.set_critical can't clobber
-                    // our save (or have us clobber theirs).
-                    let _cfg_guard = state.lock_config_write();
-                    let current = crate::config::Config::load(None).unwrap_or_default();
-
-                    // Protection state (existing).
-                    config.realtime_enabled = current.realtime_enabled;
-                    config.auto_quarantine = current.auto_quarantine;
-
-                    // Worker path (C2 fix).
-                    config.argus_worker_path = current.argus_worker_path;
-                    config.argus_worker_enabled = current.argus_worker_enabled;
-                    config.scan.argus_worker_path = current.scan.argus_worker_path;
-                    config.scan.argus_worker_enabled = current.scan.argus_worker_enabled;
-
-                    // ☠️ KILL VECTOR FIX: protect all detection-affecting fields.
-                    // An attacker setting excluded_detections=[""] kills ALL detection.
-                    // An attacker setting excluded_paths=["C:\\Users"] blinds the scanner.
-                    // An attacker adding to trusted_hashes whitelists specific malware.
-                    // An attacker emptying realtime_roots disables watcher coverage.
-                    config.excluded_paths = current.excluded_paths;
-                    config.excluded_extensions = current.excluded_extensions;
-                    config.excluded_detections = current.excluded_detections;
-                    config.trusted_hashes = current.trusted_hashes;
-                    config.realtime_roots = current.realtime_roots;
-                    config.heuristic_alerts = current.heuristic_alerts;
-                    config.idle_scan_enabled = current.idle_scan_enabled;
-                    config.scheduled_scan_enabled = current.scheduled_scan_enabled;
-                    config.enhanced_signature_provider = current.enhanced_signature_provider;
-
-                    // ☠️ KILL VECTOR FIX: preserve developer-mode password hash.
-                    // settings.get redacts password_sha256 to "" before returning,
-                    // so a round-trip GUI settings.set would otherwise wipe the
-                    // provisioned hash. Worse, an attacker with the IPC secret
-                    // could inject a hash they know the plaintext of, then
-                    // unlock developer mode without ever knowing the original
-                    // password. The hash is provisioned out-of-band by editing
-                    // the config file directly (documented dev-mode setup);
-                    // IPC settings.set must never be a path to mutate it.
-                    config.developer.password_sha256 = current.developer.password_sha256;
-
                     // Validate the remaining mutable fields.
                     config.validate();
 
@@ -2250,9 +2349,9 @@ fn dispatch_sync(
                         Err(e) => Ok(serde_json::json!({"ok": false, "error": e})),
                     }
                 }
-                Err(e) => {
-                    Ok(serde_json::json!({"ok": false, "error": format!("invalid config: {e}")}))
-                }
+                // settings_set_merge already prefixes the deserialization
+                // failure with "invalid config: " — don't double it.
+                Err(e) => Ok(serde_json::json!({"ok": false, "error": e})),
             }
         }
 
@@ -2411,9 +2510,13 @@ fn dispatch_sync(
                 ))
                 .unwrap_or_default();
             }
-            // Strip the IPC envelope fields before deserializing into FullConfig
-            // (they are not part of the config schema and would fail serde even
-            // with #[serde(default)] because of deny_unknown_fields elsewhere).
+            // Strip the IPC envelope fields before deserializing into FullConfig.
+            // Nothing in the FullConfig tree sets `deny_unknown_fields` (it is
+            // `#[serde(default)]` throughout), so serde would ignore these two
+            // keys anyway — the strip is hygiene, not a deserialization
+            // requirement. It matters the day someone adds a config key named
+            // `auth` or `token`: without the strip the IPC envelope would
+            // silently overwrite it with the secret/challenge string.
             let mut params = req.params.clone();
             if let Some(obj) = params.as_object_mut() {
                 obj.remove("auth");
@@ -2458,6 +2561,18 @@ fn dispatch_sync(
                     let path = crate::paths::paths().config_file();
                     match config.save(&path) {
                         Ok(()) => {
+                            // Push the hot-applied thresholds into AppState.
+                            // Saving the TOML alone left the daemon running on
+                            // its boot values, so the GUI's "no restart needed"
+                            // pill was lying about these two fields.
+                            // Every hot-applied setting, not just the two
+                            // staleness thresholds. `restart_requirement()`
+                            // tells the GUI these need no restart, so the
+                            // daemon has to actually re-read them here; the
+                            // FISH shield's active response was pinned to its
+                            // boot value for the process lifetime because
+                            // nothing did.
+                            state.refresh_hot_config(&config);
                             state.log_activity(
                                 "info",
                                 "settings",
@@ -2519,14 +2634,36 @@ fn dispatch_sync(
             // excluding the world or feeding the watcher a path that
             // hangs the recursion.
             fn is_dangerous_path(p: &str) -> bool {
-                let lower = p.trim().to_lowercase();
-                let stripped = lower.trim_end_matches('\\');
-                matches!(
-                    stripped,
-                    "" | "c:" | "c:/" | "/" | "\\" | "c:\\windows"
-                        | "c:\\windows\\system32" | "c:\\program files"
-                        | "c:\\program files (x86)"
-                ) || stripped.contains("..")
+                // Normalized the same way `Config::validate` normalizes
+                // excluded_paths, and for the same reason: comparing a raw
+                // string against a fixed literal set is defeated by any
+                // spelling the set does not enumerate. `trim_end_matches('\\')`
+                // popped only backslashes and the set listed only some of the
+                // separator variants, so "C://", "C:\\\\", "C:/Windows/" and
+                // "c:\\program files\\" each walked straight past a guard that
+                // caught "C:\\". Fold case, fold forward slashes onto
+                // backslashes, then pop EVERY trailing separator — after which
+                // a drive spec is exactly 2 bytes and each system root has one
+                // spelling.
+                let normalized = {
+                    let mut n = p.trim().to_ascii_lowercase().replace('/', "\\");
+                    while n.ends_with('\\') {
+                        n.pop();
+                    }
+                    n
+                };
+                let b = normalized.as_bytes();
+                let is_drive_root = b.len() == 2 && b[0].is_ascii_alphabetic() && b[1] == b':';
+                normalized.is_empty()
+                    || is_drive_root
+                    || matches!(
+                        normalized.as_str(),
+                        "c:\\windows"
+                            | "c:\\windows\\system32"
+                            | "c:\\program files"
+                            | "c:\\program files (x86)"
+                    )
+                    || normalized.contains("..")
             }
             fn is_hex64_lower(s: &str) -> bool {
                 s.len() == 64
@@ -2561,14 +2698,20 @@ fn dispatch_sync(
             }
 
             // ── Existing fields (v0.1.7) ───────────────────
+            // The runtime side effect is DEFERRED to after config.save()
+            // succeeds — see `realtime_toggle` at the bottom of this arm.
+            // Applying it here meant a request that failed validation (or
+            // failed to save) still stopped the watcher, leaving real-time
+            // protection down with config.toml and the GUI both still saying
+            // it was up. It also meant enable_protection() → start_watcher()
+            // re-read realtime_roots off disk BEFORE this handler wrote the
+            // new roots, so a save that both re-enabled protection and added
+            // a watched folder started the watcher on the old root set.
+            let mut realtime_toggle: Option<bool> = None;
             if let Some(v) = req.params.get("realtime_enabled").and_then(|v| v.as_bool()) {
                 config.realtime_enabled = v;
                 changes.push(format!("realtime_enabled={v}"));
-                if !v {
-                    state.disable_protection();
-                } else if !state.is_user_disabled() {
-                    state.enable_protection();
-                }
+                realtime_toggle = Some(v);
             }
             if let Some(v) = req.params.get("auto_quarantine").and_then(|v| v.as_bool()) {
                 config.auto_quarantine = v;
@@ -2847,6 +2990,32 @@ fn dispatch_sync(
                     // through state.load_detection_exclusions, which is the
                     // cache mirrors of the on-disk excluded_detections list.
                     state.load_detection_exclusions(config.excluded_detections.clone());
+                    // …and the trusted-hash allowlist, which has exactly the
+                    // same shape: watcher/mod.rs consults state.is_hash_trusted
+                    // (an in-memory mirror), NOT the TOML. Without this the
+                    // daemon kept honouring a hash the admin had just REMOVED
+                    // after learning the file was malicious — for the rest of
+                    // the daemon's uptime, since main.rs loads this mirror only
+                    // at boot and engine reload does not touch it.
+                    state.load_trusted_hashes(config.trusted_hashes.clone());
+                    // set_critical writes fish.* and clamav_isolation too, and
+                    // they are hot-applied by the same classification, so this
+                    // path owes the same refresh as settings.set_full.
+                    state.refresh_hot_config(&config);
+                    // Real-time toggle applied last: start_watcher() re-reads
+                    // config.toml, so it must run AFTER the save above or it
+                    // picks up the previous realtime_roots. Enabling is
+                    // unconditional — an explicit realtime_enabled=true from an
+                    // elevated caller IS the request to resume, and gating it on
+                    // !is_user_disabled() made re-enabling a no-op whenever the
+                    // same handler (or protection.disable) had set that flag.
+                    if let Some(v) = realtime_toggle {
+                        if v {
+                            state.enable_protection();
+                        } else {
+                            state.disable_protection();
+                        }
+                    }
                     Ok(serde_json::json!({"ok": true, "changes": changes}))
                 }
                 Err(e) => Ok(serde_json::json!({"ok": false, "error": e})),
@@ -3098,28 +3267,34 @@ fn dispatch_sync(
             // validate() keeps `enabled` only because the hash is provisioned.
             config.validate();
 
-            // Refresh the in-memory gate so telemetry reflects the change now.
-            state.load_developer_config(config.developer.clone());
-
-            state.log_activity(
-                "info",
-                "developer",
-                &format!(
-                    "Developer mode {} (telemetry {})",
-                    if config.developer.enabled { "enabled" } else { "disabled" },
-                    if config.developer.telemetry_enabled { "on" } else { "off" },
-                ),
-                "",
-                None,
-            );
-
             let path = crate::paths::paths().config_file();
             match config.save(&path) {
-                Ok(()) => Ok(serde_json::json!({
-                    "ok": true,
-                    "enabled": config.developer.enabled,
-                    "telemetry_enabled": config.developer.telemetry_enabled,
-                })),
+                Ok(()) => {
+                    // Refresh the in-memory gate so telemetry reflects the
+                    // change now. This runs AFTER the save, not before: a
+                    // failed save used to return {"ok": false} having already
+                    // flipped the runtime gate and logged the flip, so the
+                    // telemetry writer ran against a config.toml that still
+                    // said developer mode was off — and stayed that way until
+                    // the next daemon restart quietly turned it back.
+                    state.load_developer_config(config.developer.clone());
+                    state.log_activity(
+                        "info",
+                        "developer",
+                        &format!(
+                            "Developer mode {} (telemetry {})",
+                            if config.developer.enabled { "enabled" } else { "disabled" },
+                            if config.developer.telemetry_enabled { "on" } else { "off" },
+                        ),
+                        "",
+                        None,
+                    );
+                    Ok(serde_json::json!({
+                        "ok": true,
+                        "enabled": config.developer.enabled,
+                        "telemetry_enabled": config.developer.telemetry_enabled,
+                    }))
+                }
                 Err(e) => Ok(serde_json::json!({"ok": false, "error": e})),
             }
         }
@@ -3203,6 +3378,163 @@ fn ok_json<T: serde::Serialize>(val: T) -> Result<Value, (i32, String)> {
 #[cfg(test)]
 mod tests {
     use super::validate_local_scan_path;
+
+    // ── settings.set merge/pin helpers ─────────────────────
+
+    /// Read a dotted config path out of a serialized `Config`.
+    fn json_at<'a>(v: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+        let mut cur = v;
+        for seg in path.split('.') {
+            cur = cur.get(seg)?;
+        }
+        Some(cur)
+    }
+
+    /// Write a dotted config path into a params object, creating the
+    /// intermediate tables (`fish`, `scan`, …) as needed.
+    fn json_set(v: &mut serde_json::Value, path: &str, val: serde_json::Value) {
+        let segs: Vec<&str> = path.split('.').collect();
+        let mut cur = v;
+        for seg in &segs[..segs.len() - 1] {
+            let obj = cur.as_object_mut().expect("params node must be an object");
+            cur = obj
+                .entry((*seg).to_string())
+                .or_insert_with(|| serde_json::json!({}));
+        }
+        cur.as_object_mut()
+            .expect("params node must be an object")
+            .insert(segs[segs.len() - 1].to_string(), val);
+    }
+
+    /// A value of the same JSON shape that is guaranteed to DIFFER from `v`,
+    /// so "the pin held" is distinguishable from "the caller sent the value
+    /// it already had".
+    fn hostile(v: &serde_json::Value) -> serde_json::Value {
+        use serde_json::Value;
+        match v {
+            Value::Bool(b) => Value::Bool(!b),
+            Value::String(s) => Value::String(format!("{s}-tampered")),
+            Value::Array(a) => {
+                let mut out = a.clone();
+                out.push(Value::String("tampered".into()));
+                Value::Array(out)
+            }
+            Value::Number(n) => {
+                if let Some(u) = n.as_u64() {
+                    serde_json::json!(u + 1)
+                } else if let Some(i) = n.as_i64() {
+                    serde_json::json!(i + 1)
+                } else {
+                    serde_json::json!(n.as_f64().unwrap_or(0.0) + 1.0)
+                }
+            }
+            _ => Value::String("tampered".into()),
+        }
+    }
+
+    /// `Config` is `#[serde(default)]`, so deserializing the params object on
+    /// its own turns every OMITTED key into that key's Default. A caller that
+    /// only wanted to bump one scan limit used to silently revert ClamAV
+    /// isolation, the FISH active-response mode, the sandbox and the whole
+    /// [web_protection] section — none of which settings.set is allowed to
+    /// touch — and persist the result.
+    #[test]
+    fn settings_set_leaves_omitted_keys_alone() {
+        let mut current = crate::config::Config::default();
+        // Non-critical, deliberately non-default: only the merge preserves
+        // these; the pin list never mentions them.
+        current.log_level = "debug".into();
+        current.quarantine_retention_days = 30;
+        current.scan_archives = false;
+        // Critical, deliberately non-default.
+        current.clamav_isolation = "subprocess".into();
+        current.fish.observe_only = false;
+        current.fish.active_response = "terminate".into();
+        current.sandbox.enabled = true;
+        current.web_protection.enabled = true;
+        current.web_protection.blocklists = vec!["C:\\lists\\malware.txt|suffix".into()];
+
+        // The whole request: an envelope plus ONE non-critical knob.
+        let params = serde_json::json!({
+            "auth": "ipc-secret",
+            "token": "challenge",
+            "max_file_size_mb": 1024u64,
+        });
+
+        let merged = super::settings_set_merge(&current, &params).expect("merge must succeed");
+
+        // The one field the caller actually sent is applied.
+        assert_eq!(merged.max_file_size_mb, 1024);
+
+        // Everything omitted keeps its on-disk value.
+        assert_eq!(merged.log_level, "debug");
+        assert_eq!(merged.quarantine_retention_days, 30);
+        assert!(!merged.scan_archives);
+        assert_eq!(merged.clamav_isolation, "subprocess");
+        assert!(!merged.fish.observe_only);
+        assert_eq!(merged.fish.active_response, "terminate");
+        assert!(merged.sandbox.enabled);
+        assert!(merged.web_protection.enabled);
+        assert_eq!(
+            merged.web_protection.blocklists,
+            vec!["C:\\lists\\malware.txt|suffix".to_string()]
+        );
+    }
+
+    /// Regression guard for the pin list: walks `CRITICAL_FIELDS` and tries to
+    /// mutate every one of them through settings.set. Adding a field to
+    /// CRITICAL_FIELDS without pinning it here fails this test rather than
+    /// shipping an unelevated mutation path for a kill-vector knob.
+    #[test]
+    fn settings_set_pins_every_critical_field() {
+        use sentinella_ipc_proto::full_config::CRITICAL_FIELDS;
+
+        let current = crate::config::Config::default();
+        let current_json = serde_json::to_value(&current).expect("Config must serialize");
+
+        let mut params = serde_json::json!({"auth": "ipc-secret", "token": "challenge"});
+        for path in CRITICAL_FIELDS {
+            let cur = json_at(&current_json, path)
+                .unwrap_or_else(|| panic!("{path} is not a real Config field path"));
+            json_set(&mut params, path, hostile(cur));
+        }
+
+        let merged = super::settings_set_merge(&current, &params).expect("merge must succeed");
+        let merged_json = serde_json::to_value(&merged).expect("Config must serialize");
+
+        for path in CRITICAL_FIELDS {
+            assert_eq!(
+                json_at(&merged_json, path),
+                json_at(&current_json, path),
+                "settings.set must not mutate critical field {path} \
+                 (protection.set_critical is the elevated path for it)"
+            );
+        }
+    }
+
+    /// [web_protection] is absent from `FullConfig`, so settings.set_full
+    /// cannot reach it and `critical_diff` never sees it. That makes
+    /// settings.set the only IPC surface that could turn DNS filtering off —
+    /// it must not be one.
+    #[test]
+    fn settings_set_cannot_disable_web_protection() {
+        let mut current = crate::config::Config::default();
+        current.web_protection.enabled = true;
+        current.web_protection.allowlist = vec![".corp.example.com".into()];
+
+        let params = serde_json::json!({
+            "auth": "ipc-secret",
+            "token": "challenge",
+            "web_protection": { "enabled": false, "allowlist": [], "blocklists": [] },
+        });
+
+        let merged = super::settings_set_merge(&current, &params).expect("merge must succeed");
+        assert!(merged.web_protection.enabled);
+        assert_eq!(
+            merged.web_protection.allowlist,
+            vec![".corp.example.com".to_string()]
+        );
+    }
 
     // ☠️ R8-LETHAL regression: every path-accepting IPC method (scan.start,
     // argus.analyze) routes through validate_local_scan_path. A miss here

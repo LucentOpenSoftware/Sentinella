@@ -1,5 +1,53 @@
 # Changelog
 
+## [0.1.13] - 2026-08-02
+
+### Web protection (new)
+
+Sentinella can now block malicious domains at the DNS layer, before a
+connection is ever made. A local DNS proxy (`dnsguard`) answers on
+127.0.0.1:53, and Windows is pointed at it through an NRPT rule.
+
+The design constraint that shaped everything here: **under any
+uncertainty the system degrades to "no filtering", never to "no DNS".**
+A machine that cannot resolve names is broken in a way that a machine
+without domain blocking is not.
+
+- **The reconciler owns NRPT state, not the daemon.** `sentinelld`
+  installs the rule only after a four-step self-test proves its own
+  proxy answers correctly. A separate out-of-process boot task
+  (`sentinella-dnsreconcile`) removes the rule whenever the proxy is not
+  provably answering — so a daemon that dies, hangs, or is killed
+  mid-flight cannot leave the machine pointed at a dead resolver.
+- **Two states, deliberately not synonyms:** `web_protection.enabled` is
+  user intent (config); `nrpt_installed` is a runtime fact read back
+  from the registry. Code that conflates them cannot distinguish "off"
+  from "unknown".
+- **The rule GUID is recorded before the rule is written**, so a missing
+  GUID file proves the rule was never created, rather than leaving an
+  orphan nothing knows how to find.
+- Upstream resolvers are discovered from the live adapters
+  (`GetAdaptersAddresses`), never hardcoded to a public resolver.
+- A watchdog re-proves liveness every 20 s and distinguishes *busy* from
+  *dead* — an overloaded proxy that is still shedding load is not torn
+  down.
+- Installer integration: the NSIS hooks register the reconciler task on
+  install and, on uninstall, remove the rule *before* deleting the
+  binary that knows how to remove it — aborting the uninstall with a
+  message if that fails, rather than stranding the rule.
+
+### Fixed
+
+- **A failed signature update no longer interrupts you.** A freshclam
+  timeout used to raise a "Signature update failed" toast. The updater
+  now retries transient failures (3 attempts, 30 s / 2 min backoff) and
+  otherwise waits for the next scheduled cycle in silence. You are
+  notified only once the signatures are genuinely old — 14 days by
+  default, configurable under Settings → Updates. A fetch that failed is
+  operational noise; signature age is the only fact you can act on.
+  Failed attempts are still recorded in the activity log, and a manual
+  update you started still reports its error immediately.
+
 ## [Unreleased] - 2026-07-30
 
 Full implementation/reconstruction round following the v0.1.12 external

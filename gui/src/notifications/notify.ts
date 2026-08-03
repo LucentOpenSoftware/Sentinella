@@ -13,7 +13,7 @@ import { sendNotification, isPermissionGranted, requestPermission } from "@tauri
 import { loadNotificationSettings, meetsMinSeverity, type NotificationSeverity } from "./settings";
 import { dedupeCheck, stormControlled } from "./dedupe";
 import { recordNotification } from "./history";
-import { t } from "../i18n";
+import { t, tf } from "../i18n";
 
 // ── Permission ────────────────────────────────────────────────
 
@@ -118,18 +118,52 @@ export function notifyScanComplete(threats: number, filesScanned: number, scanTy
   const dedupeKey = `scan_complete:${scanType}:${threats}`;
   if (!dedupeCheck(dedupeKey, 60_000)) return; // 1-min cooldown for scan completion
 
-  const label = scanType === "quick" ? "Quick scan" : scanType === "full" ? "Full scan" : "Scan";
-  send(`${label} complete`, `${threats} threat${threats > 1 ? "s" : ""} found in ${filesScanned.toLocaleString()} files.`);
-  recordNotification("scan_complete", `${label} complete — ${threats} threats`);
+  // Every other toast here goes through the locale table; this one was built
+  // from English literals, so a Chinese user got an English toast in an
+  // otherwise Chinese app. The two keys below are not in the locale files yet
+  // — tf() keeps today's English text and picks up the translations the
+  // instant they land. `{threats}` carries its own plural form per locale, so
+  // no English "s" is appended.
+  // Callers pass "scan" when the daemon reported no type; "quick" → "Quick".
+  const label = scanType === "scan" || !scanType
+    ? ""
+    : scanType.charAt(0).toUpperCase() + scanType.slice(1);
+  const title = tf("notify.scan_complete", "{type} scan complete")
+    .replace("{type}", label)
+    .trim();
+  const body = tf("notify.body_scan_complete", "{threats} threat(s) found in {files} files.")
+    .replace("{threats}", String(threats))
+    .replace("{files}", filesScanned.toLocaleString());
+  send(title, body);
+  recordNotification("scan_complete", `${title} — ${body}`);
 }
 
-/** Signature update failed. */
-export function notifyUpdateFailed(reason: string): void {
+/**
+ * Signatures are old enough to be worth interrupting the user.
+ *
+ * This REPLACED a notification that fired whenever a freshclam run failed.
+ * That was the wrong event: a single failed fetch is transient (slow mirror,
+ * Wi-Fi drop, machine suspended mid-download), the updater now retries it,
+ * and the next scheduled cycle is hours away at most — so the user was being
+ * interrupted about something that had already fixed itself, with no action
+ * available to them. Signature AGE is the fact they can actually act on, and
+ * the daemon only sets `db_stale_notify` once it crosses
+ * `signature_stale_notify_days` (default 14). Failed attempts are still
+ * recorded in the activity log for diagnosis; they just no longer shout.
+ *
+ * Kept on the `onUpdateFailure` gate: it is the same user preference
+ * ("tell me about signature update problems"), now attached to the event
+ * that deserves it, so anyone who had already switched it off stays quiet.
+ */
+export function notifySignaturesStale(days: number): void {
   if (!shouldNotify("onUpdateFailure", "warning")) return;
-  if (!dedupeCheck("update_failed")) return;
+  // 24h cooldown: while the condition persists this could otherwise re-fire
+  // on the transition guard after any daemon reconnect.
+  if (!dedupeCheck("signatures_stale", 24 * 60 * 60 * 1000)) return;
 
-  send(t("notify.update_failed"), `${t("notify.update_failed")}: ${reason}`);
-  recordNotification("update_failed", t("notify.update_failed"));
+  const title = t("notify.signatures_stale");
+  send(title, t("notify.signatures_stale_body").replace("{n}", String(days)));
+  recordNotification("signatures_stale", title);
 }
 
 /** Protection state degraded or unavailable. */
@@ -155,7 +189,15 @@ export function notifyFirstRunUpdateComplete(sigCount: number): void {
   if (!loadNotificationSettings().enabled) return;
   if (!dedupeCheck("first_run_complete")) return;
 
-  send(t("notify.ready"), `${sigCount.toLocaleString()} signatures loaded.`);
+  // Title was translated, body was an English literal. notify.body_ready is
+  // not in the locale files yet — see notifyScanComplete for the same pattern.
+  send(
+    t("notify.ready"),
+    tf("notify.body_ready", "{count} signatures loaded.").replace(
+      "{count}",
+      sigCount.toLocaleString(),
+    ),
+  );
   recordNotification("first_run_complete", t("notify.ready"));
 }
 

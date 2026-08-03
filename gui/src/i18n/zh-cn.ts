@@ -3,7 +3,6 @@ export const zh_cn: Record<string, string> = {
   // ── 应用 / 全局 ────────────────────────────────────
   "app.name": "Sentinella",
   "app.subtitle": "杀毒套件",
-  "app.version": "v0.1.12",
 
   // ── 侧边栏 ─────────────────────────────────────────
   "nav.dashboard": "仪表板",
@@ -26,7 +25,6 @@ export const zh_cn: Record<string, string> = {
   "meta.notifications_sub": "警报历史",
   "meta.update_sub": "病毒特征库",
   "meta.settings_sub": "配置 Sentinella",
-  "meta.about_sub": "Sentinella v0.1.12",
 
   // ── 仪表板 ───────────────────────────────────────
   "dash.protected": "系统已受保护",
@@ -362,7 +360,8 @@ export const zh_cn: Record<string, string> = {
   "notify.file_quarantined": "文件已隔离",
   "notify.files_quarantined": "多个文件已隔离",
   "notify.quarantine_failed": "隔离失败",
-  "notify.update_failed": "特征码更新失败",
+  "notify.signatures_stale": "特征码已过期",
+  "notify.signatures_stale_body": "您的病毒特征码已有 {n} 天。Sentinella 未能完成更新。",
   "notify.protection_degraded": "防护已降级",
   "notify.realtime_unavailable": "实时防护不可用",
   "notify.ready": "Sentinella 已就绪",

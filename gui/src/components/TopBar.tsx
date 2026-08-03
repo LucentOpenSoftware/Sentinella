@@ -5,10 +5,12 @@ import { t } from "../i18n";
 /** Max notices displayed simultaneously in the TopBar. */
 const MAX_NOTICES = 3;
 
-export function TopBar({ title, subtitle, connected, onRefresh, onNotifications, notices }: {
+export function TopBar({ title, subtitle, connected, starting, onRefresh, onNotifications, notices }: {
   title: string;
   subtitle?: string;
   connected: boolean;
+  /** Service alive, pipe not up yet - show "Starting", not "Disconnected". */
+  starting?: boolean;
   onRefresh?: () => void;
   onNotifications?: () => void;
   notices?: React.ReactNode[];
@@ -38,7 +40,7 @@ export function TopBar({ title, subtitle, connected, onRefresh, onNotifications,
             <Bell size={15} />
           </button>
           <div className="h-5 w-px bg-[rgb(var(--border))]/15" />
-          <StatusBadge status={connected ? "connected" : "disconnected"} />
+          <StatusBadge status={connected ? "connected" : starting ? "starting" : "disconnected"} />
         </div>
       </div>
     </header>

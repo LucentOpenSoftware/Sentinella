@@ -361,10 +361,21 @@ pub struct AppState {
     argus_worker_timeout_count: AtomicU64,
     argus_worker_last_error: Mutex<Option<String>>,
     argus_worker_last_timeout: Mutex<Option<String>>,
-    orchestrator_file_scan_enabled: bool,
-    orchestrator_folder_scan_enabled: bool,
-    orchestrator_quick_scan_enabled: bool,
-    orchestrator_full_scan_enabled: bool,
+    /// Per-scan-type orchestrator routing, consulted by `start_scan`.
+    ///
+    /// ATOMIC, not plain bools, for the same reason as the staleness
+    /// thresholds below: `restart_requirement()` classifies all four as
+    /// hot-applied, so the GUI shows no restart pill when they change.
+    /// Cached at construction they kept their boot values, so a user who
+    /// turned `orchestrator_full_scan_enabled` off to escape a stuck
+    /// orchestrator queue was routed through it anyway — and
+    /// `orchestrator_diagnostics()` reported the stale value back, agreeing
+    /// with the wrong behaviour instead of exposing it.
+    /// `refresh_scan_routing` is what makes "hot-applied" true.
+    orchestrator_file_scan_enabled: AtomicBool,
+    orchestrator_folder_scan_enabled: AtomicBool,
+    orchestrator_quick_scan_enabled: AtomicBool,
+    orchestrator_full_scan_enabled: AtomicBool,
     last_orchestrated_job: Mutex<Option<OrchestratedJobResult>>,
     orchestrated_completed_file: AtomicU64,
     orchestrated_completed_folder: AtomicU64,
@@ -392,7 +403,16 @@ pub struct AppState {
     protection_toggle_lock: std::sync::Mutex<()>,
     // ── FISH (File Integrity Shield) ─────────────────
     fish_window: std::sync::Mutex<crate::fish::MutationWindow>,
-    fish_config: crate::fish::FishConfig,
+    /// Live FISH config — the one `fish_diagnostics()` reports and therefore
+    /// the one `fish_handle_burst` uses to choose observe vs suspend/terminate.
+    ///
+    /// RwLock, not a plain field. As a plain field it was written once at
+    /// construction and never again, so `observe_only`/`active_response`
+    /// stayed at their defaults (`true` / `"observe"`) for the life of the
+    /// process: the UAC-gated "terminate" setting saved, reported success,
+    /// and did nothing while ransomware encrypted. Reads happen per burst
+    /// and per status poll; the write happens per config load.
+    fish_config: std::sync::RwLock<crate::fish::FishConfig>,
     // ── Footprint baselines ──────────────────────────
     footprint_baselines: crate::footprint::FootprintBaselines,
     // ── Memory pressure ──────────────────────────────
@@ -401,6 +421,13 @@ pub struct AppState {
     /// Developer-mode state (gates local perf telemetry). Mutable at runtime via
     /// `load_developer_config` when the mode is toggled.
     developer_config: std::sync::Mutex<crate::config::DeveloperConfig>,
+    /// Web-protection read handle, published by `run_daemon` once the
+    /// subsystem has started (or refused). `None` until then, and `None`
+    /// forever when the feature is off. RwLock because reads (status
+    /// polls) massively outnumber the single write.
+    web_protection: std::sync::RwLock<
+        Option<std::sync::Arc<crate::web_protection::WebProtectionHandle>>,
+    >,
     /// v0.1.9 Phase 2 (audit MED-6): serialises every config load→mutate→save
     /// sequence so two concurrent IPC handlers (e.g. settings.set_full racing
     /// dev.set_developer_mode) can't clobber each other's changes via
@@ -424,7 +451,19 @@ pub struct AppState {
     gui_fullscreen_active: AtomicBool,
     gui_fullscreen_ts: AtomicI64,
     /// Signature-staleness warning threshold (hours), from config.signature_stale_days.
-    signature_stale_hours: u64,
+    ///
+    /// ATOMIC, not a plain field. `restart_requirement()` classifies both
+    /// staleness thresholds as hot-applied, so the GUI shows no restart pill
+    /// — but `settings.set_full` only writes the TOML, it pushes nothing back
+    /// into AppState. Cached at construction these kept their boot values
+    /// until the daemon restarted, making that "no restart needed" a promise
+    /// the daemon did not keep. `refresh_staleness_thresholds` makes it true.
+    signature_stale_hours: AtomicU64,
+    /// Threshold (hours) at which staleness becomes worth INTERRUPTING the
+    /// user, from config.signature_stale_notify_days. Much larger than
+    /// `signature_stale_hours` — see that config field for why a failed fetch
+    /// is not itself notification-worthy.
+    signature_stale_notify_hours: AtomicU64,
     // ── ClamAV isolation config (cached) ───────────────
     clamav_subprocess_enabled: AtomicBool,
     clamav_worker_timeout_sec: AtomicU64,
@@ -512,6 +551,15 @@ struct Inner {
     update_current_file: String,
     last_update_timestamp: Option<i64>,
     last_update_error: Option<String>,
+    /// Should `last_update_error` be surfaced as `UpdateState::Error`?
+    ///
+    /// Only for updates the USER started. They pressed a button and are
+    /// watching; silence would read as a hung UI. A SCHEDULED update that
+    /// fails is recorded (activity log + `last_update_error` for diagnostics)
+    /// but stays `Idle`, because the user is not watching and the next cycle
+    /// is at most `update_interval_hours` away. What eventually interrupts
+    /// them is `db_stale_notify` — signature age, not a failed fetch.
+    last_update_error_notifiable: bool,
 }
 
 /// Aggregate scan performance summary.
@@ -669,6 +717,21 @@ fn compute_db_stale(effective_ts: Option<i64>, now_ts: i64, threshold_hours: u64
     }
 }
 
+/// Should the user be INTERRUPTED about signature age?
+///
+/// Split out of `runtime_stats` so the no-timestamp guard is reachable from a
+/// test. `compute_db_stale` answers `(true, 0)` when it has no timestamp,
+/// which means "unknown age", NOT "old" — firing a notification on that would
+/// shout at every user whose signature mtimes were briefly unreadable at boot.
+/// Uses the same `effective_ts` as the 3-day UI threshold, so the two can
+/// never disagree about how old the database is.
+fn compute_db_stale_notify(effective_ts: Option<i64>, now_ts: i64, threshold_hours: u64) -> bool {
+    match effective_ts {
+        Some(_) => compute_db_stale(effective_ts, now_ts, threshold_hours).0,
+        None => false,
+    }
+}
+
 /// Extract the actionable reason from freshclam output for the activity log.
 /// freshclam's real error (DNS failure, dead mirror, permission/tempdir issue)
 /// is on the LAST non-empty line(s); the head is banner + progress noise. The
@@ -687,6 +750,28 @@ fn freshclam_error_detail(message: &str) -> String {
     }
     let joined = tail.into_iter().rev().collect::<Vec<_>>().join(" | ");
     joined.chars().take(300).collect()
+}
+
+/// Did a freshclam run that exited 0 actually try to fetch anything?
+///
+/// `fc_update_databases` takes a cool-down branch when a previous run got a
+/// 403 (region/IP block) or 429 (rate limit) from the ClamAV CDN: it prints the
+/// retry-after date, downloads NOTHING, sets `FC_SUCCESS` and exits 0. The
+/// in-run 429 path does the same (`goto success`). Counting those as a
+/// successful update stamps `last_update_timestamp = now`, and because
+/// `runtime_stats` takes the max of that stamp and the signature file mtimes,
+/// the stamp always wins — so the signature-age card, the product's one
+/// user-facing staleness signal, could never fire again for the life of the
+/// process. A machine blocked by the CDN for weeks showed a green "Up to date".
+fn freshclam_output_is_cooldown(message: &str) -> bool {
+    // Matches both "You are on cool-down until after: <date>" (this run hit
+    // the limit) and "You are still on cool-down until after: <date>" (an
+    // earlier run did and freshclam.dat's retry_after has not expired).
+    // Deliberately NOT the bare word "cool-down": freshclam also logs
+    // "Cool-down expired, ok to try again." immediately before a real fetch.
+    message
+        .to_ascii_lowercase()
+        .contains("cool-down until after")
 }
 
 fn reserve_active_scan(inner: &mut Inner, job: ScanJob) -> Result<(), ScanStartResponse> {
@@ -986,10 +1071,18 @@ impl AppState {
             argus_worker_timeout_count: AtomicU64::new(0),
             argus_worker_last_error: Mutex::new(None),
             argus_worker_last_timeout: Mutex::new(None),
-            orchestrator_file_scan_enabled: daemon_config.scan.orchestrator_file_scan_enabled,
-            orchestrator_folder_scan_enabled: daemon_config.scan.orchestrator_folder_scan_enabled,
-            orchestrator_quick_scan_enabled: daemon_config.scan.orchestrator_quick_scan_enabled,
-            orchestrator_full_scan_enabled: daemon_config.scan.orchestrator_full_scan_enabled,
+            orchestrator_file_scan_enabled: AtomicBool::new(
+                daemon_config.scan.orchestrator_file_scan_enabled,
+            ),
+            orchestrator_folder_scan_enabled: AtomicBool::new(
+                daemon_config.scan.orchestrator_folder_scan_enabled,
+            ),
+            orchestrator_quick_scan_enabled: AtomicBool::new(
+                daemon_config.scan.orchestrator_quick_scan_enabled,
+            ),
+            orchestrator_full_scan_enabled: AtomicBool::new(
+                daemon_config.scan.orchestrator_full_scan_enabled,
+            ),
             last_orchestrated_job: Mutex::new(None),
             orchestrated_completed_file: AtomicU64::new(0),
             orchestrated_completed_folder: AtomicU64::new(0),
@@ -1005,9 +1098,14 @@ impl AppState {
             user_disabled_protection: std::sync::atomic::AtomicBool::new(false),
             protection_disabled_at: AtomicU64::new(0),
             protection_toggle_lock: std::sync::Mutex::new(()),
-            fish_config: crate::fish::FishConfig::default(),
+            // Seed from the on-disk config, not `FishConfig::default()`:
+            // `Config::load` already validated it, and starting from the
+            // defaults meant the window and the diagnostics disagreed with
+            // the user's settings for the whole window between construction
+            // and `load_fish_config`.
+            fish_config: std::sync::RwLock::new(daemon_config.fish.clone()),
             fish_window: std::sync::Mutex::new(crate::fish::MutationWindow::new(
-                &crate::fish::FishConfig::default(),
+                &daemon_config.fish,
             )),
             footprint_baselines: crate::footprint::FootprintBaselines::new(),
             pressure_tracker: crate::footprint::pressure::PressureTracker::new(),
@@ -1052,16 +1150,26 @@ impl AppState {
             config_write_lock: std::sync::Mutex::new(()),
             gui_fullscreen_active: AtomicBool::new(false),
             gui_fullscreen_ts: AtomicI64::new(0),
+            web_protection: std::sync::RwLock::new(None),
             developer_config: std::sync::Mutex::new(
                 crate::config::Config::load(None)
                     .map(|c| c.developer)
                     .unwrap_or_default(),
             ),
-            signature_stale_hours: crate::config::Config::load(None)
-                .map(|c| c.signature_stale_days)
-                .unwrap_or(3)
-                .clamp(1, 30) as u64
-                * 24,
+            signature_stale_hours: AtomicU64::new(
+                crate::config::Config::load(None)
+                    .map(|c| c.signature_stale_days)
+                    .unwrap_or(3)
+                    .clamp(1, 30) as u64
+                    * 24,
+            ),
+            signature_stale_notify_hours: AtomicU64::new(
+                crate::config::Config::load(None)
+                    .map(|c| c.signature_stale_notify_days)
+                    .unwrap_or(14)
+                    .clamp(3, 365) as u64
+                    * 24,
+            ),
             clamav_subprocess_enabled: AtomicBool::new(false),
             clamav_worker_timeout_sec: AtomicU64::new(30),
             excluded_detections: std::sync::Mutex::new(Vec::new()),
@@ -1114,6 +1222,7 @@ impl AppState {
                 update_current_file: String::new(),
                 last_update_timestamp: None,
                 last_update_error: None,
+                last_update_error_notifiable: false,
             }),
         }
     }
@@ -1453,10 +1562,10 @@ impl AppState {
         };
 
         serde_json::json!({
-            "enabled_file_scan": self.orchestrator_file_scan_enabled,
-            "enabled_folder_scan": self.orchestrator_folder_scan_enabled,
-            "enabled_quick_scan": self.orchestrator_quick_scan_enabled,
-            "enabled_full_scan": self.orchestrator_full_scan_enabled,
+            "enabled_file_scan": self.orchestrator_file_scan_enabled.load(Ordering::Relaxed),
+            "enabled_folder_scan": self.orchestrator_folder_scan_enabled.load(Ordering::Relaxed),
+            "enabled_quick_scan": self.orchestrator_quick_scan_enabled.load(Ordering::Relaxed),
+            "enabled_full_scan": self.orchestrator_full_scan_enabled.load(Ordering::Relaxed),
             "state": state,
             "last_orchestrated_job": last_orchestrated_job,
             "manual_queue_depth": manual_queue_depth,
@@ -1749,10 +1858,35 @@ impl AppState {
         crate::devmode::telemetry::record(&dev, &rec);
     }
 
+    /// Publish the web-protection read handle for the IPC layer.
+    ///
+    /// A slot rather than a constructor argument because the subsystem
+    /// starts AFTER `AppState` exists, and an `RwLock` rather than a plain
+    /// field because a plain field could only ever hold its construction-time
+    /// value — which for a handle published later means `webprotection.status`
+    /// answering `disabled()` forever. Called from `run_daemon`; if that call
+    /// is ever dropped, the status surface goes permanently dark, so this
+    /// deliberately carries no `#[allow(dead_code)]` — let the compiler say so.
+    pub fn set_web_protection(&self, handle: std::sync::Arc<crate::web_protection::WebProtectionHandle>) {
+        *self
+            .web_protection
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(handle);
+    }
+
+    /// Current web-protection status, or the disabled shape when the
+    /// subsystem never started.
+    pub fn web_protection_status(&self) -> crate::web_protection::WebProtectionStatus {
+        self.web_protection
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|h| h.status())
+            .unwrap_or_else(crate::web_protection::WebProtectionStatus::disabled)
+    }
+
     /// Replace the cached developer-mode config (called when the mode is toggled
     /// at runtime so telemetry gating reflects the new state immediately).
-    /// Wired by the forthcoming `dev.set_developer_mode` IPC (B2).
-    #[allow(dead_code)]
     pub fn load_developer_config(&self, dev: crate::config::DeveloperConfig) {
         *self
             .developer_config
@@ -1966,19 +2100,19 @@ impl AppState {
         self.activity_tracker.record_manual_scan();
 
         match scan_type {
-            "file" if self.orchestrator_file_scan_enabled => {
+            "file" if self.orchestrator_file_scan_enabled.load(Ordering::Relaxed) => {
                 self.start_orchestrated_file_scan(engine, target)
             }
             "file" => self.scan_single_file(&engine, target),
-            "quick" if self.orchestrator_quick_scan_enabled => {
+            "quick" if self.orchestrator_quick_scan_enabled.load(Ordering::Relaxed) => {
                 self.start_orchestrated_quick_scan(engine)
             }
             "quick" => self.start_quick_scan(engine),
-            "folder" if self.orchestrator_folder_scan_enabled => {
+            "folder" if self.orchestrator_folder_scan_enabled.load(Ordering::Relaxed) => {
                 self.start_orchestrated_folder_scan(engine, target)
             }
             "folder" => self.start_folder_scan(engine, target),
-            "full" if self.orchestrator_full_scan_enabled => {
+            "full" if self.orchestrator_full_scan_enabled.load(Ordering::Relaxed) => {
                 self.start_orchestrated_full_scan(engine)
             }
             "full" => self.start_full_scan(engine),
@@ -4135,8 +4269,14 @@ impl AppState {
             }
         } else {
             match &inner.last_update_error {
-                Some(_) => (UpdateState::Error, None, String::new()),
-                None => (UpdateState::Idle, None, String::new()),
+                // A background failure is deliberately reported as Idle — see
+                // `last_update_error_notifiable`. `last_error` below is still
+                // populated either way, so the detail stays available for
+                // diagnostics without the UI treating it as an alert.
+                Some(_) if inner.last_update_error_notifiable => {
+                    (UpdateState::Error, None, String::new())
+                }
+                _ => (UpdateState::Idle, None, String::new()),
             }
         };
 
@@ -4154,9 +4294,31 @@ impl AppState {
         }
     }
 
+    /// Re-read both staleness thresholds from a freshly-saved config.
+    ///
+    /// Call after every write that can change them. Both are classified as
+    /// hot-applied by `restart_requirement()`, so the GUI promises the change
+    /// takes effect immediately; without this the daemon kept its boot values
+    /// and the promise was false. Clamps mirror `Config::validate` so a config
+    /// written by something other than `settings.set_full` cannot install an
+    /// out-of-range threshold here.
+    pub fn refresh_staleness_thresholds(&self, cfg: &crate::config::Config) {
+        self.signature_stale_hours.store(
+            cfg.signature_stale_days.clamp(1, 30) as u64 * 24,
+            Ordering::Relaxed,
+        );
+        self.signature_stale_notify_hours.store(
+            cfg.signature_stale_notify_days.clamp(3, 365) as u64 * 24,
+            Ordering::Relaxed,
+        );
+    }
+
     /// Start a signature update in the background.
     /// Returns immediately so the IPC handler is NOT blocked.
-    pub fn start_update(self: &Arc<Self>) -> serde_json::Value {
+    ///
+    /// `manual` = the user pressed Update. It controls only whether a FAILURE
+    /// is surfaced as `UpdateState::Error`; see `last_update_error_notifiable`.
+    pub fn start_update(self: &Arc<Self>, manual: bool) -> serde_json::Value {
         // Record update activity — blocks quiet re-trim.
         self.activity_tracker.record_update();
 
@@ -4164,10 +4326,19 @@ impl AppState {
         {
             let mut inner = self.lock_inner();
             if inner.update_running {
+                // The user pressed Update while a SCHEDULED run was already in
+                // flight. They are now watching that run, so adopt their
+                // intent: if it fails they must see why, rather than having
+                // their press silently inherit the background run's silence.
+                // The window this covers is up to a full cycle wide.
+                if manual {
+                    inner.last_update_error_notifiable = true;
+                }
                 return serde_json::json!({"ok": false, "error": "Update already in progress"});
             }
             inner.update_running = true;
             inner.last_update_error = None;
+            inner.last_update_error_notifiable = false;
         }
 
         self.log_activity(
@@ -4204,9 +4375,24 @@ impl AppState {
                 } else {
                     "freshclam.conf not found"
                 };
-                let mut inner = self.lock_inner();
-                inner.update_running = false;
-                inner.last_update_error = Some(msg.to_string());
+                {
+                    let mut inner = self.lock_inner();
+                    inner.update_running = false;
+                    inner.last_update_error = Some(msg.to_string());
+                    // |= not =: a manual press that arrived mid-run adopted
+                    // this cycle by setting the flag true. Assigning would
+                    // clobber that back to false and re-silence the failure
+                    // they are watching.
+                    inner.last_update_error_notifiable |= manual;
+                }
+                // SCOPE IS LOAD-BEARING. `inner` is a std::sync::Mutex guard
+                // and std mutexes are NOT reentrant; log_activity takes the
+                // same lock. Calling it inside the guard's scope self-
+                // deadlocked this thread with the daemon's central lock held
+                // forever — every later IPC request would block on it too.
+                // Reached whenever freshclam.exe is missing (another AV
+                // quarantined it, a partial install), so the daemon hung on
+                // the first update attempt rather than reporting the problem.
                 self.log_activity("warning", "update", "Update failed", msg, None);
                 return serde_json::json!({"ok": false, "error": msg});
             }
@@ -4240,7 +4426,7 @@ impl AppState {
             }
 
             // Phase 2: Run freshclam with real-time output parsing.
-            let (success, message) = crate::updater::run_freshclam_with_progress(
+            let (success, message) = crate::updater::run_freshclam_with_retry(
                 &fc_path,
                 &config_path,
                 &db_dir,
@@ -4265,7 +4451,13 @@ impl AppState {
                 },
             );
 
-            if success {
+            // Exit code 0 is not the same thing as "signatures were fetched":
+            // a CDN cool-down run downloads nothing and still exits 0. Split
+            // that case out BEFORE anything stamps freshness — see
+            // `freshclam_output_is_cooldown`.
+            let cooldown = success && freshclam_output_is_cooldown(&message);
+
+            if success && !cooldown {
                 // Phase 3: Reload ClamAV engine.
                 {
                     let mut inner = state.lock_inner();
@@ -4325,6 +4517,33 @@ impl AppState {
                     let mut inner = state.lock_inner();
                     inner.update_phase = UpdatePhase::Completed;
                 }
+            } else if cooldown {
+                // Nothing was downloaded, so nothing was reloaded and — the
+                // point of this branch — `last_update_timestamp` is left
+                // alone, so `runtime_stats` keeps ageing the DB off the real
+                // signature file mtimes and the staleness card still fires.
+                // The retry-after date is on the LAST warning line, which is
+                // exactly what `freshclam_error_detail` surfaces.
+                let detail = freshclam_error_detail(&message);
+                let mut inner = state.lock_inner();
+                inner.last_update_error = Some(detail.clone());
+                // Same rule as the failure branch: a background cool-down is
+                // not worth interrupting anyone over (there is nothing to do
+                // but wait), but a user who just pressed Update must be told
+                // why nothing happened instead of seeing a silent no-op.
+                inner.last_update_error_notifiable |= manual;
+                drop(inner);
+                tracing::warn!(
+                    detail = detail.as_str(),
+                    "signature update skipped — ClamAV CDN cool-down (403/429)"
+                );
+                state.log_activity(
+                    "warning",
+                    "update",
+                    "Signature update skipped — ClamAV CDN cool-down",
+                    &detail,
+                    None,
+                );
             } else {
                 // Surface the ACTIONABLE tail (exit code is already prefixed by
                 // run_freshclam; the reason is on the last stderr line) so a
@@ -4333,6 +4552,10 @@ impl AppState {
                 let detail = freshclam_error_detail(&message);
                 let mut inner = state.lock_inner();
                 inner.last_update_error = Some(detail.clone());
+                // |= not =: a manual press that arrived mid-run adopted this
+                // cycle by setting the flag true. Assigning would clobber that
+                // back to false and re-silence the failure they are watching.
+                inner.last_update_error_notifiable |= manual;
                 drop(inner);
                 tracing::warn!(detail = detail.as_str(), "signature update failed");
                 state.log_activity(
@@ -4417,7 +4640,11 @@ impl AppState {
         .flatten()
         .max();
         let (db_stale_raw, db_stale_hours) =
-            compute_db_stale(effective_ts, now_ts, self.signature_stale_hours);
+            compute_db_stale(
+                effective_ts,
+                now_ts,
+                self.signature_stale_hours.load(Ordering::Relaxed),
+            );
         // v0.1.8 bug fix: compute_db_stale returns (true, 0) when
         // effective_ts is None — i.e. no in-RAM `last_update_timestamp`
         // AND no readable signature file mtime. This wrongly fired
@@ -4434,14 +4661,14 @@ impl AppState {
         } else {
             db_stale_raw
         };
+        let db_stale_notify = compute_db_stale_notify(
+            effective_ts,
+            now_ts,
+            self.signature_stale_notify_hours.load(Ordering::Relaxed),
+        );
 
         // Watcher status.
-        let watcher_active = self
-            .watcher
-            .lock()
-            .ok()
-            .and_then(|g| g.as_ref().map(|w| w.is_running()))
-            .unwrap_or(false);
+        let watcher_active = self.watcher_is_live();
 
         // Quarantine count from DB.
         let q_count = {
@@ -4467,6 +4694,7 @@ impl AppState {
             signature_count: self.signature_count.load(Ordering::Relaxed),
             db_stale,
             db_stale_hours,
+            db_stale_notify,
             watcher_active,
             last_update_timestamp: inner.last_update_timestamp,
             total_files_scanned: inner.scan_history.iter().map(|s| s.files_scanned).sum(),
@@ -4558,6 +4786,23 @@ impl AppState {
             .last_recovery_reason
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(format!("worker timeout: {reason}"));
+    }
+
+    /// Is a real-time watcher installed and not torn down?
+    ///
+    /// `false` covers both "never started / stopped" (empty slot) and
+    /// "stop requested or dropped" (`running` cleared). It does NOT prove the
+    /// watcher thread is still pumping events — that needs a liveness tick
+    /// from the loop itself; see `spawn_watcher_heartbeat_monitor`.
+    /// A poisoned lock reads as not-live, which is the fail-loud answer:
+    /// `runtime_stats` reports protection as down rather than claiming
+    /// coverage it cannot verify.
+    fn watcher_is_live(&self) -> bool {
+        self.watcher
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|w| w.is_running()))
+            .unwrap_or(false)
     }
 
     /// Update watcher heartbeat.
@@ -4780,10 +5025,25 @@ impl AppState {
         self.config_drift.load(Ordering::Relaxed)
     }
 
-    /// Background heartbeat checker: if the watcher's last heartbeat is older
-    /// than 60s while realtime protection is supposed to be on, respawn it.
+    /// Background watchdog: while realtime protection is supposed to be on,
+    /// respawn the watcher whenever it is no longer installed and running.
     /// Uses `protection_toggle_lock` so a concurrent user pause/resume cannot
     /// race the restart. Spawned once from `main.rs` after the watcher starts.
+    ///
+    /// It deliberately does NOT restart on a stale `watcher_last_heartbeat`.
+    /// That heartbeat is touched from the debounce flush, which only runs when
+    /// filesystem events were actually queued, so "stale" means "the disk was
+    /// quiet", not "the watcher stalled". Restarting on age alone tore down and
+    /// rebuilt every `ReadDirectoryChangesW` registration roughly every 80 s on
+    /// an idle or locked machine, threw away the watcher's realtime dedup cache
+    /// each time, and inflated `watcher_restarts_total` — which `health`
+    /// surfaces as a tamper signal — until it meant nothing.
+    ///
+    /// The residual gap: a watcher thread that panics or wedges leaves
+    /// `is_running()` true, so this cannot see it. Closing that needs the
+    /// watcher loop to tick the heartbeat once per iteration (it wakes on a
+    /// recv timeout regardless of traffic); only then does heartbeat age
+    /// become a liveness signal that may be acted on.
     pub fn spawn_watcher_heartbeat_monitor(self: &Arc<Self>) {
         let state = Arc::clone(self);
         // Use a blocking std thread — we touch a std Mutex
@@ -4792,8 +5052,8 @@ impl AppState {
         std::thread::Builder::new()
             .name("watcher-heartbeat-monitor".into())
             .spawn(move || {
-                // Grace period after start so the watcher has time to emit its
-                // first heartbeat before we'd consider it stalled.
+                // Grace period after start so the initial watcher has time to
+                // come up before we'd consider it missing.
                 std::thread::sleep(std::time::Duration::from_secs(90));
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(20));
@@ -4807,41 +5067,31 @@ impl AppState {
                     if !realtime_on {
                         continue;
                     }
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    let hb = state.watcher_last_heartbeat.load(Ordering::Relaxed);
-                    // hb==0 means the watcher hasn't ticked yet — could be
-                    // start-pending or just no FS events on a quiet box. Only
-                    // act on a positive-but-stale heartbeat (real stall signal).
-                    if hb == 0 || now < hb {
+                    if state.watcher_is_live() {
                         continue;
                     }
-                    if now - hb > 60 {
-                        tracing::warn!(
-                            stalled_secs = now - hb,
-                            "watcher heartbeat stalled — restarting"
-                        );
-                        // Serialize against user pause/resume.
-                        let _g = state
-                            .protection_toggle_lock
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner());
-                        // Re-check after acquiring the lock — the user may have
-                        // just paused, and we MUST honor that.
-                        if state.is_user_disabled() {
-                            continue;
-                        }
-                        state.start_watcher();
-                        state
-                            .watcher_restarts_total
-                            .fetch_add(1, Ordering::Relaxed);
-                        // Refresh the heartbeat optimistically — start_watcher
-                        // may not emit immediately, and we don't want a tight
-                        // restart loop while the new watcher warms up.
-                        state.touch_watcher_heartbeat();
+                    tracing::warn!(
+                        last_heartbeat = state.watcher_last_heartbeat.load(Ordering::Relaxed),
+                        "realtime watcher is not running — restarting"
+                    );
+                    // Serialize against user pause/resume.
+                    let _g = state
+                        .protection_toggle_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    // Re-check after acquiring the lock — the user may have
+                    // just paused, and we MUST honor that.
+                    if state.is_user_disabled() {
+                        continue;
                     }
+                    state.start_watcher();
+                    state
+                        .watcher_restarts_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    // Refresh the heartbeat optimistically — start_watcher may
+                    // not emit immediately, and `resilience_diagnostics` would
+                    // otherwise keep reporting the pre-restart staleness.
+                    state.touch_watcher_heartbeat();
                 }
             })
             .ok();
@@ -4856,18 +5106,97 @@ impl AppState {
     }
 
     /// Load FISH config (from daemon config file).
-    pub fn load_fish_config(&self, config: crate::fish::FishConfig) {
-        // Rebuild mutation window with new thresholds.
-        let mut guard = self.fish_window.lock().unwrap_or_else(|e| e.into_inner());
-        *guard = crate::fish::MutationWindow::new(&config);
-        // Can't easily update fish_config since it's not behind a Mutex.
-        // The diagnostics method reads from the window's internal state.
+    ///
+    /// Updates BOTH halves of the shield's state: the mutation window (which
+    /// owns the thresholds) and the cached config (which owns `enabled`,
+    /// `observe_only` and `active_response`). Updating only the window left
+    /// `fish_diagnostics()` — and therefore the watcher's observe-vs-terminate
+    /// decision — reading construction-time defaults forever.
+    ///
+    /// Re-validates because this is the only choke point that installs a
+    /// `FishConfig` into the running daemon, and `active_response` is a
+    /// process-kill primitive: a caller that skipped `Config::validate`
+    /// must not be able to smuggle an off-allowlist value past it.
+    pub fn load_fish_config(&self, mut config: crate::fish::FishConfig) {
+        config.validate();
+        // Both halves are written under both locks so a reader can never see
+        // the new thresholds paired with the previous response mode. Lock
+        // order is window-then-config here and in `fish_diagnostics`; taking
+        // them in opposite orders in the two methods would deadlock.
+        let mut window = self.fish_window.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cached = self.fish_config.write().unwrap_or_else(|e| e.into_inner());
+        *window = crate::fish::MutationWindow::new(&config);
+        *cached = config;
     }
 
     /// Get FISH diagnostics snapshot.
     pub fn fish_diagnostics(&self) -> crate::fish::FishDiagnostics {
-        let guard = self.fish_window.lock().unwrap_or_else(|e| e.into_inner());
-        guard.diagnostics(&self.fish_config)
+        // Window before config — same order as `load_fish_config`.
+        let window = self.fish_window.lock().unwrap_or_else(|e| e.into_inner());
+        let config = self.fish_config.read().unwrap_or_else(|e| e.into_inner());
+        window.diagnostics(&config)
+    }
+
+    /// Re-read the orchestrator routing flags from a freshly-saved config.
+    ///
+    /// Companion to `refresh_staleness_thresholds`, for the same reason: all
+    /// four are classified hot-applied, so nothing else ever pushes them into
+    /// the running daemon and `start_scan` kept routing by the boot values.
+    fn refresh_scan_routing(&self, cfg: &crate::config::Config) {
+        self.orchestrator_file_scan_enabled
+            .store(cfg.scan.orchestrator_file_scan_enabled, Ordering::Relaxed);
+        self.orchestrator_folder_scan_enabled
+            .store(cfg.scan.orchestrator_folder_scan_enabled, Ordering::Relaxed);
+        self.orchestrator_quick_scan_enabled
+            .store(cfg.scan.orchestrator_quick_scan_enabled, Ordering::Relaxed);
+        self.orchestrator_full_scan_enabled
+            .store(cfg.scan.orchestrator_full_scan_enabled, Ordering::Relaxed);
+    }
+
+    /// Re-read the ClamAV worker timeout from a freshly-saved config.
+    ///
+    /// NOT hot-applied: `restart_requirement()` classifies
+    /// `clamav_worker_timeout_sec` as `DaemonRestart`, so the GUI does show a
+    /// restart pill for it. Refreshed anyway because it costs nothing and the
+    /// pill is about the isolation MODE it travels with, not the timeout —
+    /// picking the new timeout up early is strictly better than making the
+    /// user restart for a number the running daemon can just read. Without
+    /// this the boot value persisted: the only other writer is
+    /// `set_clamav_subprocess`, which `main.rs` calls at boot and only when
+    /// isolation is already `subprocess`. The isolation MODE is deliberately not touched
+    /// here: it is classified `DaemonRestart`, and swapping the scan path under
+    /// a running daemon is what that classification exists to prevent.
+    fn refresh_clamav_worker_timeout(&self, cfg: &crate::config::Config) {
+        // Same floor as `set_clamav_subprocess`.
+        self.clamav_worker_timeout_sec
+            .store(cfg.clamav_worker_timeout_sec.max(10), Ordering::Relaxed);
+    }
+
+    /// Push every hot-applied setting from a freshly-saved config into the
+    /// running daemon.
+    ///
+    /// `restart_requirement()` returns `None` for these — except
+    /// `clamav_worker_timeout_sec`, see that refresher for why it rides along
+    /// anyway — which is the GUI's promise that saving is enough. Keeping
+    /// that promise requires a single call after every successful config
+    /// write, which is why both `settings.set_full` and
+    /// `protection.set_critical` call THIS rather than the individual
+    /// refreshers: a new hot-applied field then gets wired in one place
+    /// instead of at every save site.
+    ///
+    /// FISH thresholds go through `load_fish_config`, which rebuilds the
+    /// mutation window; the in-flight event history is intentionally reset,
+    /// since counts collected under the old thresholds no longer mean the
+    /// same thing.
+    // The `allow` stands only until the call sites land in `ipc/mod.rs`
+    // (`settings.set_full` and `protection.set_critical`, both owned by a
+    // sibling change); drop it then, so a lost call site becomes a warning
+    // rather than a silently un-applied setting.
+    pub fn refresh_hot_config(&self, cfg: &crate::config::Config) {
+        self.refresh_staleness_thresholds(cfg);
+        self.refresh_scan_routing(cfg);
+        self.refresh_clamav_worker_timeout(cfg);
+        self.load_fish_config(cfg.fish.clone());
     }
 
     /// Record a FISH process suspension.
@@ -6442,6 +6771,11 @@ pub struct RuntimeStats {
     pub signature_count: u64,
     pub db_stale: bool,
     pub db_stale_hours: u64,
+    /// Signatures are old enough that it is worth interrupting the user
+    /// (config.signature_stale_notify_days, default 14). This — not a failed
+    /// update attempt — is what drives the user-facing update notification.
+    #[serde(default)]
+    pub db_stale_notify: bool,
     pub watcher_active: bool,
     pub last_update_timestamp: Option<i64>,
     pub total_files_scanned: u64,
@@ -6648,6 +6982,7 @@ mod tests {
             update_current_file: String::new(),
             last_update_timestamp: None,
             last_update_error: None,
+            last_update_error_notifiable: false,
         }
     }
 
@@ -6668,6 +7003,51 @@ mod tests {
             perf_summary: ScanPerformanceSummary::default(),
             live: None,
         }
+    }
+
+    #[test]
+    fn notify_threshold_is_far_later_than_the_ui_threshold() {
+        let now = 1_700_000_000_i64;
+        let day = 24 * 3600_i64;
+        let ui = 3 * 24_u64;      // signature_stale_days default
+        let notify = 14 * 24_u64; // signature_stale_notify_days default
+
+        // Four days old: the UI tints its card, but nothing interrupts the
+        // user. This is the whole point of the split — a few days behind is
+        // worth showing to someone already looking, not worth a toast.
+        let ts = Some(now - 4 * day);
+        assert!(compute_db_stale(ts, now, ui).0);
+        assert!(!compute_db_stale(ts, now, notify).0);
+
+        // Fifteen days: now it is worth saying out loud.
+        let ts = Some(now - 15 * day);
+        assert!(compute_db_stale(ts, now, notify).0);
+
+        // Exactly at the threshold is NOT past it (strict >), so the toast
+        // fires a day after the age is reached, never a day early.
+        let ts = Some(now - 14 * day);
+        assert!(!compute_db_stale(ts, now, notify).0);
+    }
+
+    #[test]
+    fn no_timestamp_never_fires_the_notification() {
+        let now = 1_700_000_000_i64;
+        let notify = 14 * 24_u64;
+
+        // The trap this guards: compute_db_stale reports (true, 0) with no
+        // timestamp, meaning "unknown age", not "old".
+        assert!(compute_db_stale(None, now, notify).0);
+        // ...but the notification decision must NOT inherit that true.
+        // Asserting through compute_db_stale_notify (the function
+        // runtime_stats actually calls) means deleting the guard fails this
+        // test. An earlier version re-implemented the guard with local
+        // literals and would have stayed green through exactly that deletion.
+        assert!(!compute_db_stale_notify(None, now, notify));
+
+        // And with a real timestamp it still answers the age question.
+        let day = 24 * 3600_i64;
+        assert!(!compute_db_stale_notify(Some(now - 4 * day), now, notify));
+        assert!(compute_db_stale_notify(Some(now - 15 * day), now, notify));
     }
 
     #[test]
@@ -6705,6 +7085,154 @@ mod tests {
         // No output → explicit fallback, not empty.
         assert_eq!(freshclam_error_detail(""), "freshclam failed (no output)");
         assert_eq!(freshclam_error_detail("   \n\n"), "freshclam failed (no output)");
+    }
+
+    #[test]
+    fn freshclam_cooldown_is_not_a_successful_update() {
+        // libfreshclam's cool-down branch in `fc_update_databases`: it prints
+        // this, downloads nothing, sets FC_SUCCESS and exits 0.
+        let still = "ClamAV update process started at Sat Aug  2 09:00:00 2026\n\
+                     FreshClam previously received error code 429 or 403 from the ClamAV \
+                     Content Delivery Network (CDN).\n\
+                     This means that you have been rate limited or blocked by the CDN.\n\
+                     You are still on cool-down until after: 2026-08-02 17:41:03";
+        assert!(
+            freshclam_output_is_cooldown(still),
+            "a run that never left the cool-down branch must not stamp freshness"
+        );
+
+        // The in-run 429 path (`FC_ERETRYLATER` → `goto success`) prints the
+        // same line without "still" and also exits 0.
+        let hit_now = "FreshClam received error code 429 from the ClamAV Content Delivery \
+                       Network (CDN).\n\
+                       You are on cool-down until after: 2026-08-02 17:41:03";
+        assert!(freshclam_output_is_cooldown(hit_now));
+
+        // A run that found the cool-down EXPIRED goes on to update for real.
+        // Matching the bare word "cool-down" would suppress the freshness
+        // stamp on every recovery run — permanently stale, the inverse bug.
+        let expired = "Cool-down expired, ok to try again.\n\
+                       daily.cvd database is up-to-date (version: 27800, sigs: 2074109)";
+        assert!(!freshclam_output_is_cooldown(expired));
+
+        // And an ordinary run stays a success.
+        let ok = "ClamAV update process started at Sat Aug  2 09:00:00 2026\n\
+                  daily.cvd updated (version: 27801, sigs: 2074200)\n\
+                  main.cvd database is up-to-date";
+        assert!(!freshclam_output_is_cooldown(ok));
+
+        // The detail the activity log shows must carry the retry-after date —
+        // the one actionable fact in the whole banner. The old success path
+        // logged the FIRST 200 chars, i.e. the banner, and never this.
+        let detail = freshclam_error_detail(still);
+        assert!(
+            detail.contains("2026-08-02 17:41:03"),
+            "cool-down detail must surface the retry-after date: {detail}"
+        );
+    }
+
+    /// Every field `restart_requirement()` calls hot-applied has to actually
+    /// reach the running daemon; otherwise the GUI's missing restart pill is
+    /// a promise the daemon does not keep. Boot values are whatever this
+    /// machine's `sentinelld.toml` says, so the test FLIPS each one and
+    /// asserts the flip is observable through the same surfaces the daemon
+    /// itself reads.
+    #[test]
+    fn hot_config_refresh_reaches_scan_routing_and_the_fish_shield() {
+        crate::paths::init_auto();
+        let state = AppState::new(None, None, None);
+
+        let before = state.orchestrator_diagnostics();
+        let flip = |v: &serde_json::Value| !v.as_bool().unwrap_or(false);
+        let fish_before = state.fish_diagnostics();
+
+        let mut cfg = crate::config::Config::default();
+        cfg.scan.orchestrator_file_scan_enabled = flip(&before["enabled_file_scan"]);
+        cfg.scan.orchestrator_folder_scan_enabled = flip(&before["enabled_folder_scan"]);
+        cfg.scan.orchestrator_quick_scan_enabled = flip(&before["enabled_quick_scan"]);
+        cfg.scan.orchestrator_full_scan_enabled = flip(&before["enabled_full_scan"]);
+        cfg.fish.observe_only = !fish_before.observe_only;
+        cfg.fish.active_response = if fish_before.active_response == "terminate" {
+            "suspend".to_string()
+        } else {
+            "terminate".to_string()
+        };
+
+        state.refresh_hot_config(&cfg);
+
+        // `start_scan` routes off these four; `orchestrator_diagnostics` is
+        // the surface that reports them back to the GUI. As plain fields both
+        // kept the boot values, so the diagnostics agreed with the wrong
+        // behaviour instead of exposing it.
+        let after = state.orchestrator_diagnostics();
+        for key in [
+            "enabled_file_scan",
+            "enabled_folder_scan",
+            "enabled_quick_scan",
+            "enabled_full_scan",
+        ] {
+            assert_eq!(
+                after[key].as_bool(),
+                Some(cfg_flag(&cfg, key)),
+                "{key} must follow the saved config, no restart required"
+            );
+            assert_ne!(after[key], before[key], "{key} did not change at all");
+        }
+
+        // FISH: `fish_handle_burst` chooses observe vs suspend/terminate from
+        // exactly this snapshot. Frozen at the defaults it always read
+        // observe_only=true, which made active response unreachable code.
+        let fish_after = state.fish_diagnostics();
+        assert_eq!(fish_after.observe_only, cfg.fish.observe_only);
+        assert_eq!(fish_after.active_response, cfg.fish.active_response);
+
+        // Same shape, same promise: the ClamAV worker budget was only ever
+        // written at boot, and only when isolation was already subprocess.
+        let mut cfg2 = crate::config::Config::default();
+        cfg2.clamav_worker_timeout_sec = 47;
+        state.refresh_hot_config(&cfg2);
+        assert_eq!(
+            state.clamav_worker_timeout_sec.load(Ordering::Relaxed),
+            47,
+            "a saved worker timeout must reach the running daemon"
+        );
+        // ...but never below the floor `set_clamav_subprocess` enforces.
+        cfg2.clamav_worker_timeout_sec = 1;
+        state.refresh_hot_config(&cfg2);
+        assert_eq!(state.clamav_worker_timeout_sec.load(Ordering::Relaxed), 10);
+    }
+
+    /// Helper for the loop above — maps a diagnostics key back to the config
+    /// field it is supposed to mirror.
+    fn cfg_flag(cfg: &crate::config::Config, key: &str) -> bool {
+        match key {
+            "enabled_file_scan" => cfg.scan.orchestrator_file_scan_enabled,
+            "enabled_folder_scan" => cfg.scan.orchestrator_folder_scan_enabled,
+            "enabled_quick_scan" => cfg.scan.orchestrator_quick_scan_enabled,
+            "enabled_full_scan" => cfg.scan.orchestrator_full_scan_enabled,
+            other => panic!("unmapped orchestrator diagnostics key: {other}"),
+        }
+    }
+
+    /// `active_response` is a process-kill primitive, so the choke point that
+    /// installs a `FishConfig` into the live daemon must re-validate rather
+    /// than trust its caller.
+    #[test]
+    fn load_fish_config_rejects_an_off_allowlist_active_response() {
+        crate::paths::init_auto();
+        let state = AppState::new(None, None, None);
+
+        state.load_fish_config(crate::fish::FishConfig {
+            observe_only: false,
+            active_response: "reboot".into(),
+            ..crate::fish::FishConfig::default()
+        });
+
+        assert_eq!(
+            state.fish_diagnostics().active_response,
+            "observe",
+            "an unknown response mode must fall back to the safest one"
+        );
     }
 
     #[test]
@@ -7279,106 +7807,97 @@ mod tests {
 
     // ── v0.1.7 Phase 3 — A/B engine hot-swap regression ─────────────────
     //
-    // A scan that has already loaded the current engine (via
-    // `read_engine()` returning a cloned `Arc`) must continue to see THAT
-    // engine even after a concurrent reload swaps the slot to a different
-    // one. Without this property, in-flight scans during a reload would
-    // observe the engine vanishing out from under them — exactly the
-    // scenario the lock-free ArcSwap migration exists to prevent.
+    // These two tests drive `AppState`'s OWN snapshot API on purpose. The
+    // versions they replace built a private `ArcSwap<Snap>` over stand-in
+    // payloads and asserted things about the arc_swap crate, so they stayed
+    // green through any daemon-side regression — including the exact revert
+    // they were named to prevent (splitting the slot back into
+    // `ArcSwap<Option<Arc<ClamEngine>>>` plus a sibling
+    // `RwLock<Option<String>>`). Referencing `EngineSnapshot`,
+    // `publish_engine_snapshot`, `record_engine_error` and
+    // `read_engine_snapshot` means that revert no longer compiles here.
     //
-    // We exercise the type-level guarantee with a stand-in payload so
-    // the test doesn't need a real ClamEngine (which requires libclamav
-    // + a CVD on disk).
+    // A real `ClamEngine` needs libclamav plus a CVD on disk, so the engine
+    // side is `None` in-test; the assertions are about snapshot identity and
+    // immutability, which do not depend on the payload.
+
+    /// A snapshot a reader already holds must be unaffected by a later
+    /// publish — that is what lets an in-flight scan keep scanning with the
+    /// engine it started with while a reload swaps a new one in.
     #[test]
-    fn arcswap_engine_slot_preserves_in_flight_arc_across_swap() {
-        use arc_swap::ArcSwap;
-        use std::sync::Arc;
+    fn engine_snapshot_held_by_a_reader_survives_a_publish_unchanged() {
+        crate::paths::init_auto();
+        let state = AppState::new(None, None, None);
 
-        #[derive(Clone)]
-        struct Snap { engine: Option<Arc<u32>> }
+        // What a scan holds: one Arc covering BOTH fields.
+        let held: Arc<EngineSnapshot> = Arc::clone(&state.read_engine_snapshot());
+        let held_had_engine = held.engine.is_some();
+        let held_error = held.last_error.clone();
 
-        let slot: ArcSwap<Snap> = ArcSwap::new(Arc::new(Snap { engine: Some(Arc::new(11)) }));
-
-        // Reader (= a "scan") clones the current engine ref.
-        let held = slot.load().engine.clone().expect("slot was Some");
-        assert_eq!(*held, 11);
-
-        // Writer (= a reload) publishes a new snapshot.
-        let prev = slot.swap(Arc::new(Snap { engine: Some(Arc::new(22)) }));
-
-        // The held Arc still points at the old engine — no publish can
-        // yank it out from under a scan that already holds it.
-        assert_eq!(*held, 11);
-
-        // The freshly-published slot now serves the new engine to
-        // anyone who reads after the swap.
-        let after = slot.load().engine.clone().expect("slot was Some");
-        assert_eq!(*after, 22);
-
-        // The previous slot snapshot is what `swap(...)` returned;
-        // dropping it does not free the held inner Arc — `held` is its
-        // own strong ref. This is what lets the daemon move `drop(prev)`
-        // off the IPC handler safely.
-        drop(prev);
-        assert_eq!(*held, 11);
-    }
-
-    // Phase 3 + audit fix: the engine and last_error are siblings inside
-    // ONE atomic snapshot, so a publish delivers both fields together.
-    // No matter where the writer is in its sequence, a reader takes a
-    // self-consistent (engine, last_error) tuple.
-    //
-    // This test stresses the property with two threads: a writer that
-    // repeatedly publishes (engine=N, last_error=None) snapshots, and a
-    // reader that asserts every snapshot with engine>=2 has
-    // last_error==None. With the pre-audit two-primitive design this
-    // could fail on weakly-ordered hardware; with the combined snapshot
-    // it cannot fail on any platform.
-    #[test]
-    fn arcswap_engine_snapshot_publishes_engine_and_error_consistently() {
-        use arc_swap::ArcSwap;
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
-        #[derive(Clone)]
-        struct Snap { engine: Option<u32>, err: Option<&'static str> }
-
-        let slot = Arc::new(ArcSwap::new(Arc::new(Snap {
-            engine: Some(1),
-            err: Some("stale-old-error"),
-        })));
-        let stop = Arc::new(AtomicBool::new(false));
-        let inconsistencies = Arc::new(AtomicUsize::new(0));
-
-        let r_slot = Arc::clone(&slot);
-        let r_stop = Arc::clone(&stop);
-        let r_count = Arc::clone(&inconsistencies);
-        let reader = std::thread::spawn(move || {
-            while !r_stop.load(Ordering::Relaxed) {
-                let s = r_slot.load();
-                // Writer publishes (engine=N>=2, err=None). Any
-                // snapshot with a post-reload engine MUST also have
-                // err=None.
-                if let Some(e) = s.engine {
-                    if e >= 2 && s.err.is_some() {
-                        r_count.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            }
+        // What a reload does.
+        let prev = state.publish_engine_snapshot(EngineSnapshot {
+            engine: None,
+            last_error: Some("reload failed: CL_EMALFDB".into()),
         });
 
-        for i in 2..2_000u32 {
-            slot.store(Arc::new(Snap { engine: Some(i), err: None }));
-        }
-        stop.store(true, Ordering::Relaxed);
-        reader.join().unwrap();
-
-        assert_eq!(
-            inconsistencies.load(Ordering::Relaxed),
-            0,
-            "reader observed a post-reload engine paired with a pre-reload error \
-             — engine + last_error must be a single atomic snapshot"
+        // `publish_engine_snapshot` must hand back the snapshot it
+        // DISPLACED, not the one it installed: `reload_engine` relies on
+        // that to move the old engine's drop off the IPC thread (audit
+        // MED #3). Returning the new one would drop the live engine.
+        assert!(
+            Arc::ptr_eq(&held, &prev),
+            "publish must return the previous snapshot, not the new one"
         );
+
+        // The held snapshot is immutable — the swap cannot reach into it.
+        assert_eq!(held.engine.is_some(), held_had_engine);
+        assert_eq!(held.last_error, held_error);
+
+        // Readers arriving after the swap get the new pair.
+        assert_eq!(
+            state.read_engine_snapshot().last_error.as_deref(),
+            Some("reload failed: CL_EMALFDB")
+        );
+
+        // Dropping the displaced snapshot does not disturb the reader's.
+        drop(prev);
+        assert_eq!(held.last_error, held_error);
+    }
+
+    /// A failed reload annotates the error WITHOUT evicting the engine that
+    /// is still serving scans, and does so by publishing a fresh snapshot
+    /// rather than mutating the one readers already hold.
+    #[test]
+    fn record_engine_error_publishes_a_new_snapshot_and_keeps_the_engine() {
+        crate::paths::init_auto();
+        let state = AppState::new(None, None, None);
+
+        // Start from a known-clean pair so the assertions below are about
+        // `record_engine_error`, not about how this box happened to boot.
+        state.publish_engine_snapshot(EngineSnapshot {
+            engine: None,
+            last_error: None,
+        });
+        let before: Arc<EngineSnapshot> = Arc::clone(&state.read_engine_snapshot());
+
+        state.record_engine_error(Some("libclamav: CL_EMALFDB".into()));
+
+        let after: Arc<EngineSnapshot> = Arc::clone(&state.read_engine_snapshot());
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "the RCU must publish a NEW snapshot, not mutate the live one"
+        );
+        assert_eq!(
+            before.last_error, None,
+            "a published snapshot must never change under a reader"
+        );
+        assert_eq!(after.last_error.as_deref(), Some("libclamav: CL_EMALFDB"));
+
+        // The engine handle travels forward with the error, so
+        // `read_engine()` and the snapshot's `last_error` can never
+        // disagree about the same moment.
+        assert_eq!(after.engine.is_some(), before.engine.is_some());
+        assert_eq!(state.read_engine().is_some(), after.engine.is_some());
     }
 
     // ── F-9: per-user %LOCALAPPDATA%\Programs watched-root helpers ─────

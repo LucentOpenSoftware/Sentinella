@@ -112,6 +112,23 @@ function getPath(obj: unknown, path: string): unknown {
   return cur;
 }
 
+/**
+ * Write a possibly-nested path like "fish.enabled" into `obj` in place.
+ * No-op when an intermediate segment is missing so a schema mismatch with an
+ * older/newer daemon can't fabricate half-built objects in the payload.
+ */
+function setPath(obj: unknown, path: string, value: unknown): void {
+  const parts = path.split(".");
+  let cur = obj;
+  for (let i = 0; i < parts.length - 1; i++) {
+    const next = (cur as Record<string, unknown>)?.[parts[i]];
+    if (!next || typeof next !== "object") return;
+    cur = next;
+  }
+  if (!cur || typeof cur !== "object") return;
+  (cur as Record<string, unknown>)[parts[parts.length - 1]] = value;
+}
+
 /** Deep-equality for primitives + arrays of primitives. Sufficient for FullConfig. */
 function eqValue(a: unknown, b: unknown): boolean {
   if (Array.isArray(a) && Array.isArray(b)) {
@@ -119,6 +136,39 @@ function eqValue(a: unknown, b: unknown): boolean {
     return a.every((v, i) => v === b[i]);
   }
   return a === b;
+}
+
+/**
+ * Return a copy of `draft` whose CRITICAL_FIELDS carry the values the daemon
+ * actually has on disk right now, leaving every non-critical edit untouched.
+ *
+ * `protection.set_critical` does NOT store what we sent verbatim. It
+ * lowercases + dot-strips `excluded_extensions`, lowercases `trusted_hashes`,
+ * trims `argus_worker_path`, mirrors `argus_worker_{enabled,path}` into the
+ * `[scan]` table (which the GUI draft never writes), and `Config::load`
+ * re-expands `%VAR%` in `realtime_roots`. `settings.set_full` then rejects the
+ * ENTIRE write with INSUFFICIENT_PRIVILEGE if any critical field in the
+ * payload differs from disk — so posting the pre-normalisation draft throws
+ * away every non-critical edit made in the same click, logs a bogus
+ * "kill-vector tampering" warning, and leaves the page wedged (baseline stays
+ * stale, so every later Save repeats the identical failure).
+ *
+ * Re-reading is the only way to learn the normalised form: the daemon has no
+ * "what would you store" endpoint, and mirroring its normalisation rules here
+ * would silently rot the next time they change.
+ */
+async function withPersistedCriticalFields(
+  draft: FullConfig,
+): Promise<FullConfig> {
+  const persisted = await getFullSettings();
+  const merged = structuredClone(draft);
+  for (const path of CRITICAL_FIELDS) {
+    const v = getPath(persisted, path);
+    // undefined = this daemon build doesn't carry the field; leave the
+    // draft's value alone rather than injecting `undefined` into the payload.
+    if (v !== undefined) setPath(merged, path, v);
+  }
+  return merged;
 }
 
 export type FullConfigStatus =
@@ -288,6 +338,7 @@ export function useFullConfig(): UseFullConfigResult {
 
     // 2) Send critical first (UAC required); if it fails, do NOT send
     //    the non-critical write so the user sees the one error path.
+    let payload = draft;
     if (Object.keys(criticalDiff).length > 0) {
       try {
         const r = await setCriticalSettings(criticalDiff);
@@ -300,14 +351,25 @@ export function useFullConfig(): UseFullConfigResult {
         setStatus({ kind: "ready" });
         return { ok: false, error: msg };
       }
+      // The daemon normalises and mirrors what it just wrote — adopt its
+      // version of the critical fields before step 3, or set_full rejects
+      // the whole save. See withPersistedCriticalFields.
+      try {
+        payload = await withPersistedCriticalFields(draft);
+      } catch {
+        // Re-read failed (rate limit, daemon reloading). Fall through with
+        // the raw draft: it still saves whenever the daemon stored our
+        // critical values unchanged, which is the common case.
+        payload = draft;
+      }
     }
 
-    // 3) Send the full draft via save_full_settings. The daemon rejects
-    //    with INSUFFICIENT_PRIVILEGE if any critical field still differs
-    //    — which shouldn't happen since we just applied them — but
-    //    surface that as the error path anyway.
+    // 3) Send the draft via save_full_settings. The daemon rejects with
+    //    INSUFFICIENT_PRIVILEGE if any critical field still differs from
+    //    disk — step 2 re-syncs them so that means a concurrent writer
+    //    (CLI, another GUI, hand-edited TOML) got in between; surface it.
     try {
-      const r = await saveFullSettings(draft);
+      const r = await saveFullSettings(payload);
       if (r.ok) {
         await reload(); // refresh baseline from disk
       } else {

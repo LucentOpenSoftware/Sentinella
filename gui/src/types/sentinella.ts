@@ -202,6 +202,8 @@ export interface RuntimeStats {
   signature_count: number;
   db_stale: boolean;
   db_stale_hours: number;
+  /** Signatures old enough to interrupt the user (default 14 days). */
+  db_stale_notify: boolean;
   watcher_active: boolean;
   last_update_timestamp: number | null;
   total_files_scanned: number;
@@ -513,6 +515,8 @@ export interface FullConfig {
   auto_update: boolean;
   update_interval_hours: number;
   signature_stale_days: number;
+  /** Age (days) at which staleness is worth interrupting the user. */
+  signature_stale_notify_days: number;
   update_mirror: string;
 
   // Quarantine

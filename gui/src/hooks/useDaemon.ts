@@ -3,7 +3,7 @@ import type { DashboardData, ConnectionState } from "../api/sentinella";
 import { fetchDashboard, getConnectionState } from "../api/sentinella";
 import {
   notifyScanComplete,
-  notifyUpdateFailed,
+  notifySignaturesStale,
   notifyProtectionDegraded,
   notifyRealtimeUnavailable,
   notifyQuarantined,
@@ -28,6 +28,25 @@ const DISCONNECT_THRESHOLD = 6;
 // failCountRef entirely. Now isConnected only flips false after
 // CONNECTED_DEBOUNCE consecutive engine-status failures.
 const CONNECTED_DEBOUNCE = 3;
+
+/**
+ * True when `result.quarantine` can be trusted as the daemon's real list.
+ *
+ * `getQuarantineItems()` swallows failures into `[]` (quarantine.list is
+ * auth-gated and IPC can be busy mid-reload), so an empty array on its own is
+ * ambiguous. `stats.quarantine_count` arrives from a separate IPC call and
+ * counts exactly the same rows the list returns (`status = 'quarantined'`, see
+ * db::quarantine_count / db::list_quarantine), so:
+ *   list non-empty            → real
+ *   list empty + count === 0  → really empty
+ *   list empty + count > 0    → the call failed, ignore this snapshot
+ * Only meaningful on a poll where the stats block itself is real — callers
+ * gate on `healthyThisPoll`, which requires `statsAreReal`.
+ */
+function quarantineListIsReliable(result: DashboardData): boolean {
+  if (result.quarantine.length > 0) return true;
+  return (result.stats?.quarantine_count ?? 0) === 0;
+}
 
 export interface DaemonState {
   data: DashboardData | null;
@@ -68,8 +87,15 @@ export function useDaemon(): DaemonState {
     scanType: string;
     updateState: string;
     updateError: string | null;
+    dbStaleNotify: boolean;
     protectionState: string;
     watcherActive: boolean;
+    /**
+     * False until `quarantineIds` was built from a quarantine.list we could
+     * actually trust. The notification loop refuses to diff against an
+     * unseeded baseline — see the seeding block at the end of refresh().
+     */
+    quarantineSeeded: boolean;
     quarantineCount: number;
     quarantineIds: Set<string>;
   } | null>(null);
@@ -123,13 +149,55 @@ export function useDaemon(): DaemonState {
           setConnected(false);
         }
       }
-      setData(result);
+      // Never commit the synthetic disconnect snapshot into shared state.
+      //
+      // fetchDashboard catches each of its 9 calls individually, so when
+      // stats.runtime doesn't answer it substitutes a zeroed RuntimeStats
+      // (uptime 0, signature_count 0, db_stale true, db_stale_hours 0,
+      // protection_state "unprotected") that carries no marker saying it is
+      // synthetic. Committing it had two visible sinks:
+      //   - A daemon that never came up still produced non-null `data`, so
+      //     Dashboard's `!connected && !data` offline card (WifiOff, pipe
+      //     hint, Retry) was unreachable and the user got a dashboard of
+      //     zeros instead.
+      //   - ONE timed-out poll on a healthy machine matched
+      //     `db_stale && db_stale_hours === 0 && signature_count === 0`
+      //     exactly, so App.tsx raised the red "Signatures have never been
+      //     updated" banner over a fully loaded signature database.
+      // Keeping the last real snapshot (or null, if we never had one) is both
+      // honest and strictly more useful than zeros.
+      //
+      // The gate is `statsAreReal`, NOT `healthyThisPoll`: a reachable daemon
+      // whose engine failed to load still has real stats, and that state must
+      // stay visible on the dashboard instead of hiding behind "not connected".
+      if (statsAreReal) {
+        setData(result);
+        setLastRefresh(new Date());
+      }
       setError(null);
-      setLastRefresh(new Date());
       failCountRef.current = 0; // Reset hard-failure counter on any successful fetchDashboard.
 
       // ── Detect transitions → fire notifications ───────
       const prev = prevRef.current;
+
+      // Signatures stale enough to be worth interrupting for.
+      //
+      // NOT inside the `prev &&` block below, and deliberately so. Every
+      // other notification here is about an EVENT that happens while the app
+      // is watching (a scan finished, the watcher died), so "no previous
+      // state = nothing to compare = stay quiet" is right for them. This one
+      // is about a CONDITION that latches true and stays true for weeks. The
+      // dominant real case is a user opening Sentinella on a machine whose
+      // signatures are already months old — exactly the case they asked to be
+      // told about. Requiring a false→true edge with `prev` seeded from the
+      // first poll made that case unreachable: the condition was already true
+      // before we started looking. Treating a missing `prev` as "not stale"
+      // lets the first healthy poll fire; dedupeCheck's 24h window in
+      // notifySignaturesStale stops it repeating.
+      if (healthyThisPoll && statsAreReal && result.stats.db_stale_notify && !(prev?.dbStaleNotify ?? false)) {
+        notifySignaturesStale(Math.floor((result.stats.db_stale_hours ?? 0) / 24));
+      }
+
       if (prev && healthyThisPoll) {
         // Scan completed with threats.
         if (prev.scanRunning && !result.scan.running && result.scan.state === "completed") {
@@ -140,17 +208,18 @@ export function useDaemon(): DaemonState {
           );
         }
 
-        // Update failed.
-        if (prev.updateState !== "error" && result.update.state === "error" && result.update.last_error) {
-          notifyUpdateFailed(result.update.last_error);
-        }
+        // (The staleness notification lives above this block — it must fire
+        // on the first poll too. See the comment there.)
 
         // Protection degraded — only notify if we're actually connected.
         // Transient IPC failures produce fallback stats with "unprotected" which
         // is a false positive. Only fire if the daemon is genuinely reachable
         // and reports degraded state.
         const ps = result.stats.protection_state;
-        const statsAreReal = result.stats.uptime_secs > 0; // fallback has uptime=0
+        // `statsAreReal` (fallback has uptime=0) comes from the enclosing
+        // scope. It used to be re-declared here, which shadowed the outer
+        // binding and put every earlier line in this block inside its
+        // temporal dead zone — the staleness check above reads it.
         if (statsAreReal && prev.protectionState === "fully_protected" && ps !== "fully_protected") {
           notifyProtectionDegraded(result.stats.protection_detail || "");
         }
@@ -160,14 +229,17 @@ export function useDaemon(): DaemonState {
           notifyRealtimeUnavailable();
         }
 
-        // New quarantine items (watcher auto-quarantine).
-        // `getQuarantineItems()` falls back to [] on a transient failure
-        // (quarantine.list is auth-gated + IPC can be busy mid-reload). A
-        // sudden N>0 → empty drop is almost certainly that blip, not a real
-        // clear — treat the list as UNRELIABLE and don't re-notify (which would
-        // flash an old item as freshly caught once the list comes back).
-        const qReliable = result.quarantine.length > 0 || prev.quarantineCount === 0;
-        if (qReliable) {
+        // New quarantine items (watcher auto-quarantine). Two guards:
+        //  - `quarantineSeeded`: never diff against a baseline that was itself
+        //    built from a failed quarantine.list. Without it, one transient
+        //    failure on the FIRST poll seeded an empty set and every
+        //    pre-existing quarantine entry toasted as freshly caught on poll 2
+        //    — the same phantom flash the seeding block below was written to
+        //    stop, just one poll earlier than it covered.
+        //  - `qReliable`: an N>0 → empty drop is the transient blip, not a
+        //    real clear.
+        const qReliable = quarantineListIsReliable(result);
+        if (prev.quarantineSeeded && qReliable) {
           for (const q of result.quarantine) {
             if (!prev.quarantineIds.has(q.id)) {
               notifyQuarantined(q.signature, q.original_path);
@@ -189,8 +261,7 @@ export function useDaemon(): DaemonState {
         // transient empty-blip (see qReliable above), so the dedup survives the
         // reload churn instead of re-flagging old items as new on recovery.
         const prevSnap = prevRef.current;
-        const qReliable =
-          result.quarantine.length > 0 || (prevSnap?.quarantineCount ?? 0) === 0;
+        const qReliable = quarantineListIsReliable(result);
         prevRef.current = {
           scanRunning: result.scan.running,
           scanThreats: result.scan.threats_found,
@@ -198,8 +269,14 @@ export function useDaemon(): DaemonState {
           scanType: result.scan.scan_type || "",
           updateState: result.update.state,
           updateError: result.update.last_error ?? null,
+          dbStaleNotify: result.stats.db_stale_notify ?? false,
           protectionState: result.stats.protection_state,
           watcherActive: result.stats.watcher_active,
+          // Latches once the list has been seen for real. The rest of the
+          // snapshot still seeds on this poll, so a permanently-failing
+          // quarantine.list only silences quarantine toasts — scan/protection
+          // transitions keep working.
+          quarantineSeeded: qReliable || (prevSnap?.quarantineSeeded ?? false),
           quarantineCount: qReliable
             ? result.quarantine.length
             : (prevSnap?.quarantineCount ?? 0),

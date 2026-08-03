@@ -13,11 +13,13 @@ members = [
     "crates/etw_probe",
     "crates/sentinella-dev-console",
     "crates/dnsguard",
+    "crates/nrpt",
+    "crates/sentinella-dnsreconcile",
 ]
 exclude = ["gui/src-tauri", "third_party", "fuzz"]
 
 [workspace.package]
-version = "0.1.12"
+version = "0.1.13"
 edition = "2024"
 license = "GPL-2.0-only"
 authors = ["Lucent Open Software"]
@@ -41,3 +43,5 @@ clap = { version = "4", features = ["derive"] }
 sentinella-ipc-proto = { path = "crates/sentinella-ipc-proto" }
 sentinella-common = { path = "crates/sentinella-common" }
 argus = { path = "crates/argus" }
+dnsguard = { path = "crates/dnsguard" }
+nrpt = { path = "crates/nrpt" }

@@ -29,6 +29,14 @@ export function UpdatesTab({ ctx }: { ctx: UseFullConfigResult }) {
     label: `${d} ${i18n.t("settings.days_unit")}`,
   }));
 
+  // Notification threshold. Starts at 7 because anything shorter would
+  // interrupt the user about failures that the updater's own retry plus the
+  // next scheduled cycle routinely fix on their own.
+  const notifyOpts = [7, 14, 30, 60, 90].map((d) => ({
+    value: String(d),
+    label: `${d} ${i18n.t("settings.days_unit")}`,
+  }));
+
   return (
     <div>
       {/* ── Auto-update cadence ────────────────────── */}
@@ -108,6 +116,21 @@ export function UpdatesTab({ ctx }: { ctx: UseFullConfigResult }) {
                 updatePath("signature_stale_days", parseInt(v, 10))
               }
               options={staleOpts}
+            />
+          }
+        />
+        <SettingRow
+          label={i18n.t("settings.signature_stale_notify_days")}
+          description={i18n.t("settings.signature_stale_notify_days_desc")}
+          isDefault={isDefault("signature_stale_notify_days")}
+          onReset={() => resetField("signature_stale_notify_days")}
+          control={
+            <SelectInput<string>
+              value={String(draft.signature_stale_notify_days)}
+              onChange={(v) =>
+                updatePath("signature_stale_notify_days", parseInt(v, 10))
+              }
+              options={notifyOpts}
             />
           }
         />

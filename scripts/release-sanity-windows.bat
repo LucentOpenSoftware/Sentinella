@@ -42,9 +42,9 @@ call :check "%STAGE%\runtime\rules\ioc_hashes.txt" "IOC hashes"
 :: Check config.
 call :check_dir "%STAGE%\runtime\config" "Config directory"
 call :check "%STAGE%\runtime\config\freshclam.conf" "Freshclam config"
-call :check "%STAGE%\runtime\signatures_bootstrap\main.cvd" "Bootstrap main signatures"
-call :check "%STAGE%\runtime\signatures_bootstrap\daily.cvd" "Bootstrap daily signatures"
-call :check "%STAGE%\runtime\signatures_bootstrap\bytecode.cvd" "Bootstrap bytecode signatures"
+call :check_either "%STAGE%\runtime\signatures_bootstrap\main" "Bootstrap main signatures"
+call :check_either "%STAGE%\runtime\signatures_bootstrap\daily" "Bootstrap daily signatures"
+call :check_either "%STAGE%\runtime\signatures_bootstrap\bytecode" "Bootstrap bytecode signatures"
 
 :: Check legal.
 call :check "%STAGE%\LICENSE" "LICENSE file"
@@ -83,6 +83,16 @@ exit /b
 
 :check_dir
 if exist "%~1\" ( echo  [OK]   %~2 & set /a PASS+=1 ) else ( echo  [FAIL] %~2 NOT FOUND & set /a FAIL+=1 )
+exit /b
+
+REM A ClamAV database, either extension: freshclam ships .cvd and applies
+REM incremental updates as .cld, so demanding .cvd fails a perfectly good
+REM staging dir -- and worse, passed one that had no daily database at all,
+REM because the staging script skipped daily.cld for the same reason.
+:check_either
+if exist "%~1.cvd" ( echo  [OK]   %~2 ^(.cvd^) & set /a PASS+=1 & exit /b )
+if exist "%~1.cld" ( echo  [OK]   %~2 ^(.cld^) & set /a PASS+=1 & exit /b )
+echo  [FAIL] %~2 NOT FOUND ^(neither .cvd nor .cld^) & set /a FAIL+=1
 exit /b
 
 :check_notice

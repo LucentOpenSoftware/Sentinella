@@ -1,15 +1,18 @@
 {
   "name": "gui",
   "private": true,
-  "version": "0.1.12",
+  "version": "0.1.13",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
+    "tauri:build": "npm run preflight:staging && tauri build",
     "preflight:staging": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File ../scripts/preflight-staging-versions.ps1",
-    "release:build": "npm run preflight:staging && tauri build"
+    "verify:signature": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File ../scripts/verify-updater-signature.ps1",
+    "release:manifest": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File ../scripts/generate-update-manifest.ps1",
+    "release:build": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File ../scripts/release-build.ps1"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.0",

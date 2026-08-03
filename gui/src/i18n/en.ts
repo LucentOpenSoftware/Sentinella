@@ -3,7 +3,6 @@ export const en: Record<string, string> = {
   // ── App / Global ────────────────────────────────────
   "app.name": "Sentinella",
   "app.subtitle": "Antivirus Suite",
-  "app.version": "v0.1.12",
 
   // ── Sidebar ─────────────────────────────────────────
   "nav.dashboard": "Dashboard",
@@ -26,7 +25,6 @@ export const en: Record<string, string> = {
   "meta.notifications_sub": "Alert history",
   "meta.update_sub": "Signature database",
   "meta.settings_sub": "Configure Sentinella",
-  "meta.about_sub": "Sentinella v0.1.12",
 
   // ── Dashboard ───────────────────────────────────────
   "dash.protected": "Your System is Protected",
@@ -34,6 +32,11 @@ export const en: Record<string, string> = {
   "dash.signatures_loaded": "{count} signatures loaded. ARGUS heuristics active.",
   "dash.no_signatures": "No signature database loaded yet. ARGUS heuristics active.",
   "dash.connecting": "Connecting to daemon...",
+  "notice.service_starting": "Sentinella engine is starting â loading virus signatures. First start can take a few minutes.",
+  "dash.starting": "Engine starting",
+  "dash.starting_desc": "The Sentinella service is running and loading its signature database. On a first start this takes a few minutes â the dashboard will connect on its own when it finishes.",
+  "dash.starting_tile": "Starting",
+  "dash.loading_signatures": "Loading signature database",
   "dash.not_connected": "Daemon Not Connected",
   "dash.not_connected_desc": "Cannot reach the Sentinella daemon. Make sure sentinelld is running.",
   "dash.retry": "Retry Connection",
@@ -375,7 +378,44 @@ export const en: Record<string, string> = {
   "notify.file_quarantined": "File quarantined",
   "notify.files_quarantined": "Files quarantined",
   "notify.quarantine_failed": "Quarantine failed",
-  "notify.update_failed": "Signature update failed",
+  // Added from the tf() fallbacks that had no key behind them, so a
+  // non-English machine got English text in an otherwise translated
+  // app. Values are the exact fallbacks, so behaviour is unchanged
+  // for English and the other locales pick these up when translated.
+  "firstrun.back": "Back",
+  "firstrun.continue": "Continue",
+  "firstrun.continue_dashboard": "Continue to Dashboard",
+  "firstrun.finish": "Finish Setup",
+  "firstrun.get_started": "Get Started",
+  "firstrun.no_sigs": "No Signatures Found",
+  "firstrun.no_sigs_desc": "Sentinella needs virus definitions to detect threats. We strongly recommend updating now.",
+  "firstrun.run_quick_scan": "Run Quick Scan",
+  "firstrun.scan_prompt": "Run a Quick Scan?",
+  "firstrun.scan_prompt_desc": "A quick scan checks your Downloads, Desktop, and Temp folders for threats. This is optional — you can always scan later from the Scan page.",
+  "firstrun.scan_started": "Quick Scan Started",
+  "firstrun.scan_started_desc": "Scanning Downloads, Desktop, and Temp folders. You can monitor progress from the Dashboard.",
+  "firstrun.scan_title": "Initial Scan",
+  "firstrun.signatures_title": "Signature Database",
+  "firstrun.sigs_active": "{n} virus definitions active.",
+  "firstrun.sigs_loaded": "Signatures Loaded",
+  "firstrun.step_1": "Step 1 of 2",
+  "firstrun.step_2": "Step 2 of 2 — Optional",
+  "firstrun.update_done": "Update Complete",
+  "firstrun.update_done_count": "{n} signatures loaded.",
+  "firstrun.update_done_generic": "Database updated.",
+  "firstrun.update_now": "Update Signatures Now",
+  "firstrun.updating": "Updating Signatures...",
+  "firstrun.updating_desc": "Downloading the latest virus definitions. This may take a minute.",
+  "firstrun.waiting_daemon": "Waiting for daemon connection...",
+  "firstrun.welcome_desc": "Local-first antivirus powered by ClamAV signatures and the ARGUS heuristic intelligence engine.",
+  "firstrun.welcome_privacy": "Everything runs on your machine. No cloud dependency. No telemetry. Full transparency.",
+  "firstrun.welcome_title": "Welcome to Sentinella",
+  "notify.body_ready": "{count} signatures loaded.",
+  "notify.body_scan_complete": "{threats} threat(s) found in {files} files.",
+  "notify.scan_complete": "{type} scan complete",
+  "settings.list_full": "List is full ({max} maximum)",
+  "notify.signatures_stale": "Signatures are out of date",
+  "notify.signatures_stale_body": "Your virus signatures are {n} days old. Sentinella has not been able to update them.",
   "notify.protection_degraded": "Protection degraded",
   "notify.realtime_unavailable": "Real-time protection unavailable",
   "notify.ready": "Sentinella is ready",
@@ -942,6 +982,8 @@ export const en: Record<string, string> = {
   "settings.update_mirror_desc": "Hostname of the ClamAV mirror used by freshclam.",
   "settings.signature_stale_days": "Stale after",
   "settings.signature_stale_days_desc": "After this many days without a successful update, the engine status pill turns yellow.",
+  "settings.signature_stale_notify_days": "Notify after",
+  "settings.signature_stale_notify_days_desc": "Sentinella stays quiet about failed update attempts — they usually fix themselves. It only notifies you once the signatures are actually this old.",
 
   // ── Engine tab (Phase 2) ──────────────────────────
   "settings.section_clamav": "ClamAV isolation",

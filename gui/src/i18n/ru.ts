@@ -3,7 +3,6 @@ export const ru: Record<string, string> = {
   // ── Приложение / Глобальное ────────────────────────────
   "app.name": "Sentinella",
   "app.subtitle": "Антивирусный комплекс",
-  "app.version": "v0.1.12",
 
   // ── Боковая панель ─────────────────────────────────────
   "nav.dashboard": "Обзор",
@@ -26,7 +25,6 @@ export const ru: Record<string, string> = {
   "meta.notifications_sub": "История оповещений",
   "meta.update_sub": "База сигнатур",
   "meta.settings_sub": "Настройка Sentinella",
-  "meta.about_sub": "Sentinella v0.1.12",
 
   // ── Панель управления ──────────────────────────────────
   "dash.protected": "Ваша система защищена",
@@ -362,7 +360,8 @@ export const ru: Record<string, string> = {
   "notify.file_quarantined": "Файл помещён в карантин",
   "notify.files_quarantined": "Файлы помещены в карантин",
   "notify.quarantine_failed": "Не удалось поместить в карантин",
-  "notify.update_failed": "Не удалось обновить сигнатуры",
+  "notify.signatures_stale": "Сигнатуры устарели",
+  "notify.signatures_stale_body": "Вашим сигнатурам {n} дней. Sentinella не смогла их обновить.",
   "notify.protection_degraded": "Защита ослаблена",
   "notify.realtime_unavailable": "Защита в реальном времени недоступна",
   "notify.ready": "Sentinella готова к работе",

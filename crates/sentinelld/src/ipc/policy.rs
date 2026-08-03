@@ -460,6 +460,11 @@ pub fn method_registry() -> HashMap<&'static str, MethodPolicy> {
     // and current_target to any unauth local caller (oracle for "where the
     // scanner isn't looking"). Now auth-gated.
     m.insert("watcher.status", auth_read(512, RateBucket::Status));
+    // Web protection. AuthenticatedRead, not PublicStatus: the response
+    // names the machine's upstream DNS servers and the loaded rule count,
+    // which is network topology an unauthenticated local caller should not
+    // get for free.
+    m.insert("webprotection.status", auth_read(512, RateBucket::Status));
     m.insert("idle_scanner.status", auth_read(512, RateBucket::Status));
     m.insert("update.status", pub_status(512));
     m.insert("argus.version", pub_status(512));
@@ -704,6 +709,29 @@ mod tests {
             assert_eq!(policy.class, MethodClass::DangerousOperation);
             assert!(policy.audit_log);
         }
+    }
+
+    /// A dispatch arm with NO registry entry is not a warning — it is a
+    /// method that runs with no payload cap, no rate limit, no
+    /// reload/degraded gate and outside the central auth phase, silently.
+    /// `dispatch_sync` gates all of that behind `reg.get(method)`, so the
+    /// registry entry IS the enforcement. This test is the only thing
+    /// standing between "I added a handler" and that outcome.
+    #[test]
+    fn webprotection_status_is_registered_and_authenticated() {
+        let reg = method_registry();
+        let p = reg
+            .get("webprotection.status")
+            .expect("dispatch arm exists with no registry entry — see the doc above");
+        // Read tier, not PublicStatus: the response names the machine's
+        // upstream DNS servers and its loaded rule count.
+        assert_eq!(p.class, MethodClass::AuthenticatedRead);
+        assert_eq!(p.rate_bucket, RateBucket::Status);
+        // A status poll must keep working while config reloads and while
+        // the daemon is degraded — that is exactly when someone is asking
+        // "is my DNS still going through this thing?".
+        assert!(p.allowed_while_reloading);
+        assert!(p.allowed_while_degraded);
     }
 
     #[test]

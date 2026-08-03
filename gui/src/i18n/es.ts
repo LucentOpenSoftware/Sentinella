@@ -3,7 +3,6 @@ export const es: Record<string, string> = {
   // ── App / Global ────────────────────────────────────
   "app.name": "Sentinella",
   "app.subtitle": "Suite Antivirus",
-  "app.version": "v0.1.12",
 
   // ── Sidebar ─────────────────────────────────────────
   "nav.dashboard": "Panel",
@@ -26,7 +25,6 @@ export const es: Record<string, string> = {
   "meta.notifications_sub": "Historial de alertas",
   "meta.update_sub": "Base de datos de firmas",
   "meta.settings_sub": "Configurar Sentinella",
-  "meta.about_sub": "Sentinella v0.1.12",
 
   // ── Dashboard ───────────────────────────────────────
   "dash.protected": "Tu sistema esta protegido",
@@ -34,6 +32,11 @@ export const es: Record<string, string> = {
   "dash.signatures_loaded": "{count} firmas cargadas. Motor heuristico ARGUS activo.",
   "dash.no_signatures": "Base de datos de firmas no cargada. Motor heuristico ARGUS activo.",
   "dash.connecting": "Conectando al demonio...",
+  "notice.service_starting": "El motor de Sentinella estÃ¡ iniciando â cargando firmas de virus. El primer arranque puede tardar unos minutos.",
+  "dash.starting": "Motor iniciando",
+  "dash.starting_desc": "El servicio de Sentinella estÃ¡ en ejecuciÃ³n y estÃ¡ cargando su base de firmas. En el primer arranque esto tarda unos minutos â el panel se conectarÃ¡ solo cuando termine.",
+  "dash.starting_tile": "Iniciando",
+  "dash.loading_signatures": "Cargando base de firmas",
   "dash.not_connected": "Demonio no conectado",
   "dash.not_connected_desc": "No se puede alcanzar el demonio de Sentinella. Asegurate de que sentinelld esta ejecutandose.",
   "dash.retry": "Reintentar conexion",
@@ -375,7 +378,8 @@ export const es: Record<string, string> = {
   "notify.file_quarantined": "Archivo en cuarentena",
   "notify.files_quarantined": "Archivos en cuarentena",
   "notify.quarantine_failed": "Cuarentena fallida",
-  "notify.update_failed": "Actualizacion de firmas fallida",
+  "notify.signatures_stale": "Firmas desactualizadas",
+  "notify.signatures_stale_body": "Tus firmas de virus tienen {n} dias. Sentinella no ha podido actualizarlas.",
   "notify.protection_degraded": "Proteccion degradada",
   "notify.realtime_unavailable": "Proteccion en tiempo real no disponible",
   "notify.ready": "Sentinella esta listo",
@@ -934,6 +938,8 @@ export const es: Record<string, string> = {
   "settings.update_mirror_desc": "Hostname del mirror ClamAV usado por freshclam.",
   "settings.signature_stale_days": "Obsoletas tras",
   "settings.signature_stale_days_desc": "Tras estos días sin una actualización exitosa, la pastilla de estado del motor se vuelve amarilla.",
+  "settings.signature_stale_notify_days": "Avisar tras",
+  "settings.signature_stale_notify_days_desc": "Sentinella no molesta por intentos de actualizacion fallidos: casi siempre se resuelven solos. Solo avisa cuando las firmas realmente tienen esta antiguedad.",
 
   // ── Engine (fase 2) ─────────────────────────
   "settings.section_clamav": "Aislamiento de ClamAV",

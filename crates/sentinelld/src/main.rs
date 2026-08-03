@@ -36,6 +36,7 @@ mod targeting;
 pub mod trust_graph;
 mod updater;
 mod watcher;
+mod web_protection;
 mod win_process;
 
 use clap::Parser;
@@ -489,6 +490,21 @@ async fn run_daemon(
     // Load FISH config from config file.
     server.state().load_fish_config(config.fish.clone());
 
+    // Web protection (DNS-layer filtering). Default-OFF; `start` never
+    // fails the daemon — a refusal is reported through the status surface
+    // and the log, because a daemon that will not start because its DNS
+    // filter could not is worse than one that starts with filtering off.
+    //
+    // When this succeeds AND the boot reconciler's task is registered, an
+    // NRPT rule is installed and the machine's DNS goes through the proxy.
+    // Without that task — any development build — it serves but installs
+    // nothing, and you reach it directly: `nslookup name 127.0.0.1`.
+    let mut web_protection = web_protection::WebProtection::start(&config.web_protection).await;
+    // Publish the read-only half so `webprotection.status` can answer.
+    // The subsystem itself stays owned here, because stop() needs &mut and
+    // AppState outlives process exit.
+    server.state().set_web_protection(web_protection.handle());
+
     // Load detection exclusions from config.
     if !config.excluded_detections.is_empty() {
         info!(
@@ -524,7 +540,23 @@ async fn run_daemon(
 
     // Start real-time watcher (if engine is available).
     // Watcher runs even in audit mode (minimal protection).
-    server.state().start_watcher();
+    //
+    // ...but NOT when the master switch is off. `realtime_enabled` was
+    // written by `protection.set_critical` (a UAC-gated, challenge-token
+    // path) and persisted, yet startup called start_watcher()
+    // unconditionally and start_watcher() itself only reads
+    // `realtime_roots` — so every reboot silently turned protection back on
+    // while Settings still rendered the switch as off from the same saved
+    // config. `user_disabled_protection` did not cover it either: that is
+    // an in-memory AtomicBool reset to false by AppState::new.
+    if config.realtime_enabled {
+        server.state().start_watcher();
+    } else {
+        warn!(
+            "real-time protection is OFF in sentinelld.toml — watcher NOT started; only \
+             on-demand scans will run"
+        );
+    }
 
     // Heartbeat-driven auto-restart: if the watcher stops ticking for >60s
     // while protection is supposed to be on, respawn it. A targeted attacker
@@ -609,6 +641,16 @@ async fn run_daemon(
     };
 
     // Cleanup ALWAYS runs now (both error and stop paths).
+    //
+    // Web protection stops FIRST and is JOINED, unlike the flag-store
+    // stop() of the other subsystems. It matters from commit C onward:
+    // the NRPT rule is removed during shutdown, and removing it while the
+    // sockets are still bound would leave a window where the machine's DNS
+    // points at a listener that is going away. Establishing the rendezvous
+    // now means that commit does not have to change this ordering under
+    // pressure. Bounded at 5s against the SCM's 30s total stop budget.
+    web_protection.stop().await;
+
     if let Some(s) = scheduler {
         s.stop();
     }

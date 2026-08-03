@@ -317,7 +317,11 @@ export const scanProcessMemory = (pid: number) =>
 
 // ── Supervisor / Recovery ────────────────────────────────────
 
-export type ConnectionState = "connecting" | "connected" | "recovering" | "degraded" | "disconnected" | "user_disabled";
+// "service_starting": the Windows service is alive but the daemon has not
+// created its pipe yet - it is compiling the signature DB, which takes
+// minutes on first boot. Distinct from "connecting" (our first attempt) and
+// every failure state: the right UI is a spinner, not an error.
+export type ConnectionState = "connecting" | "connected" | "recovering" | "degraded" | "disconnected" | "user_disabled" | "service_starting";
 
 export interface RecoveryInfo {
   state: ConnectionState;
@@ -363,7 +367,7 @@ export async function fetchDashboard(): Promise<DashboardData> {
       getUpdateStatus().catch(() => ({ state: "idle" as const, percent: null, bytes_downloaded: 0, bytes_total: null, last_error: null, current_file: null })),
       getQuarantineItems().catch(() => []),
       getActivity().catch(() => []),
-      getRuntimeStats().catch(() => ({ uptime_secs: 0, uptime_human: "?", scans_completed: 0, threats_found_total: 0, ipc_requests_served: 0, quarantine_count: 0, activity_count: 0, started_at: 0, engine_loaded: false, signature_count: 0, db_stale: true, db_stale_hours: 0, watcher_active: false, last_update_timestamp: null, total_files_scanned: 0, total_detections: 0, argus_version: "?", argus_files_analyzed: 0, argus_threats_detected: 0, argus_active_layers: 0, argus_avg_analysis_us: 0, argus_yara_rules: 0, protection_state: "unprotected" as const, protection_detail: "Daemon unreachable", cache_hits: 0, cache_misses: 0, cache_entries: 0, idle_scanner_state: "disabled", idle_scanner_files: 0, ipc_reconnect_count: 0, ipc_last_error_ts: 0 })),
+      getRuntimeStats().catch(() => ({ uptime_secs: 0, uptime_human: "?", scans_completed: 0, threats_found_total: 0, ipc_requests_served: 0, quarantine_count: 0, activity_count: 0, started_at: 0, engine_loaded: false, signature_count: 0, db_stale: true, db_stale_hours: 0, db_stale_notify: false, watcher_active: false, last_update_timestamp: null, total_files_scanned: 0, total_detections: 0, argus_version: "?", argus_files_analyzed: 0, argus_threats_detected: 0, argus_active_layers: 0, argus_avg_analysis_us: 0, argus_yara_rules: 0, protection_state: "unprotected" as const, protection_detail: "Daemon unreachable", cache_hits: 0, cache_misses: 0, cache_entries: 0, idle_scanner_state: "disabled", idle_scanner_files: 0, ipc_reconnect_count: 0, ipc_last_error_ts: 0 })),
       getScanHistory().catch(() => []),
       getIdleScannerStatus().catch(() => ({ state: "disabled" as const, files_scanned_session: 0, current_target: "", last_pause_reason: "", last_completed: null })),
     ]);

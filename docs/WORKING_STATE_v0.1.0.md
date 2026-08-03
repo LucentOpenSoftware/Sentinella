@@ -182,9 +182,15 @@ scripts\stage-windows-package.bat
 Copy-Item "runtime\signatures_bootstrap\*" "release\staging\windows\runtime\signatures_bootstrap\" -Force
 
 # Build NSIS installer (requires private signing key)
-$env:TAURI_SIGNING_PRIVATE_KEY_PATH = "keys\sentinella-update.key"
+#
+# TAURI_SIGNING_PRIVATE_KEY, not ..._PATH. This line said _PATH until
+# 0.1.13, and following it produced an UNSIGNED installer: `tauri build`
+# does not read that variable (the CLI added it for `tauri signer sign`).
+# TAURI_SIGNING_PRIVATE_KEY takes either the key itself or a path to it.
+# Use an absolute path -- the build runs from gui/, not the repo root.
+$env:TAURI_SIGNING_PRIVATE_KEY = "$PWD\keys\sentinella-update.key"
 cd gui
-pnpm tauri build --bundles nsis
+npm run release:build   # preflight + build + signature check
 
 # Output: gui/src-tauri/target/release/bundle/nsis/Sentinella_0.1.0_x64-setup.exe (~137 MB)
 ```

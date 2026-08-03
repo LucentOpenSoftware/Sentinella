@@ -3,7 +3,6 @@ export const pt_br: Record<string, string> = {
   // ── App / Global ────────────────────────────────────
   "app.name": "Sentinella",
   "app.subtitle": "Suíte Antivírus",
-  "app.version": "v0.1.12",
 
   // ── Barra lateral ───────────────────────────────────
   "nav.dashboard": "Painel",
@@ -26,7 +25,6 @@ export const pt_br: Record<string, string> = {
   "meta.notifications_sub": "Histórico de alertas",
   "meta.update_sub": "Base de dados de assinaturas",
   "meta.settings_sub": "Configurar a Sentinella",
-  "meta.about_sub": "Sentinella v0.1.12",
 
   // ── Painel ──────────────────────────────────────────
   "dash.protected": "Seu sistema está protegido",
@@ -362,7 +360,8 @@ export const pt_br: Record<string, string> = {
   "notify.file_quarantined": "Arquivo em quarentena",
   "notify.files_quarantined": "Arquivos em quarentena",
   "notify.quarantine_failed": "Falha na quarentena",
-  "notify.update_failed": "Falha na atualização de assinaturas",
+  "notify.signatures_stale": "Assinaturas desatualizadas",
+  "notify.signatures_stale_body": "Suas assinaturas de vírus têm {n} dias. O Sentinella não conseguiu atualizá-las.",
   "notify.protection_degraded": "Proteção degradada",
   "notify.realtime_unavailable": "Proteção em tempo real indisponível",
   "notify.ready": "Sentinella está pronto",

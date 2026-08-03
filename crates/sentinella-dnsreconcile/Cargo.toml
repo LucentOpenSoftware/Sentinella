@@ -1,0 +1,27 @@
+[package]
+name = "sentinella-dnsreconcile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Boot-time reconciler: removes Sentinella's NRPT rule unless the proxy is proven alive"
+
+[[bin]]
+name = "sentinella-dnsreconcile"
+path = "src/main.rs"
+
+[dependencies]
+nrpt = { workspace = true }
+# For the canary probe only: `wire` builds the query and
+# `proxy::is_canary_signature` checks the answer. Sharing the predicate
+# with the daemon matters more than the binary size of a task that runs
+# for milliseconds at boot.
+dnsguard = { workspace = true }
+
+[dev-dependencies]
+# The positive case — does the probe RECOGNISE a healthy proxy? — is the
+# one that matters most: if it does not, the reconciler removes the rule on
+# every boot and web protection silently never works.
+tokio = { workspace = true }

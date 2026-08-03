@@ -3,7 +3,6 @@ export const ja: Record<string, string> = {
   // ── アプリ / 全般 ────────────────────────────────────
   "app.name": "Sentinella",
   "app.subtitle": "アンチウイルススイート",
-  "app.version": "v0.1.12",
 
   // ── サイドバー ─────────────────────────────────────
   "nav.dashboard": "ダッシュボード",
@@ -26,7 +25,6 @@ export const ja: Record<string, string> = {
   "meta.notifications_sub": "アラート履歴",
   "meta.update_sub": "署名データベース",
   "meta.settings_sub": "Sentinella を設定",
-  "meta.about_sub": "Sentinella v0.1.12",
 
   // ── ダッシュボード ──────────────────────────────────
   "dash.protected": "システムは保護されています",
@@ -362,7 +360,8 @@ export const ja: Record<string, string> = {
   "notify.file_quarantined": "ファイルを隔離しました",
   "notify.files_quarantined": "ファイルを隔離しました",
   "notify.quarantine_failed": "隔離に失敗",
-  "notify.update_failed": "署名の更新に失敗",
+  "notify.signatures_stale": "署名が古くなっています",
+  "notify.signatures_stale_body": "ウイルス署名が{n}日前のものです。Sentinella は更新できませんでした。",
   "notify.protection_degraded": "保護が低下",
   "notify.realtime_unavailable": "リアルタイム保護が利用できません",
   "notify.ready": "Sentinella の準備が完了しました",
