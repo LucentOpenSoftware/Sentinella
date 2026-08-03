@@ -134,14 +134,18 @@ foreach ($name in $ShippedBinaries) {
 # procedure; nothing enforces it. Catching this here costs a second,
 # catching it after the bundle costs the whole build.
 #
-# BOTH variables count. Tauri accepts the key inline
-# (TAURI_SIGNING_PRIVATE_KEY) or as a path to a key file
-# (TAURI_SIGNING_PRIVATE_KEY_PATH), and the documented procedure uses the
-# PATH form. An earlier version of this check only knew the inline one,
-# which would have failed a correctly-configured build.
+# ONLY TAURI_SIGNING_PRIVATE_KEY counts, and it holds either the key itself
+# or a PATH to the key file. TAURI_SIGNING_PRIVATE_KEY_PATH exists, but the
+# CLI changelog (2.10.0) added it for the `tauri signer sign` subcommand;
+# `tauri build` does not read it. docs\WORKING_STATE_v0.1.0.md tells you to
+# set the _PATH form, and following that doc produces an unsigned build --
+# verified here by doing exactly that and watching the bundler still report
+# no private key. Accepting _PATH would make this check pass while the build
+# stayed unsigned, which is worse than not checking.
 #
-# This checks only that a variable is NON-EMPTY, and for the path form that
-# the file exists. It never reads, logs, echoes or validates key material.
+# This checks only that the variable is NON-EMPTY, and, when it looks like a
+# path, that the file exists. It never reads, logs, echoes or validates key
+# material.
 $TauriConf = Join-Path $RepoRoot "gui\src-tauri\tauri.conf.json"
 if (Test-Path $TauriConf) {
     $conf = Get-Content $TauriConf -Raw | ConvertFrom-Json
@@ -149,28 +153,29 @@ if (Test-Path $TauriConf) {
     if ($conf.bundle.createUpdaterArtifacts) {
         if ($conf.plugins.updater.pubkey) { $wantsSignature = $true }
     }
-    $haveInline = -not [string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)
-    $keyPath = $env:TAURI_SIGNING_PRIVATE_KEY_PATH
-    $havePath = -not [string]::IsNullOrWhiteSpace($keyPath)
-    if ($wantsSignature -and -not $haveInline -and -not $havePath) {
-        $DefaultKey = Join-Path $RepoRoot "keys\sentinella-update.key"
-        $Errors += "  - No updater signing key is configured, but tauri.conf.json sets an"
-        $Errors += "    updater pubkey. The bundle would be built UNSIGNED and the bundler"
-        $Errors += "    would still exit 0, so nothing downstream would notice. Existing"
+    $key = $env:TAURI_SIGNING_PRIVATE_KEY
+    $haveKey = -not [string]::IsNullOrWhiteSpace($key)
+    $DefaultKey = Join-Path $RepoRoot "keys\sentinella-update.key"
+    if ($wantsSignature -and -not $haveKey) {
+        $Errors += "  - TAURI_SIGNING_PRIVATE_KEY is not set, but tauri.conf.json configures"
+        $Errors += "    an updater pubkey, so the bundle would be built UNSIGNED and existing"
         $Errors += "    installs could not auto-update to it."
+        if (-not [string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY_PATH)) {
+            # The exact trap docs\WORKING_STATE_v0.1.0.md walks you into.
+            $Errors += "    NOTE: TAURI_SIGNING_PRIVATE_KEY_PATH *is* set, and `tauri build`"
+            $Errors += "    ignores it -- that variable is for `tauri signer sign`. Put the"
+            $Errors += "    path in TAURI_SIGNING_PRIVATE_KEY instead; it accepts a path."
+        }
         if (Test-Path $DefaultKey) {
             # The usual cause: the key is right there, the variable is not.
             $Errors += "    The key IS on disk. From the repo root, before building:"
-            $Errors += "      `$env:TAURI_SIGNING_PRIVATE_KEY_PATH = `"$DefaultKey`""
-        } else {
-            $Errors += "    Set TAURI_SIGNING_PRIVATE_KEY_PATH (see docs\WORKING_STATE_v0.1.0.md)."
+            $Errors += "      `$env:TAURI_SIGNING_PRIVATE_KEY = `"$DefaultKey`""
         }
-    } elseif ($havePath -and -not (Test-Path -LiteralPath $keyPath)) {
-        # A path that does not resolve fails exactly like no key at all, and
-        # just as quietly, so it is the same error.
-        $Errors += "  - TAURI_SIGNING_PRIVATE_KEY_PATH points at a file that does not exist:"
-        $Errors += "      $keyPath"
-        $Errors += "    The bundle would be built UNSIGNED and still exit 0."
+    } elseif ($haveKey -and ($key -match '[\\/]') -and -not (Test-Path -LiteralPath $key)) {
+        # It looks like a path and does not resolve. A key that is inline
+        # base64 has no separators, so this cannot misfire on one.
+        $Errors += "  - TAURI_SIGNING_PRIVATE_KEY looks like a path but no such file exists:"
+        $Errors += "      $key"
     }
 }
 

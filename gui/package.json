@@ -11,7 +11,8 @@
     "tauri:build": "npm run preflight:staging && tauri build",
     "preflight:staging": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File ../scripts/preflight-staging-versions.ps1",
     "verify:signature": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File ../scripts/verify-updater-signature.ps1",
-    "release:build": "npm run preflight:staging && tauri build && npm run verify:signature"
+    "release:manifest": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File ../scripts/generate-update-manifest.ps1",
+    "release:build": "npm run preflight:staging && tauri build && npm run verify:signature && npm run release:manifest"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.0",
