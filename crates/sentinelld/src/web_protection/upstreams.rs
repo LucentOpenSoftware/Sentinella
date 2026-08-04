@@ -28,10 +28,23 @@
 //! agree: dnsguard rejects the whole list on one bad address, so anything
 //! this filter lets through and dnsguard then refuses costs us every good
 //! upstream that was in the list alongside it.
+//!
+//! # Keeping the list current
+//!
+//! The resolved list goes stale the moment the network changes — a VPN
+//! connect replaces the machine's resolvers in one step. This module also
+//! owns the watcher that re-resolves on `NotifyIpInterfaceChange` events
+//! (with a slow poll as the fallback) and pushes the result through
+//! `UpstreamsHandle::set`, which keeps the previous list on error:
+//! stale-but-working beats empty.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::time::{Duration, Instant};
 
-use tracing::{debug, warn};
+use dnsguard::proxy::UpstreamsHandle;
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
+use tracing::{debug, info, warn};
 
 /// DNS is always port 53 here: adapter configuration carries no port, and
 /// NRPT's `NameServers` has no port syntax either.
@@ -198,15 +211,204 @@ fn is_ipv6_placeholder(ip: &IpAddr) -> bool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Change-driven re-resolution
+// ---------------------------------------------------------------------------
+
+/// Fallback poll interval, now that the subscription is the fast path.
+///
+/// `NotifyIpInterfaceChange` covers interface up/down and address
+/// arrivals — the VPN-connect case that made the 30 s poll hurt. What it
+/// does not reliably cover is a DNS-server-only rewrite that changes no
+/// interface state (some VPN clients edit adapter DNS directly), and a
+/// subscription that failed to register at startup. This poll backstops
+/// those holes, so the worst-case staleness window is this interval. Five
+/// minutes: real changes now arrive by event within seconds, so polling
+/// faster buys nothing, and `GetAdaptersAddresses` is cheap but not free.
+const FALLBACK_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// How long after the first event of a burst the batched re-resolve
+/// fires. See [`BurstCoalescer`] for why a fixed window and not a
+/// debounce. Two seconds covers the interface-up → address → DNS-written
+/// sequence a single VPN connect raises, without making a real change
+/// wait long enough to matter.
+const CHANGE_SETTLE: Duration = Duration::from_secs(2);
+
+/// Collapses a network-change event storm into at most one re-resolve
+/// per `settle` window.
+///
+/// A single VPN connect raises several `NotifyIpInterfaceChange` calls —
+/// tunnel interface up, address assigned, DNS servers written — seconds
+/// apart, and a Wi-Fi roam can flap an adapter repeatedly before it
+/// settles. Resolving on every event would hammer discovery and push
+/// half-formed lists (adapter up, its DNS not yet written) at the proxy.
+///
+/// Fixed window, NOT a debounce: the first event ARMS the coalescer and
+/// later events while armed are absorbed without moving the deadline. A
+/// debounce that extended on every event could be starved forever by a
+/// flapping interface; here a continuous storm still fires no later than
+/// `settle` after its first event.
+struct BurstCoalescer {
+    settle: Duration,
+    armed_until: Option<Instant>,
+}
+
+impl BurstCoalescer {
+    fn new(settle: Duration) -> Self {
+        Self {
+            settle,
+            armed_until: None,
+        }
+    }
+
+    /// Record a change event at `now`. Events while armed are absorbed:
+    /// the deadline does NOT move, which is the property that bounds
+    /// re-resolves to one per `settle` no matter how long the storm runs.
+    fn signal(&mut self, now: Instant) {
+        if self.armed_until.is_none() {
+            self.armed_until = Some(now + self.settle);
+        }
+    }
+
+    /// When the batched re-resolve is due; `None` means no pending events.
+    fn due(&self) -> Option<Instant> {
+        self.armed_until
+    }
+
+    /// Mark the batched re-resolve as done; the next event arms a fresh
+    /// window.
+    fn fired(&mut self) {
+        self.armed_until = None;
+    }
+}
+
+/// Receive from the subscription channel if there is one; never complete
+/// otherwise. The latter is the poll-only shape (no subscription), where
+/// the fallback interval and shutdown are the only live `select!` arms.
+async fn next_change(rx: &mut Option<mpsc::Receiver<()>>) -> Option<()> {
+    match rx {
+        Some(r) => r.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Re-discover upstreams and push them at the proxy, driven by
+/// `NotifyIpInterfaceChange` events with a slow poll as the fallback.
+///
+/// WHY EVENTS FIRST. The 30 s poll this replaces left the machine
+/// forwarding to dead resolvers for up to 30 s on every VPN connect,
+/// Wi-Fi roam or dock — and the NRPT rule routes EVERY name on the
+/// machine at us, so that is 30 s of machine-wide resolution failure.
+/// The interface-change subscription delivers the same signal in
+/// seconds; the poll stays, slower, for what the subscription cannot see
+/// (DNS-only rewrites) or in case it fails to register.
+///
+/// Conservative in exactly the way the poll was: `UpstreamsHandle::set`
+/// validates and KEEPS THE PREVIOUS LIST on error, and a failed
+/// re-discovery is logged and skipped, so a change event mid-roam — every
+/// adapter briefly down — can never leave the proxy with no resolver.
+/// Stale-but-working beats empty: degrade to no filtering, never to no
+/// DNS.
+pub fn spawn_upstream_refresh(
+    configured: Vec<String>,
+    listen: SocketAddr,
+    handle: UpstreamsHandle,
+    mut shutdown: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        // Capacity 1: one pending signal already says "the interface table
+        // changed"; a second pending copy adds nothing. The bound is what
+        // lets the FFI callback stay allocation- and wait-free.
+        let (tx, rx) = mpsc::channel::<()>(1);
+        let _subscription = match platform::subscribe_interface_changes(tx) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                warn!(%e, "web protection: interface-change subscription failed — polling only");
+                None
+            }
+        };
+        // The receiver is only meaningful while a subscription holds the
+        // sender; in the poll-only shape the arm never completes.
+        let mut events = _subscription.as_ref().map(|_| rx);
+        let mut coalescer = BurstCoalescer::new(CHANGE_SETTLE);
+        // First tick one interval out: the service resolves at startup
+        // before spawning us, so an immediate tick would re-resolve the
+        // same list.
+        let mut fallback = tokio::time::interval_at(
+            tokio::time::Instant::now() + FALLBACK_REFRESH_INTERVAL,
+            FALLBACK_REFRESH_INTERVAL,
+        );
+        let mut current: Vec<SocketAddr> = Vec::new();
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => return,
+                signal = next_change(&mut events) => {
+                    if signal.is_none() {
+                        // The sender lives in the subscription we hold, so
+                        // this cannot happen; drop the arm rather than
+                        // busy-loop on a closed channel if it ever does.
+                        events = None;
+                        continue;
+                    }
+                    coalescer.signal(Instant::now());
+                    let Some(due) = coalescer.due() else {
+                        // signal() arms an unarmed coalescer, so this is
+                        // unreachable; skip the cycle rather than panic in
+                        // a service if that ever stops being true.
+                        continue;
+                    };
+                    tokio::select! {
+                        _ = shutdown.changed() => return,
+                        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(due)) => {}
+                    }
+                    // Absorb whatever piled up during the settle window —
+                    // the re-resolve below covers all of it.
+                    if let Some(rx) = events.as_mut() {
+                        while rx.try_recv().is_ok() {}
+                    }
+                    coalescer.fired();
+                }
+                _ = fallback.tick() => {}
+            }
+            let discovered = match resolve(&configured, listen) {
+                Ok(u) => u,
+                Err(e) => {
+                    // Keep serving with what we have. An empty list here
+                    // would be worse than a stale one.
+                    warn!(%e, "web protection: upstream re-discovery failed — keeping the current list");
+                    continue;
+                }
+            };
+            if discovered == current {
+                continue;
+            }
+            match handle.set(discovered.clone()) {
+                Ok(()) => {
+                    info!(
+                        upstreams = ?discovered,
+                        "web protection: upstream list changed — proxy updated"
+                    );
+                    current = discovered;
+                }
+                Err(e) => warn!(
+                    %e,
+                    "web protection: rediscovered upstreams were rejected — keeping the current list"
+                ),
+            }
+        }
+    })
+}
+
 #[cfg(windows)]
 mod platform {
     use super::*;
     use std::ffi::c_void;
-    use windows::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, NO_ERROR};
+    use windows::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, HANDLE, NO_ERROR};
     use windows::Win32::NetworkManagement::IpHelper::{
-        GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_FRIENDLY_NAME, GAA_FLAG_SKIP_MULTICAST,
-        GAA_FLAG_SKIP_UNICAST, GetAdaptersAddresses, IF_TYPE_SOFTWARE_LOOPBACK,
-        IP_ADAPTER_ADDRESSES_LH,
+        CancelMibChangeNotify2, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_FRIENDLY_NAME,
+        GAA_FLAG_SKIP_MULTICAST, GAA_FLAG_SKIP_UNICAST, GetAdaptersAddresses,
+        IF_TYPE_SOFTWARE_LOOPBACK, IP_ADAPTER_ADDRESSES_LH, MIB_IPINTERFACE_ROW,
+        MIB_NOTIFICATION_TYPE, NotifyIpInterfaceChange,
     };
     use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
     use windows::Win32::Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKADDR_IN6};
@@ -328,6 +530,97 @@ mod platform {
             None
         }
     }
+
+    /// RAII token for a `NotifyIpInterfaceChange` registration. Held by
+    /// the watcher task; dropping it cancels the registration.
+    pub struct ChangeSubscription {
+        handle: HANDLE,
+    }
+
+    // SAFETY: `HANDLE` is a plain pointer value naming process-global
+    // iphlpapi state — it is not thread-affine, and the callback context
+    // (the leaked sender) stays valid for the life of the process, so
+    // moving this token into the watcher task moves nothing thread-bound.
+    unsafe impl Send for ChangeSubscription {}
+
+    impl Drop for ChangeSubscription {
+        fn drop(&mut self) {
+            // SAFETY: `handle` came from a successful
+            // `NotifyIpInterfaceChange` and is cancelled exactly once,
+            // here. The windows crate exposes `CancelMibChangeNotify2`,
+            // which is what the `CancelIpInterfaceChangeNotify` macro maps
+            // to. The callback context was LEAKED, so a callback already
+            // in flight cannot touch freed memory no matter how it races
+            // this cancellation.
+            unsafe {
+                let _ = CancelMibChangeNotify2(self.handle);
+            }
+        }
+    }
+
+    /// Register `tx` to be signalled on every IP interface change.
+    ///
+    /// The sender is `Box::leak`ed and handed to iphlpapi as the callback
+    /// context. Leaking is deliberate: `CancelMibChangeNotify2`'s
+    /// documentation does not state whether a callback already in flight
+    /// has returned when the call completes, so freeing the box on drop
+    /// would open a use-after-free window in a service. One leaked
+    /// `Sender` per subscription — and subscriptions are created once per
+    /// daemon start — is the cheap direction.
+    pub fn subscribe_interface_changes(
+        tx: mpsc::Sender<()>,
+    ) -> Result<ChangeSubscription, String> {
+        let ctx = Box::leak(Box::new(tx));
+        let ctx_ptr = ctx as *mut mpsc::Sender<()>;
+        let mut handle = HANDLE::default();
+        // SAFETY: `ctx_ptr` points at the live, never-freed sender leaked
+        // above, so it is valid for every callback this registration can
+        // ever make. `handle` is valid out-memory for the duration of the
+        // call. AF_UNSPEC subscribes for both address families;
+        // initial_notification = false because the service resolves once
+        // at startup before spawning the watcher — an initial notification
+        // would only re-resolve the same list.
+        let rc = unsafe {
+            NotifyIpInterfaceChange(
+                AF_UNSPEC,
+                Some(on_interface_change),
+                Some(ctx_ptr.cast::<c_void>()),
+                false,
+                &mut handle,
+            )
+        };
+        if rc != NO_ERROR {
+            // SAFETY: the registration failed, so no callback can ever
+            // receive this pointer; reclaiming the leaked box is safe.
+            unsafe { drop(Box::from_raw(ctx_ptr)) };
+            return Err(format!("NotifyIpInterfaceChange failed: {}", rc.0));
+        }
+        Ok(ChangeSubscription { handle })
+    }
+
+    /// Called by iphlpapi, on its own thread, when the IP interface table
+    /// changes. The discipline is the point: NO allocation, NO locks, NO
+    /// logging, NOTHING that can panic — a crash here crashes the service
+    /// from a network flap, and blocking here stalls iphlpapi's
+    /// notification thread. A `try_send` that finds the channel full is
+    /// dropped on purpose: the one pending signal already covers every
+    /// change queued behind it.
+    unsafe extern "system" fn on_interface_change(
+        callercontext: *const c_void,
+        _row: *const MIB_IPINTERFACE_ROW,
+        _notificationtype: MIB_NOTIFICATION_TYPE,
+    ) {
+        if callercontext.is_null() {
+            return;
+        }
+        // SAFETY: `callercontext` is the `Box::leak`ed `mpsc::Sender<()>`
+        // registered in `subscribe_interface_changes`. Being leaked, it is
+        // valid for the rest of the process, so the dereference cannot
+        // race `ChangeSubscription`'s drop. The reference is shared and
+        // lives only for this call; `try_send` takes `&self`.
+        let tx = unsafe { &*callercontext.cast::<mpsc::Sender<()>>() };
+        let _ = tx.try_send(());
+    }
 }
 
 #[cfg(not(windows))]
@@ -335,6 +628,17 @@ mod platform {
     use super::*;
     pub fn enumerate_dns_servers() -> Result<Vec<IpAddr>, String> {
         Err("adapter DNS discovery is only implemented on Windows".into())
+    }
+
+    /// Never constructed: the subscription is Windows-only, matching
+    /// discovery itself. The watcher falls back to polling when
+    /// `subscribe_interface_changes` errors, which here is always.
+    pub struct ChangeSubscription;
+
+    pub fn subscribe_interface_changes(
+        _tx: mpsc::Sender<()>,
+    ) -> Result<ChangeSubscription, String> {
+        Err("interface-change subscription is only implemented on Windows".into())
     }
 }
 
@@ -534,5 +838,81 @@ mod tests {
     fn empty_configured_list_is_an_error_not_a_default() {
         let out = resolve(&[], "127.0.0.1:53".parse().unwrap());
         assert!(matches!(out, Err(DiscoveryError::NoneConfigured)));
+    }
+
+    // ------------------------------------------------------------------
+    // BurstCoalescer
+    // ------------------------------------------------------------------
+
+    /// One signal arms the window; more signals inside it are absorbed
+    /// without moving the deadline, and firing disarms. This is the
+    /// "one re-resolve per burst" property.
+    #[test]
+    fn a_burst_collapses_to_one_fire_at_the_settle_deadline() {
+        let base = Instant::now();
+        let settle = Duration::from_secs(2);
+        let mut c = BurstCoalescer::new(settle);
+        assert_eq!(c.due(), None, "no events, nothing due");
+
+        c.signal(base);
+        assert_eq!(c.due(), Some(base + settle));
+
+        c.signal(base + Duration::from_millis(500));
+        c.signal(base + Duration::from_millis(1999));
+        assert_eq!(
+            c.due(),
+            Some(base + settle),
+            "events inside the window must be absorbed, not extend it"
+        );
+
+        c.fired();
+        assert_eq!(c.due(), None, "fired means nothing pending");
+    }
+
+    /// A flapping interface produces an ENDLESS stream of events spaced
+    /// closer than the settle window. A debounce (extend on every event)
+    /// would never fire; this coalescer must fire no later than `settle`
+    /// after the first event — stale upstreams for 2 s during a flap is
+    /// fine, stale forever is the outage this subsystem exists to kill.
+    #[test]
+    fn a_continuous_storm_still_fires_within_one_settle_window() {
+        let base = Instant::now();
+        let settle = Duration::from_secs(2);
+        let mut c = BurstCoalescer::new(settle);
+        for i in 0..100 {
+            c.signal(base + Duration::from_millis(i * 100));
+        }
+        assert_eq!(c.due(), Some(base + settle));
+    }
+
+    /// After a fire, the next event starts a NEW window from its own
+    /// arrival — at most one re-resolve per settle window, indefinitely.
+    #[test]
+    fn after_firing_the_next_event_arms_a_fresh_window() {
+        let base = Instant::now();
+        let mut c = BurstCoalescer::new(Duration::from_secs(2));
+        c.signal(base);
+        c.fired();
+        c.signal(base + Duration::from_secs(5));
+        assert_eq!(c.due(), Some(base + Duration::from_secs(7)));
+    }
+
+    /// The live FFI check: register a real subscription against this
+    /// machine's iphlpapi and drop it, proving the register/cancel path
+    /// runs cleanly. Requires Windows with a working network stack (any
+    /// normal install). Actually TRIGGERING the callback needs a network
+    /// change, which a unit test cannot stage — the callback body is a
+    /// `try_send` and nothing else, and storm behaviour is covered by the
+    /// BurstCoalescer tests above.
+    ///
+    ///   cargo test -p sentinelld subscription_registers -- --ignored
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "live FFI: registers against the real iphlpapi notification surface"]
+    fn subscription_registers_and_cancels_cleanly() {
+        let (tx, _rx) = mpsc::channel(1);
+        let sub = platform::subscribe_interface_changes(tx)
+            .expect("NotifyIpInterfaceChange registers on any working Windows network stack");
+        drop(sub); // must not hang or crash; cancellation is synchronous
     }
 }

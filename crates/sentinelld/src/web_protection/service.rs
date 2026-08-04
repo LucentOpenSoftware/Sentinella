@@ -22,13 +22,12 @@
 //! degrade-to-no-filtering direction.
 
 use std::net::SocketAddr;
-use std::time::Duration;
 use std::sync::Arc;
 use std::sync::RwLock;
 
 use dnsguard::filter::{FilterEngine, ListKind};
 use dnsguard::proxy::{
-    BlockResponse, Counters, NoopDecisionHook, Proxy, ProxyConfig, UpstreamsHandle,
+    BlockResponse, Counters, NoopDecisionHook, Proxy, ProxyConfig,
 };
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -125,71 +124,9 @@ pub struct WebProtection {
     task: Option<JoinHandle<std::io::Result<()>>>,
 }
 
-/// How often to re-discover the system resolvers.
-///
-/// The upstream list was resolved once at daemon start and never re-read.
-/// `UpstreamsHandle` exists precisely to fix that and was stored, unused —
-/// dead code that looked like the feature was implemented. Meanwhile the NRPT
-/// rule routes EVERY name on the machine at us, so once the list goes stale
-/// the machine cannot resolve anything: connect to a VPN, switch Wi-Fi, dock,
-/// or just renew a DHCP lease onto a different resolver, and the proxy keeps
-/// forwarding to addresses that no longer answer.
-///
-/// 30 s is a compromise. `GetAdaptersAddresses` is cheap, but this is a
-/// poll — a proper `NotifyIpInterfaceChange` subscription would react
-/// immediately and is the better long-term answer. Polling closes the
-/// indefinite outage now without adding an FFI callback surface.
-const UPSTREAM_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
-
-/// Re-discover upstreams periodically and push them at the proxy.
-///
-/// Deliberately quiet and deliberately conservative. `UpstreamsHandle::set`
-/// validates and KEEPS THE PREVIOUS LIST on error, so a transient discovery
-/// failure — every adapter down mid-roam — cannot leave the proxy with no
-/// resolver at all. That is the same "degrade to no filtering, never to no
-/// DNS" rule the rest of this module runs on: a stale-but-working list beats
-/// an empty one.
-fn spawn_upstream_refresh(
-    configured: Vec<String>,
-    listen: SocketAddr,
-    handle: UpstreamsHandle,
-    mut shutdown: watch::Receiver<bool>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut current: Vec<SocketAddr> = Vec::new();
-        loop {
-            tokio::select! {
-                _ = shutdown.changed() => return,
-                _ = tokio::time::sleep(UPSTREAM_REFRESH_INTERVAL) => {}
-            }
-            let discovered = match upstreams::resolve(&configured, listen) {
-                Ok(u) => u,
-                Err(e) => {
-                    // Keep serving with what we have. An empty list here
-                    // would be worse than a stale one.
-                    warn!(%e, "web protection: upstream re-discovery failed — keeping the current list");
-                    continue;
-                }
-            };
-            if discovered == current {
-                continue;
-            }
-            match handle.set(discovered.clone()) {
-                Ok(()) => {
-                    info!(
-                        upstreams = ?discovered,
-                        "web protection: upstream list changed — proxy updated"
-                    );
-                    current = discovered;
-                }
-                Err(e) => warn!(
-                    %e,
-                    "web protection: rediscovered upstreams were rejected — keeping the current list"
-                ),
-            }
-        }
-    })
-}
+/// Upstream re-discovery lives in `upstreams::spawn_upstream_refresh` —
+/// an event-driven `NotifyIpInterfaceChange` subscription with a 5-min poll
+/// fallback (replaced the 30 s poll; same keep-previous-on-error invariant).
 
 /// Remove a rule that some PREVIOUS run of this daemon installed, when this
 /// run is not going to serve.
@@ -413,7 +350,7 @@ impl WebProtection {
         // Spawned BEFORE `proxy.run` consumes the proxy, and given its own
         // shutdown receiver so it dies with the rest of the service rather
         // than outliving it and pushing upstreams at a stopped proxy.
-        let refresher = spawn_upstream_refresh(
+        let refresher = upstreams::spawn_upstream_refresh(
             cfg.upstreams.clone(),
             listen,
             upstreams_handle,
