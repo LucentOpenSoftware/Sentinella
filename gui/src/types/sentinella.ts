@@ -501,6 +501,28 @@ export interface DeveloperConfigPublic {
   // password_sha256 is NEVER carried on the wire — see proto::full_config.
 }
 
+/**
+ * Mirrors the daemon's `[web_protection]` TOML section (same names/types).
+ * Every field is CRITICAL daemon-side: mutation must travel via
+ * set_critical_settings (UAC), never save_full_settings — the daemon
+ * rejects the whole write if any of these differs from disk.
+ */
+export interface FullWebProtectionConfig {
+  enabled: boolean;
+  /** IPv4 loopback :53 only when enabled — the daemon validates this. */
+  listen: string;
+  /** "system" or explicit IP:port entries. */
+  upstreams: string[];
+  /** "nxdomain" | "zero_ip" */
+  block_response: string;
+  health_check_name: string;
+  /** Each entry is `path` or `path|suffix`. */
+  blocklists: string[];
+  /** Bare name = exact host, leading dot = suffix rule. */
+  allowlist: string[];
+  log_queries: boolean;
+}
+
 export interface FullConfig {
   // Real-time protection
   realtime_enabled: boolean;
@@ -578,6 +600,16 @@ export interface FullConfig {
   fish: FullFishConfig;
   sandbox: FullSandboxConfig;
   developer: DeveloperConfigPublic;
+  /**
+   * OPTIONAL on the wire (Option<> daemon-side). Absent/null means "this
+   * client made no statement about the section": the daemon leaves the
+   * stored [web_protection] untouched and does not treat it as a
+   * kill-vector diff. Older daemons never send it. A daemon that sends
+   * it expects it round-tripped back verbatim — the save path spreads
+   * the fetched object, so the section rides along automatically; this
+   * type is what keeps tsc honest about that.
+   */
+  web_protection?: FullWebProtectionConfig | null;
 }
 
 /** Sentinel for "kill-vector" fields — must travel via set_critical_settings, not save_full_settings. */
@@ -604,6 +636,20 @@ export const CRITICAL_FIELDS: ReadonlySet<string> = new Set([
   "fish.active_response",
   "sandbox.enabled",
   "clamav_isolation",
+  // [web_protection] — the whole section is critical daemon-side (DNS
+  // routing + filtering suppression). No Settings UI edits these yet, so
+  // they never appear in a criticalDiff; listing them here keeps
+  // withPersistedCriticalFields re-syncing the section from disk before
+  // save_full_settings, so a concurrently-changed stored section can't
+  // get the whole non-critical save rejected as kill-vector tampering.
+  "web_protection.enabled",
+  "web_protection.listen",
+  "web_protection.upstreams",
+  "web_protection.block_response",
+  "web_protection.health_check_name",
+  "web_protection.blocklists",
+  "web_protection.allowlist",
+  "web_protection.log_queries",
 ]);
 
 /** Response shape for save_full_settings / set_critical_settings. */

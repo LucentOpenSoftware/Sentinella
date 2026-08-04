@@ -88,6 +88,25 @@ pub fn restart_requirement(field_path: &str) -> RestartRequirement {
         | "fish.enabled"
         | "sandbox.enabled" => DaemonRestart,
 
+        // ── web_protection.*: no hot apply exists ──
+        //
+        // Changing enabled/listen/upstreams re-plumbs where the machine's
+        // DNS goes, and nothing re-reads the section on a live daemon.
+        // Claiming `None` here would put a "saved, applies immediately"
+        // pill next to a value the running proxy never picks up — and a
+        // half-applied DNS change is exactly how an NRPT rule ends up
+        // pointing at a dead listener. DaemonRestart is the honest
+        // answer until a hot path is built; build it and move these in
+        // the SAME commit.
+        "web_protection.enabled"
+        | "web_protection.listen"
+        | "web_protection.upstreams"
+        | "web_protection.block_response"
+        | "web_protection.health_check_name"
+        | "web_protection.blocklists"
+        | "web_protection.allowlist"
+        | "web_protection.log_queries" => DaemonRestart,
+
         // ── DaemonRestart (value is COPIED at startup) ─
         //
         // These are saved to the TOML the moment the user hits save, but the
@@ -169,6 +188,25 @@ pub const CRITICAL_FIELDS: &[&str] = &[
     "fish.active_response",
     "sandbox.enabled",
     "clamav_isolation",
+    // ── Web protection (DNS filtering) — the WHOLE section ──
+    // enabled/listen/upstreams decide whether the machine's DNS is
+    // routed into the local proxy at all: a bad write there is how an
+    // NRPT rule ends up pointing at a dead listener, which is "no DNS"
+    // — the one failure mode this subsystem must never produce.
+    // blocklists/allowlist are the filtering equivalent of
+    // excluded_detections/trusted_hashes: emptying blocklists or
+    // allowlisting a malicious domain is detection suppression. The
+    // remaining knobs travel with the section so a future
+    // protection.set_critical handler applies it atomically instead of
+    // as split-brain halves.
+    "web_protection.enabled",
+    "web_protection.listen",
+    "web_protection.upstreams",
+    "web_protection.block_response",
+    "web_protection.health_check_name",
+    "web_protection.blocklists",
+    "web_protection.allowlist",
+    "web_protection.log_queries",
 ];
 
 /// True if the given field path is in [`CRITICAL_FIELDS`].
@@ -258,6 +296,24 @@ pub struct FullConfig {
     pub fish: FullFishConfig,
     pub sandbox: FullSandboxConfig,
     pub developer: DeveloperConfigPublic,
+    /// DNS-layer web protection. OPTIONAL on the wire, unlike every
+    /// sibling section — this is the fix for the absent-vs-default trap
+    /// that kept [web_protection] off FullConfig entirely:
+    ///
+    /// - `None` (key absent, or explicit null) = the client made NO
+    ///   statement about the section. `serde(default)` on a plain
+    ///   section struct would materialise defaults here, which the
+    ///   daemon then cannot tell apart from a client that genuinely
+    ///   asked for defaults — and every field in this section is
+    ///   CRITICAL, so an older GUI PUTting a FullConfig without the
+    ///   key would either get every unrelated save rejected as a
+    ///   kill-vector mutation (stored config differs from defaults) or,
+    ///   worse, have defaults written over the user's blocklists and
+    ///   upstreams. `None` carries neither risk: the daemon ignores it.
+    /// - `Some(section)` = an explicit statement. Every field must
+    ///   match the stored config or `settings.set_full` rejects the
+    ///   whole request; mutation travels via `protection.set_critical`.
+    pub web_protection: Option<FullWebProtectionConfig>,
 }
 
 impl Default for FullConfig {
@@ -324,6 +380,11 @@ impl Default for FullConfig {
             fish: FullFishConfig::default(),
             sandbox: FullSandboxConfig::default(),
             developer: DeveloperConfigPublic::default(),
+            // None = "no statement about the section" — the daemon ignores
+            // it on apply. A `Some(default)` here would be a claim that the
+            // user's [web_protection] IS the default, which `critical_diff`
+            // would then enforce against any non-default stored config.
+            web_protection: None,
         }
     }
 }
@@ -432,6 +493,50 @@ impl Default for FullSandboxConfig {
             timeout_sec: 10,
             min_score: 26,
             max_score: 75,
+        }
+    }
+}
+
+/// Mirror of the daemon's `web_protection::WebProtectionConfig` — same
+/// names, same types as the TOML section. Defaults here match the daemon
+/// struct's `Default` exactly.
+///
+/// Unlike the other nested sections this one sits behind an `Option` at
+/// the `FullConfig` level — see the `web_protection` field's doc comment
+/// for the absent-vs-default semantics. Every field is in
+/// [`CRITICAL_FIELDS`], so `settings.set_full` can never mutate any of
+/// them; they are mirrored so the GUI can RENDER the section and so an
+/// elevated `protection.set_critical` flow has a typed shape to send.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FullWebProtectionConfig {
+    pub enabled: bool,
+    /// IPv4 loopback :53 only when enabled — see the daemon's
+    /// WebProtectionConfig docs for why nothing else can serve.
+    pub listen: String,
+    /// "system" or explicit IP:port entries.
+    pub upstreams: Vec<String>,
+    /// "nxdomain" (default) or "zero_ip".
+    pub block_response: String,
+    pub health_check_name: String,
+    /// Each entry is `path` or `path|suffix`.
+    pub blocklists: Vec<String>,
+    /// Bare name = exact host, leading dot = suffix rule.
+    pub allowlist: Vec<String>,
+    pub log_queries: bool,
+}
+
+impl Default for FullWebProtectionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: "127.0.0.1:53".into(),
+            upstreams: vec!["system".into()],
+            block_response: "nxdomain".into(),
+            health_check_name: "example.com".into(),
+            blocklists: Vec::new(),
+            allowlist: Vec::new(),
+            log_queries: false,
         }
     }
 }
@@ -552,6 +657,15 @@ impl RestartRequirementMap {
             "developer.enabled",
             "developer.telemetry_enabled",
             "developer.telemetry_max_kb",
+            // web_protection.* — every field DaemonRestart (no hot path)
+            "web_protection.enabled",
+            "web_protection.listen",
+            "web_protection.upstreams",
+            "web_protection.block_response",
+            "web_protection.health_check_name",
+            "web_protection.blocklists",
+            "web_protection.allowlist",
+            "web_protection.log_queries",
         ];
         let mut fields = std::collections::HashMap::with_capacity(paths.len());
         for p in paths {
@@ -672,6 +786,82 @@ mod tests {
             assert!(
                 is_critical(field),
                 "{field} must stay in CRITICAL_FIELDS — v0.1.9 ransomware-shield / sandbox / isolation regression"
+            );
+        }
+    }
+
+    #[test]
+    fn web_protection_section_is_optional_on_the_wire() {
+        // Absent key → None, NOT a defaulted section. This pins the
+        // absent-vs-default semantics: an older/partial client PUTting a
+        // FullConfig without the section must not have one materialised
+        // out of serde defaults — the daemon relies on `None` meaning
+        // "no statement, leave the stored [web_protection] alone".
+        let parsed: FullConfig = serde_json::from_str("{}").expect("empty payload parses");
+        assert!(parsed.web_protection.is_none());
+        // Explicit null means the same thing.
+        let parsed: FullConfig =
+            serde_json::from_str(r#"{"web_protection":null}"#).expect("null parses");
+        assert!(parsed.web_protection.is_none());
+        // FullConfig::default() carries None and serializes back to it.
+        let json = serde_json::to_string(&FullConfig::default()).expect("serialize");
+        let parsed: FullConfig = serde_json::from_str(&json).expect("deserialize");
+        assert!(parsed.web_protection.is_none());
+
+        // A present section round-trips with its values intact.
+        let mut cfg = FullConfig::default();
+        cfg.web_protection = Some(FullWebProtectionConfig {
+            enabled: true,
+            upstreams: vec!["9.9.9.9:53".into()],
+            block_response: "zero_ip".into(),
+            blocklists: vec!["C:\\feeds\\md.txt|suffix".into()],
+            allowlist: vec![".corp.example.com".into()],
+            log_queries: true,
+            ..FullWebProtectionConfig::default()
+        });
+        let json = serde_json::to_string(&cfg).expect("serialize");
+        let parsed: FullConfig = serde_json::from_str(&json).expect("deserialize");
+        let section = parsed.web_protection.expect("section must round-trip");
+        assert!(section.enabled);
+        assert_eq!(section.listen, "127.0.0.1:53");
+        assert_eq!(section.upstreams, vec!["9.9.9.9:53"]);
+        assert_eq!(section.block_response, "zero_ip");
+        assert_eq!(section.health_check_name, "example.com");
+        assert_eq!(section.blocklists, vec!["C:\\feeds\\md.txt|suffix"]);
+        assert_eq!(section.allowlist, vec![".corp.example.com"]);
+        assert!(section.log_queries);
+    }
+
+    #[test]
+    fn web_protection_fields_are_critical_and_restart_bound() {
+        // Every web_protection.* field is a kill vector (DNS routing +
+        // filtering suppression) AND has no hot-apply path: classifying
+        // any of them `None` promises a live change the running daemon
+        // never picks up. Named explicitly so a careless edit that drops
+        // one fails here instead of reopening the gap.
+        for field in [
+            "web_protection.enabled",
+            "web_protection.listen",
+            "web_protection.upstreams",
+            "web_protection.block_response",
+            "web_protection.health_check_name",
+            "web_protection.blocklists",
+            "web_protection.allowlist",
+            "web_protection.log_queries",
+        ] {
+            assert!(
+                is_critical(field),
+                "{field} must be in CRITICAL_FIELDS — kill-vector regression"
+            );
+            assert_eq!(
+                restart_requirement(field),
+                RestartRequirement::DaemonRestart,
+                "{field} has no hot path — a None pill would lie about applying live"
+            );
+            assert_eq!(
+                RestartRequirementMap::build().fields.get(field).copied(),
+                Some(RestartRequirement::DaemonRestart),
+                "{field} must appear in the restart-requirements map"
             );
         }
     }

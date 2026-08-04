@@ -3496,10 +3496,12 @@ mod tests {
         }
     }
 
-    /// [web_protection] is absent from `FullConfig`, so settings.set_full
-    /// cannot reach it and `critical_diff` never sees it. That makes
-    /// settings.set the only IPC surface that could turn DNS filtering off —
-    /// it must not be one.
+    /// [web_protection] is bridged into `FullConfig` (as an `Option`), but
+    /// every `web_protection.*` path is in `CRITICAL_FIELDS`, so plain
+    /// settings.set_full can never write it — mutations require
+    /// protection.set_critical (challenge + elevation). That leaves
+    /// settings.set as the only IPC surface that could turn DNS filtering
+    /// off — it must not be one.
     #[test]
     fn settings_set_cannot_disable_web_protection() {
         let mut current = crate::config::Config::default();

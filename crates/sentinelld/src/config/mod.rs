@@ -1306,9 +1306,11 @@ fn merge_table_into(target: &mut toml_edit::Table, fresh: &toml_edit::Table) {
 // simply never read. `every_config_field_is_accounted_for_by_the_bridge`
 // below is the guard — it destructures Config with no `..`, so adding a
 // field there stops that test COMPILING until someone decides where the
-// field belongs. (It was added after [web_protection] reached Config
-// without reaching any part of the bridge — see the test for why that
-// section is still deliberately unbridged.)
+// field belongs. ([web_protection] spent one release as the example of
+// the gap: it reached Config without reaching any part of the bridge.
+// It is now bridged as `Option<FullWebProtectionConfig>` — None on the
+// wire means "client made no statement", which is what keeps an older
+// GUI's save from being rejected as a kill-vector mutation.)
 //
 // `apply_non_critical` is the inverse used by `settings.set_full`: it
 // applies every NON-critical field from a FullConfig into a Config,
@@ -1317,7 +1319,7 @@ fn merge_table_into(target: &mut toml_edit::Table, fresh: &toml_edit::Table) {
 
 use sentinella_ipc_proto::full_config::{
     DeveloperConfigPublic, FullConfig, FullFishConfig, FullPerformanceConfig, FullSandboxConfig,
-    FullScanConfig, CRITICAL_FIELDS,
+    FullScanConfig, FullWebProtectionConfig, CRITICAL_FIELDS,
 };
 
 impl From<&Config> for FullConfig {
@@ -1420,6 +1422,20 @@ impl From<&Config> for FullConfig {
                 telemetry_enabled: c.developer.telemetry_enabled,
                 telemetry_max_kb: c.developer.telemetry_max_kb,
             },
+            // Always Some from the daemon: the GUI must round-trip the
+            // section it received. None exists for CLIENTS that don't
+            // know the section (see FullConfig::web_protection docs) —
+            // the daemon always has a stored section to describe.
+            web_protection: Some(FullWebProtectionConfig {
+                enabled: c.web_protection.enabled,
+                listen: c.web_protection.listen.clone(),
+                upstreams: c.web_protection.upstreams.clone(),
+                block_response: c.web_protection.block_response.clone(),
+                health_check_name: c.web_protection.health_check_name.clone(),
+                blocklists: c.web_protection.blocklists.clone(),
+                allowlist: c.web_protection.allowlist.clone(),
+                log_queries: c.web_protection.log_queries,
+            }),
         }
     }
 }
@@ -1529,13 +1545,24 @@ impl Config {
         self.developer.telemetry_enabled = full.developer.telemetry_enabled;
         self.developer.telemetry_max_kb = full.developer.telemetry_max_kb;
 
+        // ── Nested: web_protection — ENTIRELY critical, nothing applied ──
+        // Every field either decides where the machine's DNS goes
+        // (enabled/listen/upstreams) or what the filter blocks
+        // (blocklists/allowlist), so the whole section is in
+        // CRITICAL_FIELDS and mutation must travel via
+        // protection.set_critical with an elevated caller. Even a
+        // `Some(section)` in the payload is ignored here; the wire
+        // Option matters in `critical_diff` below, not here.
+        // self.web_protection = ...;                     // CRITICAL (all 8 fields)
+
         // The following are CRITICAL and intentionally NOT applied:
         //   realtime_enabled, auto_quarantine, heuristic_alerts,
         //   idle_scan_enabled, scheduled_scan_enabled,
         //   excluded_paths, excluded_extensions, excluded_detections,
         //   trusted_hashes, realtime_roots, enhanced_signature_provider,
         //   argus_worker_enabled, argus_worker_path,
-        //   scan.argus_worker_enabled, scan.argus_worker_path
+        //   scan.argus_worker_enabled, scan.argus_worker_path,
+        //   web_protection.* (all eight fields)
     }
 
     /// Verify the incoming FullConfig leaves every CRITICAL_FIELDS value
@@ -1609,6 +1636,39 @@ impl Config {
         if self.clamav_isolation != full.clamav_isolation {
             diffs.push("clamav_isolation");
         }
+        // [web_protection] — the whole section is CRITICAL. The Option is
+        // load-bearing: None means the client made NO statement about the
+        // section (older GUI, partial payload), so there is nothing to
+        // diff. Comparing the stored section against serde-defaulted
+        // values instead would reject every unrelated settings save from
+        // such a client as kill-vector tampering the moment the user's
+        // [web_protection] differs from defaults.
+        if let Some(wp) = &full.web_protection {
+            if self.web_protection.enabled != wp.enabled {
+                diffs.push("web_protection.enabled");
+            }
+            if self.web_protection.listen != wp.listen {
+                diffs.push("web_protection.listen");
+            }
+            if self.web_protection.upstreams != wp.upstreams {
+                diffs.push("web_protection.upstreams");
+            }
+            if self.web_protection.block_response != wp.block_response {
+                diffs.push("web_protection.block_response");
+            }
+            if self.web_protection.health_check_name != wp.health_check_name {
+                diffs.push("web_protection.health_check_name");
+            }
+            if self.web_protection.blocklists != wp.blocklists {
+                diffs.push("web_protection.blocklists");
+            }
+            if self.web_protection.allowlist != wp.allowlist {
+                diffs.push("web_protection.allowlist");
+            }
+            if self.web_protection.log_queries != wp.log_queries {
+                diffs.push("web_protection.log_queries");
+            }
+        }
         // Cross-check: anything we diff here must be in CRITICAL_FIELDS.
         // (debug-build assertion catches drift between this fn and the proto list)
         debug_assert!(
@@ -1655,6 +1715,13 @@ mod full_config_bridge_tests {
             enhanced_signature_provider: "none".into(),
             argus_worker_enabled: false,
             argus_worker_path: "argusd.exe".into(),
+            web_protection: crate::web_protection::WebProtectionConfig {
+                enabled: true,
+                upstreams: vec!["9.9.9.9:53".into()],
+                blocklists: vec!["C:\\feeds\\md.txt|suffix".into()],
+                allowlist: vec![".corp.example.com".into()],
+                ..Default::default()
+            },
             ..Config::default()
         };
 
@@ -1672,6 +1739,17 @@ mod full_config_bridge_tests {
         hostile.heuristic_alerts = !baseline.heuristic_alerts;
         hostile.idle_scan_enabled = !baseline.idle_scan_enabled;
         hostile.scheduled_scan_enabled = !baseline.scheduled_scan_enabled;
+        // [web_protection]: disabling the filter while pointing the proxy
+        // at a dead address and wiping the blocklists is exactly the
+        // kill vector this section's CRITICAL marking exists to refuse.
+        hostile.web_protection = Some(FullWebProtectionConfig {
+            enabled: false,
+            listen: "127.0.0.1:5353".into(),
+            upstreams: vec![],
+            blocklists: vec![],
+            allowlist: vec![".".into()],
+            ..FullWebProtectionConfig::default()
+        });
 
         let mut victim = baseline.clone();
         victim.apply_non_critical(&hostile);
@@ -1694,6 +1772,15 @@ mod full_config_bridge_tests {
         assert_eq!(
             victim.scheduled_scan_enabled,
             baseline.scheduled_scan_enabled
+        );
+        // WebProtectionConfig has no PartialEq; compare the serialized
+        // form. Hostile's enabled/listen/upstreams/blocklists/allowlist
+        // all differ from the baseline, so equality here proves none of
+        // them was applied.
+        assert_eq!(
+            serde_json::to_value(&victim.web_protection).unwrap(),
+            serde_json::to_value(&baseline.web_protection).unwrap(),
+            "apply_non_critical must never touch [web_protection]"
         );
     }
 
@@ -1725,11 +1812,40 @@ mod full_config_bridge_tests {
         hostile.fish.active_response = "terminate".into();
         hostile.sandbox.enabled = !baseline.sandbox.enabled;
         hostile.clamav_isolation = "subprocess".into();
+        // [web_protection]: every field of the section is CRITICAL, so the
+        // set-equality below only holds if all eight are exercised here.
+        // Some(...) is required — a None section is "no statement" and
+        // correctly produces no diffs.
+        hostile.web_protection = Some(FullWebProtectionConfig {
+            enabled: !baseline.web_protection.enabled,
+            listen: "127.0.0.1:5353".into(),
+            upstreams: vec![],
+            block_response: "zero_ip".into(),
+            health_check_name: "attacker.example.com".into(),
+            blocklists: vec!["C:\\feeds\\md.txt|suffix".into()],
+            allowlist: vec![".corp.example.com".into()],
+            log_queries: !baseline.web_protection.log_queries,
+        });
         // Guard the mutations that are only "different" relative to a
         // default — if a default ever changes to match, the field would
         // stop being tested and the assert below would go quiet.
         assert_ne!(baseline.fish.active_response, hostile.fish.active_response);
         assert_ne!(baseline.clamav_isolation, hostile.clamav_isolation);
+        // Same guard for [web_protection]: if a daemon default ever shifts
+        // to match one of the hostile values above, that field's branch in
+        // critical_diff would stop being exercised while the set-equality
+        // assert below stays green on the OTHER fields — until the whole
+        // section goes quiet one field at a time.
+        let hwp = hostile.web_protection.as_ref().unwrap();
+        let bwp = &baseline.web_protection;
+        assert_ne!(bwp.enabled, hwp.enabled);
+        assert_ne!(bwp.listen, hwp.listen);
+        assert_ne!(bwp.upstreams, hwp.upstreams);
+        assert_ne!(bwp.block_response, hwp.block_response);
+        assert_ne!(bwp.health_check_name, hwp.health_check_name);
+        assert_ne!(bwp.blocklists, hwp.blocklists);
+        assert_ne!(bwp.allowlist, hwp.allowlist);
+        assert_ne!(bwp.log_queries, hwp.log_queries);
 
         let diffs = baseline.critical_diff(&hostile);
 
@@ -1812,14 +1928,12 @@ mod full_config_bridge_tests {
             // developer is bridged as DeveloperConfigPublic — password_sha256
             // is deliberately dropped on the way out.
             developer: _,
-            // NOT bridged, deliberately. [web_protection] has no FullConfig
-            // counterpart, so settings.get_full/set_full cannot see it and the
-            // section is TOML-only for now. Adding the mirror without the GUI
-            // half would be worse than the gap: FullConfig is
-            // #[serde(default)], so a save from a GUI that does not round-trip
-            // the section would deserialize a default WebProtectionConfig and
-            // apply_non_critical would wipe the user's blocklists, allowlist
-            // and upstreams on every unrelated settings save.
+            // Bridged as Option<FullWebProtectionConfig>. The whole section
+            // is CRITICAL (see CRITICAL_FIELDS), so settings.set_full can
+            // render and round-trip it but never mutate it; None on the
+            // wire means "client made no statement", which is what keeps
+            // an older GUI's save from clobbering — or being rejected
+            // because of — the stored section.
             web_protection: _,
         } = Config::default();
     }
@@ -1837,6 +1951,90 @@ mod full_config_bridge_tests {
         assert!(
             !json.contains("deadbeef"),
             "password hash bytes leaked into wire format"
+        );
+    }
+
+    /// DONE-WHEN (a): a NON-default [web_protection] survives the full
+    /// wire round-trip — Config → FullConfig → JSON → FullConfig → apply —
+    /// with the section identical at the end and no critical_diff raised
+    /// (a same-values payload must be ACCEPTED, not flagged as tampering).
+    #[test]
+    fn web_protection_roundtrips_through_full_config() {
+        let mut original = Config::default();
+        original.web_protection.enabled = true;
+        original.web_protection.upstreams = vec!["9.9.9.9:53".into()];
+        original.web_protection.block_response = "zero_ip".into();
+        original.web_protection.health_check_name = "canary.example.com".into();
+        original.web_protection.blocklists = vec!["C:\\feeds\\md.txt|suffix".into()];
+        original.web_protection.allowlist = vec![".corp.example.com".into()];
+        original.web_protection.log_queries = true;
+
+        let full = FullConfig::from(&original);
+        let json = serde_json::to_string(&full).expect("serialize");
+        let parsed: FullConfig = serde_json::from_str(&json).expect("deserialize");
+
+        // The daemon always sends the section, and it is identical to the
+        // stored one (serialized comparison — WebProtectionConfig has no
+        // PartialEq).
+        assert_eq!(
+            serde_json::to_value(
+                parsed
+                    .web_protection
+                    .as_ref()
+                    .expect("daemon must always send the section")
+            )
+            .unwrap(),
+            serde_json::to_value(&original.web_protection).unwrap(),
+        );
+
+        // Applying the round-tripped payload is a no-op for the section
+        // and raises no kill-vector objection.
+        assert!(
+            original.critical_diff(&parsed).is_empty(),
+            "an identical section must not read as a critical mutation"
+        );
+        let mut applied = original.clone();
+        applied.apply_non_critical(&parsed);
+        assert_eq!(
+            serde_json::to_value(&applied.web_protection).unwrap(),
+            serde_json::to_value(&original.web_protection).unwrap(),
+        );
+    }
+
+    /// DONE-WHEN (b): a FullConfig payload with the web_protection key
+    /// ABSENT (older/partial GUI) must leave the stored section untouched
+    /// AND must not be rejected as kill-vector tampering. This is the
+    /// serde(default) trap: without the Option, the absent key would
+    /// materialise as a defaulted section, which critical_diff would then
+    /// compare against the user's non-default stored config — rejecting
+    /// every unrelated save from that client.
+    #[test]
+    fn absent_web_protection_section_leaves_stored_config_untouched() {
+        let mut stored = Config::default();
+        stored.web_protection.enabled = true;
+        stored.web_protection.blocklists = vec!["C:\\feeds\\md.txt|suffix".into()];
+        stored.web_protection.allowlist = vec![".corp.example.com".into()];
+
+        // Build what such a client actually sends: a full payload with the
+        // section key removed.
+        let mut json = serde_json::to_value(FullConfig::from(&stored)).unwrap();
+        json.as_object_mut().unwrap().remove("web_protection");
+        let parsed: FullConfig = serde_json::from_value(json).expect("parses without the key");
+        assert!(
+            parsed.web_protection.is_none(),
+            "absent key must NOT materialise a defaulted section"
+        );
+
+        assert!(
+            stored.critical_diff(&parsed).is_empty(),
+            "absent section must not read as an attempted critical mutation"
+        );
+        let mut victim = stored.clone();
+        victim.apply_non_critical(&parsed);
+        assert_eq!(
+            serde_json::to_value(&victim.web_protection).unwrap(),
+            serde_json::to_value(&stored.web_protection).unwrap(),
+            "absent section must leave the stored config byte-identical"
         );
     }
 }
