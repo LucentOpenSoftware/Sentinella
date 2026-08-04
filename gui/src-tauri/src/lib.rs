@@ -274,6 +274,18 @@ async fn get_watcher_status() -> Result<Value, String> {
         .map_err(Into::into)
 }
 
+// ── Web Protection ─────────────────────────────────────────────
+
+#[tauri::command]
+async fn get_web_protection_status() -> Result<Value, String> {
+    // webprotection.status is AuthenticatedRead (policy.rs) — same gate as
+    // watcher.status. Read-only: there is deliberately no setter command;
+    // enabling travels via sentinelld.toml + daemon restart.
+    daemon_client::call_auth("webprotection.status", serde_json::json!({}))
+        .await
+        .map_err(Into::into)
+}
+
 // ── Idle Scanner ────────────────────────────────────────────────
 
 #[tauri::command]
@@ -1169,6 +1181,7 @@ pub fn run() {
             quarantine_delete,
             report_safe,
             get_watcher_status,
+            get_web_protection_status,
             get_idle_scanner_status,
             get_update_status,
             start_signature_update,

@@ -18,6 +18,7 @@ import type {
   ArgusVerdictRecord,
   ArgusPacksResponse,
   IdleScannerStatus,
+  WebProtectionStatus,
 } from "../types/sentinella";
 
 // ── Engine ──────────────────────────────────────────────────
@@ -176,6 +177,12 @@ export const runBenchmark = (passes?: number) =>
 
 export const getWatcherStatus = () =>
   invoke<WatcherStatus>("get_watcher_status");
+
+// ── Web Protection ───────────────────────────────────────────
+
+/** Read-only: there is no setter — enabling is via sentinelld.toml + daemon restart. */
+export const getWebProtectionStatus = () =>
+  invoke<WebProtectionStatus>("get_web_protection_status");
 
 // ── Idle Scanner ───────────────────────────────────────────────
 

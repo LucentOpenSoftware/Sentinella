@@ -86,6 +86,46 @@ export interface WatcherStatus {
   last_event: number | null;
 }
 
+// ── Web Protection ────────────────────────────────────────────
+//
+// DRIFT HAZARD: transcribed BY HAND from
+// crates/sentinelld/src/web_protection/status.rs — these types are NOT
+// generated from the Rust, and tsc is structurally blind to a rename on
+// the daemon side (a missing field just reads back as `undefined`). The
+// Rust side pins the wire shape with the serde test
+// `status_serializes_with_both_states_distinguishable`; if that test
+// changes, this block must change in the same commit. Enum values below
+// are snake_case because `ProxyState` carries
+// `#[serde(rename_all = "snake_case")]`.
+
+export type ProxyState = "disabled" | "bind_failed" | "self_test_failed" | "serving";
+
+export interface WebProtectionStatus {
+  /** User intent, straight from config — NOT proof of protection. */
+  enabled: boolean;
+  /**
+   * Runtime fact read from the registry: is our NRPT rule present RIGHT
+   * NOW. `null` means "the daemon could not tell" — a third state, never
+   * to be rendered as "not installed".
+   */
+  nrpt_installed: boolean | null;
+  state: ProxyState;
+  /** Address actually bound, when serving. */
+  listen: string | null;
+  upstreams: string[];
+  /** Healthy upstreams over total, from the last self-test. */
+  upstreams_healthy: number;
+  upstreams_total: number;
+  /** Rules loaded into the filter engine. */
+  rules_loaded: number;
+  /** Human-readable detail for a failed state; empty when serving. */
+  detail: string;
+  queries: number;
+  blocked: number;
+  cache_hits: number;
+  upstream_errors: number;
+}
+
 export interface UpdateStatus {
   state: "idle" | "checking" | "downloading" | "applying" | "completed" | "error";
   percent: number | null;

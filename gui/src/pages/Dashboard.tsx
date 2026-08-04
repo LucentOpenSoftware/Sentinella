@@ -7,6 +7,7 @@ import {
   Clock,
   Database,
   Eye,
+  Globe,
   Loader2,
   RefreshCw,
   Search,
@@ -18,10 +19,10 @@ import { useState, useEffect } from "react";
 import { Card } from "../components/Card";
 import { ShieldIcon } from "../components/ShieldIcon";
 import { useDaemonContext } from "../hooks/DaemonContext";
-import { startQuickScan, startSignatureUpdate, getRuntimeIntelligence, getTrustStatus } from "../api/sentinella";
+import { startQuickScan, startSignatureUpdate, getRuntimeIntelligence, getTrustStatus, getWebProtectionStatus } from "../api/sentinella";
 import { t } from "../i18n";
 import type { Page } from "../components/Sidebar";
-import type { RuntimeIntelligenceStatus, TrustGraphStatus } from "../types/sentinella";
+import type { RuntimeIntelligenceStatus, TrustGraphStatus, WebProtectionStatus } from "../types/sentinella";
 
 export function Dashboard({ onNavigate }: { onNavigate: (p: Page) => void }) {
   const { data, connected, connectionState, loading, error, lastRefresh, refresh } = useDaemonContext();
@@ -304,6 +305,7 @@ export function Dashboard({ onNavigate }: { onNavigate: (p: Page) => void }) {
           color={engine.signature_count > 0 ? "green" : "amber"}
           icon={<Database size={18} />}
         />
+        <WebProtectionTile onNavigate={onNavigate} />
       </div>
 
       {/* ARGUS + Runtime Intelligence — side by side */}
@@ -421,22 +423,28 @@ function StatusTile({
   sub,
   color,
   icon,
+  onClick,
 }: {
   label: string;
   value: string;
   sub: string;
-  color: "accent" | "green" | "amber" | "red";
+  color: "accent" | "green" | "amber" | "red" | "neutral";
   icon: React.ReactNode;
+  onClick?: () => void;
 }) {
   const palette = {
     accent: "var(--accent)",
     green: "var(--green)",
     amber: "var(--amber)",
     red: "var(--red)",
+    neutral: "var(--t3)",
   }[color];
 
   return (
-    <div className="glass-card flex flex-col gap-2 px-5 py-4 h-full">
+    <div
+      className={`glass-card flex flex-col gap-2 px-5 py-4 h-full ${onClick ? "cursor-pointer hover:bg-[rgb(var(--raised))]/15 transition-colors" : ""}`}
+      onClick={onClick}
+    >
       {/* Header: icon + label */}
       <div className="flex items-center gap-2.5">
         <div
@@ -670,5 +678,79 @@ function BehavioralFamiliarityCard() {
         </div>
       )}
     </div>
+  );
+}
+
+// ── Web Protection tile ─────────────────────────────────────
+
+/**
+ * Colours by the COMBINATION of proxy state and NRPT fact, never by
+ * `enabled` alone: a green tile on intent alone would claim protection
+ * while the system DNS rule is absent — the exact failure the
+ * intent/fact split in WebProtectionStatus exists to prevent.
+ */
+function WebProtectionTile({ onNavigate }: { onNavigate: (p: Page) => void }) {
+  const [wp, setWp] = useState<WebProtectionStatus | null>(null);
+  const { connected } = useDaemonContext();
+
+  useEffect(() => {
+    if (!connected) return;
+    getWebProtectionStatus().then(setWp).catch(() => {});
+    const interval = setInterval(() => {
+      getWebProtectionStatus().then(setWp).catch(() => {});
+    }, 10000);
+    return () => clearInterval(interval);
+  }, [connected]);
+
+  if (!wp) return null;
+
+  let value: string;
+  let sub: string;
+  let color: "accent" | "green" | "amber" | "red" | "neutral";
+
+  if (wp.state === "serving" && wp.nrpt_installed === true) {
+    // Proxy serving AND the system DNS rule is live — actually filtering.
+    color = "green";
+    value = t("tile.active");
+    sub = `${wp.rules_loaded.toLocaleString()} ${t("wp.tile_rules_suffix")}`;
+  } else if (wp.state === "serving" && wp.nrpt_installed === false) {
+    // Serving, but Windows is not sending DNS through us.
+    color = "amber";
+    value = t("wp.tile_no_rule");
+    sub = t("wp.tile_no_rule_sub");
+  } else if (wp.state === "serving") {
+    // nrpt_installed === null: "could not tell" — not green, not absent.
+    color = "amber";
+    value = t("wp.tile_unverified");
+    sub = t("wp.tile_unverified_sub");
+  } else if (wp.state === "bind_failed") {
+    color = "red";
+    value = t("wp.tile_bind");
+    sub = t("wp.tile_bind_sub");
+  } else if (wp.state === "self_test_failed") {
+    color = "amber";
+    value = t("wp.tile_self_test");
+    sub = wp.detail || t("wp.tile_unverified_sub");
+  } else if (wp.enabled) {
+    // Config asked for protection but nothing is running (e.g. the config
+    // failed validation and was forced off) — worth a warning.
+    color = "amber";
+    value = t("tile.off");
+    sub = wp.detail || t("wp.tile_disabled_sub");
+  } else {
+    color = "neutral";
+    value = t("tile.off");
+    sub = t("wp.tile_disabled_sub");
+  }
+
+  return (
+    <StatusTile
+      label={t("nav.webprotection")}
+      value={value}
+      sub={sub}
+      color={color}
+      icon={<Globe size={18} />}
+      onClick={() => onNavigate("webprotection")}
+    />
   );
 }

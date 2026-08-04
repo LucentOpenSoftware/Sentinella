@@ -11,6 +11,7 @@ const titleKeys: Record<Page, string> = {
   history: "nav.history",
   notifications: "nav.notifications",
   intelligence: "nav.intelligence",
+  webprotection: "nav.webprotection",
   update: "nav.update",
   settings: "nav.settings",
   about: "nav.about",
@@ -29,6 +30,7 @@ const subtitleKeys: Record<Exclude<Page, "about">, string> = {
   history: "meta.history_sub",
   notifications: "meta.notifications_sub",
   intelligence: "meta.intelligence_sub",
+  webprotection: "meta.webprotection_sub",
   update: "meta.update_sub",
   settings: "meta.settings_sub",
 };
