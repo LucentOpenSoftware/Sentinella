@@ -109,22 +109,35 @@ impl FishConfig {
         // window_seconds: too-short windows defeat detection (every event
         // looks isolated); too-long windows blow memory in the event queue.
         self.window_seconds = self.window_seconds.clamp(5, 3600);
-        // slow-burn window must stay within sane bounds — 0 would tumble
-        // constantly; >1 day defeats the slow-burn purpose.
+        // A threshold of 0 means UNSET, so restore that field's default —
+        // it does NOT mean 1.
+        //
+        // It used to mean 1, and that is the opposite of safe: a threshold
+        // of 1 fires on the very first event of its kind, so a config with
+        // `ext_mutation_threshold = 0` made FISH alert on the first
+        // .docx -> .enc rename anyone performed. `MutationWindow::new`
+        // carried its own 0-fallbacks (5 / 600 / 250) with a comment
+        // promising exactly this protection, but every construction site
+        // runs `validate()` first, so those branches were unreachable and
+        // the 1 always won. The defaults live in one place now.
+        let d = Self::default();
+        if self.slow_burn_window_secs == 0 {
+            self.slow_burn_window_secs = d.slow_burn_window_secs;
+        }
+        // >1 day defeats the slow-burn purpose; the floor keeps a
+        // deliberately-small window from tumbling constantly.
         self.slow_burn_window_secs = self.slow_burn_window_secs.clamp(60, 86_400);
-        // Any threshold of 0 trips immediately on the first event of that
-        // kind — floor to 1 so an alert always requires at least one event.
         if self.rename_threshold == 0 {
-            self.rename_threshold = 1;
+            self.rename_threshold = d.rename_threshold;
         }
         if self.rewrite_threshold == 0 {
-            self.rewrite_threshold = 1;
+            self.rewrite_threshold = d.rewrite_threshold;
         }
         if self.ext_mutation_threshold == 0 {
-            self.ext_mutation_threshold = 1;
+            self.ext_mutation_threshold = d.ext_mutation_threshold;
         }
         if self.slow_burn_threshold == 0 {
-            self.slow_burn_threshold = 1;
+            self.slow_burn_threshold = d.slow_burn_threshold;
         }
         // Cooldown >1 day suppresses every subsequent alert in practice.
         if self.alert_cooldown_seconds > 86_400 {
@@ -249,24 +262,14 @@ impl MutationWindow {
             window: Duration::from_secs(config.window_seconds),
             rename_threshold: config.rename_threshold,
             rewrite_threshold: config.rewrite_threshold,
-            // Treat 0 as "use the default 5" so a zeroed config can't make
-            // every single extension change trip an alert.
-            ext_mutation_threshold: if config.ext_mutation_threshold == 0 {
-                5
-            } else {
-                config.ext_mutation_threshold
-            },
+            // Taken as given. `FishConfig::validate` owns the 0-means-unset
+            // substitution and every construction site runs it first, so the
+            // 0-fallbacks that used to sit here were unreachable — and they
+            // disagreed with what validate actually installed.
+            ext_mutation_threshold: config.ext_mutation_threshold,
             cooldown: Duration::from_secs(config.alert_cooldown_seconds),
-            slow_burn_window: Duration::from_secs(if config.slow_burn_window_secs == 0 {
-                600
-            } else {
-                config.slow_burn_window_secs
-            }),
-            slow_burn_threshold: if config.slow_burn_threshold == 0 {
-                250
-            } else {
-                config.slow_burn_threshold
-            },
+            slow_burn_window: Duration::from_secs(config.slow_burn_window_secs),
+            slow_burn_threshold: config.slow_burn_threshold,
             slow_burn_count: 0,
             slow_burn_start: Instant::now(),
             rename_bursts: 0,
@@ -672,9 +675,18 @@ mod tests {
             "2nd mutation must trip the configured threshold of 2"
         );
 
-        // A zeroed threshold falls back to the safe default (5), NOT trip-on-1.
+        // A zeroed threshold falls back to the safe default, NOT trip-on-1.
+        //
+        // Through validate(), which is what every production construction
+        // site does. This used to build the window directly from a raw
+        // config and so exercised a 0-fallback inside MutationWindow::new
+        // that production could never reach — the branch was dead, and
+        // validate was meanwhile installing 1, the exact trip-on-first
+        // behaviour this assertion forbids. The property was right; the
+        // path was fiction.
         let mut cfg0 = make_config();
         cfg0.ext_mutation_threshold = 0;
+        cfg0.validate();
         let mut w0 = MutationWindow::new(&cfg0);
         let d = w0.record(FileMutationEvent {
             path: PathBuf::from("only.docx"),
@@ -857,5 +869,50 @@ mod tests {
             }
         }
         assert!(alerted, "the enabled shield must still see this burst");
+    }
+}
+
+#[cfg(test)]
+mod zero_threshold_tests {
+    use super::*;
+
+    #[test]
+    fn a_zeroed_threshold_restores_the_default_not_one() {
+        // The defect: validate floored every 0 to 1, so
+        // `ext_mutation_threshold = 0` in config.toml made FISH alert on the
+        // FIRST .docx -> .enc rename on the machine. MutationWindow::new
+        // carried 0-fallbacks promising the opposite, but validate runs
+        // first at every construction site so they never executed.
+        let d = FishConfig::default();
+        let mut c = FishConfig {
+            rename_threshold: 0,
+            rewrite_threshold: 0,
+            ext_mutation_threshold: 0,
+            slow_burn_threshold: 0,
+            slow_burn_window_secs: 0,
+            ..FishConfig::default()
+        };
+        c.validate();
+        assert_eq!(c.ext_mutation_threshold, d.ext_mutation_threshold, "0 must mean unset, not 1");
+        assert_eq!(c.rename_threshold, d.rename_threshold);
+        assert_eq!(c.rewrite_threshold, d.rewrite_threshold);
+        assert_eq!(c.slow_burn_threshold, d.slow_burn_threshold);
+        assert_eq!(c.slow_burn_window_secs, d.slow_burn_window_secs);
+        assert!(c.ext_mutation_threshold > 1, "a threshold of 1 fires on the first event");
+    }
+
+    #[test]
+    fn the_window_carries_validates_values_verbatim() {
+        // MutationWindow must not re-substitute: two places deciding what 0
+        // means is how they came to disagree. A window built from a
+        // validated config has exactly that config's numbers.
+        let mut c = FishConfig { ext_mutation_threshold: 0, ..FishConfig::default() };
+        c.validate();
+        let w = MutationWindow::new(&c);
+        assert_eq!(w.ext_mutation_threshold, c.ext_mutation_threshold);
+        // And an explicit low-but-nonzero value is the user's choice to keep.
+        let mut c2 = FishConfig { ext_mutation_threshold: 2, ..FishConfig::default() };
+        c2.validate();
+        assert_eq!(MutationWindow::new(&c2).ext_mutation_threshold, 2);
     }
 }

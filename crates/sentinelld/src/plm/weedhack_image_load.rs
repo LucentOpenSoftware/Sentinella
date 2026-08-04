@@ -4,9 +4,14 @@
 //!
 //! Sits between the Windows ETW `Microsoft-Windows-Kernel-Process` ImageLoad
 //! provider and the canonical `weedhack_browser_injection::evaluate()`
-//! detector. It is the FIRST real ETW source wired up for WeedHack
-//! runtime correlation; FileIO (wallet harvest) and WinHTTP (EtherHiding)
-//! intentionally remain unimplemented for now.
+//! detector. It was the first ETW source wired up for WeedHack runtime
+//! correlation, and is no longer the only one: `etw_file_io` (wallet
+//! harvest) and `weedhack_http_intake` (EtherHiding) are both live and feed
+//! the same `WeedHackCampaignTracker` from the same PLM session. This header
+//! claimed they "intentionally remain unimplemented", which mattered because
+//! the tracker tiers a campaign on signal kinds CONVERGING — read that and
+//! you conclude BrowserInjectionFromJava is the only signal that can ever
+//! arrive, and that a campaign can never advance past a single-signal tier.
 //!
 //! Pipeline:
 //!

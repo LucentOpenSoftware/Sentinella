@@ -393,14 +393,23 @@ fn is_elevated_check() -> bool {
 /// child's cold-start-to-mutex-check is 200-600 ms. The window where
 /// the child loses is real and timing-dependent.
 ///
-/// v0.1.9 fix: pass `--elevated-restart` as a CLI argument when
-/// spawning the elevated copy. The single-instance plugin callback in
-/// the elevated process detects this argument and treats itself as a
-/// LEGITIMATE second instance (no focus-existing dedup). The race is
-/// now structurally impossible — even if the parent is still alive
-/// when the child checks the mutex, the child doesn't dedup itself
-/// because the arg explicitly opts out. The parent still exits via
-/// `app.exit(0)` for cleanliness, but timing no longer matters.
+/// How it is actually fixed, in two layers — and NEITHER is the
+/// callback-argument check this doc used to describe. That first
+/// attempt was deleted as broken: the plugin's dedup kills the second
+/// instance BEFORE the parent's callback runs, so checking the argument
+/// there only ever informed a parent whose child had already exited.
+///
+/// 1. The parent exits with `std::process::exit(0)`, NOT `app.exit(0)`.
+///    A graceful Tauri unwind held the single-instance mutex for
+///    hundreds of milliseconds, which is exactly long enough to lose
+///    the race. TIMING STILL MATTERS — this doc claimed it did not, and
+///    anyone who believed that would swap the hard exit back for a
+///    graceful one and restore the original bug.
+/// 2. The elevated child skips the single_instance plugin at its own
+///    `main()` entry when it sees `--elevated-restart` AND is genuinely
+///    elevated (see `run`). The elevation gate is not decoration: without
+///    it any unprivileged process could spawn unlimited GUI instances by
+///    passing the flag.
 ///
 /// `ShellExecuteW` with the "runas" verb is synchronous on the UAC
 /// dialog — does not return until the user dismisses it. So when we

@@ -263,7 +263,9 @@ const en: Record<HelpTopic, TopicData> = {
       {
         heading: "Zero telemetry",
         body: [
-          "Sentinella does not collect, transmit, or store any usage data, scan results, detection statistics, or system information. There is no analytics endpoint, no crash reporting service, no \"anonymous usage data\" toggle. The daemon makes exactly one type of outgoing network connection: downloading ClamAV signature updates from ClamAV's official mirror.",
+          "Sentinella does not collect, transmit, or store any usage data, scan results, detection statistics, or system information. There is no analytics endpoint, no crash reporting service, no \"anonymous usage data\" toggle.",
+          "The daemon makes two kinds of outgoing connection, and no others. First: downloading ClamAV signature updates from ClamAV's official mirror. Second, ONLY if you enable Web Protection: forwarding your DNS queries to the resolvers your network already hands out. Web Protection is off by default, and when it is off the daemon never touches the network except to fetch signatures.",
+          "Be clear about what enabling it means. Web Protection installs a system-wide DNS rule, so every name your machine looks up passes through the local Sentinella proxy before reaching those upstream resolvers. Names are matched against blocklists on your machine and are never sent anywhere else — but the daemon does see them, which it otherwise would not.",
         ],
       },
       {
@@ -575,7 +577,9 @@ const es: Record<HelpTopic, TopicData> = {
       {
         heading: "Cero telemetría",
         body: [
-          "Sentinella no recopila, transmite ni almacena ningún dato de uso, resultado de escaneo, estadística de detección ni información del sistema. No hay un punto de análisis, ni un servicio de reporte de fallos, ni una opción de \"datos de uso anónimos\". El servicio realiza exactamente un tipo de conexión de red saliente: descargar las actualizaciones de firmas de ClamAV desde su servidor oficial.",
+          "Sentinella no recopila, transmite ni almacena ningún dato de uso, resultado de escaneo, estadística de detección ni información del sistema. No hay un punto de análisis, ni un servicio de reporte de fallos, ni una opción de \"datos de uso anónimos\".",
+          "El servicio realiza dos tipos de conexión saliente, y ninguno más. Primero: descargar las actualizaciones de firmas de ClamAV desde su servidor oficial. Segundo, SOLO si activás Protección Web: reenviar tus consultas DNS a los resolutores que tu propia red ya entrega. La Protección Web viene desactivada, y mientras lo esté el servicio no toca la red salvo para bajar firmas.",
+          "Conviene ser claro sobre lo que implica activarla. La Protección Web instala una regla DNS para todo el sistema, así que cada nombre que tu máquina resuelve pasa por el proxy local de Sentinella antes de llegar a esos resolutores. Los nombres se comparan contra listas de bloqueo en tu propia máquina y nunca se envían a ningún lado — pero el servicio sí los ve, cosa que de otro modo no ocurriría.",
         ],
       },
       {

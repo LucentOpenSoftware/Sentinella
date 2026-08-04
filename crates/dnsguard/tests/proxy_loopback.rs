@@ -62,12 +62,32 @@ async fn spawn_udp_upstream<F>(responder: F) -> (SocketAddr, Arc<AtomicUsize>)
 where
     F: Fn(&[u8]) -> Option<Vec<u8>> + Send + Sync + 'static,
 {
-    let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind upstream");
-    let addr = sock.local_addr().expect("addr");
-    // TCP side on the same port (loopback port allocation is per-protocol).
-    let tcp = TcpListener::bind(("127.0.0.1", addr.port()))
-        .await
-        .expect("bind upstream tcp side");
+    // UDP and TCP must land on the SAME port, but the OS allocates them
+    // independently: a port free on UDP can be taken on TCP, or sit inside a
+    // Windows excluded range (Hyper-V/WSL reserve blocks), which surfaces as
+    // WSAEACCES. Binding once and hoping made this helper fail roughly one
+    // run in three with "bind upstream tcp side: PermissionDenied" — a flake
+    // that reads exactly like a product bug in whichever test drew the bad
+    // port. Retry with a fresh pair until both sides agree.
+    let (sock, tcp, addr) = {
+        let mut last: Option<std::io::Error> = None;
+        let mut got = None;
+        for _ in 0..32 {
+            let s = UdpSocket::bind("127.0.0.1:0").await.expect("bind upstream udp");
+            let a = s.local_addr().expect("addr");
+            match TcpListener::bind(("127.0.0.1", a.port())).await {
+                Ok(t) => {
+                    got = Some((s, t, a));
+                    break;
+                }
+                // Drop the UDP socket and take another port.
+                Err(e) => last = Some(e),
+            }
+        }
+        got.unwrap_or_else(|| {
+            panic!("no port free on both UDP and TCP after 32 tries: {last:?}")
+        })
+    };
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_task = Arc::clone(&calls);
     let responder = Arc::new(responder);
