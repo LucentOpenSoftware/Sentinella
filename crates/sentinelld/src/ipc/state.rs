@@ -4567,6 +4567,16 @@ impl AppState {
                 );
             }
 
+            // Web-protection blocklist refresh rides the SAME update cycle —
+            // one update story. Deliberately outside the success/cooldown/
+            // failure branches above: a failed freshclam must not skip the
+            // list refresh (different host, usually a transient cause), and
+            // a list-refresh failure must never mark the signature update
+            // failed. It only rewrites files under rules\dns\managed — on
+            // any error the previous list stays in force; it cannot disable
+            // filtering or touch the proxy/NRPT.
+            crate::web_protection::lists::refresh_on_update_cycle();
+
             // Mark update as done.
             {
                 let mut inner = state.lock_inner();

@@ -26,6 +26,7 @@ mkdir "%STAGE%\runtime\config"
 mkdir "%STAGE%\runtime\argus\rules\yara"
 mkdir "%STAGE%\runtime\argus\manifests"
 mkdir "%STAGE%\runtime\rules"
+mkdir "%STAGE%\runtime\rules\dns"
 mkdir "%STAGE%\runtime\signatures_bootstrap"
 mkdir "%STAGE%\certs"
 mkdir "%STAGE%\scripts"
@@ -146,6 +147,21 @@ if defined SIG_HAVE_MAIN (
     echo        main/daily/bytecode OK
 ) else (
     echo        [WARN] Bootstrap signatures not found
+)
+
+:: ── Bundled DNS blocklist (web-protection starter) ──
+:: Required content, not optional: the installer seeds it into
+:: ProgramData and the sanity script demands it in the bundle, so a
+:: missing source here is a broken release, not a warning.
+echo  [5b/9] DNS blocklist...
+if exist "%ROOT%\runtime\rules\dns\stevenblack.hosts" (
+    copy /Y "%ROOT%\runtime\rules\dns\stevenblack.hosts" "%STAGE%\runtime\rules\dns\" >nul
+    echo        stevenblack.hosts OK
+) else (
+    echo        [FAIL] runtime\rules\dns\stevenblack.hosts not found — web-protection starter list is required content
+    echo.
+    echo  Staging FAILED: bundled DNS blocklist missing.
+    exit /b 1
 )
 
 :: ── Config templates ──

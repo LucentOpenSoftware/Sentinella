@@ -79,6 +79,8 @@
   CreateDirectory "$SENTI_DATA\argus\rules\yara"
   CreateDirectory "$SENTI_DATA\argus\manifests"
   CreateDirectory "$SENTI_DATA\rules"
+  CreateDirectory "$SENTI_DATA\rules\dns"
+  CreateDirectory "$SENTI_DATA\rules\dns\managed"
   CreateDirectory "$SENTI_DATA\clamav_tmp"
   CreateDirectory "$SENTI_DATA\diagnostics"
   CreateDirectory "$SENTI_DATA\enhanced_signatures"
@@ -98,6 +100,18 @@
 
   ; === Copy IOC hashes ===
   CopyFiles /SILENT "$SENTI_DAEMON\runtime\rules\*.*" "$SENTI_DATA\rules\"
+
+  ; === Copy the bundled DNS blocklist (only if absent) ===
+  ; Same per-file guard as the bootstrap signature databases below, for
+  ; the same reason: an upgrade must never overwrite a list the user
+  ; replaced. This is the OFFLINE SEED — the daemon's managed-list fetcher
+  ; refreshes its own copy under rules\dns\managed\ on each update cycle,
+  ; so the guard costs no freshness. The wildcard copy above does not
+  ; reach subdirectories, so this file needs its own copy.
+  IfFileExists "$SENTI_DATA\rules\dns\stevenblack.hosts" senti_dns_done 0
+  IfFileExists "$SENTI_DAEMON\runtime\rules\dns\stevenblack.hosts" 0 senti_dns_done
+    CopyFiles /SILENT "$SENTI_DAEMON\runtime\rules\dns\stevenblack.hosts" "$SENTI_DATA\rules\dns\"
+  senti_dns_done:
 
   ; === Copy bootstrap ClamAV signatures (per database, only if absent) ===
   ; This avoids overwriting newer signatures from a previous install/freshclam.

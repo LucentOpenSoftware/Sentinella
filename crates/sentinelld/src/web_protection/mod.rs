@@ -45,6 +45,7 @@
 //! quarantined binary, power loss.
 
 pub mod config;
+pub mod lists;
 pub mod rule;
 pub mod service;
 pub mod status;

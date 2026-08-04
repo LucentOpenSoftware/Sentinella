@@ -13,3 +13,16 @@ Systems, Inc. or the ClamAV team. It is an independent open-source project
 that uses the ClamAV engine as its scanning backend.
 
 For more information about ClamAV, visit: https://www.clamav.net
+
+---
+
+Sentinella also bundles the **StevenBlack/hosts** "unified hosts" blocklist
+(adware + malware) as the starter DNS blocklist for web protection
+(`runtime/rules/dns/stevenblack.hosts`).
+
+StevenBlack/hosts is Copyright (c) 2023 Steven Black and is used under the
+terms of the MIT License; the full license text is included in the header of
+the bundled file. Upstream project: https://github.com/StevenBlack/hosts
+
+Sentinella is **not** affiliated with, endorsed by, or supported by the
+StevenBlack/hosts project.

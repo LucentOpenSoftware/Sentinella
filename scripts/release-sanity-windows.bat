@@ -45,6 +45,7 @@ call :check "%STAGE%\runtime\config\freshclam.conf" "Freshclam config"
 call :check_either "%STAGE%\runtime\signatures_bootstrap\main" "Bootstrap main signatures"
 call :check_either "%STAGE%\runtime\signatures_bootstrap\daily" "Bootstrap daily signatures"
 call :check_either "%STAGE%\runtime\signatures_bootstrap\bytecode" "Bootstrap bytecode signatures"
+call :check_dns_list "%STAGE%\runtime\rules\dns\stevenblack.hosts" "Bundled DNS blocklist"
 
 :: Check legal.
 call :check "%STAGE%\LICENSE" "LICENSE file"
@@ -93,6 +94,17 @@ REM because the staging script skipped daily.cld for the same reason.
 if exist "%~1.cvd" ( echo  [OK]   %~2 ^(.cvd^) & set /a PASS+=1 & exit /b )
 if exist "%~1.cld" ( echo  [OK]   %~2 ^(.cld^) & set /a PASS+=1 & exit /b )
 echo  [FAIL] %~2 NOT FOUND ^(neither .cvd nor .cld^) & set /a FAIL+=1
+exit /b
+
+REM A bare existence check is not enough for the blocklist: a 0-byte or
+REM stub file stages fine and then loads as zero rules — the daemon reports
+REM serving with no filtering behind it. StevenBlack unified is ~3 MB, so
+REM demand real content. %~z1 is only read after the existence check, or it
+REM expands to nothing and the comparison itself errors out.
+:check_dns_list
+if not exist "%~1" ( echo  [FAIL] %~2 NOT FOUND & set /a FAIL+=1 & exit /b )
+if %~z1 LSS 102400 ( echo  [FAIL] %~2 is suspiciously small ^(%~z1 bytes^) & set /a FAIL+=1 & exit /b )
+echo  [OK]   %~2 ^(%~z1 bytes^) & set /a PASS+=1
 exit /b
 
 :check_notice
