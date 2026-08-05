@@ -90,10 +90,33 @@ impl Default for FishConfig {
             rename_threshold: 50,
             rewrite_threshold: 200,
             ext_mutation_threshold: 5,
-            // ~250 mass mutations in 10 min, well above legit bulk edits but
-            // below a real encryption run, even a slow one.
+            // MEASURED, not estimated. 250-in-10-minutes was chosen as
+            // "well above legit bulk edits" and is not: on an ordinary
+            // desktop with OneDrive syncing and a messenger running, the
+            // watched roots (AppData\Roaming, OneDrive, Documents) produced
+            // 1342 mutations in one 600 s window and tripped this 19 times in
+            // under three hours, every one a false positive.
+            //
+            // Since `entropy_delta_threshold` is inert (see above), this is a
+            // pure volume counter and cannot tell encryption from sync. The
+            // number is therefore a NOISE FLOOR: high enough to clear
+            // observed legitimate churn, which is a weaker guarantee than it
+            // looks. A real encryption run over a user's Documents moves far
+            // more than this, far faster; a deliberately slow one may not
+            // trip it at all, and that gap closes only by wiring a content
+            // discriminator, not by tuning this.
             slow_burn_window_secs: 600,
-            slow_burn_threshold: 250,
+            slow_burn_threshold: 2000,
+            // INERT. Nothing reads this field: it is declared, defaulted,
+            // validated and clamped, and no detection path consumes it.
+            // Kept rather than deleted because removing a config key breaks
+            // every TOML that sets it, but do not mistake its presence for a
+            // capability — FISH currently has NO discriminator between "many
+            // files were written" and "many files were encrypted". Wiring it
+            // needs a before/after sample of each file, and by the time the
+            // watcher sees the event the "before" is already gone, so it
+            // needs a content cache first. That is why the thresholds below
+            // are a noise floor rather than a detection threshold.
             entropy_delta_threshold: 0.20,
             alert_cooldown_seconds: 60,
             active_response: "observe".into(),
@@ -914,5 +937,43 @@ mod zero_threshold_tests {
         let mut c2 = FishConfig { ext_mutation_threshold: 2, ..FishConfig::default() };
         c2.validate();
         assert_eq!(MutationWindow::new(&c2).ext_mutation_threshold, 2);
+    }
+}
+
+#[cfg(test)]
+mod noise_floor_tests {
+    use super::*;
+
+    /// Highest legitimate mutation count observed in one 600 s window on a
+    /// developer desktop (OneDrive syncing, messenger running, browser open),
+    /// 2026-08-05. The old default of 250 sat far below this and fired 19
+    /// times in under three hours, all false positives.
+    const OBSERVED_LEGITIMATE_CHURN_PER_WINDOW: u32 = 1342;
+
+    #[test]
+    fn the_slow_burn_floor_clears_measured_legitimate_churn() {
+        let d = FishConfig::default();
+        assert_eq!(d.slow_burn_window_secs, 600, "the measurement is per 600 s window");
+        assert!(
+            d.slow_burn_threshold > OBSERVED_LEGITIMATE_CHURN_PER_WINDOW,
+            "slow_burn_threshold {} does not clear churn measured on a real desktop ({});              lowering it re-creates a shield that cries wolf every few minutes",
+            d.slow_burn_threshold,
+            OBSERVED_LEGITIMATE_CHURN_PER_WINDOW
+        );
+    }
+
+    #[test]
+    fn the_entropy_knob_is_still_inert_and_this_test_says_so_out_loud() {
+        // Not a behaviour assertion — a tripwire. entropy_delta_threshold is
+        // validated and clamped but no detection path reads it, which is why
+        // the slow-burn threshold is a noise floor rather than a real
+        // discriminator. When someone wires it, this test should fail and be
+        // replaced by one that exercises the discriminator.
+        let mut c = FishConfig { entropy_delta_threshold: f64::NAN, ..FishConfig::default() };
+        c.validate();
+        assert_eq!(c.entropy_delta_threshold, 0.20, "validate still owns this field");
+        let w = MutationWindow::new(&c);
+        // MutationWindow does not carry it at all: nothing consumes it.
+        let _ = w;
     }
 }

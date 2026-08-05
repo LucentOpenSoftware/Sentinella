@@ -1330,6 +1330,34 @@ fn fish_should_skip_path(path: &std::path::Path) -> bool {
 }
 
 /// Handle a FISH burst — observe or take active response.
+/// At most one observe-mode FISH row per this interval.
+const OBSERVE_LOG_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
+/// Should this observe-mode burst be written to the activity log, and how
+/// many were folded into it?
+///
+/// `Some(n)` = write, having suppressed `n` since the last row.
+/// `None` = stay quiet.
+fn fish_observe_suppressed_since_last_log() -> Option<u64> {
+    use std::sync::Mutex as StdMutex;
+    use std::sync::OnceLock;
+    static LAST: OnceLock<StdMutex<(Option<Instant>, u64)>> = OnceLock::new();
+    let cell = LAST.get_or_init(|| StdMutex::new((None, 0)));
+    let mut g = cell.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    match g.0 {
+        Some(last) if now.duration_since(last) < OBSERVE_LOG_INTERVAL => {
+            g.1 += 1;
+            None
+        }
+        _ => {
+            let folded = g.1;
+            *g = (Some(now), 0);
+            Some(folded)
+        }
+    }
+}
+
 fn fish_handle_burst(
     state: &Arc<crate::ipc::AppState>,
     affected_path: &std::path::Path,
@@ -1347,13 +1375,27 @@ fn fish_handle_burst(
 
     match response_mode {
         ResponseType::Observe => {
-            state.log_activity(
-                "warning",
-                "fish",
-                description,
-                "Observe-only — no action taken",
-                None,
-            );
+            // TELEMETRY, and it must not crowd the activity log.
+            //
+            // In observe mode this is not an event the user can act on: FISH
+            // saw volume, took no action, and the running totals live in
+            // `fish_diagnostics`. Writing a row per burst filled the log on a
+            // real machine — 50 entries covering 173 minutes, ALL of them
+            // FISH, which evicted the engine and update events someone was
+            // trying to read. The tracing line below keeps the full detail in
+            // the daemon log, where telemetry belongs.
+            //
+            // One row per OBSERVE_LOG_INTERVAL, carrying however many bursts
+            // were folded into it, so the signal survives without the flood.
+            let suppressed = fish_observe_suppressed_since_last_log();
+            if let Some(n) = suppressed {
+                let detail = if n > 0 {
+                    format!("Observe-only — no action taken ({n} similar since the last entry)")
+                } else {
+                    "Observe-only — no action taken".to_string()
+                };
+                state.log_activity("warning", "fish", description, &detail, None);
+            }
         }
         ResponseType::Suspend | ResponseType::Terminate => {
             // Find suspect processes in the affected directory.
